@@ -886,6 +886,11 @@ add_library(maichat_agent
   src/MaiChatTools/DesktopComputerTools.cpp
   src/MaiChatTools/DesktopComputerInputOwnership.h
   src/MaiChatTools/DesktopComputerInputOwnership.cpp
+  src/MaiChatTools/DesktopComputerInputTypes.h
+  src/MaiChatTools/DesktopComputerInputSession.h
+  src/MaiChatTools/DesktopComputerInputSession.cpp
+  src/MaiChatTools/DesktopComputerInputProtocol.h
+  src/MaiChatTools/DesktopComputerInputProtocol.cpp
   ../third_party/qrcodegen/qrcodegen.c
   src/agent/DesktopSessionSyncHost.h
   src/agent/DesktopSessionSyncHost.cpp
@@ -915,6 +920,22 @@ add_library(maichat_agent
   src/agent/AgentSessionList.cpp
 )
 target_compile_features(maichat_agent PRIVATE c_std_11)
+# Keep DTO validation independent of Qt/the model host and usable by each native
+# backend and its recording receiver, without a static-library dependency cycle.
+add_library(maichat_desktop_input_types STATIC src/MaiChatTools/DesktopComputerInputTypes.cpp)
+set_target_properties(maichat_desktop_input_types PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+target_include_directories(maichat_desktop_input_types PUBLIC src)
+target_link_libraries(maichat_desktop_input_types PUBLIC maiagent)
+target_link_libraries(maichat_agent PRIVATE maichat_desktop_input_types)
+# The pointer candidate is project-owned C++17 and calls Win32 directly.
+# Keyboard and mouse execution stay in the single native session below.
+if(WIN32)
+  add_library(maichat_desktop_pointer STATIC src/MaiChatTools/DesktopComputerWindowsTouch.cpp)
+  set_target_properties(maichat_desktop_pointer PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+  target_include_directories(maichat_desktop_pointer PRIVATE src ../../MaiAgent/include)
+  target_link_libraries(maichat_desktop_pointer PRIVATE maichat_desktop_input_types user32)
+  target_link_libraries(maichat_agent PRIVATE maichat_desktop_pointer)
+endif()
 if(APPLE)
   target_sources(maichat_agent PRIVATE
     src/agent/MaiDesktopGpu.h src/agent/MaiDesktopGpuMac.mm
@@ -924,7 +945,9 @@ if(APPLE)
 elseif(WIN32)
   target_sources(maichat_agent PRIVATE
     src/agent/MaiDesktopGpu.h src/agent/MaiDesktopGpuWindows.cpp
-    src/MaiChatTools/DesktopComputerWindows.cpp)
+    src/MaiChatTools/DesktopComputerWindows.cpp
+    src/MaiChatTools/DesktopComputerWindowsInputInternal.h
+    src/MaiChatTools/DesktopComputerWindowsKeyMap.cpp)
   target_compile_definitions(maichat_agent PRIVATE NOMINMAX)
   target_link_libraries(maichat_agent PRIVATE dxgi dwmapi uiautomationcore ole32)
 endif()
@@ -1275,7 +1298,12 @@ add_test(NAME desktop_computer_contracts COMMAND desktop_computer_contracts_test
 add_executable(desktop_computer_input_ownership_test tests/DesktopComputerInputOwnershipTest.cpp)
 target_link_libraries(desktop_computer_input_ownership_test PRIVATE maichat_agent Qt6::Core)
 add_test(NAME desktop_computer_input_ownership COMMAND desktop_computer_input_ownership_test)
-
+add_executable(desktop_computer_input_events_test tests/DesktopComputerInputEventsTest.cpp)
+target_link_libraries(desktop_computer_input_events_test PRIVATE maichat_agent)
+add_test(NAME desktop_computer_input_events COMMAND desktop_computer_input_events_test)
+add_executable(desktop_computer_input_session_test tests/DesktopComputerInputSessionTest.cpp)
+target_link_libraries(desktop_computer_input_session_test PRIVATE maichat_agent)
+add_test(NAME desktop_computer_input_session COMMAND desktop_computer_input_session_test)
 add_executable(desktop_computer_agent_integration_test tests/DesktopComputerAgentIntegrationTest.cpp)
 target_link_libraries(desktop_computer_agent_integration_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
   remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
@@ -1291,6 +1319,21 @@ add_test(NAME desktop_computer_native_integration COMMAND desktop_computer_nativ
 set_tests_properties(desktop_computer_native_integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
 
 if(WIN32)
+  add_executable(desktop_computer_windows_touch_test tests/DesktopComputerWindowsTouchTest.cpp)
+  set_target_properties(desktop_computer_windows_touch_test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+  target_link_libraries(desktop_computer_windows_touch_test PRIVATE maichat_desktop_pointer maichat_desktop_input_types)
+  add_test(NAME desktop_computer_windows_touch COMMAND desktop_computer_windows_touch_test)
+  # No input SDK, virtual controller or driver is involved in this contract test.
+  add_executable(desktop_computer_windows_native_session_test tests/DesktopComputerWindowsNativeSessionTest.cpp)
+  set_target_properties(desktop_computer_windows_native_session_test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+  target_link_libraries(desktop_computer_windows_native_session_test PRIVATE maichat_agent)
+  add_test(NAME desktop_computer_windows_native_session COMMAND desktop_computer_windows_native_session_test)
+  add_executable(desktop_computer_system_input_native_test tests/DesktopComputerSystemInputNativeTest.cpp)
+  set_target_properties(desktop_computer_system_input_native_test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+  target_compile_definitions(desktop_computer_system_input_native_test PRIVATE _WIN32_WINNT=0x0A00 NOMINMAX)
+  target_link_libraries(desktop_computer_system_input_native_test PRIVATE maichat_agent Qt6::Widgets user32 gdi32)
+  add_test(NAME desktop_computer_system_input_native COMMAND desktop_computer_system_input_native_test)
+  set_tests_properties(desktop_computer_system_input_native PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
   add_executable(DesktopComputerDragNativeTest tests/DesktopComputerDragNativeTest.cpp)
   target_link_libraries(DesktopComputerDragNativeTest PRIVATE maichat_agent Qt6::Widgets Qt6::Test)
   target_include_directories(DesktopComputerDragNativeTest PRIVATE ../../MaiAgent/third_party/nlohmann)

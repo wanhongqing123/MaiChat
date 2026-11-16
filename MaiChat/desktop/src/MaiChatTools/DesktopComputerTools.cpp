@@ -1,6 +1,8 @@
 #include "MaiChatTools/DesktopComputerTools.h"
 #include "MaiChatTools/DesktopComputerBackend.h"
 #include "MaiChatTools/DesktopComputerKeys.h"
+#include "MaiChatTools/DesktopComputerInputProtocol.h"
+#include "MaiChatTools/DesktopComputerInputSession.h"
 
 #include <QDir>
 #include <QSaveFile>
@@ -166,7 +168,10 @@ public:
         return maiDesktopInput(input);
     }
     std::shared_ptr<DesktopNativeInputSession> createInputSession() override {
-        return maiDesktopCreateInputSession();
+        return makeDesktopComputerInputSession(maiDesktopCreateInputSession());
+    }
+    DesktopInputCapabilities inputCapabilities() const override {
+        return maiDesktopInputCapabilities();
     }
     MaiResult<std::string> focusedText(const DesktopNativeWindow& window) override {
         return maiDesktopFocusedText(window);
@@ -225,8 +230,21 @@ Json windowJson(const DesktopNativeWindow& window) {
 }
 
 Json inputStateJson(const DesktopNativeInputState& state) {
+    Json rawKeys = Json::array();
+    for (const auto& key : state.rawKeys)
+        rawKeys.push_back({{"code", key.code}, {"flags", key.flags}, {"modifiers", key.modifiers}});
+    Json controllers = Json::array();
+    for (const auto& controller : state.controllers)
+        controllers.push_back({{"controller_id", controller.controllerId},
+                               {"generation", std::to_string(controller.generation)},
+                               {"profile", maiDesktopInputProfileName(controller.profile)}});
     return {{"buttons_down", state.buttonsDown},
             {"keys_down", state.keysDown},
+            {"raw_keys_down", rawKeys},
+            {"touch_pointers", state.touchPointers},
+            {"pen_active", state.penActive},
+            {"devices", state.devices},
+            {"controllers", controllers},
             {"scope", "owned_synthetic_inputs"},
             {"idle_release_ms", 120000},
             {"idle_remaining_ms", state.idleRemainingMs}};
@@ -265,6 +283,40 @@ bool ownsRequestedUp(const DesktopNativeInputState& state, const DesktopComputer
                held.value().character == requested.value().character &&
                held.value().function == requested.value().function;
     });
+}
+
+DesktopInputPort inputPort(double x, double y, double width, double height,
+                           const std::vector<DesktopNativeDisplay>& displays) {
+    DesktopInputPort port;
+    port.x = x;
+    port.y = y;
+    port.width = width;
+    port.height = height;
+    port.environmentX = x;
+    port.environmentY = y;
+    double right = x + width;
+    double bottom = y + height;
+    bool hasEnvironment = false;
+    // Native display bounds, including negative origins, define the input
+    // environment. Model-supplied pixels or cropped image geometry never do.
+    for (const auto& display : displays) {
+        if (!validDisplay(display)) continue;
+        if (!hasEnvironment) {
+            port.environmentX = display.x;
+            port.environmentY = display.y;
+            right = display.x + display.width;
+            bottom = display.y + display.height;
+            hasEnvironment = true;
+            continue;
+        }
+        port.environmentX = (std::min)(port.environmentX, display.x);
+        port.environmentY = (std::min)(port.environmentY, display.y);
+        right = (std::max)(right, display.x + display.width);
+        bottom = (std::max)(bottom, display.y + display.height);
+    }
+    port.environmentWidth = right - port.environmentX;
+    port.environmentHeight = bottom - port.environmentY;
+    return port;
 }
 
 }  // namespace
@@ -333,6 +385,17 @@ DesktopNativeInputState DesktopComputerController::inputState(const std::string&
     return impl_->inputOwnership->state(sessionId);
 }
 
+DesktopInputCapabilities DesktopComputerController::capabilities() const {
+    return impl_->backend->inputCapabilities();
+}
+
+MaiResult<DesktopInputFeedbackBatch> DesktopComputerController::feedback(const std::string& sessionId,
+                                                                         std::uint64_t afterSequence,
+                                                                         std::uint32_t limit) const {
+    if (limit == 0 || limit > 256) return {MaiErrorCode::InvalidInput, "feedback limit must be 1..256"};
+    return impl_->inputOwnership->feedback(sessionId, afterSequence, limit);
+}
+
 MaiError DesktopComputerController::releaseInput(const std::string& sessionId, const std::string& expectedTurn) {
     bool released = false;
     const auto result = impl_->inputOwnership->release(sessionId, expectedTurn, &released);
@@ -340,6 +403,15 @@ MaiError DesktopComputerController::releaseInput(const std::string& sessionId, c
     // token when cleanup concerns the current task; a late old-turn event must
     // not disturb a replacement task's input state or token.
     if (released) impl_->invalidate(sessionId, expectedTurn);
+    return result;
+}
+
+MaiError DesktopComputerController::resetInput(const std::string& sessionId, const std::string& expectedTurn) {
+    std::unique_lock<std::mutex> desktopLock(desktopOperationMutex, std::try_to_lock);
+    if (!desktopLock.owns_lock()) return {MaiErrorCode::Busy, "another desktop operation is in flight"};
+    bool reset = false;
+    const auto result = impl_->inputOwnership->reset(sessionId, expectedTurn, &reset);
+    if (reset) impl_->invalidate(sessionId, expectedTurn);
     return result;
 }
 
@@ -644,7 +716,41 @@ MaiError DesktopComputerController::act(const std::string& sessionId, const std:
 
 MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const std::string& sessionId,
                                                                           const DesktopComputerAction& request) {
+    // Keep validation and failure cleanup in the same serialized operation.
+    // A reset cannot slip between unlocking input and an older failure guard.
+    std::unique_lock<std::mutex> desktopLock(desktopOperationMutex, std::try_to_lock);
+    if (!desktopLock.owns_lock()) return {MaiErrorCode::Busy, "another desktop operation is in flight"};
     const std::string& action = request.action;
+    const bool eventBatch = action == "input_events";
+    if (eventBatch) {
+        auto error = maiDesktopValidateInputEvents(request.events);
+        if (!error) error = maiDesktopValidateInputOptions(request.inputOptions);
+        if (error) {
+            if (!request.dryRun) releaseInput(sessionId, request.turnId);
+            return error;
+        }
+        if (maiDesktopInputEventsOnlyRelease(request.events)) {
+            // Owned cleanup is independent of screenshots, focus and canceled
+            // tasks. A previous turn cannot release a replacement turn's lease.
+            if (request.isCanceled && request.isCanceled()) releaseInput(sessionId, request.turnId);
+
+            const auto native = impl_->inputOwnership->prepare(sessionId, request, false, true);
+            if (!native) return native.error();
+            DesktopComputerActionResult receipt;
+            receipt.state = request.dryRun ? "validated" : "released";
+            receipt.dryRun = request.dryRun;
+            if (!request.dryRun && native.value()) {
+                DesktopInputBatch batch;
+                const auto sent = native.value()->inputEvents(request.events, {}, {}, request.inputOptions);
+                impl_->invalidate(sessionId, request.turnId);
+                if (sent) return inputDispatchFailure(sent);
+                receipt.dispatched = true;
+                receipt.acceptedEvents = request.events.size();
+            }
+            receipt.inputState = inputState(sessionId);
+            return receipt;
+        }
+    }
     if (action == "mouse_up" || action == "key_up") {
         if (action == "mouse_up" && (int(request.button) < int(DesktopMouseButton::Left) ||
                                      int(request.button) > int(DesktopMouseButton::Forward)))
@@ -656,7 +762,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
             if (!parsed.value().modifiers.empty())
                 return {MaiErrorCode::InvalidInput, "key_up needs one physical key, not a chord"};
         }
-        std::lock_guard<std::mutex> desktopLock(desktopOperationMutex);
+
         const auto native = impl_->inputOwnership->prepare(sessionId, request, false, true);
         if (!native) return native.error();
         DesktopComputerActionResult receipt;
@@ -690,13 +796,16 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     const bool positioned = action == "click" || action == "double_click" || action == "right_click" ||
                             action == "drag" || action == "scroll" || action == "move" || action == "mouse_down";
     const bool writesText = action == "type" || action == "replace_text";
+    const bool batchText =
+        eventBatch && std::any_of(request.events.begin(), request.events.end(),
+                                  [](const auto& item) { return item.kind == DesktopInputEventKind::UnicodeText; });
     if (positioned &&
         (int(request.button) < int(DesktopMouseButton::Left) || int(request.button) > int(DesktopMouseButton::Forward)))
         return {MaiErrorCode::InvalidInput, "invalid mouse button"};
     if (action == "scroll" && request.scrollAxis != DesktopScrollAxis::Vertical &&
         request.scrollAxis != DesktopScrollAxis::Horizontal)
         return {MaiErrorCode::InvalidInput, "invalid scroll axis"};
-    if (action != "focus" && !positioned && !writesText && action != "key" && action != "key_down" &&
+    if (action != "focus" && !eventBatch && !positioned && !writesText && action != "key" && action != "key_down" &&
         action != "verify")
         return {MaiErrorCode::InvalidInput, "unknown computer action"};
     if (positioned && (!ratio(request.xRatio) || !ratio(request.yRatio)))
@@ -710,6 +819,14 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     if (action == "verify" && !validText(request.expectedText, true))
         return {MaiErrorCode::InvalidInput, "expected text must be valid UTF-8 within 4000 bytes"};
     bool keyNeedsInputCheck = false;
+    if (eventBatch) {
+        keyNeedsInputCheck = std::any_of(request.events.begin(), request.events.end(), [](const auto& item) {
+            // Raw bindings can remap even a modifier/navigation code into an
+            // editing key. The native effective binding is authoritative, so
+            // the controller conservatively checks every raw down here.
+            return item.kind == DesktopInputEventKind::RawKey && !item.key.release;
+        });
+    }
     if (action == "key" || action == "key_down") {
         const auto parsed = maiDesktopParseKey(request.key);
         if (!parsed) return parsed.error();
@@ -750,14 +867,14 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         return {MaiErrorCode::InvalidInput, "window observation expired; observe again"};
     // Only one controller may manipulate the physical desktop at a time. The
     // native layer also checks target identity between multi-event inputs.
-    std::lock_guard<std::mutex> desktopLock(desktopOperationMutex);
+
     if (state->invalidated.load()) return {MaiErrorCode::Canceled, "input observation was revoked"};
     const auto inputCanceled = [&request, state] {
         return state->invalidated.load() || (request.isCanceled && request.isCanceled());
     };
     const auto allowed = impl_->inputOwnership->prepare(sessionId, request, false);
     if (!allowed) return allowed.error();
-    if (writesText) {
+    if (writesText || batchText) {
         for (const auto& key : inputState(sessionId).keysDown) {
             const auto parsed = maiDesktopParseKey(key);
             DesktopKeyModifier modifier;
@@ -785,7 +902,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
             receipt.dryRun = true;
             return success(std::move(receipt));
         }
-        if (writesText || keyNeedsInputCheck) {
+        if (writesText || batchText || keyNeedsInputCheck) {
             const auto secure = impl_->backend->secureInput();
             if (!secure) return secure.error();
             if (secure.value()) return {MaiErrorCode::NotSupported, "secure inputs need manual user entry"};
@@ -816,19 +933,24 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
                      : action == "mouse_down"   ? DesktopNativeInputKind::MouseDown
                      : action == "key_down"     ? DesktopNativeInputKind::KeyDown
                                                 : DesktopNativeInputKind::Scroll;
-        auto native = allowed.value();
-        if (action == "mouse_down" || action == "key_down") {
-            const auto created = impl_->inputOwnership->prepare(sessionId, request, true);
-            if (!created) return created.error();
-            native = created.value();
-        }
+        // Composite and primitive operations enter the same owned native
+        // executor, even when a one-shot operation begins without held keys.
+        const auto created = impl_->inputOwnership->prepare(sessionId, request, true);
+        if (!created) return created.error();
+        const auto native = created.value();
         state->token.clear();
         DesktopInputBatch inputBatch;
-        const MaiError sent = native ? native->input(input) : impl_->backend->input(input);
+        const MaiError sent =
+            eventBatch ? native->inputEvents(request.events, input,
+                                             inputPort(state->display.x, state->display.y, state->display.width,
+                                                       state->display.height, current.value()),
+                                             request.inputOptions)
+            : native->input(input);
         if (sent) return inputDispatchFailure(sent);
         inputBatch.finish();
         receipt.state = "dispatched";
         receipt.dispatched = true;
+        if (eventBatch) receipt.acceptedEvents = request.events.size();
         receipt.inputState = inputState(sessionId);
         const auto next = observeDisplay(sessionId, state->workspace, state->display.id, request.isCanceled,
                                          state->frameSequence, MaiTime::getCurrentTime(), 0, request.turnId);
@@ -895,7 +1017,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         receipt.dispatched = true;
         return success(std::move(receipt));
     }
-    if (writesText || keyNeedsInputCheck) {
+    if (writesText || batchText || keyNeedsInputCheck) {
         const auto secure = impl_->backend->secureInput();
         if (!secure) return secure.error();
         if (secure.value())
@@ -926,18 +1048,25 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
                  : action == "mouse_down"   ? DesktopNativeInputKind::MouseDown
                  : action == "key_down"     ? DesktopNativeInputKind::KeyDown
                                             : DesktopNativeInputKind::Scroll;
-    auto native = allowed.value();
-    if (action == "mouse_down" || action == "key_down") {
-        const auto created = impl_->inputOwnership->prepare(sessionId, request, true);
-        if (!created) return created.error();
-        native = created.value();
+    const auto created = impl_->inputOwnership->prepare(sessionId, request, true);
+    if (!created) return created.error();
+    const auto native = created.value();
+    DesktopInputPort port;
+    if (eventBatch) {
+        const auto displays = impl_->backend->displays();
+        if (!displays) return displays.error();
+        if (std::none_of(displays.value().begin(), displays.value().end(), validDisplay))
+            return {MaiErrorCode::InvalidInput, "typed window input needs active native display geometry"};
+        port = inputPort(state->window.x, state->window.y, state->window.width, state->window.height, displays.value());
     }
-    const MaiError sent = native ? native->input(input) : impl_->backend->input(input);
+    const MaiError sent = eventBatch ? native->inputEvents(request.events, input, port, request.inputOptions)
+                                    : native->input(input);
     if (sent) return inputDispatchFailure(sent);
     if (canceled())
         return inputDispatchFailure({MaiErrorCode::Canceled, "computer operation canceled after input dispatch"});
     receipt.state = "dispatched";
     receipt.dispatched = true;
+    if (eventBatch) receipt.acceptedEvents = request.events.size();
     receipt.inputState = inputState(sessionId);
     return success(std::move(receipt));
 }
@@ -975,6 +1104,12 @@ public:
                "double_click and drag accept a mouse button; right_click is a fixed right-button alias. "
                "move positions the pointer, scroll supports either axis, key taps a key/chord, and type "
                "inserts Unicode text. These actions may be selected independently as needed.\n"
+               "PRIMITIVE BATCHES: input_events sends an ordered typed event batch through the same "
+               "target and owner: absolute/relative motion, stationary buttons, wheel in 120 units per "
+               "tick, raw physical keys and Unicode. Touch and pen are separate system-input candidates; "
+               "check input_capabilities before using them. A schema type alone does not establish native "
+               "availability or successful delivery. Virtual controllers, hardware-HID emulation and "
+               "controller feedback are deferred and are not offered by the current native backend.\n"
                "COORDINATES: x_ratio/y_ratio and drag destination to_x_ratio/to_y_ratio are fractions "
                "0..1 of the selected target bounds, never pixels. Top-left is (0,0), bottom-right "
                "(1,1), center (0.5,0.5); x increases right, y down. For target=display, a point "
@@ -1013,7 +1148,10 @@ public:
                "observe do not release inputs. Click/key taps and complete drag release only their "
                "own transient presses. drag moves to a supplied endpoint and releases; it does not "
                "check visual alignment. input_state reports this caller's buttons_down/keys_down. "
-               "mouse_up, key_up and release_all pair only owned presses, remain usable without a "
+               "reset_inputs releases owned controls and stops repeat while retaining the native "
+               "context and configuration. Reset is serialized "
+               "with input and returns Busy without effects while another operation is in flight. release_all "
+               "tears down this caller's input session. mouse_up, key_up, reset_inputs and release_all remain usable without a "
                "fresh snapshot or foreground focus, and do not adopt/release physical user holds. "
                "One session/task/target owns held input at a time. Release before changing target. "
                "Owned holds are released at task end/cancel, dispatch failure, clear/destruction or "
@@ -1040,8 +1178,8 @@ public:
                "it does not clear input text. After clear, observe again.";
     }
     std::string parametersSchema() const override {
-        return R"({"type":"object","properties":{
-          "action":{"type":"string","enum":["list","list_displays","list_keys","observe","focus","move","click","double_click","right_click","drag","mouse_down","mouse_up","type","replace_text","key","key_down","key_up","scroll","input_state","release_all","verify","clear"]},
+        return maiDesktopComputerInputSchema(R"({"type":"object","properties":{
+          "action":{"type":"string","enum":["list","list_displays","list_keys","observe","focus","move","click","double_click","right_click","drag","mouse_down","mouse_up","type","replace_text","key","key_down","key_up","scroll","input_state","reset_inputs","release_all","verify","clear"]},
           "button":{"type":"string","enum":["left","right","middle","back","forward"],"description":"Button for click/double_click/drag/mouse_down/mouse_up; default left. right_click always means right."},
           "axis":{"type":"string","enum":["vertical","horizontal"],"description":"Scroll axis, default vertical. Positive lines mean up vertically or right horizontally."},
           "target":{"type":"string","enum":["window","display"],"description":"Set explicitly on observe/input. display: selected whole screen and its bound image (preferred for visual work). window: selected window bounds/UIA, no window image. Omitted means window."},
@@ -1060,7 +1198,7 @@ public:
           "key":{"type":"string","minLength":1,"maxLength":128,"description":"key accepts a single key or modifier chord; key_down/key_up accept one physical key only. list_keys gives accepted names. Examples: Ctrl+A, Cmd+A, Ctrl+Shift, ControlRight+F4, Ctrl+Plus, NumpadEnter"},
           "lines":{"type":"integer","minimum":-10,"maximum":10},
           "expected_text":{"type":"string","maxLength":4000},"dry_run":{"type":"boolean"}
-        },"required":["action"],"additionalProperties":false})";
+        },"required":["action"],"additionalProperties":false})");
     }
     bool requiresApproval(const std::string& raw) const override {
         return requiresPerCallApproval(raw);
@@ -1069,16 +1207,30 @@ public:
         const Json args = Json::parse(raw, nullptr, false);
         if (!args.is_object() || !args.value("action", Json{}).is_string()) return true;
         const auto action = args["action"].get<std::string>();
+        if (action == "input_events") {
+            const auto batch = maiDesktopParseInputBatch(
+                args.value("events", Json{}).dump(),
+                args.contains("input_options") ? args["input_options"].dump() : std::string());
+            return !batch || !maiDesktopInputEventsOnlyRelease(batch.value().events);
+        }
         // Cleanup cannot depend on a new approval dialog or a still-valid
         // observation; these operations only release this caller's own ledger.
-        return action != "clear" && action != "release_all" && action != "mouse_up" && action != "key_up" &&
-               action != "input_state";
+        return action != "input_capabilities" && action != "feedback" && action != "clear" && action != "release_all" &&
+               action != "reset_inputs" && action != "mouse_up" && action != "key_up" && action != "input_state";
     }
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
         Json args = Json::parse(raw, nullptr, false);
-        const bool cleanup = args.is_object() && args.value("action", Json{}).is_string() &&
-                             (args["action"] == "release_all" || args["action"] == "mouse_up" ||
-                              args["action"] == "key_up" || args["action"] == "input_state");
+        bool releaseEvents = false;
+        if (args.is_object() && args.value("action", Json{}) == "input_events") {
+            const auto parsed = maiDesktopParseInputBatch(
+                args.value("events", Json{}).dump(),
+                args.contains("input_options") ? args["input_options"].dump() : std::string());
+            releaseEvents = parsed && maiDesktopInputEventsOnlyRelease(parsed.value().events);
+        }
+        const bool cleanup =
+            args.is_object() && args.value("action", Json{}).is_string() &&
+            (args["action"] == "release_all" || args["action"] == "reset_inputs" || args["action"] == "mouse_up" ||
+             args["action"] == "key_up" || args["action"] == "input_state" || releaseEvents);
         if (context.isCanceled()) {
             controller_->releaseInput(context.sessionId, context.turnId);
             if (!cleanup) return MaiToolResult::failure(MaiErrorCode::Canceled, "computer operation canceled");
@@ -1087,7 +1239,16 @@ public:
             return MaiToolResult::failure(MaiErrorCode::NotConfigured, "a local Desktop Session is required");
         if (!args.is_object() || !args.value("action", Json{}).is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "computer action is required");
-        if (args["action"] == "input_state" || args["action"] == "release_all") {
+        if (args["action"] == "input_capabilities") {
+            if (args.size() != 1)
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "input_capabilities has no other parameters");
+            return MaiToolResult::success(maiDesktopInputCapabilitiesJson(controller_->capabilities()));
+        }
+        if (args["action"] == "feedback")
+            return MaiToolResult::failure(MaiErrorCode::NotSupported,
+                "virtual-controller feedback is deferred; ordinary input results use their action receipt");
+        if (args["action"] == "input_events") return executeInputEvents(args, context);
+        if (args["action"] == "input_state" || args["action"] == "release_all" || args["action"] == "reset_inputs") {
             if (args.size() != 1)
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                               "owned input state actions have no other parameters");
@@ -1096,7 +1257,13 @@ public:
                     controller_->releaseInput(context.sessionId, context.isCanceled() ? context.turnId : std::string());
                 if (released) return failure(released);
             }
-            return MaiToolResult::success(inputStateJson(controller_->inputState(context.sessionId)).dump());
+            if (args["action"] == "reset_inputs") {
+                const auto reset = controller_->resetInput(context.sessionId, context.turnId);
+                if (reset) return failure(reset);
+            }
+            auto result = inputStateJson(controller_->inputState(context.sessionId));
+            if (args["action"] == "reset_inputs") result["state"] = "inputs_reset";
+            return MaiToolResult::success(result.dump());
         }
         if (args["action"] == "mouse_up" || args["action"] == "key_up") {
             const bool mouse = args["action"] == "mouse_up";
@@ -1315,6 +1482,80 @@ public:
     }
 
 private:
+    MaiToolResult executeInputEvents(const Json& args, const MaiToolContext& context) {
+        for (auto field = args.begin(); field != args.end(); ++field)
+            if (field.key() != "action" && field.key() != "target" && field.key() != "window_id" &&
+                field.key() != "display_id" && field.key() != "snapshot_id" && field.key() != "events" &&
+                field.key() != "input_options" && field.key() != "dry_run")
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "unexpected input_events parameter");
+        if ((args.contains("target") &&
+             (!args["target"].is_string() || (args["target"] != "display" && args["target"] != "window"))) ||
+            (args.contains("dry_run") && !args["dry_run"].is_boolean()))
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "input_events target/dry_run is invalid");
+        const auto parsed =
+            maiDesktopParseInputBatch(args.value("events", Json{}).dump(),
+                                      args.contains("input_options") ? args["input_options"].dump() : std::string());
+        if (!parsed) {
+            if (!args.value("dry_run", false)) controller_->releaseInput(context.sessionId, context.turnId);
+            return failure(parsed.error());
+        }
+        const bool releasing = maiDesktopInputEventsOnlyRelease(parsed.value().events);
+        const bool display = args.value("target", std::string("window")) == "display";
+        if (args.contains(display ? "window_id" : "display_id"))
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "input_events cannot mix input targets");
+        DesktopComputerAction request;
+        request.action = "input_events";
+        request.events = parsed.value().events;
+        request.inputOptions = parsed.value().options;
+        request.desktopScope = display;
+        request.workspace = context.root;
+        request.turnId = context.turnId;
+        request.isCanceled = [&context] { return context.isCanceled(); };
+        request.dryRun = args.value("dry_run", false);
+        const char* targetField = display ? "display_id" : "window_id";
+        if (!releasing || args.contains(targetField)) {
+            const auto target = windowIdFrom(args.value(targetField, Json{}));
+            if (!target) return failure(target.error());
+            if (display)
+                request.displayId = target.value();
+            else
+                request.windowId = target.value();
+        }
+        if (!releasing || args.contains("snapshot_id")) {
+            if (!args.value("snapshot_id", Json{}).is_string())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "input_events needs a fresh snapshot_id");
+            request.snapshotId = args["snapshot_id"].get<std::string>();
+        }
+        if (display && !releasing) {
+            const auto modelInfo = maiCloudModelInfo(context.model);
+            if ((modelInfo && !modelInfo->supportsImages) || context.model.compare(0, 6, "local:") == 0)
+                return MaiToolResult::failure(MaiErrorCode::NotSupported,
+                                              "Desktop screen operation requires an image-capable primary model");
+        }
+        const auto result = controller_->perform(context.sessionId, request);
+        if (!result) return failure(result.error());
+        Json output{{"action", "input_events"},
+                    {"state", result.value().state},
+                    {"dispatched", result.value().dispatched},
+                    {"dry_run", result.value().dryRun},
+                    {"accepted_events", result.value().acceptedEvents},
+                    {"input_state", inputStateJson(result.value().inputState)}};
+        if (!result.value().observationError.empty()) {
+            output["observation_error"] = result.value().observationError;
+            output["next_step"] = "Input was dispatched. Observe again; do not repeat the batch blindly.";
+        }
+        if (!result.value().observation.json.empty()) {
+            output["observation"] = Json::parse(result.value().observation.json);
+            output["next_step"] = "Inspect the screen; use observation.snapshot_id for the next input.";
+            return MaiToolResult::successWithImages(output.dump(),
+                                                    {MaiToolImage{result.value().observation.imagePath, "image/png"}});
+        }
+        if (!releasing)
+            output["next_step"] = request.dryRun ? "No input was sent; the snapshot remains available."
+                                                 : "Observe again before the next input; verify task results.";
+        return MaiToolResult::success(output.dump());
+    }
+
     MaiToolResult executeDisplay(const Json& args, const MaiToolContext& context) {
         const std::string action = args["action"].get<std::string>();
         if (action == "list_displays") {

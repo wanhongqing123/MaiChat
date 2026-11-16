@@ -362,6 +362,14 @@ int runEditor(const QString& title, const QString& statePath) {
     auto* layout = new QVBoxLayout(&window);
     auto* heading = new QLabel(QStringLiteral("独立进程原生电脑操作验收"), &window);
     auto* recorder = new OwnedKeyRecorderEdit(&window);
+    // This receiver measures physical scan/side identity, not text composition.
+    // A TSF/IME commit can bypass keyPressEvent and consume a later keypad
+    // digit. Disable composition only on this owned probe; the real text editor
+    // below retains its normal input-method behavior and Unicode checks.
+    // QLineEdit may re-enable its input method when focus/editability changes.
+    // A read-only probe keeps that contract disabled for its whole lifetime.
+    recorder->setReadOnly(true);
+    recorder->setAttribute(Qt::WA_InputMethodEnabled, false);
     recorder->setAccessibleName(QStringLiteral("Native integration key recorder"));
     recorder->setPlaceholderText(QStringLiteral("Owned safe-key receiver"));
     auto* editor = new OwnedTextEditor(&window);
@@ -848,20 +856,37 @@ int runParent(bool physicalKeyCatalog = true) {
             }, "a named physical punctuation key did not reach the owned receiver")) return workflow.exitCode();
     }
     const std::size_t cancelStart = readJson(statePath).value("native_keys", Json::array()).size();
-    int checks = 0;
+    const auto canceledSession = maiDesktopCreateInputSession();
     DesktopNativeInput canceled;
     canceled.kind = DesktopNativeInputKind::Key;
     canceled.key = "ControlRight+ShiftRight+F24";
     canceled.expectedWindowId = native.id;
     canceled.expectedProcessId = native.processId;
-    canceled.isCanceled = [&] { return ++checks >= 3; };
-    const MaiError canceledResult = maiDesktopInput(canceled);
+    // Observe the real modifier down before canceling. Counting validator calls
+    // couples this regression to internal check ordering and can cancel before
+    // any down exists. The same native session owns both calls and the cleanup.
+    auto heldModifier = canceled;
+    heldModifier.kind = DesktopNativeInputKind::KeyDown;
+    heldModifier.key = "ControlRight";
+    if (!workflow.expect(bool(canceledSession), "native cancellation session is unavailable") ||
+        !workflow.expect(!canceledSession->input(heldModifier), "could not hold the cancellation modifier") ||
+        !workflow.stateMatches([&](const Json& state) {
+            const Json events = state.value("native_keys", Json::array());
+            for (std::size_t index = cancelStart; index < events.size(); ++index)
+                if (receivedKey(events[index]) == VK_CONTROL && events[index].value("extended", false) &&
+                    !events[index].value("up", false)) return true;
+            return false;
+        }, "cancellation modifier down did not arrive")) return workflow.exitCode();
+    canceled.isCanceled = [] { return true; };
+    const MaiError canceledResult = canceledSession->input(canceled);
     if (!workflow.expect(canceledResult.code() == MaiErrorCode::Canceled, "native cancellation did not return Canceled") ||
         !workflow.stateMatches([&](const Json& state) {
             bool down = false, up = false;
             const Json events = state.value("native_keys", Json::array());
             for (std::size_t index = cancelStart; index < events.size(); ++index) {
                 const auto& event = events[index];
+                if (!event.value("up", false) &&
+                    (receivedKey(event) == VK_SHIFT || receivedKey(event) == VK_F24)) return false;
                 if (receivedKey(event) != VK_CONTROL || !event.value("extended", false)) continue;
                 if (event.value("up", false)) up = true;
                 else down = true;

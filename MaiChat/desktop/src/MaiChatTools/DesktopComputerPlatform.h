@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "MaiError.h"
+#include "MaiChatTools/DesktopComputerInputTypes.h"
 
 struct DesktopNativeWindow {
     std::uint64_t id = 0;
@@ -63,9 +64,21 @@ enum class DesktopScrollAxis { Vertical, Horizontal };
 struct DesktopNativeInputState {
     std::vector<std::string> buttonsDown;
     std::vector<std::string> keysDown;
+    // Read-only projection of persistent raw source tokens from the native
+    // ledger. These are the original source codes, not a second held-key map.
+    // The first down freezes each token's resolved binding; up/repeat never
+    // reinterpret it after a layout or remapping change. release/repeat are false.
+    std::vector<DesktopInputRawKey> rawKeys;
+    std::vector<std::uint32_t> touchPointers;
+    bool penActive = false;
+    // Neutral devices still own native resources. They participate in the
+    // owner's timeout/turn cleanup even when no control is currently pressed.
+    std::vector<std::string> devices;
+    std::vector<DesktopInputDevice> controllers;
     std::int64_t idleRemainingMs = 0;
     bool empty() const {
-        return buttonsDown.empty() && keysDown.empty();
+        return buttonsDown.empty() && keysDown.empty() && rawKeys.empty() && touchPointers.empty() && !penActive && devices.empty() &&
+               controllers.empty();
     }
 };
 
@@ -108,7 +121,17 @@ public:
     // Read-only target/permission validation for the owner's watchdog; no
     // per-call cancellation callback is retained or consulted here.
     virtual MaiError validate() const = 0;
+    // Reset owned controls while retaining typed controller identities. The
+    // legacy default owns no gamepads and delegates to releaseAll(). Like
+    // targeted ups, this cleanup does not need a current observation/focus.
+    // Composite reset returns Busy without effects while public input is in
+    // flight; releaseAll remains the asynchronous cancellation/teardown entry.
+    virtual MaiError resetControls();
     virtual MaiError releaseAll() = 0;
+    virtual MaiError inputEvents(const std::vector<DesktopInputEvent>& events, const DesktopNativeInput& scope,
+                                 const DesktopInputPort& port, const DesktopInputOptions& options);
+    virtual DesktopInputCapabilities capabilities() const;
+    virtual DesktopInputFeedbackBatch feedback(std::uint64_t afterSequence, std::uint32_t limit) const;
 };
 
 std::shared_ptr<DesktopNativeInputSession> maiDesktopCreateInputSession();
@@ -134,6 +157,10 @@ MaiResult<bool> maiDesktopWindowAcceptsInput(const DesktopNativeWindow& window);
 
 #if defined(_WIN32)
 #include "MaiChatTools/DesktopComputerKeys.h"
+
+// No injection or cursor movement. Reuses the native scope's interactive
+// desktop, monitor geometry, foreground and process checks for all event kinds.
+MaiError maiDesktopWindowsValidateInputScope(const DesktopNativeInput& scope);
 
 // Read-only native key resolution shared by dispatch and host diagnostics. The
 // supplied layout is the target thread's HKL; resolving never activates a window

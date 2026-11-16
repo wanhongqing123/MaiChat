@@ -1,5 +1,7 @@
 #include "MaiChatTools/DesktopComputerPlatform.h"
 #include "MaiChatTools/DesktopComputerKeys.h"
+#include "MaiChatTools/DesktopComputerWindowsInputInternal.h"
+#include "MaiChatTools/DesktopComputerWindowsTouch.h"
 
 #include <windows.h>
 #include <dwmapi.h>
@@ -8,9 +10,13 @@
 #include <oleauto.h>
 
 #include <cmath>
+#include <atomic>
+#include <optional>
+#include <memory>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -225,210 +231,25 @@ DesktopKeyChord withImpliedModifiers(DesktopKeyChord chord, const DesktopWindows
     return chord;
 }
 
-MaiError sendInput(INPUT event) {
-    const UINT accepted = SendInput(1, &event, sizeof(INPUT));
-    if (accepted != 1)
-        // Neither the count nor GetLastError identifies UIPI as the cause.
-        return {MaiErrorCode::Internal,
-                "Windows accepted " + std::to_string(accepted) + " of 1 input events; input dispatch failed"};
-    return {};
-}
-
-class InputScope {
-public:
-    explicit InputScope(const DesktopNativeInput& input)
-        : input_(input),
-          foreground_(input.desktopScope       ? nullptr
-                      : input.expectedWindowId ? reinterpret_cast<HWND>(std::uintptr_t(input.expectedWindowId))
-                                               : GetForegroundWindow()) {}
-    ~InputScope() {
-        // Cleanup deliberately ignores cancellation/focus: every successful
-        // synthetic down must have its matching up even after an early return.
-        for (auto event = releases_.rbegin(); event != releases_.rend(); ++event) sendInput(event->up);
-    }
-    void begin(const DesktopNativeInput& input) {
-        if (input.kind == DesktopNativeInputKind::MouseUp || input.kind == DesktopNativeInputKind::KeyUp) {
-            input_.isCanceled = {};
-            return;  // Cleanup must not replace the binding of other held inputs.
-        }
-        input_ = input;
-        foreground_ = input.desktopScope       ? nullptr
-                      : input.expectedWindowId ? reinterpret_cast<HWND>(std::uintptr_t(input.expectedWindowId))
-                                               : GetForegroundWindow();
-    }
-    bool ownsTag(const std::string& tag) const {
-        return std::any_of(releases_.begin(), releases_.end(), [&](const auto& pending) { return pending.tag == tag; });
-    }
-    void finishCall() {
-        // Only tagged independent downs survive a successful call. Never retain
-        // the caller's context/cancel callback during model inference.
-        for (std::size_t i = releases_.size(); i-- > 0;)
-            if (releases_[i].tag.empty() && !sendInput(releases_[i].up))
-                releases_.erase(releases_.begin() + std::ptrdiff_t(i));
-        input_.isCanceled = {};
-        input_.text.clear();
-        input_.key.clear();
-    }
-    MaiError releaseAll() {
-        MaiError error;
-        for (std::size_t i = releases_.size(); i-- > 0;) {
-            const auto sent = sendInput(releases_[i].up);
-            if (!sent)
-                releases_.erase(releases_.begin() + std::ptrdiff_t(i));
-            else if (!error)
-                error = sent;
-        }
-        return error;
-    }
-    MaiError releaseTag(const std::string& tag) {
-        for (std::size_t i = releases_.size(); i-- > 0;)
-            if (releases_[i].tag == tag) {
-                const auto sent = sendInput(releases_[i].up);
-                if (!sent) releases_.erase(releases_.begin() + std::ptrdiff_t(i));
-                return sent;
-            }
-        return {};  // Unknown ups are idempotent and never release user input.
-    }
-    DesktopNativeInputState state() const {
-        DesktopNativeInputState result;
-        for (const auto& pending : releases_) {
-            if (pending.tag.find("mouse:") == 0) result.buttonsDown.push_back(pending.label);
-            if (pending.tag.find("key:") == 0) result.keysDown.push_back(pending.label);
-        }
-        return result;
-    }
-    bool ownsButton(int key) const {
-        for (const auto& pending : releases_) {
-            if (pending.tag.find("mouse:") != 0) continue;
-            const auto& mouse = pending.up.mi;
-            if ((key == VK_LBUTTON && (mouse.dwFlags & MOUSEEVENTF_LEFTUP)) ||
-                (key == VK_RBUTTON && (mouse.dwFlags & MOUSEEVENTF_RIGHTUP)) ||
-                (key == VK_MBUTTON && (mouse.dwFlags & MOUSEEVENTF_MIDDLEUP)) ||
-                (key == VK_XBUTTON1 && (mouse.dwFlags & MOUSEEVENTF_XUP) && mouse.mouseData == XBUTTON1) ||
-                (key == VK_XBUTTON2 && (mouse.dwFlags & MOUSEEVENTF_XUP) && mouse.mouseData == XBUTTON2))
-                return true;
-        }
-        return false;
-    }
-    bool ownsModifier(DesktopKeyModifier side) const {
-        const auto binding = modifierBinding(side, foregroundLayout());
-        if (!binding) return false;
-        WORD key = binding.value().virtualKey;
-        for (const auto& pending : releases_) {
-            if (pending.tag.find("key:") != 0) continue;
-            const WORD held = pending.up.ki.wVk;
-            if (held == key || (held == VK_CONTROL && key == VK_LCONTROL) || (held == VK_SHIFT && key == VK_LSHIFT) ||
-                (held == VK_MENU && key == VK_LMENU))
-                return true;
-        }
-        return false;
-    }
-    MaiError validate() const {
-        if (input_.isCanceled && input_.isCanceled()) return {MaiErrorCode::Canceled, "computer input canceled"};
-        if (input_.desktopScope) {
-            // Desktop actions may intentionally open Start, switch apps, or
-            // cross popup windows. Their identity is the observed display,
-            // which must remain active and retain the exact pointer mapping.
-            if (!interactiveDesktop())
-                return {MaiErrorCode::NotConfigured, "Windows input requires the active interactive desktop"};
-            MONITORINFO information{};
-            if (!monitorInformation(input_.display.id, information))
-                return {MaiErrorCode::NotFound, "observed display is no longer active"};
-            const auto& bounds = information.rcMonitor;
-            if (input_.display.x != bounds.left || input_.display.y != bounds.top ||
-                input_.display.width != bounds.right - bounds.left ||
-                input_.display.height != bounds.bottom - bounds.top)
-                return {MaiErrorCode::Busy, "observed display geometry changed before input"};
-            return {};
-        }
-        if (!foreground_ || !belongsToSelected(GetForegroundWindow(), foreground_))
-            return {MaiErrorCode::Busy, "foreground window changed during computer input"};
-        DWORD process = 0;
-        if (input_.expectedProcessId &&
-            (!GetWindowThreadProcessId(foreground_, &process) || process != input_.expectedProcessId))
-            return {MaiErrorCode::Busy, "foreground window no longer belongs to the selected process"};
-        return {};
-    }
-    MaiError hold(INPUT down, INPUT up, std::string tag = {}, std::string label = {}) {
-        const MaiError ready = validate();
-        if (ready) return ready;
-        if (down.type == INPUT_MOUSE) {
-            POINT point{};
-            if (!GetCursorPos(&point)) return {MaiErrorCode::Internal, "Windows could not inspect the pointer"};
-            const MaiError target = validatePoint(point);
-            if (target) return target;
-        }
-        // Allocate the ledger before emitting a down. Recording the paired up
-        // after successful input must not allocate or throw.
-        releases_.reserve(releases_.size() + 1);
-        Pending pending{up, std::move(tag), std::move(label)};
-        const MaiError sent = sendInput(down);
-        if (!sent) releases_.push_back(std::move(pending));
-        return sent;
-    }
-    MaiError release() {
-        if (releases_.empty()) return {};
-        const MaiError sent = sendInput(releases_.back().up);
-        if (!sent) releases_.pop_back();
-        return sent;
-    }
-    MaiError tap(INPUT down, INPUT up) {
-        const MaiError held = hold(down, up);
-        if (held) return held;
-        const MaiError released = release();
-        if (released) return released;
-        return validate();
-    }
-    MaiError move(double x, double y) const {
-        const POINT point{int(std::lround(x)), int(std::lround(y))};
-        const MaiError ready = validatePoint(point);
-        if (ready) return ready;
-        if (!SetCursorPos(point.x, point.y)) return {MaiErrorCode::Internal, "Windows could not move the pointer"};
-        return validate();
-    }
-
-private:
-    MaiError validatePoint(POINT point) const {
-        const MaiError ready = validate();
-        if (ready) return ready;
-        if (input_.desktopScope) {
-            const auto& display = input_.display;
-            if (point.x < display.x || point.y < display.y || point.x >= display.x + display.width ||
-                point.y >= display.y + display.height)
-                return {MaiErrorCode::InvalidInput, "pointer location is outside the observed display"};
-            return {};
-        }
-        if (!belongsToSelected(WindowFromPoint(point), foreground_))
-            return {MaiErrorCode::Busy, "pointer location no longer belongs to the selected window"};
-        return {};
-    }
-    DesktopNativeInput input_;
-    HWND foreground_ = nullptr;
-    struct Pending {
-        INPUT up;
-        std::string tag;
-        std::string label;
-    };
-    std::vector<Pending> releases_;
-};
+#include "MaiChatTools/DesktopComputerWindowsScope.h"
 
 MaiError sendChord(InputScope& scope, const DesktopKeyChord& chord, const DesktopWindowsKeyBinding& key, HKL layout) {
+    DesktopKeyModifier terminal;
+    const bool isModifier = maiDesktopKeyModifier(chord.key, terminal);
+    if (!isModifier && (scope.ownsBinding(key) || (scope.keyState(key.virtualKey) & 0x8000)))
+        return {MaiErrorCode::Busy, "the requested terminal key is already held"};
     int held = 0;
     for (const auto modifier : chord.modifiers) {
         const auto binding = modifierBinding(modifier, layout);
         if (!binding) return binding.error();
         // Generic families borrow either user-held side. Explicit modifiers only
         // borrow that exact side, and every injected side owns its matching up.
-        if (modifierPressed(modifier)) continue;
+        if (scope.modifierPressed(modifier)) continue;
         const MaiError sent = scope.hold(keyEvent(binding.value()), keyEvent(binding.value(), true));
         if (sent) return sent;
         ++held;
     }
-    DesktopKeyModifier terminal;
-    const bool isModifier = maiDesktopKeyModifier(chord.key, terminal);
-    if (!isModifier && (GetAsyncKeyState(key.virtualKey) & 0x8000))
-        return {MaiErrorCode::Busy, "the requested key is already held by the user"};
-    if (!isModifier || !modifierPressed(terminal)) {
+    if (!isModifier || !scope.modifierPressed(terminal)) {
         const MaiError tapped = scope.tap(keyEvent(key), keyEvent(key, true));
         if (tapped) return tapped;
     }
@@ -440,14 +261,20 @@ MaiError sendChord(InputScope& scope, const DesktopKeyChord& chord, const Deskto
 }
 
 MaiError sendChord(InputScope& scope, const DesktopKeyChord& chord) {
-    const HKL layout = foregroundLayout();
+    const HKL layout = scope.layout();
     const auto binding = maiDesktopWindowsResolveKey(chord, reinterpret_cast<std::uintptr_t>(layout));
     if (!binding) return binding.error();
     return sendChord(scope, withImpliedModifiers(chord, binding.value()), binding.value(), layout);
 }
 
-MaiError sendText(InputScope& scope, const std::string& text) {
-    const QString decoded = QString::fromUtf8(text.c_str(), int(text.size()));
+MaiError InputScope::unicode(std::string_view text) {
+    DesktopInputEvent request;
+    request.kind = DesktopInputEventKind::UnicodeText;
+    request.text = std::string(text);
+    if (const auto error = maiDesktopValidateInputEvents({request})) return error;
+    if (text.empty()) return {};
+    if (const auto secure = guardLiteralText()) return secure;
+    const QString decoded = QString::fromUtf8(text.data(), int(text.size()));
     for (QChar unit : decoded) {
         INPUT down{};
         down.type = INPUT_KEYBOARD;
@@ -455,10 +282,9 @@ MaiError sendText(InputScope& scope, const std::string& text) {
         down.ki.dwFlags = KEYEVENTF_UNICODE;
         INPUT up = down;
         up.ki.dwFlags |= KEYEVENTF_KEYUP;
-        const MaiError sent = scope.tap(down, up);
-        if (sent) return sent;
+        if (const auto sent = tap(down, up)) return sent;
     }
-    return scope.validate();
+    return validate();
 }
 
 bool validPoint(double x, double y) {
@@ -481,7 +307,7 @@ bool hasUnexpectedModifiers(const DesktopKeyChord* chord, const InputScope* owne
     for (const auto& family : sides) {
         if (contains(family.first)) continue;
         for (const auto side : {family.second.first, family.second.second})
-            if (modifierPressed(side) && !contains(side) && !(owner && owner->ownsModifier(side))) return true;
+            if ((owner ? owner->modifierPressed(side) : modifierPressed(side)) && !contains(side) && !(owner && owner->ownsModifier(side))) return true;
     }
     return false;
 }
@@ -926,6 +752,65 @@ MouseBinding mouseBinding(DesktopMouseButton button) {
     return {};
 }
 
+
+MaiError InputScope::dispatchTyped(const DesktopInputEvent& event, const DesktopInputPort& port,
+                                  const DesktopInputOptions& options) {
+    using Kind = DesktopInputEventKind;
+    if ((event.kind == Kind::RelativeMove && !event.deltaX && !event.deltaY) ||
+        (event.kind == Kind::Wheel && !event.wheelDelta120) || (event.kind == Kind::UnicodeText && event.text.empty())) return {};
+    if (event.kind == Kind::RawKey) {
+        if (!event.key.release && !options.keyboardEnabled)
+            return {MaiErrorCode::NotConfigured, "keyboard input is disabled"};
+        return rawKey(event.key, options);
+    }
+    if (event.kind == Kind::MouseButton) {
+        const auto button = event.button == 1 ? DesktopMouseButton::Left : event.button == 2 ? DesktopMouseButton::Middle :
+            event.button == 3 ? DesktopMouseButton::Right : event.button == 4 ? DesktopMouseButton::Back : DesktopMouseButton::Forward;
+        const auto binding = mouseBinding(button);
+        const auto tag = std::string("mouse:") + binding.name;
+        if (event.release) return releaseTag(tag);
+        if (!options.mouseEnabled) return {MaiErrorCode::NotConfigured, "mouse input is disabled"};
+        if (ownsTag(tag)) return {};
+        if (const auto gate = validatePointerTarget()) return gate;
+        if ((keyState(binding.key) & 0x8000) && !ownsButton(binding.key))
+            return {MaiErrorCode::Busy, "Mouse button is already held outside this input owner"};
+        INPUT down{};
+        down.type = INPUT_MOUSE;
+        down.mi.dwFlags = binding.down;
+        down.mi.mouseData = binding.data;
+        auto up = down;
+        up.mi.dwFlags = binding.up;
+        return hold(down, up, tag, binding.name);
+    }
+    if (event.kind == Kind::UnicodeText) {
+        if (!options.keyboardEnabled) return {MaiErrorCode::NotConfigured, "keyboard input is disabled"};
+        return unicode(event.text);
+    }
+    if (event.kind == Kind::Touch) {
+        if (!options.mouseEnabled || !options.nativePenTouchEnabled)
+            return {MaiErrorCode::NotConfigured, "native touch input is disabled"};
+        if (hooks_.emitInput) return {MaiErrorCode::NotSupported, "pointer devices require their explicit native test transport"};
+        if (!touch_) touch_ = makeDesktopComputerWindowsTouch();
+        const auto result = touch_->dispatch(event.contacts, port);
+        publish();
+        return result;
+    }
+    if (event.kind == Kind::Pen)
+        return {MaiErrorCode::NotSupported, "native pen system API adapter is a pending candidate"};
+    if (event.kind != Kind::RelativeMove && event.kind != Kind::AbsoluteMove && event.kind != Kind::Wheel)
+        return {MaiErrorCode::NotSupported, "virtual devices are deferred in this native input session"};
+    if (!options.mouseEnabled) return {MaiErrorCode::NotConfigured, "mouse input is disabled"};
+    if (event.kind == Kind::RelativeMove) return moveRelative(event.deltaX, event.deltaY);
+    if (event.kind == Kind::Wheel) return wheel(event.wheelDelta120, event.horizontal, options.highResolutionScroll);
+    if (!std::isfinite(port.x) || !std::isfinite(port.y) || !std::isfinite(port.width) || !std::isfinite(port.height) ||
+        port.width < 1 || port.height < 1)
+        return {MaiErrorCode::InvalidInput, "absolute movement requires a valid observed viewport"};
+    const auto x = port.x + event.x * (port.width - 1), y = port.y + event.y * (port.height - 1);
+    if (!validPoint(x, y)) return {MaiErrorCode::InvalidInput, "absolute pointer coordinate is outside Windows range"};
+    if (const auto foreign = noForeignMouseButtons()) return foreign;
+    return move(x, y);
+}
+
 MaiError dispatchNativeInput(const DesktopNativeInput& input, InputScope& scope) {
     DpiScope dpi;
     if (int(input.kind) < int(DesktopNativeInputKind::Click) || int(input.kind) > int(DesktopNativeInputKind::KeyUp))
@@ -966,6 +851,10 @@ MaiError dispatchNativeInput(const DesktopNativeInput& input, InputScope& scope)
     if (input.kind == DesktopNativeInputKind::Type || input.kind == DesktopNativeInputKind::ReplaceFocusedText) {
         if (input.text.size() > 4000 || (input.kind == DesktopNativeInputKind::Type && input.text.empty()))
             return {MaiErrorCode::InvalidInput, "text must contain at most 4000 UTF-8 bytes"};
+        DesktopInputEvent text;
+        text.kind = DesktopInputEventKind::UnicodeText;
+        text.text = input.text;
+        if (const auto error = maiDesktopValidateInputEvents({text})) return error;
     }
     const bool positioned =
         input.kind == DesktopNativeInputKind::Click || input.kind == DesktopNativeInputKind::DoubleClick ||
@@ -993,7 +882,7 @@ MaiError dispatchNativeInput(const DesktopNativeInput& input, InputScope& scope)
         if (!parsed) return parsed.error();
         if (input.kind == DesktopNativeInputKind::KeyDown && !parsed.value().modifiers.empty())
             return {MaiErrorCode::InvalidInput, "key_down needs one key, not a chord"};
-        keyLayout = foregroundLayout();
+        keyLayout = scope.layout();
         auto effective = parsed.value();
         for (const auto modifier : {DesktopKeyModifier::ControlLeft, DesktopKeyModifier::ControlRight,
                                     DesktopKeyModifier::AltLeft, DesktopKeyModifier::AltRight})
@@ -1006,62 +895,64 @@ MaiError dispatchNativeInput(const DesktopNativeInput& input, InputScope& scope)
         keyBinding = resolved.value();
         chord = withImpliedModifiers(parsed.value(), keyBinding);
     }
-    if (input.kind == DesktopNativeInputKind::Type || input.kind == DesktopNativeInputKind::ReplaceFocusedText) {
-        for (const auto modifier :
-             {DesktopKeyModifier::ControlLeft, DesktopKeyModifier::ControlRight, DesktopKeyModifier::ShiftLeft,
-              DesktopKeyModifier::ShiftRight, DesktopKeyModifier::AltLeft, DesktopKeyModifier::AltRight,
-              DesktopKeyModifier::MetaLeft, DesktopKeyModifier::MetaRight})
-            if (scope.ownsModifier(modifier))
-                return {MaiErrorCode::Busy,
-                        "literal text needs released modifiers; use key for composed physical input"};
-    }
-    // Extra physical modifiers change the requested action (for example a
-    // Ctrl-click or a different shortcut). Preserve those user keys and wait.
-    if (hasUnexpectedModifiers(input.kind == DesktopNativeInputKind::Key ? &chord : nullptr, &scope))
+    // Physical pointer intent is checked by the shared Scope primitives.
+    // A named keyboard chord retains its explicitly requested modifier policy.
+    if ((input.kind == DesktopNativeInputKind::Key || input.kind == DesktopNativeInputKind::KeyDown) &&
+        hasUnexpectedModifiers(input.kind == DesktopNativeInputKind::Key ? &chord : nullptr, &scope))
         return {MaiErrorCode::Busy, "release modifiers that are not part of the requested action"};
-    if (!interactiveDesktop())
+    if (!scope.isInteractive())
         return {MaiErrorCode::NotConfigured, "Windows input requires the active interactive desktop"};
     const MaiError ready = scope.validate();
     if (ready) return ready;
+    if (input.kind == DesktopNativeInputKind::Key || input.kind == DesktopNativeInputKind::KeyDown) {
+        std::uint8_t modifiers = 0;
+        for (const auto modifier : chord.modifiers) {
+            switch (maiDesktopModifierFamily(modifier)) {
+            case DesktopKeyModifier::Shift: modifiers |= 1; break;
+            case DesktopKeyModifier::Control: modifiers |= 2; break;
+            case DesktopKeyModifier::Alt: modifiers |= 4; break;
+            case DesktopKeyModifier::Meta: modifiers |= 8; break;
+            default: break;
+            }
+        }
+        if (const auto secure = scope.guardKey(keyBinding.virtualKey, modifiers)) return secure;
+    }
+    if (input.kind == DesktopNativeInputKind::ReplaceFocusedText)
+        if (const auto secure = scope.guardLiteralText()) return secure;
     if (input.kind == DesktopNativeInputKind::KeyDown) {
-        if (GetAsyncKeyState(keyBinding.virtualKey) & 0x8000)
+        if ((scope.keyState(keyBinding.virtualKey) & 0x8000) && !scope.ownsBinding(keyBinding))
             return {MaiErrorCode::Busy, "the requested key is already down"};
         return scope.hold(keyEvent(keyBinding), keyEvent(keyBinding, true), independentKeyTag(chord),
                           independentKeyName(chord, input.key));
     }
     if (input.kind == DesktopNativeInputKind::Key) return sendChord(scope, chord, keyBinding, keyLayout);
-    if (input.kind == DesktopNativeInputKind::Type) return sendText(scope, input.text);
+    if (input.kind == DesktopNativeInputKind::Type) return scope.unicode(input.text);
     if (input.kind == DesktopNativeInputKind::ReplaceFocusedText) {
         const auto select = maiDesktopParseKey("Ctrl+A");
         const MaiError selected = sendChord(scope, select.value());
         if (selected) return selected;
         // Replacing with an empty value must delete the selection explicitly.
         if (input.text.empty()) {
-            const auto backspace = virtualKeyBinding(VK_BACK, foregroundLayout());
+            const auto backspace = virtualKeyBinding(VK_BACK, scope.layout());
             return scope.tap(keyEvent(backspace), keyEvent(backspace, true));
         }
-        return sendText(scope, input.text);
+        return scope.unicode(input.text);
     }
     // Moving a pointer while the user holds another button can drag their
     // content before our own down occurs. Check before any cursor movement.
     for (const int button : {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2})
-        if ((GetAsyncKeyState(button) & 0x8000) && !scope.ownsButton(button))
+        if ((scope.keyState(button) & 0x8000) && !scope.ownsButton(button))
             return {MaiErrorCode::Busy, "a mouse button is already held outside this input session"};
     const MaiError moved = scope.move(input.x, input.y);
     if (moved) return moved;
     if (input.kind == DesktopNativeInputKind::Move) return {};
-    if (input.kind == DesktopNativeInputKind::Scroll) {
-        INPUT event{};
-        event.type = INPUT_MOUSE;
-        event.mi.dwFlags = input.scrollAxis == DesktopScrollAxis::Horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL;
-        event.mi.mouseData = DWORD(input.lines * WHEEL_DELTA);
-        const MaiError sent = sendInput(event);
-        return sent ? sent : scope.validate();
-    }
+    if (input.kind == DesktopNativeInputKind::Scroll)
+        return scope.wheel(input.lines * WHEEL_DELTA, input.scrollAxis == DesktopScrollAxis::Horizontal, true);
+
     const auto binding =
         mouseBinding(input.kind == DesktopNativeInputKind::RightClick ? DesktopMouseButton::Right : input.button);
     if (!binding.name) return {MaiErrorCode::InvalidInput, "invalid mouse button"};
-    if (GetAsyncKeyState(binding.key) & 0x8000)
+    if ((scope.keyState(binding.key) & 0x8000) && !(input.kind == DesktopNativeInputKind::MouseDown && scope.ownsButton(binding.key)))
         return {MaiErrorCode::Busy, "the requested mouse button is already down; use move or mouse_up"};
     INPUT down{};
     down.type = INPUT_MOUSE;
@@ -1095,45 +986,165 @@ MaiError dispatchNativeInput(const DesktopNativeInput& input, InputScope& scope)
     return scope.tap(down, up);
 }
 
+
+MaiError InputScope::dispatchLegacy(const DesktopNativeInput& input) { return dispatchNativeInput(input, *this); }
+
 class WindowsInputSession final : public DesktopNativeInputSession {
 public:
-    ~WindowsInputSession() override {
-        releaseAll();
-    }
+    explicit WindowsInputSession(DesktopWindowsInputHooks hooks = {}) : hooks_(std::move(hooks)) {}
+    ~WindowsInputSession() override { releaseAll(); }
     MaiError input(const DesktopNativeInput& input) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!scope_) scope_ = std::make_unique<InputScope>(input);
-        scope_->begin(input);
-        bool succeeded = false;
-        const auto cleanup = qScopeGuard([&] {
-            scope_->finishCall();
-            if (!succeeded) scope_->releaseAll();
+        if (activeOperation_.load()) return inFlight();
+        return perform(input, input.kind == DesktopNativeInputKind::KeyUp || input.kind == DesktopNativeInputKind::MouseUp,
+            [&](InputScope& scope) { return scope.dispatchLegacy(input); });
+    }
+    MaiError inputEvents(const std::vector<DesktopInputEvent>& events, const DesktopNativeInput& input,
+                         const DesktopInputPort& port, const DesktopInputOptions& options) override {
+        if (activeOperation_.load()) return inFlight();
+        if (const auto error = maiDesktopValidateInputEvents(events)) return error;
+        if (const auto error = maiDesktopValidateInputOptions(options)) return error;
+        if (std::any_of(events.begin(), events.end(), [](const auto& event) { return event.delayMs != 0; }))
+            return {MaiErrorCode::InvalidInput, "native input requires a prepared event with consumed delay"};
+        if (events.empty()) return {};
+        const auto neutral = [](const DesktopInputEvent& event) {
+            return (event.kind == DesktopInputEventKind::RelativeMove && !event.deltaX && !event.deltaY) ||
+                (event.kind == DesktopInputEventKind::Wheel && !event.wheelDelta120) ||
+                (event.kind == DesktopInputEventKind::UnicodeText && event.text.empty());
+        };
+        // This is only a no-effect native fast path, not the host's broader
+        // authorization/only-release classification or a renewed scope.
+        if (std::all_of(events.begin(), events.end(), neutral)) return {};
+        auto scope = input;
+        scope.kind = std::any_of(events.begin(), events.end(), [](const auto& event) {
+            return event.kind == DesktopInputEventKind::RawKey || event.kind == DesktopInputEventKind::UnicodeText;
+        }) ? DesktopNativeInputKind::Key : DesktopNativeInputKind::Move;
+        return perform(scope, maiDesktopInputEventsOnlyRelease(events), [&](InputScope& owner) {
+            for (const auto& event : events) {
+                // Common consumes batch delays/repeat timing. This native seam
+                // receives prepared events and never silently drops a delay.
+                if (event.delayMs) return MaiError{MaiErrorCode::InvalidInput, "native input requires a prepared event with consumed delay"};
+                if (!maiDesktopInputEventsOnlyRelease({event}))
+                    if (const auto ready = owner.validate()) return ready;
+                if (const auto error = owner.dispatchTyped(event, port, options)) return error;
+            }
+            return MaiError{};
         });
-        const auto result = dispatchNativeInput(input, *scope_);
-        succeeded = !result;
+    }
+    DesktopNativeInputState state() const override { return *std::atomic_load(&snapshot_->state); }
+    MaiError validate() const override {
+        if (state().empty()) return {};
+        const auto scope = std::atomic_load(&snapshot_->scope);
+        return hooks_.validate ? hooks_.validate(*scope) : maiDesktopWindowsValidateInputScope(*scope);
+    }
+    MaiError resetControls() override {
+        if (activeOperation_.load()) return inFlight();
+        std::unique_lock<std::mutex> operation(operationMutex_, std::try_to_lock);
+        if (!operation.owns_lock()) return {MaiErrorCode::Busy, "native input is in flight"};
+        ActiveOperation active(activeOperation_);
+        ++epoch_;
+        const auto result = scope_ ? scope_->releaseAll() : MaiError{};
+        if (result) cleanupRequested_ = true;
         return result;
     }
-    DesktopNativeInputState state() const override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return scope_ ? scope_->state() : DesktopNativeInputState{};
-    }
-    MaiError validate() const override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return scope_ ? scope_->validate() : MaiError{};
-    }
     MaiError releaseAll() override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return scope_ ? scope_->releaseAll() : MaiError{};
+        ++epoch_; // Revoke immediately, before any worker can need GUI progress.
+        cleanupRequested_ = true;
+        if (activeOperation_.load()) return {MaiErrorCode::Busy, "native input cancellation requested; cleanup is pending"};
+        std::unique_lock<std::mutex> operation(operationMutex_, std::try_to_lock);
+        if (!operation.owns_lock()) return {MaiErrorCode::Busy, "native input cancellation requested; cleanup is pending"};
+        ActiveOperation active(activeOperation_);
+        cleanupRequested_ = false;
+        const auto result = scope_ ? scope_->releaseAll() : MaiError{};
+        if (result) cleanupRequested_ = true;
+        return result;
     }
-
+    DesktopInputCapabilities capabilities() const override {
+        DesktopInputCapabilities result;
+        result.baseline = "Windows native SendInput / User32";
+        for (const auto* name : {"absolute_move", "relative_move", "mouse_button", "wheel", "raw_key", "unicode_text"})
+            result.features.push_back({name, true, true, "win32_native", "System native input; application acknowledgement is separate", {}});
+        result.features.push_back({"touch", true, false, "win32_synthetic_touch_frame", "System API candidate",
+            "Continuous-touch native acceptance has not passed on this host"});
+        result.features.push_back({"pen", false, false, "win32_synthetic_pen", "System API candidate", "Native pen adapter is pending"});
+        return result;
+    }
 private:
-    mutable std::mutex mutex_;
+    class ActiveOperation {
+    public:
+        explicit ActiveOperation(std::atomic<bool>& active) : active_(active) { active_.store(true); }
+        ~ActiveOperation() { active_.store(false); }
+    private:
+        std::atomic<bool>& active_;
+    };
+    static MaiError inFlight() { return {MaiErrorCode::Busy, "another native input operation is in flight"}; }
+    template<class Function>
+    MaiError perform(const DesktopNativeInput& input, bool cleanupOnly, Function&& function) {
+        // A caller cancellation callback may re-enter this object on the same
+        // thread. Never call mutex.try_lock() when that thread already owns it.
+        if (activeOperation_.load()) return inFlight();
+        DpiScope dpi; // Both entry points resolve/read/move in physical coordinates, then restore the caller.
+        std::unique_lock<std::mutex> operation(operationMutex_, std::try_to_lock);
+        if (!operation.owns_lock()) return {MaiErrorCode::Busy, "another native input operation is in flight"};
+        ActiveOperation active(activeOperation_);
+        const auto generation = epoch_.load(); // Fixed at admission, before any pending native UP can block.
+        if (cleanupRequested_.exchange(false) && scope_) {
+            if (const auto pending = scope_->releaseAll()) {
+                cleanupRequested_ = true;
+                return pending;
+            }
+        }
+        if (epoch_.load() != generation)
+            return {MaiErrorCode::Canceled, "native input canceled during pending cleanup"};
+        auto scoped = input;
+        scoped.isCanceled = [this, generation, &input] {
+            if (epoch_.load() != generation) return true;
+            const bool requested = input.isCanceled && input.isCanceled();
+            return requested || epoch_.load() != generation;
+        };
+        if (!scope_) scope_ = std::make_unique<InputScope>(scoped, hooks_, snapshot_);
+        if (const auto prepared = scope_->begin(scoped, cleanupOnly)) return prepared;
+        auto result = function(*scope_);
+        const auto temporary = scope_->finishCall();
+        if (!result && temporary) result = temporary;
+        const bool revoked = generation != epoch_.load();
+        if (!result && revoked) result = {MaiErrorCode::Canceled, "native input canceled"};
+        const bool requestedCleanup = cleanupRequested_.exchange(false);
+        if (result || revoked || requestedCleanup) {
+            const auto cleanup = scope_->releaseAll();
+            if (cleanup) {
+                cleanupRequested_ = true;
+                result = result ? MaiError{result.code(), result.message() + "; cleanup failed: " + cleanup.message()} : cleanup;
+            }
+        }
+        return result;
+    }
+    DesktopWindowsInputHooks hooks_;
+    std::shared_ptr<WindowsInputSnapshot> snapshot_ = std::make_shared<WindowsInputSnapshot>();
+    std::mutex operationMutex_;
+    std::atomic<bool> activeOperation_{false};
+    std::atomic<std::uint64_t> epoch_{0};
+    std::atomic<bool> cleanupRequested_{false};
     std::unique_ptr<InputScope> scope_;
 };
+
 }  // namespace
 
 std::shared_ptr<DesktopNativeInputSession> maiDesktopCreateInputSession() {
     return std::make_shared<WindowsInputSession>();
+}
+
+std::shared_ptr<DesktopNativeInputSession> makeDesktopWindowsInputSessionForTesting(DesktopWindowsInputHooks hooks) {
+    return std::make_shared<WindowsInputSession>(std::move(hooks));
+}
+
+MaiError maiDesktopWindowsValidateInputScope(const DesktopNativeInput& input) {
+    DpiScope dpi;
+    if ((input.expectedWindowId == 0) != (input.expectedProcessId == 0))
+        return {MaiErrorCode::InvalidInput, "expected window and process identities must be provided together"};
+    if (!interactiveDesktop())
+        return {MaiErrorCode::NotConfigured, "Windows input requires the active interactive desktop"};
+    InputScope scope(input);
+    return scope.validate();
 }
 
 MaiError maiDesktopInput(const DesktopNativeInput& input) {

@@ -41,6 +41,7 @@ public:
     // Optional ordinary stateful native seam. Legacy recording backends keep
     // using input(); a missing session explicitly rejects independent holds.
     virtual std::shared_ptr<DesktopNativeInputSession> createInputSession();
+    virtual DesktopInputCapabilities inputCapabilities() const;
     virtual MaiResult<std::string> focusedText(const DesktopNativeWindow& window) = 0;
 };
 

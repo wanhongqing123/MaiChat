@@ -21,7 +21,12 @@ public:
                                                                   bool releasing = false);
     void touch(const std::string& session, const std::string& expectedTurn = {});
     DesktopNativeInputState state(const std::string& session) const;
+    MaiResult<DesktopInputFeedbackBatch> feedback(const std::string& session, std::uint64_t afterSequence,
+                                                  std::uint32_t limit) const;
     MaiError release(const std::string& session, const std::string& expectedTurn = {}, bool* released = nullptr);
+    // Neutralize only this task's controls, retaining its native gamepads and
+    // target lease. Expired owners still take the stronger teardown path.
+    MaiError reset(const std::string& session, const std::string& expectedTurn = {}, bool* reset = nullptr);
 
 private:
     struct Entry {

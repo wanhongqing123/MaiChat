@@ -31,6 +31,8 @@
 #include "MaiChatTools/DesktopComputerBackend.h"
 #include <thread>
 #include "MaiChatTools/DesktopComputerKeys.h"
+#include "MaiChatTools/DesktopComputerInputProtocol.h"
+#include "MaiChatTools/DesktopComputerInputSession.h"
 #include "MaiChatTools/DesktopComputerTools.h"
 #include "MaiTool.h"
 #include "MaiAgentSendMediaTool.h"
@@ -66,25 +68,54 @@ std::int64_t fixtureClockMs() {
 // Keep the watchdog's reads synchronized and never retain a per-call callback.
 class RecordingInputSession final : public DesktopNativeInputSession {
 public:
+    using OneShot = std::function<MaiError(const DesktopNativeInput&)>;
+    explicit RecordingInputSession(bool stateful = true, OneShot oneShot = {})
+        : stateful_(stateful), oneShot_(std::move(oneShot)) {}
     std::function<void()> beforeInput;
+    std::function<void()> beforeBatch;
+    bool failBatchIfReset = false;
+
     MaiError input(const DesktopNativeInput& request) override {
         if (beforeInput) beforeInput();
         if (request.isCanceled && request.isCanceled()) return {MaiErrorCode::Canceled, "fixture canceled"};
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++inputCalls_;
-        if (request.kind == DesktopNativeInputKind::KeyDown &&
-            std::find(held_.keysDown.begin(), held_.keysDown.end(), request.key) == held_.keysDown.end())
-            held_.keysDown.push_back(request.key);
-        if (request.kind == DesktopNativeInputKind::KeyUp)
-            held_.keysDown.erase(std::remove(held_.keysDown.begin(), held_.keysDown.end(), request.key),
-                                 held_.keysDown.end());
-        return {};
+        const bool independent = request.kind == DesktopNativeInputKind::KeyDown ||
+            request.kind == DesktopNativeInputKind::KeyUp || request.kind == DesktopNativeInputKind::MouseDown ||
+            request.kind == DesktopNativeInputKind::MouseUp;
+        if (!stateful_ && independent)
+            return {MaiErrorCode::NotSupported, "one-shot fixture does not support independent holds"};
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++inputCalls_;
+            if (request.kind == DesktopNativeInputKind::KeyDown) add(held_.keysDown, request.key);
+            if (request.kind == DesktopNativeInputKind::KeyUp) erase(held_.keysDown, request.key);
+            if (request.kind == DesktopNativeInputKind::MouseDown) add(held_.buttonsDown, buttonName(request.button));
+            if (request.kind == DesktopNativeInputKind::MouseUp) erase(held_.buttonsDown, buttonName(request.button));
+        }
+        // Only the test adapter delegates one-shot effects to the old backend spy.
+        // Production still has one native executor, never a backend.input fallback.
+        return oneShot_ ? oneShot_(request) : MaiError{};
     }
     DesktopNativeInputState state() const override {
         std::lock_guard<std::mutex> lock(mutex_);
-        return held_;
+        auto projection = held_;
+        for (const auto& key : held_.rawKeys)
+            projection.keysDown.push_back("raw:" + std::to_string(key.code) + ":" + std::to_string(key.flags));
+        return projection;
     }
-    MaiError validate() const override {
+    MaiError validate() const override { return {}; }
+    DesktopInputCapabilities capabilities() const override {
+        DesktopInputCapabilities value;
+        value.baseline = "recording-native-contract";
+        value.maxControllers = 0;
+        value.maxTouchContacts = 0;
+        for (const char* name : {"absolute_move", "relative_move", "mouse_button", "wheel", "raw_key", "unicode_text"})
+            value.features.push_back({name, true, true, "recording-native", "record-only", "owned contract fixture"});
+        return value;
+    }
+    MaiError resetControls() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++resetCalls_;
+        held_ = {};
         return {};
     }
     MaiError releaseAll() override {
@@ -93,27 +124,93 @@ public:
         held_ = {};
         return {};
     }
-    int inputCalls() const {
+    MaiError inputEvents(const std::vector<DesktopInputEvent>& events, const DesktopNativeInput& scope,
+                         const DesktopInputPort& port, const DesktopInputOptions& options) override {
+        if (!stateful_) return {MaiErrorCode::NotSupported, "one-shot fixture has no typed hold ledger"};
+        for (const auto& event : events)
+            if (event.kind > DesktopInputEventKind::UnicodeText)
+                return {MaiErrorCode::NotSupported, "fixture does not implement deferred pointer/device simulation"};
+        const int resetBefore = resetCalls();
+        if (beforeBatch) beforeBatch();
+        if (scope.isCanceled && scope.isCanceled()) return {MaiErrorCode::Canceled, "fixture batch canceled"};
         std::lock_guard<std::mutex> lock(mutex_);
-        return inputCalls_;
+        if (failBatchIfReset && resetBefore != resetCalls_)
+            return {MaiErrorCode::Canceled, "fixture operation revoked by reset"};
+        ++batchCalls_;
+        batch_ = events;
+        port_ = port;
+        options_ = options;
+        scope_ = scope;
+        scope_.isCanceled = {};  // Per-call callbacks never survive this synchronous seam.
+        for (const auto& event : events) {
+            if (event.kind == DesktopInputEventKind::MouseButton) {
+                const char* names[] = {"left", "middle", "right", "back", "forward"};
+                if (event.button >= 1 && event.button <= 5) {
+                    if (event.release) erase(held_.buttonsDown, names[event.button - 1]);
+                    else add(held_.buttonsDown, names[event.button - 1]);
+                }
+            }
+            if (event.kind != DesktopInputEventKind::RawKey) continue;
+            const auto same = [&](const DesktopInputRawKey& key) {
+                return key.code == event.key.code && key.flags == event.key.flags &&
+                    ((key.modifiers ^ event.key.modifiers) & 0x10) == 0;
+            };
+            const auto found = std::find_if(held_.rawKeys.begin(), held_.rawKeys.end(), same);
+            if (event.key.release) {
+                if (found != held_.rawKeys.end()) held_.rawKeys.erase(found);
+            } else if (!event.key.repeat && found == held_.rawKeys.end()) {
+                auto source = event.key;
+                source.release = false;
+                source.repeat = false;
+                held_.rawKeys.push_back(source);  // A projection of this one native ledger, not borrowed state.
+            }
+        }
+        return {};
     }
-    int releaseCalls() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return releaseCalls_;
-    }
+    int batchCalls() const { std::lock_guard<std::mutex> lock(mutex_); return batchCalls_; }
+    std::vector<DesktopInputEvent> batch() const { std::lock_guard<std::mutex> lock(mutex_); return batch_; }
+    DesktopInputPort port() const { std::lock_guard<std::mutex> lock(mutex_); return port_; }
+    DesktopNativeInput scope() const { std::lock_guard<std::mutex> lock(mutex_); return scope_; }
+    DesktopInputOptions options() const { std::lock_guard<std::mutex> lock(mutex_); return options_; }
+    int inputCalls() const { std::lock_guard<std::mutex> lock(mutex_); return inputCalls_; }
+    int releaseCalls() const { std::lock_guard<std::mutex> lock(mutex_); return releaseCalls_; }
+    int resetCalls() const { std::lock_guard<std::mutex> lock(mutex_); return resetCalls_; }
 
 private:
+    static void add(std::vector<std::string>& values, const std::string& value) {
+        if (std::find(values.begin(), values.end(), value) == values.end()) values.push_back(value);
+    }
+    static void erase(std::vector<std::string>& values, const std::string& value) {
+        values.erase(std::remove(values.begin(), values.end(), value), values.end());
+    }
+    static const char* buttonName(DesktopMouseButton button) {
+        switch (button) {
+        case DesktopMouseButton::Left: return "left";
+        case DesktopMouseButton::Right: return "right";
+        case DesktopMouseButton::Middle: return "middle";
+        case DesktopMouseButton::Back: return "back";
+        case DesktopMouseButton::Forward: return "forward";
+        }
+        return "unknown";
+    }
+    bool stateful_;
+    OneShot oneShot_;
     mutable std::mutex mutex_;
     DesktopNativeInputState held_;
-    int inputCalls_ = 0;
-    int releaseCalls_ = 0;
+    int inputCalls_ = 0, releaseCalls_ = 0, resetCalls_ = 0, batchCalls_ = 0;
+    std::vector<DesktopInputEvent> batch_;
+    DesktopInputPort port_;
+    DesktopInputOptions options_;
+    DesktopNativeInput scope_;
 };
 
 // This backend supplies actual PNG data and records the controller's native
 // boundary calls. It never enumerates, captures or injects into the user's OS.
-class RecordingBackend final : public DesktopComputerBackend {
+class RecordingBackend : public DesktopComputerBackend {
 public:
     bool statefulInput = false;
+    bool composeInputSession = false;
+    int inputSessionCreations = 0;
     std::shared_ptr<RecordingInputSession> lastInputSession;
     std::vector<DesktopNativeWindow> visible{{101, 5001, "Isolated editor", "Fixture", 100, 200, 400, 300}};
     std::vector<DesktopNativeDisplay> availableDisplays{{11, 0, 0, 1600, 900, true},
@@ -151,9 +248,22 @@ public:
     std::function<MaiError(const CaptureOptions&)> onDisplayCaptureOptions;
 
     std::shared_ptr<DesktopNativeInputSession> createInputSession() override {
-        if (!statefulInput) return {};
-        lastInputSession = std::make_shared<RecordingInputSession>();
+        ++inputSessionCreations;
+        RecordingInputSession::OneShot oneShot;
+        if (!statefulInput) oneShot = [this](const DesktopNativeInput& input) { return this->input(input); };
+        lastInputSession = std::make_shared<RecordingInputSession>(statefulInput, std::move(oneShot));
+        if (composeInputSession)
+            return makeDesktopComputerInputSession(lastInputSession,
+                [](const DesktopNativeInput&) { return MaiError{}; });
         return lastInputSession;
+    }
+
+    DesktopInputCapabilities inputCapabilities() const override {
+        DesktopInputCapabilities value;
+        value.baseline = "recording-backend-contract";
+        value.maxControllers = 0;
+        value.maxTouchContacts = 0;
+        return value;  // Capability discovery must never reach the real OS from this fixture.
     }
 
     MaiResult<std::vector<DesktopNativeWindow>> windows() override {
@@ -272,6 +382,7 @@ public:
     MaiError input(const DesktopNativeInput& value) override {
         events.push_back("input");
         inputs.push_back(value);
+        inputs.back().isCanceled = {};  // Record effects, never retain this call's callback.
         if (onInput) onInput();
         if (inputError) return inputError;
         if (value.kind == DesktopNativeInputKind::RightClick) {
@@ -2355,6 +2466,527 @@ void verifyFailureAndCancellationBoundaries() {
     }
 }
 
+void verifyReadOnlyAndDryRunNeverCreateNativeSession() {
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        auto action = display ? fixture.observeDisplay("click") : fixture.observe("click");
+        CHECK(fixture.backend->inputSessionCreations == 0 && !fixture.backend->lastInputSession);
+        action.dryRun = true;
+        CHECK(fixture.controller.perform("owner", action));
+        CHECK(fixture.backend->inputSessionCreations == 0 && fixture.backend->inputs.empty());
+        MaiToolRegistry registry;
+        auto controller = std::shared_ptr<DesktopComputerController>(&fixture.controller, [](DesktopComputerController*) {});
+        registerDesktopComputerTools(registry, controller);
+        auto* tool = registry.find("desktop_computer");
+        CHECK(tool);
+        if (!tool) continue;
+        MaiToolContext context;
+        context.sessionId = "owner";
+        for (const char* query : {R"({"action":"input_capabilities"})", R"({"action":"list_keys"})",
+                                 R"({"action":"input_state"})"})
+            CHECK(!tool->execute(query, context).hasError());
+        CHECK(fixture.backend->inputSessionCreations == 0 && !fixture.backend->lastInputSession);
+    }
+}
+
+void verifyOneShotNativeAdapterPreservesSpyAndRejectsIndependentHolds() {
+    {
+        Fixture fixture;
+        auto action = fixture.observe("click");
+        CHECK(fixture.controller.perform("owner", action));
+        CHECK(fixture.backend->inputSessionCreations == 1 && fixture.backend->inputs.size() == 1);
+        CHECK(fixture.backend->lastInputSession && fixture.backend->lastInputSession->inputCalls() == 1);
+    }
+    for (const char* kind : {"key_down", "mouse_down"}) {
+        Fixture fixture;
+        auto action = fixture.observe(kind);
+        action.key = "Ctrl";
+        const auto rejected = fixture.controller.perform("owner", action);
+        CHECK(!rejected);
+        if (!rejected) CHECK(rejected.error().code() == MaiErrorCode::NotSupported);
+        CHECK(fixture.backend->inputs.empty() && fixture.controller.inputState("owner").empty());
+    }
+    RecordingInputSession oneShot(false);
+    DesktopNativeInput up;
+    up.kind = DesktopNativeInputKind::KeyUp;
+    up.key = "Ctrl";
+    CHECK(oneShot.input(up).code() == MaiErrorCode::NotSupported);
+    up.kind = DesktopNativeInputKind::MouseUp;
+    CHECK(oneShot.input(up).code() == MaiErrorCode::NotSupported);
+}
+
+void verifyInputEventsLosslessParsing() {
+    const auto omitted = maiDesktopParseInputBatch(R"([{"type":"relative_move","delta_x":1,"delta_y":0}])");
+    CHECK(omitted && omitted.value().options.inheritExisting);
+    const auto explicitDefault =
+        maiDesktopParseInputBatch(R"([{"type":"relative_move","delta_x":1,"delta_y":0}])", "{}");
+    CHECK(explicitDefault && !explicitDefault.value().options.inheritExisting);
+    CHECK(!maiDesktopParseInputBatch(R"([{"type":"relative_move","delta_x":1,"delta_y":0}])",
+                                     R"({"inherit_existing":true})"));
+    const auto parsed = maiDesktopParseInputBatch(
+        R"([
+        {"type":"absolute_move","x_ratio":0,"y_ratio":1},
+        {"type":"relative_move","delta_x":-32768,"delta_y":32767},
+        {"type":"mouse_button","button":"forward","release":false},
+        {"type":"wheel","axis":"horizontal","delta_120":30},
+        {"type":"raw_key","code":259,"flags":1,"modifiers":31,"release":false},
+        {"type":"unicode_text","text":"\u4e2d\u6587"},
+        {"type":"touch","contacts":[{"phase":"down","pointer_id":4294967295,"x_ratio":0.25,"y_ratio":0.75,
+          "pressure_or_distance":0.8,"contact_area_major":0.2,"contact_area_minor":0.1,"rotation":null}]},
+        {"type":"pen","phase":"hover","tool_type":2,"buttons":7,"tilt":90,"rotation":360,
+          "x_ratio":0.1,"y_ratio":0.9,"pressure_or_distance":0.2}
+    ])",
+        R"({"keyboard_enabled":false,"mouse_enabled":false,"native_pen_touch_enabled":false,
+              "always_send_scan_codes":false,"right_alt_to_meta":true,"high_resolution_scroll":false,
+              "keyboard_repeat":false,"repeat_delay_ms":0,"repeat_period_ms":1,"key_bindings":[[65535,1]]})");
+    CHECK(parsed);
+    if (parsed) {
+        const auto& batch = parsed.value();
+        CHECK(batch.events.size() == 8);
+        if (batch.events.size() == 8) {
+            CHECK(batch.events[1].deltaX == -32768 && batch.events[1].deltaY == 32767);
+            CHECK(batch.events[2].button == 5);
+            CHECK(batch.events[3].horizontal && batch.events[3].wheelDelta120 == 30);
+            CHECK(batch.events[4].key.code == 259 && batch.events[4].key.modifiers == 31);
+            CHECK(batch.events[6].contacts[0].pointerId == 0xffffffffu);
+            CHECK(batch.events[6].contacts[0].rotation == 0xffff);
+            CHECK(batch.events[7].pen.toolType == 2 && batch.events[7].pen.buttons == 7);
+        }
+        CHECK(!batch.options.keyboardEnabled && !batch.options.mouseEnabled);
+        CHECK(!batch.options.nativePenTouchEnabled && !batch.options.alwaysSendScanCodes);
+        CHECK(batch.options.rightAltToMeta && !batch.options.highResolutionScroll);
+        CHECK(!batch.options.keyboardRepeat && batch.options.repeatDelayMs == 0 && batch.options.repeatPeriodMs == 1);
+        CHECK(batch.options.keyBindings.size() == 1 && batch.options.keyBindings[0][0] == 65535);
+    }
+
+    // These values are legal JSON numbers but cannot be narrowed to the public
+    // integer widths. They must fail before a platform session is even created.
+    for (const char* bad :
+         {R"([{"type":"raw_key","code":65536,"release":false}])", R"([{"type":"raw_key","code":-1,"release":false}])",
+          R"([{"type":"raw_key","code":65.5,"release":false}])",
+          R"([{"type":"raw_key","code":65,"flags":256,"release":false}])",
+          R"([{"type":"raw_key","code":65,"modifiers":256,"release":false}])",
+          R"([{"type":"raw_key","code":65,"repeat":true,"release":false}])",
+          R"([{"type":"relative_move","delta_x":2147483648,"delta_y":0}])",
+          R"([{"type":"wheel","axis":"vertical","delta_120":1.5}])",
+          R"([{"type":"touch","contacts":[{"phase":"up","pointer_id":4294967296}]}])",
+          R"([{"type":"pen","phase":"hover","x_ratio":0,"y_ratio":0,"tilt":256}])",
+          R"([{"type":"relative_move","delta_x":1,"delta_y":1,"text":"unused"}])"}) {
+        const auto rejected = maiDesktopParseInputBatch(bad);
+        CHECK(!rejected);
+        if (!rejected) CHECK(rejected.error().code() == MaiErrorCode::InvalidInput);
+    }
+    CHECK(!maiDesktopParseInputBatch(R"([{"type":"relative_move","delta_x":1,"delta_y":1}])",
+                                     R"({"keyboard_enabled":1})"));
+    CHECK(!maiDesktopInputSequence("18446744073709551616"));
+    CHECK(maiDesktopInputSequence("18446744073709551615"));
+}
+
+// Virtual profiles/driver selection, retained-pad reset and SDK feedback payloads
+// are explicitly deferred. Their exact former source is archived with the pre-migration
+// file in .cache/desktop-contracts-system-native-20261116; they are not claimed to pass.
+void verifyModelOptionsOmissionInheritsButOrdinaryDefaultsReset() {
+    for (const bool model : {true, false}) {
+        auto backend = std::make_shared<RecordingBackend>();
+        backend->statefulInput = true;
+        backend->composeInputSession = true;
+        auto controller = std::make_shared<DesktopComputerController>(backend);
+        QTemporaryDir workspace;
+        MaiToolRegistry registry;
+        registerDesktopComputerTools(registry, controller);
+        auto* tool = registry.find("desktop_computer");
+        CHECK(tool && workspace.isValid());
+        if (!tool || !workspace.isValid()) continue;
+        MaiToolContext context;
+        context.sessionId = model ? "inherited-model-options" : "explicit-ordinary-options";
+        context.turnId = "configuration-turn";
+        context.root = workspace.path().toUtf8().toStdString();
+        const auto observe = [&] {
+            const auto observed = controller->observe(context.sessionId, "", context.root, false, 101, false, {}, context.turnId);
+            CHECK(observed);
+            return observed ? Json::parse(observed.value().json)["snapshot_id"].get<std::string>() : std::string();
+        };
+        auto snapshot = observe();
+        DesktopComputerAction first;
+        first.action = "input_events"; first.windowId = 101; first.snapshotId = snapshot; first.turnId = context.turnId;
+        first.inputOptions.keyboardRepeat = false;
+        first.inputOptions.highResolutionScroll = false;
+        first.inputOptions.repeatDelayMs = 73;
+        first.inputOptions.repeatPeriodMs = 17;
+        first.inputOptions.keyBindings = {{65, 66}};
+        DesktopInputEvent held;
+        held.kind = DesktopInputEventKind::MouseButton;
+        held.button = 1;
+        first.events = {held};
+        if (model) {
+            const Json args{{"action", "input_events"}, {"window_id", "101"}, {"snapshot_id", snapshot},
+                {"events", Json::array({Json{{"type", "mouse_button"}, {"button", "left"}, {"release", false}}})},
+                {"input_options", {{"keyboard_repeat", false}, {"high_resolution_scroll", false},
+                    {"repeat_delay_ms", 73}, {"repeat_period_ms", 17}, {"key_bindings", {{65, 66}}}}}};
+            CHECK(!tool->execute(args.dump(), context).hasError());
+        } else {
+            CHECK(!first.inputOptions.inheritExisting);
+            CHECK(controller->perform(context.sessionId, first));
+        }
+        const auto native = backend->lastInputSession;
+        CHECK(native && native->state().buttonsDown == std::vector<std::string>{"left"});
+        if (!native) continue;
+        CHECK(!native->options().keyboardRepeat && !native->options().highResolutionScroll);
+        CHECK(native->options().repeatDelayMs == 73 && native->options().repeatPeriodMs == 17);
+        CHECK(native->options().keyBindings == (std::vector<std::array<std::uint16_t, 2>>{{65, 66}}));
+        snapshot = observe();
+        const Json move{{"action", "input_events"}, {"window_id", "101"}, {"snapshot_id", snapshot},
+            {"events", Json::array({Json{{"type", "relative_move"}, {"delta_x", 1}, {"delta_y", 0}}})}};
+        if (model) {
+            CHECK(!tool->execute(move.dump(), context).hasError());
+            CHECK(!native->options().keyboardRepeat && !native->options().highResolutionScroll);
+            CHECK(native->options().keyBindings == (std::vector<std::array<std::uint16_t, 2>>{{65, 66}}));
+            auto reset = move;
+            reset["snapshot_id"] = observe();
+            reset["input_options"] = Json::object();
+            CHECK(!tool->execute(reset.dump(), context).hasError());
+        } else {
+            DesktopComputerAction reset;
+            reset.action = "input_events"; reset.windowId = 101; reset.snapshotId = snapshot; reset.turnId = context.turnId;
+            DesktopInputEvent relative; relative.kind = DesktopInputEventKind::RelativeMove; relative.deltaX = 1;
+            reset.events = {relative};
+            CHECK(!reset.inputOptions.inheritExisting);
+            CHECK(controller->perform(context.sessionId, reset));
+        }
+        CHECK(native->options().keyboardRepeat && native->options().highResolutionScroll);
+        CHECK(native->options().repeatDelayMs == 500 && native->options().repeatPeriodMs == 40);
+        CHECK(native->options().keyBindings.empty() && !native->options().inheritExisting);
+        CHECK(backend->lastInputSession == native && backend->inputSessionCreations == 1);
+        CHECK(native->state().buttonsDown == std::vector<std::string>{"left"});
+        CHECK(native->releaseCalls() == 0 && native->resetCalls() == 0);
+        CHECK(!controller->releaseInput(context.sessionId, context.turnId));
+        CHECK(controller->inputState(context.sessionId).empty());
+    }
+}
+
+void verifyResetIsBusyDuringRawKeyDispatch() {
+    auto backend = std::make_shared<RecordingBackend>();
+    backend->statefulInput = true;
+    DesktopComputerController controller(backend);
+    QTemporaryDir workspace;
+    const std::string id = "owned-raw-reset-race", turn = "same-task";
+    const auto observe = [&] {
+        const auto observation = controller.observe(id, "", workspace.path().toStdString(), false, 101, false, {}, turn);
+        CHECK(observation);
+        return observation ? Json::parse(observation.value().json)["snapshot_id"].get<std::string>() : std::string();
+    };
+    DesktopComputerAction action;
+    action.action = "input_events"; action.windowId = 101; action.turnId = turn; action.snapshotId = observe();
+    DesktopInputEvent event; event.kind = DesktopInputEventKind::RawKey; event.key.code = 65;
+    action.events = {event};
+    CHECK(controller.perform(id, action));
+    const auto native = backend->lastInputSession;
+    CHECK(native && native->state().rawKeys.size() == 1);
+    if (!native) return;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false, proceed = false;
+    native->failBatchIfReset = true;
+    native->beforeBatch = [&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true; changed.notify_all();
+        changed.wait(lock, [&] { return proceed; });
+    };
+    action.snapshotId = observe(); action.events[0].key.code = 66;
+    MaiError failure;
+    std::thread pending([&] {
+        const auto result = controller.perform(id, action);
+        failure = result ? MaiError{} : result.error();
+    });
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        CHECK(changed.wait_for(lock, std::chrono::seconds(2), [&] { return entered; }));
+    }
+    const auto reset = controller.resetInput(id, turn);
+    const auto keysAfterReset = native->state().rawKeys.size();
+    const int resetsAfterBusy = native->resetCalls(), releasesAfterBusy = native->releaseCalls();
+    { std::lock_guard<std::mutex> lock(mutex); proceed = true; }
+    changed.notify_all(); pending.join();
+    native->beforeBatch = {};
+    CHECK(reset.code() == MaiErrorCode::Busy && keysAfterReset == 1);
+    CHECK(resetsAfterBusy == 0 && releasesAfterBusy == 0);
+    CHECK(failure.code() == MaiErrorCode::Ok);
+    CHECK(native->state().rawKeys.size() == 2 && controller.inputState(id).rawKeys.size() == 2);
+    CHECK(backend->lastInputSession == native && backend->inputSessionCreations == 1);
+    CHECK(native->resetCalls() == 0 && native->releaseCalls() == 0);
+    CHECK(!controller.resetInput(id, turn));
+    CHECK(native->resetCalls() == 1 && native->state().empty());
+}
+
+void verifyResetInputsRequiresNoObservationAndClearsKeysAndMouse() {
+    auto backend = std::make_shared<RecordingBackend>();
+    backend->statefulInput = true;
+    auto controller = std::make_shared<DesktopComputerController>(backend);
+    QTemporaryDir workspace;
+    MaiToolRegistry registry;
+    registerDesktopComputerTools(registry, controller);
+    auto* tool = registry.find("desktop_computer");
+    CHECK(tool && workspace.isValid());
+    if (!tool || !workspace.isValid()) return;
+    MaiToolContext context;
+    context.sessionId = "reset-native-controls-model"; context.turnId = "reset-turn";
+    context.root = workspace.path().toUtf8().toStdString();
+    const auto observed = controller->observe(context.sessionId, "", context.root, false, 101, false, {}, context.turnId);
+    CHECK(observed);
+    if (!observed) return;
+    DesktopComputerAction action;
+    action.action = "input_events"; action.windowId = 101; action.turnId = context.turnId;
+    action.snapshotId = Json::parse(observed.value().json)["snapshot_id"].get<std::string>();
+    DesktopInputEvent key; key.kind = DesktopInputEventKind::RawKey; key.key.code = 65;
+    DesktopInputEvent mouse; mouse.kind = DesktopInputEventKind::MouseButton; mouse.button = 1;
+    action.events = {key, mouse};
+    CHECK(controller->perform(context.sessionId, action));
+    const auto native = backend->lastInputSession;
+    CHECK(native && native->state().rawKeys.size() == 1 && native->state().buttonsDown.size() == 1);
+    if (!native) return;
+    const int activations = backend->activationCount, captures = backend->captureCount;
+    backend->focused = false; backend->secure = true;
+    context.root.clear(); // Reset has no observation/workspace requirement.
+    const std::string reset = R"({"action":"reset_inputs"})";
+    CHECK(!tool->requiresPerCallApproval(reset));
+    CHECK(contains(Json::parse(tool->parametersSchema())["properties"]["action"]["enum"], "reset_inputs"));
+    auto oldTurn = context; oldTurn.turnId = "old-turn";
+    CHECK(!tool->execute(reset, oldTurn).hasError());
+    CHECK(native->resetCalls() == 0 && !native->state().empty());
+    const auto actual = tool->execute(reset, context);
+    CHECK(!actual.hasError());
+    if (!actual.hasError()) CHECK(Json::parse(actual.output())["state"] == "inputs_reset");
+    CHECK(native->resetCalls() == 1 && native->state().empty() && controller->inputState(context.sessionId).empty());
+    CHECK(backend->lastInputSession == native && backend->inputSessionCreations == 1);
+    CHECK(backend->activationCount == activations && backend->captureCount == captures);
+    const auto bad = tool->execute(R"({"action":"reset_inputs","snapshot_id":"wrong"})", context);
+    CHECK(bad.hasError() && native->resetCalls() == 1);
+    CHECK(!tool->execute(R"({"action":"release_all"})", context).hasError());
+    CHECK(controller->inputState(context.sessionId).empty());
+}
+
+void verifyInputEventsControllerAndTool() {
+    {
+        Fixture fixture;
+        fixture.backend->statefulInput = true;
+        // A partially off-screen window must not enlarge the OS input space.
+        fixture.backend->visible.front().x = -1600;
+        auto action = fixture.observe("input_events");
+        DesktopInputEvent move;
+        move.kind = DesktopInputEventKind::RelativeMove;
+        move.deltaX = 3;
+        move.deltaY = -2;
+        DesktopInputEvent wheel;
+        wheel.kind = DesktopInputEventKind::Wheel;
+        wheel.wheelDelta120 = 30;
+        action.events = {move, wheel};
+        const auto result = fixture.controller.perform("owner", action);
+        CHECK(result && result.value().acceptedEvents == 2);
+        const auto native = fixture.backend->lastInputSession;
+        CHECK(native && native->batchCalls() == 1);
+        if (native) {
+            const auto batch = native->batch();
+            CHECK(batch.size() == 2 && batch[0].deltaX == 3 && batch[1].wheelDelta120 == 30);
+            CHECK(native->scope().expectedWindowId == 101 && native->scope().expectedProcessId == 5001);
+            CHECK(native->port().x == -1600 && native->port().y == 200);
+            CHECK(native->port().environmentX == -1280 && native->port().environmentY == -120);
+        }
+        CHECK(fixture.backend->inputs.empty());  // Typed primitives never become legacy absolute moves.
+        CHECK(!fixture.controller.perform("owner", action));
+    }
+    {
+        DisplayToolFixture fixture;
+        fixture.backend->statefulInput = true;
+        if (!fixture.tool) return;
+        const auto observed =
+            fixture.tool->execute(R"({"action":"observe","target":"display","display_id":"22"})", fixture.context);
+        CHECK(!observed.hasError());
+        if (observed.hasError()) return;
+        const auto snapshot = Json::parse(observed.output())["snapshot_id"];
+        Json args{{"action", "input_events"},
+                  {"target", "display"},
+                  {"display_id", "22"},
+                  {"snapshot_id", snapshot},
+                  {"events", Json::array({Json{{"type", "relative_move"}, {"delta_x", 3}, {"delta_y", -2}},
+                                          Json{{"type", "wheel"}, {"axis", "horizontal"}, {"delta_120", 30}}})}};
+        const auto result = fixture.tool->execute(args.dump(), fixture.context);
+        CHECK(!result.hasError());
+        if (!result.hasError()) {
+            const auto output = Json::parse(result.output());
+            CHECK(output["accepted_events"] == 2);
+            CHECK(output["observation"]["snapshot_id"] != snapshot);
+            CHECK(result.images().size() == 1);
+        }
+        CHECK(fixture.backend->displayCaptureCount == 2);
+        CHECK(fixture.backend->lastInputSession && fixture.backend->lastInputSession->batchCalls() == 1);
+        CHECK(fixture.backend->inputs.empty());
+    }
+    {
+        Fixture fixture;
+        fixture.backend->statefulInput = true;
+        auto action = fixture.observe("input_events");
+        action.turnId = "current";
+        DesktopInputEvent key;
+        key.kind = DesktopInputEventKind::RawKey;
+        key.key.code = 65;
+        action.events = {key};
+        CHECK(fixture.controller.perform("owner", action));
+        const auto native = fixture.backend->lastInputSession;
+        CHECK(native && !native->state().empty());
+        DesktopComputerAction release;
+        release.action = "input_events";
+        key.key.release = true;
+        release.events = {key};
+        release.turnId = "old";
+        CHECK(fixture.controller.perform("owner", release));
+        CHECK(native && native->batchCalls() == 1 && !native->state().empty());
+        release.turnId = "current";
+        release.dryRun = true;
+        CHECK(fixture.controller.perform("owner", release));
+        CHECK(native && native->batchCalls() == 1 && !native->state().empty());
+        release.dryRun = false;
+        CHECK(fixture.controller.perform("owner", release));
+        CHECK(native && native->batchCalls() == 2 && native->state().empty());
+    }
+    {
+        Fixture fixture;
+        fixture.backend->statefulInput = true;
+        fixture.backend->secure = true;
+        auto action = fixture.observe("input_events");
+        DesktopInputEvent key;
+        key.kind = DesktopInputEventKind::RawKey;
+        key.key.code = 65;
+        action.events = {key};
+        const auto result = fixture.controller.perform("owner", action);
+        CHECK(!result);
+        if (!result) CHECK(result.error().code() == MaiErrorCode::NotSupported);
+        CHECK(!fixture.backend->lastInputSession);
+        action = fixture.observe("input_events");
+        key.key.code = 0x11;
+        action.events = {key};
+        action.inputOptions.keyBindings = {{0x11, 65}};
+        const auto remapped = fixture.controller.perform("owner", action);
+        CHECK(!remapped);
+        if (!remapped) CHECK(remapped.error().code() == MaiErrorCode::NotSupported);
+        CHECK(!fixture.backend->lastInputSession);
+    }
+}
+
+void verifyDeferredVirtualInputContract() {
+    const auto schema = Json::parse(maiDesktopComputerInputSchema(
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["move","input_state","reset_inputs","release_all"]}}})"));
+    const auto& properties = schema["properties"];
+    const auto& actions = properties["action"]["enum"];
+    for (const char* action : {"move", "input_state", "reset_inputs", "release_all", "input_events", "input_capabilities"})
+        CHECK(contains(actions, action));
+    CHECK(!contains(actions, "feedback"));
+    CHECK(!properties.contains("after_sequence"));
+    CHECK(!properties.contains("limit"));
+
+    Json names = Json::array();
+    for (const auto& variant : properties["events"]["items"]["oneOf"])
+        names.push_back(variant["properties"]["type"]["enum"][0]);
+    CHECK(names.size() == 8);
+    for (const char* type : {"absolute_move", "relative_move", "mouse_button", "wheel", "raw_key", "unicode_text", "touch", "pen"})
+        CHECK(contains(names, type));
+    const auto& configuration = properties["input_options"]["properties"];
+    CHECK(configuration.size() == 10);
+    for (const char* name : {"keyboard_enabled", "mouse_enabled", "native_pen_touch_enabled", "always_send_scan_codes",
+                             "right_alt_to_meta", "high_resolution_scroll", "keyboard_repeat", "repeat_delay_ms",
+                             "repeat_period_ms", "key_bindings"})
+        CHECK(configuration.contains(name));
+    for (const char* name : {"controller_enabled", "ds4_back_as_touchpad", "motion_as_playstation", "touchpad_as_playstation",
+                             "randomize_controller_mac", "driver", "default_profile", "back_button_timeout_ms"})
+        CHECK(!configuration.contains(name));
+
+    // Deferred fields must be refused even with a historical default value.
+    // Parsing the complete batch first also prevents a preceding ordinary event
+    // from reaching native input before a deferred event is discovered.
+    for (const char* gamepad : {
+             R"({"type":"gamepad_attach","controller_id":0})",
+             R"({"type":"gamepad_state","controller_id":0})",
+             R"({"type":"gamepad_touch","controller_id":0,"contact":{"phase":"down","pointer_id":1,"x_ratio":0.5,"y_ratio":0.5}})",
+             R"({"type":"gamepad_motion","controller_id":0,"motion_type":1,"x":0,"y":0,"z":0})",
+             R"({"type":"gamepad_battery","controller_id":0,"state":1})",
+             R"({"type":"gamepad_detach","controller_id":0})",
+             R"({"type":"gamepad_rebind","controller_id":0})"}) {
+        const auto deferred = maiDesktopParseInputBatch(
+            std::string(R"([{"type":"relative_move","delta_x":1,"delta_y":0},)") + gamepad + "]");
+        CHECK(!deferred);
+        if (!deferred) CHECK(deferred.error().code() == MaiErrorCode::NotSupported);
+    }
+    for (const char* config : {R"({"controller_enabled":true})", R"({"ds4_back_as_touchpad":false})",
+                               R"({"motion_as_playstation":true})", R"({"touchpad_as_playstation":true})",
+                               R"({"randomize_controller_mac":true})", R"({"driver":"auto"})",
+                               R"({"default_profile":"x360"})", R"({"back_button_timeout_ms":-1})"}) {
+        const auto deferred = maiDesktopParseInputBatch(
+            R"([{"type":"relative_move","delta_x":1,"delta_y":0}])", config);
+        CHECK(!deferred);
+        if (!deferred) CHECK(deferred.error().code() == MaiErrorCode::NotSupported);
+    }
+}
+
+void verifyInputEventsProtocolDiscovery() {
+    auto backend = std::make_shared<RecordingBackend>();
+    auto controller = std::make_shared<DesktopComputerController>(backend);
+    MaiToolRegistry registry;
+    registerDesktopComputerTools(registry, controller);
+    MaiTool* tool = registry.find("desktop_computer");
+    CHECK(tool);
+    if (!tool) return;
+
+    const auto schema = Json::parse(tool->parametersSchema(), nullptr, false);
+    CHECK(schema.is_object());
+    if (schema.is_object()) {
+        const auto properties = schema.value("properties", Json::object());
+        const auto actions = properties.value("action", Json::object()).value("enum", Json::array());
+        for (const char* action : {"input_events", "input_capabilities"}) CHECK(contains(actions, action));
+        CHECK(properties.value("events", Json::object()).value("type", std::string()) == "array");
+        Json eventNames = Json::array();
+        for (const auto& variant :
+             properties.value("events", Json::object()).value("items", Json::object()).value("oneOf", Json::array())) {
+            const auto names =
+                variant.value("properties", Json::object()).value("type", Json::object()).value("enum", Json::array());
+            if (names.size() == 1) eventNames.push_back(names[0]);
+        }
+        // Schema syntax includes the six ordinary primitives and two system
+        // candidates. It does not assert that touch/pen delivery is accepted.
+        CHECK(eventNames.size() == 8);
+        for (const char* name : {"absolute_move", "relative_move", "mouse_button", "wheel", "raw_key", "unicode_text", "touch", "pen"})
+            CHECK(contains(eventNames, name));
+        CHECK(!contains(actions, "feedback"));
+    }
+
+    MaiToolContext context;
+    context.sessionId = "input-protocol-without-observation";
+    // Capability discovery must report the connected backend's actual support
+    // without capturing, activating, or posting even a probe input event.
+    const auto capability = tool->execute(R"({"action":"input_capabilities"})", context);
+    CHECK(!capability.hasError());
+    CHECK(capability.images().empty());
+    if (!capability.hasError()) CHECK(Json::parse(capability.output(), nullptr, false).is_object());
+    CHECK(backend->events.empty());
+    CHECK(backend->inputs.empty());
+    CHECK(backend->activationCount == 0);
+    CHECK(backend->captureCount == 0);
+    CHECK(backend->displayCaptureCount == 0);
+
+    const auto extra = tool->execute(R"({"action":"input_capabilities","text":"unused"})", context);
+    CHECK(extra.hasError());
+    if (extra.hasError()) CHECK(extra.error().code() == MaiErrorCode::InvalidInput);
+    for (const char* deferred : {
+             R"({"action":"input_events","events":[{"type":"relative_move","delta_x":1,"delta_y":0},{"type":"gamepad_attach","controller_id":0}]})",
+             R"({"action":"input_events","events":[{"type":"relative_move","delta_x":1,"delta_y":0}],"input_options":{"driver":"auto"}})",
+             R"({"action":"feedback"})"}) {
+        const auto result = tool->execute(deferred, context);
+        CHECK(result.hasError());
+        if (result.hasError()) CHECK(result.error().code() == MaiErrorCode::NotSupported);
+    }
+    CHECK(backend->inputSessionCreations == 0);
+    CHECK(backend->events.empty() && backend->inputs.empty());
+    CHECK(backend->activationCount == 0 && backend->captureCount == 0 && backend->displayCaptureCount == 0);
+}
+
 void verifyPublicContract() {
     MaiToolRegistry registry;
     auto controller = std::make_shared<DesktopComputerController>();
@@ -2434,6 +3066,15 @@ int main(int argc, char** argv) {
     verifyDisplayToolRejectsMixedTargetsAndInvalidIds();
     verifyDisplayToolRejectsTextModelsBeforeNativeAccess();
     verifyDisplayToolWorkspaceChangeRejectsOldToken();
+    verifyReadOnlyAndDryRunNeverCreateNativeSession();
+    verifyOneShotNativeAdapterPreservesSpyAndRejectsIndependentHolds();
+    verifyInputEventsLosslessParsing();
+    verifyModelOptionsOmissionInheritsButOrdinaryDefaultsReset();
+    verifyResetIsBusyDuringRawKeyDispatch();
+    verifyResetInputsRequiresNoObservationAndClearsKeysAndMouse();
+    verifyInputEventsControllerAndTool();
+    verifyDeferredVirtualInputContract();
+    verifyInputEventsProtocolDiscovery();
     verifyPublicContract();
     verifyKeyGrammar();
     verifyExpandedKeyGrammar();

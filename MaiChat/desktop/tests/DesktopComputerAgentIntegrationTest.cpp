@@ -90,12 +90,70 @@ struct ScriptState {
     }
 };
 
+// One-shot simulation only: this adapter delegates to the fixture's existing
+// UI/spy implementation. It has no physical input ledger and never injects OS
+// input. Separate holds must remain unsupported rather than appear successful.
+class CallbackNativeSession final : public DesktopNativeInputSession {
+public:
+    explicit CallbackNativeSession(std::function<MaiError(const DesktopNativeInput&)> callback)
+        : callback_(std::move(callback)) {}
+    MaiError input(const DesktopNativeInput& input) override {
+        if (input.kind == DesktopNativeInputKind::KeyDown || input.kind == DesktopNativeInputKind::KeyUp ||
+            input.kind == DesktopNativeInputKind::MouseDown || input.kind == DesktopNativeInputKind::MouseUp)
+            return {MaiErrorCode::NotSupported, "this one-shot fixture does not support independent holds"};
+        return callback_(input);
+    }
+    DesktopNativeInputState state() const override { return {}; }
+    MaiError validate() const override { return {}; }
+    MaiError releaseAll() override { return {}; }
+private:
+    std::function<MaiError(const DesktopNativeInput&)> callback_;
+};
+
+// Statistics wrap the one native session, including its state/cleanup. No
+// second executor or held-state projection is introduced by the test fixture.
+class CountingNativeSession final : public DesktopNativeInputSession {
+public:
+    using Receipt = std::function<MaiError(MaiError, const char*)>;
+    CountingNativeSession(std::shared_ptr<DesktopNativeInputSession> native, std::function<void()> beganInput,
+                          Receipt receipt)
+        : native_(std::move(native)), beganInput_(std::move(beganInput)), receipt_(std::move(receipt)) {}
+    MaiError input(const DesktopNativeInput& input) override {
+        beganInput_();
+        return receipt_(native_->input(input), "input");
+    }
+    MaiError inputEvents(const std::vector<DesktopInputEvent>& events, const DesktopNativeInput& scope,
+                         const DesktopInputPort& port, const DesktopInputOptions& options) override {
+        beganInput_();
+        return receipt_(native_->inputEvents(events, scope, port, options), "inputEvents");
+    }
+    DesktopNativeInputState state() const override { return native_->state(); }
+    MaiError validate() const override { return receipt_(native_->validate(), "validate"); }
+    MaiError resetControls() override { return receipt_(native_->resetControls(), "resetControls"); }
+    MaiError releaseAll() override { return receipt_(native_->releaseAll(), "releaseAll"); }
+    DesktopInputCapabilities capabilities() const override { return native_->capabilities(); }
+    DesktopInputFeedbackBatch feedback(std::uint64_t after, std::uint32_t limit) const override {
+        return native_->feedback(after, limit);
+    }
+private:
+    std::shared_ptr<DesktopNativeInputSession> native_;
+    std::function<void()> beganInput_;
+    Receipt receipt_;
+};
+
 // The editor operations stay on the GUI thread. This seam never uses global
 // mouse/keyboard input and therefore also runs under an offscreen Qt platform.
-class EditorBackend final : public DesktopComputerBackend {
+class EditorBackend final : public DesktopComputerBackend, public std::enable_shared_from_this<EditorBackend> {
 public:
     EditorBackend(QWidget& scene, QWidget& editorWindow, QLineEdit& editor)
         : scene_(scene), editorWindow_(editorWindow), editor_(editor) {}
+
+    std::shared_ptr<DesktopNativeInputSession> createInputSession() override {
+        ++sessionCreations;
+        return std::make_shared<CallbackNativeSession>([owner = shared_from_this()](const DesktopNativeInput& input) {
+            return owner->input(input);
+        });
+    }
 
     MaiResult<std::vector<DesktopNativeWindow>> windows() override {
         std::vector<DesktopNativeWindow> output;
@@ -181,6 +239,7 @@ public:
         return output;
     }
 
+    int sessionCreations = 0;
     int inputCount = 0;
     int readCount = 0;
     int captureCount = 0;
@@ -338,10 +397,17 @@ private:
 
 // This backend owns synthetic display pixels and receives ordinary controller
 // input only. It never lists real windows, captures the OS or injects input.
-class FakeDisplayBackend final : public DesktopComputerBackend {
+class FakeDisplayBackend final : public DesktopComputerBackend, public std::enable_shared_from_this<FakeDisplayBackend> {
 public:
     FakeDisplayBackend() : producerEpochMs_(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count() + 60000) {}
+
+    std::shared_ptr<DesktopNativeInputSession> createInputSession() override {
+        ++sessionCreations;
+        return std::make_shared<CallbackNativeSession>([owner = shared_from_this()](const DesktopNativeInput& input) {
+            return owner->input(input);
+        });
+    }
 
     MaiResult<std::vector<DesktopNativeDisplay>> displays() override {
         return std::vector<DesktopNativeDisplay>{{71, 0, 0, 1920, 1080, true},
@@ -419,6 +485,7 @@ public:
         return {MaiErrorCode::NotSupported, "display fixture has no window text readback"};
     }
 
+    int sessionCreations = 0;
     int captures = 0;
     int inputs = 0;
     int freshBarrierCount = 0;
@@ -601,11 +668,27 @@ struct OwnedNativeEditor {
 
 // Only discovery is narrowed. All capture, activation, input, foreground,
 // secure-input and text-read operations use the production implementation.
-class ScopedNativeBackend final : public DesktopComputerBackend {
+class ScopedNativeBackend final : public DesktopComputerBackend, public std::enable_shared_from_this<ScopedNativeBackend> {
 public:
     ScopedNativeBackend(std::shared_ptr<DesktopComputerBackend> native, DesktopNativeWindow target,
                         QString screenshotDirectory)
         : native_(std::move(native)), target_(std::move(target)), screenshotDirectory_(std::move(screenshotDirectory)) {}
+
+    std::shared_ptr<DesktopNativeInputSession> createInputSession() override {
+        ++sessionCreations;
+        auto native = native_->createInputSession();
+        if (!native) {
+            remember(MaiError{MaiErrorCode::NotSupported, "production backend has no owned input session"},
+                     "createInputSession");
+            return {};
+        }
+        const auto owner = shared_from_this();
+        return std::make_shared<CountingNativeSession>(std::move(native), [owner] {
+            owner->beganInput = true;
+            ++owner->inputs;
+        }, [owner](MaiError error, const char* operation) { return owner->remember(std::move(error), operation); });
+    }
+    DesktopInputCapabilities inputCapabilities() const override { return native_->inputCapabilities(); }
 
     MaiResult<std::vector<DesktopNativeWindow>> windows() override {
         const auto listed = remember(native_->windows(), "windows");
@@ -655,10 +738,11 @@ public:
         return focused;
     }
     MaiResult<bool> secureInput() override { return remember(native_->secureInput(), "secureInput"); }
-    MaiError input(const DesktopNativeInput& input) override {
-        beganInput = true;
-        ++inputs;
-        return remember(native_->input(input), "input");
+    MaiError input(const DesktopNativeInput&) override {
+        // Controller dispatch must use the counted production session. Keep an
+        // accidental legacy call visible without executing a second input path.
+        return remember(MaiError{MaiErrorCode::NotSupported, "native integration input requires its owned session"},
+                        "legacy_input");
     }
     MaiResult<std::string> focusedText(const DesktopNativeWindow& window) override {
         ++reads;
@@ -668,10 +752,12 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return Json{{"backend", "production_native_scoped_to_owned_child"},
                     {"child_pid", target_.processId}, {"window_id", std::to_string(target_.id)},
+                    {"session_creations", sessionCreations.load()},
                     {"input_attempts", inputs.load()}, {"captures", captures.load()},
                     {"text_reads", reads.load()}, {"failures", failures_}};
     }
 
+    std::atomic<int> sessionCreations{0};
     std::atomic<int> captures{0};
     std::atomic<int> inputs{0};
     std::atomic<int> reads{0};
@@ -793,10 +879,68 @@ private:
     }
 
 private slots:
+    void backendSessionsKeepCreationSeparateFromDispatch();
     void chinesePromptTraversesRealAgentAndReadsBackEditor();
     void displayPromptTraversesRealAgentAndReceivesFreshImages();
     void nativePromptTraversesRealAgentAndReadsBackOwnedProcess();
 };
+
+void DesktopComputerAgentIntegrationTest::backendSessionsKeepCreationSeparateFromDispatch() {
+    auto backend = std::make_shared<FakeDisplayBackend>();
+    auto scoped = std::make_shared<ScopedNativeBackend>(backend, DesktopNativeWindow{}, QString{});
+    scoped->inputCapabilities();
+    QCOMPARE(backend->sessionCreations, 0);
+    QCOMPARE(scoped->sessionCreations.load(), 0);
+    QCOMPARE(backend->inputs, 0);
+    QVERIFY(!scoped->beganInput.load());
+    const auto session = scoped->createInputSession();
+    QVERIFY(session);
+    QCOMPARE(backend->sessionCreations, 1);
+    QCOMPARE(scoped->sessionCreations.load(), 1);
+    QCOMPARE(scoped->inputs.load(), 0);
+    QVERIFY(!scoped->beganInput.load());
+
+    DesktopNativeInput move;
+    move.kind = DesktopNativeInputKind::Move;
+    move.desktopScope = true;
+    move.display.id = 72;
+    move.x = -1200.25;
+    move.y = 359.5;
+    QVERIFY(!session->input(move));
+    QCOMPARE(backend->inputs, 1);
+    QCOMPARE(scoped->inputs.load(), 1);
+    QVERIFY(scoped->beganInput.load());
+    QVERIFY(session->state().empty());
+    QVERIFY(!session->validate());
+    QVERIFY(!session->resetControls());
+    QVERIFY(!session->releaseAll());
+    QCOMPARE(session->feedback(42, 1).nextSequence, std::uint64_t(42));
+    QCOMPARE(backend->inputs, 1);
+    QCOMPARE(scoped->inputs.load(), 1);
+
+    for (const auto kind : {DesktopNativeInputKind::KeyDown, DesktopNativeInputKind::KeyUp,
+                            DesktopNativeInputKind::MouseDown, DesktopNativeInputKind::MouseUp}) {
+        auto independent = move;
+        independent.kind = kind;
+        QCOMPARE(session->input(independent).code(), MaiErrorCode::NotSupported);
+    }
+    QCOMPARE(backend->inputs, 1);
+    QCOMPARE(scoped->inputs.load(), 5); // Dispatch attempts include refused commands.
+    QVERIFY(session->state().empty());
+    DesktopInputEvent relative;
+    relative.kind = DesktopInputEventKind::RelativeMove;
+    relative.deltaX = 1;
+    QCOMPARE(session->inputEvents({relative}, move, {}, {}).code(), MaiErrorCode::NotSupported);
+    QCOMPARE(backend->inputs, 1);
+    QCOMPARE(scoped->inputs.load(), 6);
+    QCOMPARE(scoped->input(move).code(), MaiErrorCode::NotSupported);
+    QCOMPARE(backend->inputs, 1);
+    QCOMPARE(scoped->inputs.load(), 6);
+    const auto failures = scoped->diagnostics()["failures"];
+    QCOMPARE(failures.size(), std::size_t(6));
+    QCOMPARE(failures[4]["operation"].get<std::string>(), std::string("inputEvents"));
+    QCOMPARE(failures[5]["operation"].get<std::string>(), std::string("legacy_input"));
+}
 
 void DesktopComputerAgentIntegrationTest::chinesePromptTraversesRealAgentAndReadsBackEditor() {
     QTemporaryDir workspace;

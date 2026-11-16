@@ -46,8 +46,18 @@ MaiResult<std::shared_ptr<DesktopNativeInputSession>> DesktopComputerInputOwners
     const std::string& session, const DesktopComputerAction& action, bool create, bool releasing) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto found = entries_.find(session);
-    if (!releasing && found != entries_.end() && std::chrono::steady_clock::now() >= found->second.deadline)
-        expire(found->second);
+    if (!releasing && found != entries_.end() && std::chrono::steady_clock::now() >= found->second.deadline) {
+        if (found->second.native->state().empty()) {
+            // A native API session can retain configuration and wheel remainder
+            // without any held input or virtual device. Its idle cleanup must
+            // retire that context too, not manufacture a device in state().
+            const auto cleaned = found->second.native->releaseAll();
+            if (cleaned) return cleaned;
+            entries_.erase(found);
+            found = entries_.end();
+        } else
+            expire(found->second);
+    }
     if (!releasing && found != entries_.end() && found->second.expired)
         return {MaiErrorCode::InvalidInput, "held input expired; observe the current state again"};
     const auto local = found == entries_.end() ? nullptr : found->second.native;
@@ -61,9 +71,18 @@ MaiResult<std::shared_ptr<DesktopNativeInputSession>> DesktopComputerInputOwners
         ((target != 0 && (found->second.display != action.desktopScope || found->second.target != target)) ||
          found->second.turn != action.turnId))
         return {MaiErrorCode::Busy, "release owned inputs before changing input target or task"};
-    if (!create && (found == entries_.end() || local->state().empty()))
+    const bool changedContext = found != entries_.end() &&
+        (found->second.turn != action.turnId ||
+         (target != 0 && (found->second.display != action.desktopScope || found->second.target != target)));
+    if (!create && (found == entries_.end() || changedContext))
         return std::shared_ptr<DesktopNativeInputSession>{};
-    if (found == entries_.end() || local->state().empty()) {
+    if (found == entries_.end() || changedContext) {
+        if (found != entries_.end()) {
+            const auto cleaned = local->releaseAll();
+            if (cleaned) return cleaned;
+            if (!local->state().empty())
+                return {MaiErrorCode::Busy, "previous native input cleanup is still pending"};
+        }
         auto native = backend_->createInputSession();
         if (!native) return {MaiErrorCode::NotSupported, "independent input is unavailable in this backend"};
         found = entries_
@@ -83,8 +102,21 @@ void DesktopComputerInputOwnership::touch(const std::string& session, const std:
     const auto found = entries_.find(session);
     if (found == entries_.end()) return;
     if (!expectedTurn.empty() && found->second.turn != expectedTurn) return;
-    if (std::chrono::steady_clock::now() >= found->second.deadline) expire(found->second);
-    if (found->second.native->state().empty())
+    if (std::chrono::steady_clock::now() >= found->second.deadline) {
+        if (found->second.native->state().empty()) {
+            const auto cleaned = found->second.native->releaseAll();
+            if (!cleaned)
+                entries_.erase(found);
+            else {
+                found->second.expired = true;
+                found->second.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+            }
+            changed_.notify_all();
+            return;
+        }
+        expire(found->second);
+    }
+    if (found->second.expired && found->second.native->state().empty())
         entries_.erase(found);
     else if (!found->second.expired)
         found->second.deadline = std::chrono::steady_clock::now() + timeout_;
@@ -104,6 +136,20 @@ DesktopNativeInputState DesktopComputerInputOwnership::state(const std::string& 
     return result;
 }
 
+MaiResult<DesktopInputFeedbackBatch> DesktopComputerInputOwnership::feedback(const std::string& session,
+                                                                             std::uint64_t afterSequence,
+                                                                             std::uint32_t limit) const {
+    if (!limit || limit > 256) return {MaiErrorCode::InvalidInput, "feedback limit must be 1..256"};
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(session);
+    if (found == entries_.end()) {
+        DesktopInputFeedbackBatch empty;
+        empty.nextSequence = afterSequence;
+        return empty;
+    }
+    return found->second.native->feedback(afterSequence, limit);
+}
+
 MaiError DesktopComputerInputOwnership::release(const std::string& session, const std::string& expectedTurn,
                                                 bool* released) {
     if (released) *released = false;
@@ -119,17 +165,71 @@ MaiError DesktopComputerInputOwnership::release(const std::string& session, cons
     return result;
 }
 
+MaiError DesktopComputerInputOwnership::reset(const std::string& session, const std::string& expectedTurn,
+                                              bool* reset) {
+    if (reset) *reset = false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(session);
+    if (found == entries_.end() || (!expectedTurn.empty() && found->second.turn != expectedTurn)) return {};
+    auto& entry = found->second;
+    const bool held = !entry.native->state().empty();
+    if (reset) *reset = held || entry.expired;
+    // A reset cannot turn a timed-out/canceled lease into a retained device.
+    const bool expired = entry.expired || std::chrono::steady_clock::now() >= entry.deadline;
+    const auto result = expired ? entry.native->releaseAll() : entry.native->resetControls();
+    if (held) invalidate_();
+    if (expired && entry.native->state().empty())
+        entries_.erase(found);
+    else if (expired) {
+        entry.expired = true;
+        entry.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    } else if (!result)
+        entry.deadline = std::chrono::steady_clock::now() + timeout_;
+    changed_.notify_all();
+    return result;
+}
+
 void DesktopComputerInputOwnership::watch() {
     MaiThread::setCurrentName("mai-input-hold");
     std::unique_lock<std::mutex> lock(mutex_);
     while (!stopping_) {
         auto next = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-        for (auto& item : entries_) {
+        for (auto item = entries_.begin(); item != entries_.end();) {
+            if (item->second.native->state().empty() &&
+                std::chrono::steady_clock::now() >= item->second.deadline) {
+                const auto cleaned = item->second.native->releaseAll();
+                if (!cleaned) {
+                    item = entries_.erase(item);
+                    continue;
+                }
+                item->second.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+            }
+            ++item;
+        }
+        std::vector<std::pair<std::string, std::shared_ptr<DesktopNativeInputSession>>> pending;
+        for (const auto& item : entries_) {
             if (item.second.native->state().empty()) continue;
-            if (std::chrono::steady_clock::now() >= item.second.deadline || item.second.native->validate())
-                expire(item.second);
+            pending.emplace_back(item.first, item.second.native);
+        }
+        for (const auto& item : pending) {
+            // Validation may synchronously ask the target GUI for UIA/AX data.
+            // Let that GUI read/cancel owner state while servicing the request.
+            // Recheck the native identity after reacquiring the lock: a result
+            // for an old owner must never expire a replacement task's resources.
+            lock.unlock();
+            const auto invalid = item.second->validate();
+            lock.lock();
+            if (stopping_) break;
+            const auto current = entries_.find(item.first);
+            if (current == entries_.end() || current->second.native != item.second ||
+                current->second.native->state().empty())
+                continue;
+            if (std::chrono::steady_clock::now() >= current->second.deadline || invalid) expire(current->second);
+        }
+        for (const auto& item : entries_) {
             next = (std::min)(next, item.second.deadline);
         }
+        if (stopping_) break;
         changed_.wait_until(lock, next);
     }
 }

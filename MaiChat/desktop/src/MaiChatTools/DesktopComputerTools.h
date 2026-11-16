@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <functional>
@@ -36,6 +37,10 @@ struct DesktopComputerAction {
     int durationMs = 200;
     DesktopMouseButton button = DesktopMouseButton::Left;
     DesktopScrollAxis scrollAxis = DesktopScrollAxis::Vertical;
+    // Typed primitives share the same target, token and owner as legacy input.
+    // Options are per call; native sessions never retain the cancel callback.
+    std::vector<DesktopInputEvent> events;
+    DesktopInputOptions inputOptions;
     // Stable task identity supplied by the host. Queued completion for an older
     // task must never release a newer task's holds in the same session.
     std::string turnId;
@@ -52,6 +57,7 @@ struct DesktopComputerActionResult {
     DesktopComputerObservation observation;
     std::string observationError;
     DesktopNativeInputState inputState;
+    std::size_t acceptedEvents = 0;
 };
 
 // Session-owned observed window state. A later action must match the same
@@ -72,6 +78,9 @@ public:
                                                   const std::string& turnId = {});
     MaiResult<std::vector<DesktopNativeWindow>> windows();
     MaiResult<std::vector<DesktopNativeDisplay>> displays();
+    DesktopInputCapabilities capabilities() const;
+    MaiResult<DesktopInputFeedbackBatch> feedback(const std::string& sessionId, std::uint64_t afterSequence = 0,
+                                                  std::uint32_t limit = 64) const;
     // Observe a whole display using the resident capture worker. The token binds
     // this Session, input bounds and PNG dimensions. Desktop actions may switch
     // foreground applications and provide a subsequent screen observation.
@@ -90,6 +99,10 @@ public:
     // Empty expectedTurn releases this ordinary caller's session state. Hosts
     // pass the actual completed/interrupted turn to protect a replacement task.
     MaiError releaseInput(const std::string& sessionId, const std::string& expectedTurn = {});
+    // Reset owned controls while retaining the native context/configuration.
+    // The same target and idle limit continue to apply. Busy while
+    // another desktop operation is in flight; no reset occurs in that case.
+    MaiError resetInput(const std::string& sessionId, const std::string& expectedTurn = {});
 
 private:
     struct Impl;
