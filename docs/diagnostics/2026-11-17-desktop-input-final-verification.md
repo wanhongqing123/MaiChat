@@ -1,7 +1,7 @@
 # Windows desktop input final verification
 
-Date: 2026-11-17. Source base `b7001a6d`, followed by this task's final input
-commit. This closes the required Windows system-API implementation and its
+Date: 2026-11-17. Input implementation commit: `94f785d7`, based on
+`b7001a6d`. This closes the required Windows system-API implementation and its
 development-build verification. It does not replace the installed App or claim
 Mac native acceptance. The reference is Sunshine
 `bb6930bd782ed3edd2eea9a71d46b42183be9358`; virtual hardware/HID devices,

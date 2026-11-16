@@ -1,6 +1,6 @@
 # desktop_computer 当前操作清单
 
-日期：2026-11-17。依据本机 main 的原生输入实现及本轮键盘/Pen 修订；窗口发现修订基于 `b7001a6d`。尚未替换已安装的 Windows App，实际测试产物见同日 keyboard-and-pen 诊断记录。
+日期：2026-11-17。本轮 Windows 输入实现已提交为 `94f785d7`；窗口发现修订为 `b7001a6d`。尚未替换已安装的 Windows App，统一验证记录见 `2026-11-17-desktop-input-final-verification.md`。
 
 模型调用的是同一个 `desktop_computer` 工具。`action` 选择要做什么；`input_events` 是其中一个动作，它再用 `type` 指定按下、移动、滚动等细操作。`input_options` 只调整这些操作的方式，不是另一套工具。
 
