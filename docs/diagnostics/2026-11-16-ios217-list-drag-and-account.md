@@ -30,3 +30,11 @@ The attempted keep-data installation failed with CoreDeviceError4016 because the
 physical iPhone was unavailable. This is not a completed device installation or
 device regression. Existing authorization is retained for a connected device; no
 pairing, permission, desktop application or service was changed here.
+
+The later authorized retry succeeded with the same signed 217 candidate, without
+source changes or rebuilding: keep-data installation exit 0 in 12.787 seconds,
+normal launch without fixture arguments PID 67368, fresh installed metadata
+2.2.4(217). The original 4016 failure remains part of the evidence. This confirms
+installation, version and process on the physical device; the complete three-case
+touch regression above was executed on Simulator, not replayed against the user's
+real chat history on the phone. Device binary readback was not claimed.
