@@ -84,6 +84,13 @@ Mac adapter 由独立平台协作者消费冻结接口，当前测试身份 AXIs
 R3 头 `c3db90986d21092128da57594399cd3988afb38f532352b5e06faab125f1a71b`
 实际编译 exit 0，非注入与 record-only 矩阵 exit 0，OS posts=0。
 
+后继消费回执进一步限定：该 Mac 编译使用最终原生适配文件、最终 Platform R3 头和
+本地稳定 Keys/Error 依赖；尚未在该工作区独立编译链接 `c38c5af1` 的 common Core、
+Controller、InputOwnership 和 StarterCatalog。Windows 的 Core/UI 结果不能替代这一
+Mac common 层验证；目前也不宣称 Mac 全树构建或完整集成验收通过。为保留该机现有
+Android/Swift/播放器 WIP 及用户连续 iOS 真机回归，本轮未执行全树更新、全 Qt 构建
+或包装。该未验证项保留，后继通过独立精确源 overlay 再核，不扩大 TCC 或安装授权。
+
 Mac 草稿两处同步 main 等待被独立审查判为 P1；最终改 heap ticket、有界可取消等待、
 离线键位解析和 commit 前检查。旧草稿同例两入口实际等待超过1.2秒，最终六例全部
 通过（超时253～254ms、取消19～23ms、晚 activation/layout 均0、回调弱引用释放）。
