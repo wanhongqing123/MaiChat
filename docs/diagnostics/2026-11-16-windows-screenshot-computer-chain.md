@@ -132,3 +132,27 @@ Windows 目标构建及运行依赖门通过。候选继续沿用 2.2.65，仅�
 完整证据和候选 receipt 位于 `.cache/windows-computer-chain-20261116/`。
 Android 2.2.43 / 285 的两项 UI 问题已实际更新并验证；Windows 更新和 Sync 服务 R2
 部署仍是各自独立、此前已询问但尚未收到明确答复的授权，不能由本轮测试指令推定同意。
+
+## 2026-11-16：补全模型直接读取的坐标说明
+
+用户要求把坐标相关使用说明写清楚，避免模型混用整屏截图与窗口坐标。本次在
+`bb3903b7` 基础上修改 `desktop_computer` 的 description、参数 description，以及
+独立 `screenshot` 的 description；没有修改输入、快照校验或截图行为。完整说明及
+调用示例见 [坐标与截图使用说明](../development/desktop-computer-coordinates.md)。
+
+预期调用是 `list_displays → observe(target=display) → 根据绑定图片计算比例 → 输入
+→ 检查返回图片并使用 observation.snapshot_id`。说明同时覆盖窗口 UIA 比例、整屏到
+窗口的原生 bounds 换算、缩略图与原图尺寸、负原点、多屏、DPI、单次快照，以及截图
+不代表键盘焦点等边界。窗口模式保留，默认值及参数约束不变。
+
+Windows 普通缓存增量构建 exit 0；当前源码链接后的八套 Core 回归、
+`desktop_computer_contracts_test` 和 `MaiScreenshotToolTests --request-validation-only`
+十个执行入口全部 exit 0。Screenshot 既有测试直接用普通 Core 目标的编译参数、当前
+`maiagent` 库和同一传递依赖编译链接，没有新增产品构建入口。静态核验剥离 description
+后 schema 约束完全相同，两份 C++ 文件除模型描述方法外完全相同，四个 JSON 示例可解析，
+原有三路径 WIP SHA256 保持。
+
+证据位于 `.cache/desktop-coordinate-help-20261116/` 的 `build.log`、`build-final.log`、
+`test-results.json`、`static-checks.json` 和各执行日志。本次未运行付费模型、未重跑原生
+输入或实际屏幕采集，也未重新包装、替换或重启用户 App。新说明需要后续客户端构建及
+更新后才会进入用户当前运行版本；不将本次说明检查当作新的模型选点实机验收。

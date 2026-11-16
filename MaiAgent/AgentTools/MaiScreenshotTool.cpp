@@ -29,7 +29,14 @@ public:
         // 工具只采集光标所在屏幕，不向模型提供窗口选择；capture 获取最近完整帧，默认执行此动作。
         // 原生会话可保持活跃，stop 释放采集会话和工作线程；停止不需要截图审批或工作区。
         // JSON 返回工作区相对路径、类型、尺寸和原始帧元数据；用同一文件交付，不用脚本重截。
+        // 独立截图不绑定桌面输入坐标或快照；需要操作时应重新观察明确显示器，避免跨屏或跨区域选点。
         return "Capture the display containing the mouse pointer and inspect the returned image. "
+               "This is a whole-display image, not a window crop or browser viewport. It returns "
+               "no desktop_computer display_id or snapshot_id and does not renew an input token. "
+               "For desktop_computer visual input, list_displays then observe with target=display "
+               "and the chosen display_id; choose the point from THAT returned bound image and "
+               "use its snapshot_id. Never apply this screenshot's whole-screen ratios directly "
+               "to target=window, or mix a scaled preview's pixels with original image dimensions. "
                "Use action=capture (the default) to retrieve the latest complete native frame. "
                "The native capture session can remain active between calls; use action=stop "
                "to release the capture session and worker. Capture follows per-call approval; "

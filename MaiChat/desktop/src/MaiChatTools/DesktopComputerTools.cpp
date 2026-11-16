@@ -746,28 +746,48 @@ public:
         return "desktop_computer";
     }
     std::string description() const override {
-        return "Operate the desktop through native mouse/keyboard input. For general computer work, "
-               "list_displays, then observe with target=display and its display_id. The returned "
-               "whole-screen PNG and snapshot bind that display's native input bounds. Use target=display, "
-               "observe may include wait_ms=0..5000 for paint/loading; a fresh frame alone does not prove "
-               "the application handled input. Wait and observe before retrying an unchanged result. "
-               "display_id and snapshot_id for move/click/key/type/drag/scroll; coordinates are 0..1 "
-               "within that screen. Desktop input may switch foreground applications. Successful "
-               "desktop actions return observation with a new snapshot and screen image for the next "
-               "step; inspect it rather than assuming success. These captures reuse the resident "
-               "screen worker. If observation fails after dispatch, observe again without blindly "
-               "repeating the input. Meta taps the Windows launcher; Cmd+Space can open Spotlight. "
-               "For precise window work, list windows and observe one window_id (or exact window_title) "
-               "to get window metadata, "
-               "Accessibility/UIA elements and snapshot_id. Observation does not capture window images. "
-               "The screenshot tool returns a whole display, not a window crop. Never apply "
-               "whole-display screenshot ratios directly to a window: first read image-relative fractions u/v "
-               "from the actual image being inspected, map to native desktop points as "
-               "Dx+u*(Dwidth-1), Dy+v*(Dheight-1), subtract the window origin, then divide by "
-               "the observed window width-1 and height-1. Do not mix preview pixels with original image dimensions. "
-               "Prefer target=display with its bound observation image for screenshot-based work. "
-               "Use window-relative 0..1 coordinates for "
-               "click, double_click, right_click, drag and scroll; focus activates that window. "
+        // Keep image scope, native bounds and token lifetime together: the model
+        // must not infer window coordinates from an unrelated whole-screen image.
+        return "Operate the desktop through native mouse/keyboard input.\n"
+               "SCREEN WORKFLOW (preferred for visual/cross-application work): call list_displays, "
+               "choose a display_id, then observe with target=display and that display_id. Inspect "
+               "the returned whole-screen image. For input use the same target, display_id and its "
+               "snapshot_id. Always specify target on observe/input; omission defaults to window.\n"
+               "COORDINATES: x_ratio/y_ratio and drag destination to_x_ratio/to_y_ratio are fractions "
+               "0..1 of the selected target bounds, never pixels. Top-left is (0,0), bottom-right "
+               "(1,1), center (0.5,0.5); x increases right, y down. For target=display, a point "
+               "(px,py) in the inspected full-screen image of size (Iw,Ih) gives "
+               "x_ratio=px/(Iw-1), y_ratio=py/(Ih-1). Use that actual image's dimensions, including "
+               "when viewing a scaled preview; do not divide preview pixels by original dimensions "
+               "or apply an extra DPI/zoom factor. A crop or browser viewport has a different origin "
+               "and cannot supply screen ratios directly. Never mix monitors or image/token pairs.\n"
+               "WINDOW WORKFLOW: call list, then observe with target=window and one window_id "
+               "(or exact window_title). This returns window bounds, Accessibility/UIA elements "
+               "and snapshot_id, not a window image. Use the returned window_id and snapshot_id "
+               "for that window's input. Element center_x_ratio/center_y_ratio are already "
+               "window-relative; use them directly. Other window coordinates refer to the entire "
+               "observed window bounds, not just web content. Window input activates and checks "
+               "the selected window; this does not freeze its position.\n"
+               "CROSS-SCOPE CONVERSION: never apply whole-display screenshot ratios directly to "
+               "a window. Only with known matching display/window bounds, first compute u=px/(Iw-1), "
+               "v=py/(Ih-1) from the actual full-display image. For native display bounds D and window "
+               "bounds W, window x_ratio=(D.x+u*(D.width-1)-W.x)/(W.width-1), and "
+               "y_ratio=(D.y+v*(D.height-1)-W.y)/(W.height-1). Native bounds can differ from image "
+               "pixels and have negative origins. If bounds are unknown, changed, degenerate or the "
+               "point is outside 0..1, re-observe rather than guess/clamp. Prefer the screen workflow.\n"
+               "IMAGES, SNAPSHOTS AND FOCUS: standalone screenshot captures the display under the "
+               "pointer, which may be another monitor. A screenshot does not refresh a computer "
+               "snapshot_id or bind an input target. After using it, obtain and inspect a new bound "
+               "display observation before visual input. Each input attempt, including window focus, "
+               "consumes its snapshot; do not reuse it for click then type. For display actions, inspect "
+               "the returned image and use observation.snapshot_id for the next action. For window "
+               "actions, observe again. Re-observe after stale/changed-target errors. If input was "
+               "dispatched but observation failed, observe again without blindly repeating the input. "
+               "Display move does not focus a window; display key/type goes to the current keyboard "
+               "focus. Verify focus after clicking or a foreground change; taking a screenshot is "
+               "not proof of focus. Display observe accepts wait_ms=0..5000 for paint/loading; a fresh "
+               "frame alone does not prove the application handled input. Inspect before retrying.\n"
+               "KEYBOARD AND READBACK: Meta taps the Windows launcher; Cmd+Space can open Spotlight. "
                "list_keys returns the accepted shared keyboard names without observing or injecting input. "
                "Native platform support is checked before dispatch; an unavailable key is not replaced "
                "with a different key. key accepts named keys and chords such as Ctrl+A, Cmd+A, "
@@ -776,10 +796,8 @@ public:
                "from Enter. type enters Unicode text, including Chinese and emoji; use it for text "
                "instead of spelling characters as hardware keys. "
                "replace_text selects all in the focused editable control then types the replacement "
-               "(an empty string deletes its text). A screenshot does not refresh a computer snapshot_id. "
-               "Each input attempt, including focus, consumes the window snapshot. "
-               "Re-observe after every operation before reusing "
-               "the window. verify reads the focused non-password control and compares expected_text; "
+               "(an empty string deletes its text). Window-only verify reads the focused non-password "
+               "control and compares expected_text; "
                "only verified=true confirms that readback, not application save/persistence. "
                "dry_run validates a planned action without activating or injecting input. "
                "Approval follows the Agent policy; OS focus, interactive-desktop and platform "
@@ -791,12 +809,17 @@ public:
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{
           "action":{"type":"string","enum":["list","list_displays","list_keys","observe","focus","move","click","double_click","right_click","drag","type","replace_text","key","scroll","verify","clear"]},
-          "target":{"type":"string","enum":["window","display"]},"display_id":{"type":"string"},
-          "window_title":{"type":"string","maxLength":500},"window_id":{"type":"string"},
-          "include_elements":{"type":"boolean"},"snapshot_id":{"type":"string"},
-          "wait_ms":{"type":"integer","minimum":0,"maximum":5000},
-          "x_ratio":{"type":"number","minimum":0,"maximum":1},"y_ratio":{"type":"number","minimum":0,"maximum":1},
-          "to_x_ratio":{"type":"number","minimum":0,"maximum":1},"to_y_ratio":{"type":"number","minimum":0,"maximum":1},
+          "target":{"type":"string","enum":["window","display"],"description":"Set explicitly on observe/input. display: selected whole screen and its bound image (preferred for visual work). window: selected window bounds/UIA, no window image. Omitted means window."},
+          "display_id":{"type":"string","description":"Exact ID from list_displays; required for display observe/input. Keep the image, display_id and snapshot_id from the same observation."},
+          "window_title":{"type":"string","maxLength":500,"description":"Exact title for window observe; supply this OR window_id, not both."},
+          "window_id":{"type":"string","description":"ID from list/window observe. Required for window input; coordinates refer to this window's full observed bounds."},
+          "include_elements":{"type":"boolean","description":"Window observe only: include Accessibility/UIA elements. Their center_x_ratio/center_y_ratio can be used directly for window input."},
+          "snapshot_id":{"type":"string","description":"Fresh token for this session and target. Initial observe returns snapshot_id; display input returns the next token at observation.snapshot_id. Input consumes it; standalone screenshot never renews it."},
+          "wait_ms":{"type":"integer","minimum":0,"maximum":5000,"description":"Display observe only: wait before acquiring a fresh frame, e.g. for application paint/loading."},
+          "x_ratio":{"type":"number","minimum":0,"maximum":1,"description":"Horizontal fraction of selected display/window bounds: 0 left, 1 right. For the bound full-display image use px/(inspected image width-1), never raw pixels or browser-viewport ratios."},
+          "y_ratio":{"type":"number","minimum":0,"maximum":1,"description":"Vertical fraction of selected display/window bounds: 0 top, 1 bottom. For the bound full-display image use py/(inspected image height-1). Whole-screen ratios are not window ratios."},
+          "to_x_ratio":{"type":"number","minimum":0,"maximum":1,"description":"Drag destination x in the SAME target coordinate space as x_ratio; never a pixel offset."},
+          "to_y_ratio":{"type":"number","minimum":0,"maximum":1,"description":"Drag destination y in the SAME target coordinate space as y_ratio; never a pixel offset."},
           "duration_ms":{"type":"integer","minimum":1,"maximum":5000},
           "text":{"type":"string","minLength":0,"maxLength":4000},
           "key":{"type":"string","minLength":1,"maxLength":128,"description":"Single key or modifier chord; list_keys gives accepted names. Examples: Ctrl+A, Cmd+A, Ctrl+Shift, ControlRight+F4, Ctrl+Plus, NumpadEnter"},
