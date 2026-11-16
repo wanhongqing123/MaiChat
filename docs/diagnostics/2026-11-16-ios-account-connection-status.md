@@ -20,3 +20,10 @@ Mac 协作者报告正常 Simulator 既有 UI driver 1/0，并已查看 My/Accou
 
 本机为 Windows，仅核验精确源码、结构与辅助功能语义，未执行 iOS 构建、设备操作或
 网络服务变更。原有三路径 WIP 保留；该授权不外推 Windows 进程更新、Mac TCC 或 Sync 部署。
+
+后继协作者回执：215 正常 device build、签名及保数据安装全部 exit0（13.522秒），
+fresh metadata 为215，正常启动 PID67054。此项是跨机回执，不是本机设备操作。
+用户随后要求头像旁公开账号明确标为 MaiChat；216 正在独立验证，尚未消费其源码。
+因此215保持为已交付的中间版本，不标成最终账号文案。当前已提交 SettingsView blob
+为 `b8b22b7c`，后继应按精确基线增量核合，不重复应用215；不据文案变更修改 Auth、
+Keychain 或服务端账号数据，也不将 IM user ID 解释成第二套登录账号。
