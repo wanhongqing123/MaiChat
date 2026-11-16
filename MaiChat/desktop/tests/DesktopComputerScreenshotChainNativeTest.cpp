@@ -7,6 +7,7 @@
 #include <QImage>
 #include <QJsonDocument>
 #include <QLineEdit>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QScreen>
 #include <QScopeGuard>
@@ -83,13 +84,57 @@ MaiToolResult invoke(MaiTool* tool, const Json& arguments, const MaiToolContext&
     return std::move(*result);
 }
 
-QPointF markerCenter(const QImage& image) {
+QPointF markerCenter(const QImage& image, QRgb color = 0xcc33ff) {
     QRect marker;
     for (int y = 0; y < image.height(); ++y)
         for (int x = 0; x < image.width(); ++x)
-            if ((image.pixel(x, y) & 0xffffff) == 0xcc33ff) marker |= QRect(x, y, 1, 1);
+            if ((image.pixel(x, y) & 0xffffff) == (color & 0xffffff)) marker |= QRect(x, y, 1, 1);
     return marker.isEmpty() ? QPointF(-1, -1) : QRectF(marker).center();
 }
+
+// A disposable slider makes the release point observable without any website.
+// The deliberately short drag below must remain unaligned after mouse-up.
+class HeldSlider final : public QWidget {
+public:
+    int handleX = 160;
+    int presses = 0;
+    int releases = 0;
+    int heldMoves = 0;
+    bool held = false;
+    static constexpr int targetX = 620;
+    static constexpr int trackY = 220;
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.fillRect(rect(), QColor("#263147"));
+        painter.fillRect(120, trackY - 4, 560, 8, QColor("#8b9cb8"));
+        painter.fillRect(targetX - 18, trackY - 20, 36, 40, QColor("#df8547"));
+        painter.fillRect(handleX - 18, trackY - 20, 36, 40, QColor("#28af77"));
+        painter.setPen(Qt::white);
+        painter.drawText(
+            120, 150,
+            held ? QStringLiteral("Owned slider: mouse held") : QStringLiteral("Owned slider: mouse released"));
+    }
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() != Qt::LeftButton) return;
+        ++presses;
+        held = true;
+        update();
+    }
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (!(event->buttons() & Qt::LeftButton)) return;
+        ++heldMoves;
+        handleX = qRound(event->position().x());
+        update();
+    }
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        if (event->button() != Qt::LeftButton) return;
+        ++releases;
+        held = false;
+        update();
+    }
+};
 }  // namespace
 
 class DesktopComputerScreenshotChainNativeTest : public QObject {
@@ -97,6 +142,7 @@ class DesktopComputerScreenshotChainNativeTest : public QObject {
 private slots:
     void screenshotPixelsFocusAndFreshSnapshotsCompose_data();
     void screenshotPixelsFocusAndFreshSnapshotsCompose();
+    void screenshotPreservesHeldButtonAndAtomicDragReleases();
 };
 
 void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnapshotsCompose_data() {
@@ -400,17 +446,28 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     point = markerCenter(image);
     QVERIFY(point.x() >= 0);
 
+    input.clear();
+    form.setFocus();
+    QTest::qWait(50);
+    QVERIFY(!input.hasFocus());
     const auto displayObserved = invoke(
         computer, {{"action", "observe"}, {"target", "display"}, {"display_id", std::to_string(display.id)}}, context);
     QVERIFY2(!displayObserved.hasError(), displayObserved.error().message().c_str());
     Json displaySnapshot = Json::parse(displayObserved.output());
+    // Select from the very image bound to this token, not the earlier standalone
+    // screenshot. The following click -> returned observation -> type is the
+    // exact sequence described to the model.
+    const QImage boundImage(QString::fromStdString(displayObserved.images().at(0).path));
+    QVERIFY(!boundImage.isNull());
+    const QPointF boundPoint = markerCenter(boundImage);
+    QVERIFY(boundPoint.x() >= 0);
     const auto displayClick = invoke(computer,
                                      {{"action", "click"},
                                       {"target", "display"},
                                       {"display_id", std::to_string(display.id)},
                                       {"snapshot_id", displaySnapshot.at("snapshot_id")},
-                                      {"x_ratio", point.x() / (image.width() - 1)},
-                                      {"y_ratio", point.y() / (image.height() - 1)}},
+                                      {"x_ratio", boundPoint.x() / (boundImage.width() - 1)},
+                                      {"y_ratio", boundPoint.y() / (boundImage.height() - 1)}},
                                      context);
     QVERIFY2(!displayClick.hasError(), displayClick.error().message().c_str());
     const Json displayResult = Json::parse(displayClick.output());
@@ -418,6 +475,29 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     QVERIFY(displayResult.at("observation").at("frame_sequence").get<std::uint64_t>() >
             displaySnapshot.at("frame_sequence").get<std::uint64_t>());
     QTRY_VERIFY(input.hasFocus());
+    QVERIFY(displayClick.images().size() == 1);
+    QVERIFY(displayResult.at("observation").at("snapshot_id") != displaySnapshot.at("snapshot_id"));
+    const auto displayType = [&](const Json& token, const std::string& text) {
+        return invoke(computer,
+                      {{"action", "type"},
+                       {"target", "display"},
+                       {"display_id", std::to_string(display.id)},
+                       {"snapshot_id", token.at("snapshot_id")},
+                       {"text", text}},
+                      context);
+    };
+    QVERIFY(displayType(displaySnapshot, "must not type with the consumed click token").hasError());
+    const std::string suffix = " [fresh display token]";
+    const auto displayTyped = displayType(displayResult.at("observation"), expected + suffix);
+    QVERIFY2(!displayTyped.hasError(), displayTyped.error().message().c_str());
+    QTRY_COMPARE(input.text().toUtf8().toStdString(), expected + suffix);
+    QVERIFY(displayTyped.images().size() == 1);
+    const Json typedDisplay = Json::parse(displayTyped.output());
+    QVERIFY(typedDisplay.at("observation").at("snapshot_id") != displayResult.at("observation").at("snapshot_id"));
+    trace.push_back({{"stage", "bound_display_observe_click_new_snapshot_type"},
+                     {"oldTokenRejected", true},
+                     {"newTokenAccepted", true},
+                     {"exactTextReadBack", true}});
     captureControl.refresh();
     QCOMPARE(captureControl.captureState().workerStarts, initialCapture.workerStarts);
     QCOMPARE(captureControl.captureState().sessionStarts, initialCapture.sessionStarts);
@@ -449,7 +529,7 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     activationWorker.join();
     QVERIFY(activationTimeout.hasError());
     QVERIFY(activationElapsed.count() < 400);
-    QCOMPARE(input.text().toStdString(), expected);
+    QCOMPARE(input.text().toUtf8().toStdString(), expected + suffix);
     trace.push_back({{"stage", "unresponsive_owned_target_has_bounded_failure"},
                      {"elapsedMs", activationElapsed.count()},
                      {"noInputDispatched", true}});
@@ -465,6 +545,162 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     captureControl.requestStop();
     QTRY_VERIFY_WITH_TIMEOUT(!captureControl.isStopping(), 10000);
     QVERIFY(!captureControl.captureState().capturing && !captureControl.captureState().workerRunning);
+    QVERIFY(!canceled.load());
+}
+
+void DesktopComputerScreenshotChainNativeTest::screenshotPreservesHeldButtonAndAtomicDragReleases() {
+    if (!qEnvironmentVariableIsSet("MAICHAT_RUN_SCREENSHOT_COMPUTER_CHAIN"))
+        QSKIP("Explicit owned screenshot/computer chain opt-in required");
+    QCOMPARE(QGuiApplication::platformName(), QStringLiteral("windows"));
+    for (int key : {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON})
+        if (GetAsyncKeyState(key) & 0x8000) QSKIP("Physical mouse input is held");
+    HeldSlider slider;
+    slider.setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+    slider.showFullScreen();
+    QVERIFY(QTest::qWaitForWindowExposed(&slider));
+    const HWND handle = reinterpret_cast<HWND>(slider.winId());
+    const auto monitor =
+        std::uint64_t(reinterpret_cast<std::uintptr_t>(MonitorFromWindow(handle, MONITOR_DEFAULTTONULL)));
+    const auto displays = maiDesktopDisplays();
+    QVERIFY(displays);
+    DesktopNativeDisplay display;
+    for (const auto& item : displays.value())
+        if (item.id == monitor) display = item;
+    QVERIFY(display.id && ownsDisplay(display, handle));
+    POINT clientOrigin{0, 0};
+    QVERIFY(ClientToScreen(handle, &clientOrigin));
+    const auto nativePoint = [&](QPoint point) {
+        return QPoint(clientOrigin.x + qRound(point.x() * slider.devicePixelRatioF()),
+                      clientOrigin.y + qRound(point.y() * slider.devicePixelRatioF()));
+    };
+    DesktopNativeInput activate;
+    activate.desktopScope = true;
+    activate.display = display;
+    activate.kind = DesktopNativeInputKind::Click;
+    const QPoint blank = nativePoint(QPoint(60, 60));
+    activate.x = blank.x();
+    activate.y = blank.y();
+    const auto activated = maiDesktopInput(activate);
+    QVERIFY2(!activated, activated.message().c_str());
+    QTRY_COMPARE(GetForegroundWindow(), handle);
+    QTRY_VERIFY(!slider.held && slider.releases > 0);
+    slider.presses = slider.releases = slider.heldMoves = 0;
+
+    std::atomic<bool> canceled{false};
+    QTimer guard;
+    connect(&guard, &QTimer::timeout, this, [&] {
+        if (!ownsDisplay(display, handle) || GetForegroundWindow() != handle) canceled = true;
+    });
+    guard.start(20);
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    MaiToolContext context;
+    context.sessionId = "owned-held-slider";
+    context.root = workspace.path().toStdString();
+    context.model = "glm-5.3-flash";
+    context.cancel = &canceled;
+    MaiToolRegistry registry;
+    registerDesktopComputerTools(registry, std::make_shared<DesktopComputerController>());
+    registry.add(makeMaiScreenshotTool());
+    auto* computer = registry.find("desktop_computer");
+    auto* screenshot = registry.find("screenshot");
+    const auto stop = qScopeGuard([&] { maiStopScreenshotCapture(); });
+    // This fixture alone supplies the down/up pair. It is not a model action or
+    // a proposed way to bypass the production "user already holds a button" guard.
+    bool fixtureHeld = false;
+    const auto releaseFixtureButton = [&] {
+        if (!fixtureHeld) return;
+        INPUT up{};
+        up.type = INPUT_MOUSE;
+        up.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        SendInput(1, &up, sizeof(up));
+        fixtureHeld = false;
+    };
+    const auto release = qScopeGuard(releaseFixtureButton);
+    const QPoint start = nativePoint(QPoint(slider.handleX, HeldSlider::trackY));
+    QVERIFY(SetCursorPos(start.x(), start.y()));
+    INPUT down{};
+    down.type = INPUT_MOUSE;
+    down.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    QCOMPARE(SendInput(1, &down, sizeof(down)), UINT(1));
+    fixtureHeld = true;
+    QTRY_VERIFY(slider.held && slider.presses == 1);
+    Json trace = Json::array();
+    for (const bool bound : {false, true}) {
+        const Json args =
+            bound ? Json{{"action", "observe"}, {"target", "display"}, {"display_id", std::to_string(display.id)}}
+                  : Json{{"action", "capture"}};
+        const auto captured = invoke(bound ? computer : screenshot, args, context);
+        QVERIFY2(!captured.hasError(), captured.error().message().c_str());
+        QVERIFY(captured.images().size() == 1);
+        QVERIFY(slider.held && slider.releases == 0);
+        QVERIFY(GetAsyncKeyState(VK_LBUTTON) & 0x8000);
+        trace.push_back({{"stage", bound ? "bound_observe_while_held" : "screenshot_while_held"},
+                         {"buttonStillDown", true},
+                         {"receiverReleases", slider.releases}});
+        const QString evidence = qEnvironmentVariable("MAICHAT_CHAIN_EVIDENCE");
+        if (!evidence.isEmpty())
+            QVERIFY(QImage(QString::fromStdString(captured.images().at(0).path))
+                        .save(evidence +
+                              (bound ? QStringLiteral("-held-observe.png") : QStringLiteral("-held-screenshot.png"))));
+    }
+    releaseFixtureButton();
+    QTRY_VERIFY(!slider.held && slider.releases == 1);
+
+    // First stop short; the tool must not be mistaken for an alignment checker.
+    // Then use a fresh image to reach the marker with one complete drag.
+    for (const int offset : {-40, 0}) {
+        const auto observed =
+            invoke(computer, {{"action", "observe"}, {"target", "display"}, {"display_id", std::to_string(display.id)}},
+                   context);
+        QVERIFY2(!observed.hasError(), observed.error().message().c_str());
+        const QImage image(QString::fromStdString(observed.images().at(0).path));
+        QVERIFY(!image.isNull());
+        const QPointF point = markerCenter(image, QColor("#28af77").rgb());
+        const QPointF target = markerCenter(image, QColor("#df8547").rgb());
+        QVERIFY(point.x() >= 0 && target.x() >= 0);
+        const int releasesBefore = slider.releases;
+        const auto dragged =
+            invoke(computer,
+                   {{"action", "drag"},
+                    {"target", "display"},
+                    {"display_id", std::to_string(display.id)},
+                    {"snapshot_id", Json::parse(observed.output()).at("snapshot_id")},
+                    {"x_ratio", point.x() / (image.width() - 1)},
+                    {"y_ratio", point.y() / (image.height() - 1)},
+                    {"to_x_ratio", (target.x() + offset * slider.devicePixelRatioF()) / (image.width() - 1)},
+                    {"to_y_ratio", target.y() / (image.height() - 1)},
+                    {"duration_ms", 200}},
+                   context);
+        QVERIFY2(!dragged.hasError(), dragged.error().message().c_str());
+        QTRY_COMPARE(slider.releases, releasesBefore + 1);
+        QVERIFY(!slider.held && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000));
+        QVERIFY(slider.heldMoves > 0);
+        QVERIFY(std::abs(slider.handleX - HeldSlider::targetX - offset) <= 1);
+        const Json result = Json::parse(dragged.output());
+        QVERIFY(result.value("dispatched", false) && !result.value("verified", true));
+        QVERIFY(result.contains("observation") && dragged.images().size() == 1);
+        const bool aligned = std::abs(slider.handleX - HeldSlider::targetX) <= 1;
+        QCOMPARE(aligned, offset == 0);
+        trace.push_back({{"stage", offset ? "short_drag_then_returned_image" : "aligned_drag_then_returned_image"},
+                         {"buttonAlreadyUp", true},
+                         {"aligned", aligned},
+                         {"dispatched", true},
+                         {"verified", false},
+                         {"receiverReleases", slider.releases}});
+        const QString evidence = qEnvironmentVariable("MAICHAT_CHAIN_EVIDENCE");
+        if (!evidence.isEmpty()) {
+            const QString base = evidence + QStringLiteral("-slider-%1").arg(offset);
+            QVERIFY(QImage(QString::fromStdString(dragged.images().at(0).path)).save(base + QStringLiteral(".png")));
+        }
+    }
+    const QString evidence = qEnvironmentVariable("MAICHAT_CHAIN_EVIDENCE");
+    if (!evidence.isEmpty()) {
+        QFile file(evidence + QStringLiteral("-held-slider.json"));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        const std::string bytes = trace.dump(2);
+        QCOMPARE(file.write(bytes.data(), qint64(bytes.size())), qint64(bytes.size()));
+    }
     QVERIFY(!canceled.load());
 }
 
