@@ -1,5 +1,6 @@
-// Atomic Windows touchscreen frames, independent of the HID SDK. Only this
-// source's synthetic handle/slots are refreshed or canceled during cleanup.
+// Windows touchscreen source reports, independent of a HID SDK. A resident
+// writer introduces interactive contacts through its normal report cycle;
+// cleanup refreshes/cancels only this source's native handle and slots.
 #if defined(_WIN32)
 #if !defined(WINVER) || WINVER < 0x0A00
 #undef WINVER
@@ -20,6 +21,7 @@
 #endif
 
 #include "MaiChatTools/DesktopComputerWindowsTouchInternal.h"
+#include "MaiThread.h"
 
 #include <algorithm>
 #include <array>
@@ -29,6 +31,8 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <future>
+#include <optional>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -47,6 +51,9 @@ struct HeldContact {
     std::int64_t left = 0, top = 0, right = 0, bottom = 0;
     std::uint32_t pressure = 0, orientation = 0;
     bool touching = false, hasPressure = false, hasOrientation = false, hasArea = false;
+    // Possible native positions belong to this contact, so an accepted UP
+    // retires its uncertainty rather than leaving an unrelated parent cache.
+    std::vector<std::pair<std::int32_t, std::int32_t>> uncertainPositions;
 };
 using Contacts = std::map<std::uint32_t, HeldContact>;
 
@@ -149,6 +156,28 @@ std::uint32_t restingFlags(const HeldContact& contact) {
     return kDesktopTouchUpdate | kDesktopTouchInRange | (contact.touching ? kDesktopTouchInContact : 0);
 }
 
+struct TouchPublished {
+    DesktopNativeInputState state;
+    std::vector<std::pair<std::int32_t, std::int32_t>> positions;
+    MaiError fault;
+};
+struct TouchStep {
+    Contacts next;
+    Environment desktop;
+    DesktopWindowsTouchFrame frame;
+    bool expands = false;
+};
+struct TouchPlan {
+    std::vector<TouchStep> steps;
+    bool retireLayout = false;
+};
+bool sameEnvironment(const Environment& a, const Environment& b) {
+    return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+}
+bool touching(const Contacts& contacts) {
+    return std::any_of(contacts.begin(), contacts.end(), [](const auto& entry) { return entry.second.touching; });
+}
+
 class TouchFrames final : public DesktopComputerWindowsTouch {
 public:
     TouchFrames(std::shared_ptr<DesktopWindowsTouchTransport> transport, std::chrono::milliseconds interval)
@@ -156,178 +185,196 @@ public:
         static std::atomic<std::uint64_t> sequence{0};
         sourceName_ = "windows-touch-" + std::to_string(++sequence);
     }
-    ~TouchFrames() override { releaseAll(); }
-
-    MaiError dispatch(const std::vector<DesktopInputTouch>& inputs, const DesktopInputPort& port) override {
+    ~TouchFrames() override {
+        stopping_ = true;
+        ++epoch_;
+        cleanupRequested_ = true;
+        changed_.notify_all();
+        if (writer_.joinable()) writer_.join();
+    }
+    MaiError dispatch(const std::vector<DesktopInputTouch>& inputs, const DesktopInputPort& port,
+                      std::function<bool()> isCanceled) override {
+        const auto generation = epoch_.load();
+        PublicCall call(admitted_);
+        if (!call.accepted) return busy();
+        if (cleanupRequested_) return busy();
         DesktopInputEvent request;
         request.kind = DesktopInputEventKind::Touch;
         request.contacts = inputs;
-        if (auto error = maiDesktopValidateInputEvents({request})) return error;
-        std::unique_lock<std::mutex> operation(operationMutex_);
-        Contacts previous;
-        Environment desktop;
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            if (faulted_) return {MaiErrorCode::Busy, "touch source needs releaseAll after a failed native submission"};
-            previous = contacts_;
-            desktop = desktop_;
-        }
-        auto next = previous;
-        std::map<std::uint32_t, bool> ending;
-        bool changed = false;
-        bool haveDesktop = false;
-        for (const auto& input : inputs) {
-            if (input.phase == Phase::CancelAll) {
-                for (const auto& held : previous) ending[held.first] = true;
-                next.clear();
-                changed = changed || !previous.empty();
-                continue;
-            }
-            if (input.phase == Phase::Up || input.phase == Phase::Cancel || input.phase == Phase::HoverLeave) {
-                const auto held = next.find(input.pointerId);
-                if (held == next.end()) continue; // Unknown ups never create/inject a source.
-                if (previous.find(input.pointerId) != previous.end())
-                    ending[input.pointerId] = input.phase == Phase::Cancel;
-                next.erase(held);
-                changed = true;
-                continue;
-            }
-            if (!haveDesktop) {
-                const auto bounds = environment(port);
-                if (!bounds) return bounds.error();
-                desktop = bounds.value();
-                haveDesktop = true;
-            }
-            if (ending.find(input.pointerId) != ending.end())
-                return invalid("an ended touch ID cannot restart within the same native frame");
-            auto held = next.find(input.pointerId);
-            std::uint32_t slot = held == next.end() ? 0 : held->second.slot;
-            if (held == next.end()) {
-                std::array<bool, maxContacts> used{};
-                // Ended slots remain reserved through acceptance of their UP.
-                for (const auto& value : previous) used[value.second.slot] = true;
-                for (const auto& value : next) used[value.second.slot] = true;
-                while (slot < maxContacts && used[slot]) ++slot;
-                if (slot == maxContacts) return {MaiErrorCode::Busy, "all ten native touch slots remain owned in this frame"};
-            }
-            const auto projected = project(input, port, desktop, slot);
-            if (!projected) return projected.error();
-            next[input.pointerId] = projected.value();
-            changed = true;
-        }
-        if (!changed) return {};
-        auto pending = frame(desktop);
-        for (const auto& held : previous) {
-            const auto end = ending.find(held.first);
-            if (end != ending.end()) {
-                const auto flags = (held.second.touching ? kDesktopTouchUp : kDesktopTouchUpdate) |
-                    (end->second ? kDesktopTouchCanceled : 0);
-                pending.points.push_back(nativePoint(held.second, desktop, flags));
-            }
-        }
-        for (const auto& held : next) {
-            const auto old = previous.find(held.first);
-            auto flags = restingFlags(held.second);
-            if (old == previous.end() || (!old->second.touching && held.second.touching))
-                flags = kDesktopTouchInRange | (held.second.touching ? kDesktopTouchDown | kDesktopTouchInContact : kDesktopTouchUpdate);
-            else if (old->second.touching && !held.second.touching)
-                flags = kDesktopTouchUp | kDesktopTouchInRange;
-            pending.points.push_back(nativePoint(held.second, desktop, flags));
-        }
-        if (pending.points.empty()) return {};
-        for (const auto& point : pending.points) {
-            if (point.x < 0 || point.y < 0 || point.x >= pending.virtualWidth || point.y >= pending.virtualHeight)
-                return invalid("an owned touch lies outside the new virtual desktop; release it before rebinding bounds");
-        }
-        std::sort(pending.points.begin(), pending.points.end(), [](const auto& a, const auto& b) { return a.pointerId < b.pointerId; });
-        bool opened = false;
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            opened = deviceOpen_;
-        }
-        if (!opened) {
-            if (auto error = transport_->create(maxContacts)) return error;
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            deviceOpen_ = true; // Own the resource before a down can escape.
-        }
-        if (auto error = submit(pending)) {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            faulted_ = true;
-            return error;
-        }
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            contacts_ = std::move(next); // Remove ended contacts only after accepted frame.
-            desktop_ = desktop;
-        }
-        if (emptyContacts()) return finishSource();
-        if (interval_.count() > 0 && !worker_.joinable()) {
-            {
-                std::lock_guard<std::mutex> lock(stateMutex_);
-                stopping_ = false;
-            }
-            worker_ = std::thread([this] { refresh(); });
-        }
-        return {};
+        if (const auto error = maiDesktopValidateInputEvents({request})) return error;
+        auto command = std::make_shared<Command>();
+        command->inputs = inputs;
+        command->port = port;
+        command->cancel = std::move(isCanceled);
+        command->epoch = generation;
+        command->onlyRelease = maiDesktopInputEventsOnlyRelease({request});
+        return execute(std::move(command));
     }
-
     DesktopNativeInputState state() const override {
-        std::lock_guard<std::mutex> lock(stateMutex_);
-        DesktopNativeInputState result;
-        for (const auto& contact : contacts_) result.touchPointers.push_back(contact.first);
-        if (deviceOpen_) result.devices.push_back(sourceName_);
-        return result;
+        return std::atomic_load(&published_)->state;
     }
-
+    std::vector<std::pair<std::int32_t, std::int32_t>> positions() const override {
+        return std::atomic_load(&published_)->positions;
+    }
+    MaiError validate() const override {
+        return std::atomic_load(&published_)->fault;
+    }
     MaiError releaseAll() override {
-        std::unique_lock<std::mutex> operation(operationMutex_);
-        stopWorker();
-        Contacts held;
-        Environment desktop;
-        bool opened = false;
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            held = contacts_;
-            desktop = desktop_;
-            opened = deviceOpen_;
-        }
-        if (!opened) return {};
-        MaiError canceled;
-        if (!held.empty()) {
-            auto cancel = frame(desktop);
-            for (const auto& contact : held)
-                cancel.points.push_back(nativePoint(contact.second, desktop,
-                    kDesktopTouchCanceled | (contact.second.touching ? kDesktopTouchUp : kDesktopTouchUpdate)));
-            canceled = submit(cancel);
-        }
-        // Destroy is attempted even if cancellation failed. A destroyed owned
-        // source ends its contacts; it does not prove the app rolled back work.
-        const auto destroyed = transport_->destroy();
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            if (!canceled || !destroyed) contacts_.clear();
-            if (!destroyed) { deviceOpen_ = false; faulted_ = false; desktop_ = {}; }
-            else faulted_ = true;
-        }
-        return destroyed ? destroyed : canceled;
+        // Queue scheduling and background admission share this short lock. No
+        // native call or caller callback holds it, so Stop cannot wait on I/O.
+        std::unique_lock<std::mutex> lock(queueMutex_);
+        const auto generation = ++epoch_;  // Revoke before checking admission.
+        cleanupRequested_ = true;
+        PublicCall call(admitted_);
+        lock.unlock();
+        changed_.notify_all();
+        if (!call.accepted) return busy();
+        auto command = std::make_shared<Command>();
+        command->cleanup = true;
+        command->epoch = generation;
+        return execute(std::move(command));
     }
 
 private:
-    bool emptyContacts() const {
-        std::lock_guard<std::mutex> lock(stateMutex_);
-        return contacts_.empty();
+    using Clock = std::chrono::steady_clock;
+    struct PublicCall {
+        explicit PublicCall(std::atomic<bool>& value) : value(value) {
+            bool expected = false;
+            accepted = value.compare_exchange_strong(expected, true);
+        }
+        ~PublicCall() {
+            if (accepted) value = false;
+        }
+        std::atomic<bool>& value;
+        bool accepted = false;
+    };
+    struct Command {
+        std::vector<DesktopInputTouch> inputs;
+        DesktopInputPort port;
+        std::function<bool()> cancel;
+        std::promise<MaiError> response;
+        std::uint64_t epoch = 0;
+        bool cleanup = false, onlyRelease = false;
+    };
+    static MaiError busy() {
+        return {MaiErrorCode::Busy, "touch source work or cleanup is in flight"};
     }
-    MaiError submit(const DesktopWindowsTouchFrame& frameInput) {
-        auto value = frameInput;
-        // Keep slot order stable across caller deltas, stationary refresh and
-        // cancellation even when opaque caller IDs have a different order.
+    static MaiError canceled() {
+        return {MaiErrorCode::Canceled, "touch input canceled"};
+    }
+
+    MaiError execute(std::shared_ptr<Command> command) {
+        auto result = command->response.get_future();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (!writer_.joinable()) writer_ = std::thread([this] { work(); });
+            pending_ = std::move(command);
+        }
+        changed_.notify_all();
+        return result.get();
+    }
+    bool revoked(const Command* command, std::uint64_t generation) {
+        if (epoch_.load() != generation || stopping_) return true;
+        if (!command || command->onlyRelease) return false;
+        const bool result = command->cancel && command->cancel();
+        return result || epoch_.load() != generation || stopping_;
+    }
+    void publish() {
+        auto value = std::make_shared<TouchPublished>();
+        value->fault = fault_;
+        if (created_) {
+            value->state.devices = {sourceName_};
+            for (const auto& entry : contacts_) {
+                value->state.touchPointers.push_back(entry.first);
+                value->positions.emplace_back(entry.second.screenX, entry.second.screenY);
+                for (const auto& point : entry.second.uncertainPositions)
+                    if (std::find(value->positions.begin(), value->positions.end(), point) == value->positions.end())
+                        value->positions.push_back(point);
+            }
+        }
+        std::atomic_store(&published_, std::shared_ptr<const TouchPublished>(std::move(value)));
+    }
+
+    MaiResult<TouchPlan> preflight(const Command& command) const {
+        TouchPlan plan;
+        auto simulated = contacts_;
+        auto desktop = desktop_;
+        for (const auto& input : command.inputs) {
+            const auto before = simulated;
+            std::map<std::uint32_t, bool> ending;
+            bool expands = false;
+            if (input.phase == Phase::CancelAll) {
+                for (const auto& entry : simulated) ending[entry.first] = true;
+                simulated.clear();
+            } else if (input.phase == Phase::Up || input.phase == Phase::Cancel || input.phase == Phase::HoverLeave) {
+                const auto held = simulated.find(input.pointerId);
+                if (held == simulated.end()) continue;
+                ending[input.pointerId] = input.phase == Phase::Cancel;
+                simulated.erase(held);
+            } else {
+                const auto bounds = environment(command.port);
+                if (!bounds) return bounds.error();
+                if (created_ && !contacts_.empty() && !sameEnvironment(bounds.value(), desktop_))
+                    plan.retireLayout = true;
+                desktop = bounds.value();
+                const auto old = simulated.find(input.pointerId);
+                std::uint32_t slot = old == simulated.end() ? 0 : old->second.slot;
+                if (old == simulated.end()) {
+                    std::array<bool, maxContacts> used{};
+                    for (const auto& entry : simulated) used[entry.second.slot] = true;
+                    while (slot < maxContacts && used[slot]) ++slot;
+                    if (slot == maxContacts) return busy();
+                }
+                const auto projected = project(input, command.port, desktop, slot);
+                if (!projected) return projected.error();
+                expands = old == simulated.end() || (!old->second.touching && projected.value().touching);
+                simulated[input.pointerId] = projected.value();
+            }
+            if (before.empty() && simulated.empty()) continue;
+            TouchStep step;
+            step.next = simulated;
+            step.desktop = desktop;
+            step.expands = expands;
+            step.frame = frame(desktop);
+            if (!plan.retireLayout) {
+                for (const auto& old : before) {
+                    const auto end = ending.find(old.first);
+                    if (end != ending.end())
+                        step.frame.points.push_back(
+                            nativePoint(old.second, desktop,
+                                        (old.second.touching ? kDesktopTouchUp : kDesktopTouchUpdate) |
+                                            (end->second ? kDesktopTouchCanceled : 0)));
+                }
+                for (const auto& entry : simulated) {
+                    const auto old = before.find(entry.first);
+                    auto flags = restingFlags(entry.second);
+                    if (old == before.end() || (!old->second.touching && entry.second.touching))
+                        flags =
+                            kDesktopTouchInRange |
+                            (entry.second.touching ? kDesktopTouchDown | kDesktopTouchInContact : kDesktopTouchUpdate);
+                    else if (old->second.touching && !entry.second.touching)
+                        flags = kDesktopTouchUp | kDesktopTouchInRange;
+                    step.frame.points.push_back(nativePoint(entry.second, desktop, flags));
+                }
+                for (const auto& point : step.frame.points)
+                    if (point.x < 0 || point.y < 0 || point.x >= desktop.width || point.y >= desktop.height)
+                        return invalid("owned touch lies outside the observed virtual desktop");
+            }
+            plan.steps.push_back(std::move(step));
+        }
+        return plan;
+    }
+
+    MaiError submit(DesktopWindowsTouchFrame value, const Command* command,
+                    std::optional<std::uint64_t> generation = {}) {
         std::sort(value.points.begin(), value.points.end(), [](const auto& a, const auto& b) { return a.pointerId < b.pointerId; });
         for (int attempt = 0; attempt < 8; ++attempt) {
+            if (generation && revoked(command, *generation)) return canceled();
             const auto result = transport_->inject(value);
             switch (result.kind) {
             case DesktopWindowsTouchSubmitKind::Accepted: return {};
             case DesktopWindowsTouchSubmitKind::Failed:
-                return result.error ? result.error : MaiError{MaiErrorCode::Internal, "native touch frame was rejected"};
+                return result.error ? result.error : MaiError{MaiErrorCode::Internal, "native touch frame rejected"};
             case DesktopWindowsTouchSubmitKind::Retry:
                 if (attempt != 7) std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 break;
@@ -336,63 +383,300 @@ private:
         }
         return {MaiErrorCode::Busy, "native touch frame remained not ready after eight identical attempts"};
     }
-    void stopWorker() {
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            stopping_ = true;
+    MaiError open(const Command& command) {
+        if (created_) return {};
+        if (revoked(&command, command.epoch)) return canceled();
+        created_ = true;  // Includes a possible native create that throws after acquiring its handle.
+        publish();
+        const auto error = transport_->create(maxContacts);
+        if (error) return error;
+        if (revoked(&command, command.epoch)) return canceled();
+        return {};
+    }
+    MaiError report(const Command* command, std::uint64_t generation) {
+        if (!created_ || contacts_.empty()) return {};
+        auto update = frame(desktop_);
+        for (const auto& entry : contacts_)
+            update.points.push_back(nativePoint(entry.second, desktop_, restingFlags(entry.second)));
+        if (const auto error = submit(std::move(update), command, generation)) return error;
+        if (epoch_.load() != generation || stopping_) return canceled();
+        seedPending_ = false;
+        nextReport_ = Clock::now() + interval_;
+        return {};
+    }
+    MaiError finishSeedReport(const Command& command) {
+        // This is the ordinary source reporting clock. It is not a target-window
+        // acknowledgment or a documented Windows delivery fence.
+        while (interval_.count() > 0 && Clock::now() < nextReport_) {
+            if (revoked(&command, command.epoch)) return canceled();
+            std::unique_lock<std::mutex> lock(queueMutex_);
+            changed_.wait_until(lock, (std::min)(nextReport_, Clock::now() + std::chrono::milliseconds(5)), [&] {
+                return stopping_ || cleanupRequested_.load() || epoch_.load() != command.epoch;
+            });
         }
-        changed_.notify_all();
-        // Refresh never blocks on operationMutex_, so public cleanup may hold
-        // that mutex while joining without a reverse-lock deadlock.
-        if (worker_.joinable()) worker_.join();
+        if (revoked(&command, command.epoch)) return canceled();
+        return report(&command, command.epoch);
     }
-    MaiError finishSource() {
-        stopWorker();
-        const auto result = transport_->destroy();
-        std::lock_guard<std::mutex> lock(stateMutex_);
-        if (!result) { deviceOpen_ = false; faulted_ = false; desktop_ = {}; }
-        else faulted_ = true;
-        return result;
+    void rememberUncertain(const TouchStep& step) {
+        for (const auto& entry : step.next) {
+            const auto found = contacts_.find(entry.first);
+            if (found == contacts_.end())
+                contacts_[entry.first] = entry.second;
+            else if (found->second.screenX != entry.second.screenX || found->second.screenY != entry.second.screenY)
+                found->second.uncertainPositions.emplace_back(entry.second.screenX, entry.second.screenY);
+        }
+        publish();
     }
-    void refresh() {
-        std::unique_lock<std::mutex> state(stateMutex_);
-        while (!stopping_) {
-            changed_.wait_for(state, interval_, [&] { return stopping_; });
-            if (stopping_) break;
-            state.unlock();
-            {
-                std::unique_lock<std::mutex> operation(operationMutex_, std::try_to_lock);
-                if (operation.owns_lock()) {
-                    DesktopWindowsTouchFrame update;
-                    bool active = false;
-                    {
-                        std::lock_guard<std::mutex> lock(stateMutex_);
-                        active = !stopping_ && !faulted_ && deviceOpen_ && !contacts_.empty();
-                        if (active) {
-                            update = frame(desktop_);
-                            for (const auto& held : contacts_)
-                                update.points.push_back(nativePoint(held.second, desktop_, restingFlags(held.second)));
-                        }
+    MaiError retire(bool clearFault) {
+        const auto generation = epoch_.load();
+        MaiError first;
+        if (created_) {
+            if (!contacts_.empty()) {
+                auto cancel = frame(desktop_);
+                for (const auto& entry : contacts_)
+                    cancel.points.push_back(nativePoint(
+                        entry.second, desktop_,
+                        kDesktopTouchCanceled | (entry.second.touching ? kDesktopTouchUp : kDesktopTouchUpdate)));
+                try {
+                    first = submit(std::move(cancel), nullptr);
+                } catch (...) {
+                    first = {MaiErrorCode::Internal, "touch cleanup injection threw"};
+                }
+                if (!first) {
+                    contacts_.clear();
+                } else {
+                    fault_ = first;
+                    publish();
+                }
+            }
+            MaiError destroyed;
+            try {
+                destroyed = transport_->destroy();
+            } catch (...) {
+                destroyed = {MaiErrorCode::Internal, "touch source destruction threw"};
+            }
+            if (!destroyed) {
+                created_ = false;
+                contacts_.clear();
+
+                desktop_ = {};
+                seedPending_ = false;
+                nextReport_ = {};
+            } else if (!first)
+                first = destroyed;
+        }
+        if (first) {
+            fault_ = first;
+            // Cleanup may run after revocation but before its synchronous
+            // command reaches the writer. Preserve that request's real failure
+            // across an idempotent empty-source cleanup.
+            cleanupFailure_ = first;
+            cleanupFailureEpoch_ = epoch_.load();
+        } else if (clearFault) {
+            fault_ = {};
+            cleanupFailure_ = {};
+        }
+        if (epoch_.load() == generation) cleanupRequested_ = false;
+        publish();
+        return first;
+    }
+    MaiError run(Command& command) {
+        if (command.cleanup) {
+            if (cleanupFailure_ && cleanupFailureEpoch_ >= command.epoch) return cleanupFailure_;
+            return retire(true);
+        }
+        if (revoked(&command, command.epoch)) {
+            const auto error = canceled();
+            if (created_) {
+                fault_ = error;
+                publish();
+                retire(false);
+            }
+            return error;
+        }
+        if (fault_ && !command.onlyRelease) return fault_;
+        const auto prepared = preflight(command);
+        if (!prepared) return prepared.error();  // Entire batch pure preflight, before create or inject.
+        if (prepared.value().retireLayout) {
+            fault_ = {MaiErrorCode::Busy, "touch coordinate plane changed; the source was retired"};
+            // Old physical points must never be reinterpreted in a new plane.
+            MaiError destroyed;
+            try {
+                destroyed = created_ ? transport_->destroy() : MaiError{};
+            } catch (...) {
+                destroyed = {MaiErrorCode::Internal, "touch layout retirement threw"};
+            }
+            if (!destroyed) {
+                created_ = false;
+                contacts_.clear();
+                desktop_ = {};
+                seedPending_ = false;
+                nextReport_ = {};
+            }
+            if (destroyed) fault_ = destroyed;
+            publish();
+            return fault_;
+        }
+        bool introduced = false;
+        for (const auto& step : prepared.value().steps) {
+            if (revoked(&command, command.epoch)) {
+                fault_ = canceled();
+                publish();
+                retire(false);
+                return canceled();
+            }
+            if (step.expands && seedPending_) {
+                if (const auto error = finishSeedReport(command)) {
+                    fault_ = error;
+                    publish();
+                    retire(false);
+                    return error;
+                }
+            }
+            if (!step.frame.points.empty()) {
+                if (const auto error = open(command)) {
+                    fault_ = error;
+                    publish();
+                    retire(false);
+                    return error;
+                }
+                const bool hadTouch = touching(contacts_);
+                try {
+                    if (const auto error = submit(step.frame, &command, command.epoch)) {
+                        fault_ = error;
+                        publish();
+                        if (introduced || step.expands || error.code() == MaiErrorCode::Canceled)
+                            retire(false);
+                        else
+                            publish();  // A failed UP retains its owned binding for retry.
+                        return error;
                     }
-                    if (active) if (auto error = submit(update)) {
-                        std::lock_guard<std::mutex> lock(stateMutex_);
-                        faulted_ = true;
+                } catch (...) {
+                    desktop_ = step.desktop;
+                    fault_ = {MaiErrorCode::Internal, "touch injection threw after a possible native submission"};
+                    rememberUncertain(step);
+                    retire(false);
+                    return fault_;
+                }
+                contacts_ = step.next;  // Each accepted partial stage is authoritative immediately.
+                desktop_ = step.desktop;
+                introduced = introduced || step.expands;
+                if (!hadTouch && touching(contacts_)) {
+                    seedPending_ = true;
+                    nextReport_ = Clock::now() + interval_;
+                }
+                if (!touching(contacts_)) seedPending_ = false;
+                if (nextReport_ == Clock::time_point{}) nextReport_ = Clock::now() + interval_;
+                publish();
+                if (contacts_.empty()) {
+                    const auto error = retire(false);
+                    if (error) return error;
+                }
+            }
+        }
+        if (revoked(&command, command.epoch)) {
+            fault_ = canceled();
+            publish();
+            retire(false);
+            return canceled();
+        }
+        return {};
+    }
+    void complete(const std::shared_ptr<Command>& command, MaiError result) {
+        command->cancel = {};  // No caller closure survives the synchronous response.
+        command->response.set_value(std::move(result));
+    }
+    void work() {
+        MaiThread::setCurrentName("mai-input-touch");
+        for (;;) {
+            // Capture before cleanup tests/admission. A later Stop must not
+            // become this report's newly adopted generation.
+            const auto generation = epoch_.load();
+            std::shared_ptr<Command> command;
+            std::optional<PublicCall> background;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex_);
+                if (!pending_ && !cleanupRequested_ && !stopping_) {
+                    if (created_ && !contacts_.empty() && !fault_ && interval_.count() > 0)
+                        changed_.wait_until(lock, nextReport_,
+                                            [&] { return pending_ || cleanupRequested_.load() || stopping_; });
+                    else
+                        changed_.wait(lock, [&] { return pending_ || cleanupRequested_.load() || stopping_; });
+                }
+                command = std::move(pending_);
+                if (!command) {
+                    // Reports and deferred cleanup also own public admission.
+                    // A transport callback can read snapshots, but reentrant
+                    // dispatch/release must never wait on this same writer.
+                    background.emplace(admitted_);
+                    if (!background->accepted) {
+                        // A caller can own admission while preparing its job.
+                        // Yield the queue lock rather than spin past a due tick.
+                        changed_.wait_for(lock, std::chrono::milliseconds(1));
+                        continue;
                     }
                 }
             }
-            state.lock();
+            if (stopping_) {
+                retire(false);
+                if (command) complete(command, canceled());
+                return;
+            }
+            if (command) {
+                MaiError result;
+                try {
+                    result = run(*command);
+                } catch (...) {
+                    fault_ = {MaiErrorCode::Internal, "touch source work threw"};
+                    publish();
+                    retire(false);
+                    result = fault_;
+                }
+                if (cleanupRequested_) {
+                    const auto cleaned = retire(false);
+                    if (!result && cleaned) result = cleaned;
+                }
+                complete(command, std::move(result));
+                continue;
+            }
+            if (cleanupRequested_) {
+                retire(false);
+                continue;
+            }
+            if (created_ && !contacts_.empty() && !fault_ && interval_.count() > 0 && Clock::now() >= nextReport_ &&
+                epoch_.load() == generation && !cleanupRequested_) {
+                try {
+                    if (const auto error = report(nullptr, generation)) {
+                        fault_ = error;
+                        publish();
+                        retire(false);
+                    }
+                } catch (...) {
+                    fault_ = {MaiErrorCode::Internal, "touch periodic report threw"};
+                    publish();
+                    retire(false);
+                }
+            }
         }
     }
+
     std::shared_ptr<DesktopWindowsTouchTransport> transport_;
-    const std::chrono::milliseconds interval_;
+    std::chrono::milliseconds interval_;
     std::string sourceName_;
-    std::mutex operationMutex_;
-    mutable std::mutex stateMutex_;
+    std::atomic<bool> admitted_{false}, cleanupRequested_{false}, stopping_{false};
+    std::atomic<std::uint64_t> epoch_{0};
+    std::shared_ptr<const TouchPublished> published_ = std::make_shared<TouchPublished>();
+    std::mutex queueMutex_;
     std::condition_variable changed_;
-    std::thread worker_;
+    std::thread writer_;
+    std::shared_ptr<Command> pending_;
+    // The resident writer alone owns this native source and contact ledger.
     Contacts contacts_;
     Environment desktop_;
-    bool deviceOpen_ = false, stopping_ = false, faulted_ = false;
+    bool created_ = false, seedPending_ = false;
+    Clock::time_point nextReport_{};
+    MaiError fault_, cleanupFailure_;
+    std::uint64_t cleanupFailureEpoch_ = 0;
 };
 
 #if defined(_WIN32)
@@ -418,10 +702,14 @@ public:
         if (device_) return {MaiErrorCode::Busy, "this native touchscreen source is already open"};
         lastAcceptedQpc_ = pendingQpc_ = 0;
         pendingBytes_.clear();
+        const auto previousDpi = dpi_ ? dpi_(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) : nullptr;
         if (trace_) { creator_ = currentDpi(); creatorThread_ = GetCurrentThreadId(); capacity_ = capacity; }
         device_ = create_(PT_TOUCH, capacity, feedback_ ? POINTER_FEEDBACK_DEFAULT : POINTER_FEEDBACK_NONE);
-        return device_ ? MaiError{} : MaiError{MaiErrorCode::Internal,
-            "create owned touchscreen failed (Win32 " + std::to_string(GetLastError()) + ")"};
+        const auto error = device_ ? ERROR_SUCCESS : GetLastError();
+        if (dpi_ && previousDpi) dpi_(previousDpi);
+        return device_ ? MaiError{}
+                       : MaiError{MaiErrorCode::Internal,
+                                  "create owned touchscreen failed (Win32 " + std::to_string(error) + ")"};
     }
     DesktopWindowsTouchSubmission inject(const DesktopWindowsTouchFrame& value) override {
         if (!device_ || value.points.empty() || value.points.size() > maxContacts)

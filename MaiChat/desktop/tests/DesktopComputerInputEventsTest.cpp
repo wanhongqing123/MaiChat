@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <limits>
+#include <type_traits>
 
 namespace {
 int failures = 0;
@@ -140,6 +141,46 @@ void rawKeysAndText() {
     valid(value);
     value.text += "a";
     invalid(value);
+}
+
+void editingKeysCanonicalizeBeforeBindings() {
+    for (std::uint16_t offset = 0; offset < 4; ++offset) {
+        DesktopInputRawKey source;
+        source.code = std::uint16_t(0x7a + offset);
+        source.flags = 1;
+        source.modifiers = 0x12;
+        const auto identity = maiDesktopInputKeyIdentity(source);
+        const auto canonical = std::uint16_t(0x100 + offset);
+        const auto prepared = maiDesktopRemapInputKey(source, {});
+        CHECK(prepared.code == canonical);
+        CHECK(prepared.flags == source.flags && prepared.modifiers == source.modifiers);
+        CHECK(source.code == std::uint16_t(0x7a + offset) && maiDesktopInputKeyIdentity(source) == identity);
+
+        DesktopInputOptions selected;
+        selected.keyBindings = {{{source.code, 'B'}}, {{canonical, 'A'}}};
+        CHECK(maiDesktopRemapInputKey(source, selected).code == 'A');
+        auto dedicated = source;
+        dedicated.code = canonical;
+        CHECK(maiDesktopRemapInputKey(dedicated, {}).code == canonical);
+        CHECK(maiDesktopRemapInputKey(dedicated, selected).code == 'A');
+
+        // Canonical editing bindings do not redefine ordinary F11-F14 forms.
+        selected.keyBindings = {{{canonical, 'A'}}};
+        auto function = source;
+        function.code |= 0x8000;
+        CHECK(maiDesktopRemapInputKey(function, {}).code == function.code);
+        CHECK(maiDesktopRemapInputKey(function, selected).code == function.code);
+        function = source;
+        function.flags = 0;
+        CHECK(maiDesktopRemapInputKey(function, {}).code == function.code);
+        CHECK(maiDesktopRemapInputKey(function, selected).code == function.code);
+    }
+    for (const std::uint16_t boundary : {std::uint16_t{0x79}, std::uint16_t{0x7e}}) {
+        DesktopInputRawKey source;
+        source.code = boundary;
+        source.flags = 1;
+        CHECK(maiDesktopRemapInputKey(source, {}).code == boundary);
+    }
 }
 
 void touchAndPen() {
@@ -371,7 +412,7 @@ void optionsAndNames() {
           options.ds4BackAsTouchpad && options.motionAsPlayStation && options.touchpadAsPlayStation &&
           options.randomizeControllerMac && options.highResolutionScroll && options.keyboardRepeat);
     CHECK(options.driver == DesktopInputDriver::Auto && options.defaultProfile == DesktopInputProfile::Auto);
-    CHECK(options.repeatDelayMs == 500 && options.repeatPeriodMs == 40 && options.backButtonTimeoutMs == -1);
+    CHECK(options.repeatDelayMs == 500 && options.repeatPeriodMs == 1000.0 / 24.9 && options.backButtonTimeoutMs == -1);
     CHECK(!maiDesktopValidateInputOptions(options));
     for (auto driver : {DesktopInputDriver::Auto, DesktopInputDriver::VirtualHid,
                         DesktopInputDriver::ViGEm, DesktopInputDriver::Disabled}) {
@@ -397,12 +438,12 @@ void optionsAndNames() {
     options.keyBindings = {{{1, 0xffff}}, {{0xffff, 1}}};
     CHECK(!maiDesktopValidateInputOptions(options));
     auto candidate = options;
-    candidate.repeatDelayMs = 5001;
+    candidate.repeatDelayMs = std::uint32_t(std::numeric_limits<std::int32_t>::max()) + 1;
     CHECK(maiDesktopValidateInputOptions(candidate).code() == MaiErrorCode::InvalidInput);
     candidate = options;
     candidate.repeatPeriodMs = 0;
     CHECK(maiDesktopValidateInputOptions(candidate).code() == MaiErrorCode::InvalidInput);
-    candidate.repeatPeriodMs = 1001;
+    candidate.repeatPeriodMs = std::uint32_t(std::numeric_limits<std::int32_t>::max()) + 1;
     CHECK(maiDesktopValidateInputOptions(candidate).code() == MaiErrorCode::InvalidInput);
     candidate = options;
     candidate.keyboardRepeat = false;
@@ -466,6 +507,35 @@ void deferredOptionsCannotSilentlyConfigureOrdinaryInput() {
         candidate.*member = !(candidate.*member);
         CHECK(!maiDesktopValidateInputOptions(candidate));
     }
+}
+
+template <class Period>
+void invalidFractionalRepeatPeriods(Period DesktopInputOptions::* member) {
+    CHECK((std::is_same<Period, double>::value));
+    if constexpr (std::is_floating_point<Period>::value) {
+        for (const double bad :
+             {0.0, -0.25, -1.0, std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
+              -std::numeric_limits<double>::infinity(), double(std::numeric_limits<std::int32_t>::max()) + 1}) {
+            DesktopInputOptions candidate;
+            candidate.*member = bad;
+            CHECK(maiDesktopValidateInputOptions(candidate).code() == MaiErrorCode::InvalidInput);
+        }
+    }
+}
+
+void fractionalAndSlowRepeatDomain() {
+    DesktopInputOptions options;
+    options.repeatDelayMs = std::uint32_t(std::numeric_limits<std::int32_t>::max());
+    CHECK(!maiDesktopValidateInputOptions(options));
+    options.repeatDelayMs = 500;
+    for (const double period :
+         {0.25, 1.5, 1000.0 / 24.9, 1001.0, 60000.5, double(std::numeric_limits<std::int32_t>::max()),
+          std::numeric_limits<double>::denorm_min()}) {
+        options.repeatPeriodMs = static_cast<decltype(options.repeatPeriodMs)>(period);
+        CHECK(options.repeatPeriodMs == period);
+        CHECK(!maiDesktopValidateInputOptions(options));
+    }
+    invalidFractionalRepeatPeriods(&DesktopInputOptions::repeatPeriodMs);
 }
 
 void releases() {
@@ -537,10 +607,12 @@ int main() {
     batchAndKinds();
     basicPrimitives();
     rawKeysAndText();
+    editingKeysCanonicalizeBeforeBindings();
     touchAndPen();
     controllers();
     optionsAndNames();
     deferredOptionsCannotSilentlyConfigureOrdinaryInput();
+    fractionalAndSlowRepeatDomain();
     releases();
     std::printf("DesktopComputerInputEventsTest: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

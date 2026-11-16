@@ -10,6 +10,9 @@
 
 #include "MaiChatTools/DesktopComputerPlatform.h"
 
+class DesktopComputerWindowsPen;
+class DesktopComputerWindowsTouch;
+
 struct DesktopWindowsInputHooks {
     std::function<UINT(const INPUT&)> emitInput;
     std::function<MaiError(POINT)> move;
@@ -19,6 +22,10 @@ struct DesktopWindowsInputHooks {
     std::function<SHORT(int)> keyState;
     std::function<std::uintptr_t()> layout;
     std::function<MaiResult<bool>()> secureInput;
+    // Explicit recording adapter for the same native session. A keyboard hook
+    // alone must never enable real pointer injection in a deterministic test.
+    std::shared_ptr<DesktopComputerWindowsPen> pen;
+    std::shared_ptr<DesktopComputerWindowsTouch> touch;
 };
 
 struct DesktopWindowsRawBinding {

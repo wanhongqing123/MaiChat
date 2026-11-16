@@ -20,9 +20,11 @@
 #include <QResizeEvent>
 #include <QSaveFile>
 #include <QThread>
+#include <QTimer>
 #include <QWidget>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -34,6 +36,7 @@
 
 namespace {
 using Kind = DesktopInputEventKind;
+bool pollingPumpControl = false;
 std::uint64_t identifier(HWND window) {
     return std::uint64_t(reinterpret_cast<std::uintptr_t>(window));
 }
@@ -44,6 +47,15 @@ QJsonArray rect(RECT value) {
     return {int(value.left), int(value.top), int(value.right), int(value.bottom)};
 }
 void pumpFor(int milliseconds = 25) {
+    if (!pollingPumpControl) {
+        // Run the same continuous GUI dispatcher as the App. Sleeping between
+        // processEvents calls can add one Windows timer tick to every UIA/COM
+        // round trip and must not be measured as native input dispatch cost.
+        QEventLoop loop;
+        QTimer::singleShot(milliseconds, &loop, &QEventLoop::quit);
+        loop.exec();
+        return;
+    }
     QElapsedTimer timer;
     timer.start();
     do {
@@ -69,6 +81,7 @@ struct Event {
     unsigned button = 0;
     int wheel = 0;
     std::uint64_t time = 0;
+    double highResolutionMs = 0;
     DWORD queuedTime = 0;
     std::uint64_t wparam = 0;
     std::int64_t lparam = 0;
@@ -145,6 +158,8 @@ public:
         value.wparam = std::uint64_t(wp);
         value.lparam = std::int64_t(lp);
         value.time = GetTickCount64();
+        value.highResolutionMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
         value.queuedTime = DWORD(GetMessageTime());
         if (message == WM_CHAR) text.append(QChar(ushort(wp)));
         if (mouseMessage(message)) {
@@ -285,7 +300,14 @@ public:
             return preconditionResult("get_window_rect_failed", false, GetLastError());
         scope_.expectedWindowId = identifier(receiver_.root());
         scope_.expectedProcessId = GetCurrentProcessId();
-        scope_.isCanceled = [this] { return !admitted(); };
+        scope_.isCanceled = [this] {
+            QElapsedTimer cost;
+            cost.start();
+            cancelChecks_.fetch_add(1);
+            const bool result = !admitted();
+            cancelCostNs_.fetch_add(std::uint64_t(cost.nsecsElapsed()));
+            return result;
+        };
         const POINT activation{origin.x + 36, origin.y + 56};
         activation_ = activation;
         activationKnown_ = true;
@@ -363,6 +385,7 @@ public:
             events.append(QJsonObject{{"message", int(value.message)},
                                       {"hwnd", QString::number(identifier(value.window))},
                                       {"observed_ms", QString::number(value.time)},
+                                      {"observed_high_resolution_ms", value.highResolutionMs},
                                       {"queued_time", int(value.queuedTime)},
                                       {"wparam", QString::number(value.wparam)},
                                       {"lparam", QString::number(value.lparam)},
@@ -386,6 +409,10 @@ public:
                                  {"available_basic_input_passed", prepared_ && failures_ == 0},
                                  {"full_sunshine_native_acceptance", false},
                                  {"interrupted", bool(receiver_.canceled)},
+                                 {"polling_pump_control", pollingPumpControl},
+                                 {"cancel_callback_count", QString::number(cancelChecks_.load())},
+                                 {"cancel_callback_ns", QString::number(cancelCostNs_.load())},
+                                 {"repeat_timing", repeatTiming_},
                                  {"cases", cases_},
                                  {"calls", calls_},
                                  {"events", events},
@@ -730,8 +757,29 @@ private:
         options_.repeatDelayMs = 25;
         options_.repeatPeriodMs = 15;
         const auto count = receiver_.count(WM_KEYDOWN, VK_F6);
+        const auto repeatStart = receiver_.events.size();
         typed("repeat_f6_down", {key(VK_F6)});
+        const auto checksAfterDown = cancelChecks_.load();
         check("repeat_native_keydowns", pumpUntil([&] { return receiver_.count(WM_KEYDOWN, VK_F6) >= count + 3; }));
+        QJsonArray repeatTimes, repeatIntervals, preciseRepeatIntervals;
+        std::optional<std::uint64_t> previousRepeat;
+        std::optional<double> previousPreciseRepeat;
+        for (std::size_t i = repeatStart; i < receiver_.events.size(); ++i) {
+            const auto& event = receiver_.events[i];
+            if (event.message != WM_KEYDOWN || event.key != VK_F6) continue;
+            repeatTimes.append(QString::number(event.time));
+            if (previousRepeat) repeatIntervals.append(int(event.time - *previousRepeat));
+            if (previousPreciseRepeat) preciseRepeatIntervals.append(event.highResolutionMs - *previousPreciseRepeat);
+            previousRepeat = event.time;
+            previousPreciseRepeat = event.highResolutionMs;
+        }
+        repeatTiming_ = QJsonObject{
+            {"configured_delay_ms", int(options_.repeatDelayMs)},
+            {"configured_period_ms", options_.repeatPeriodMs},
+            {"received_down_times_ms", repeatTimes},
+            {"received_intervals_ms", repeatIntervals},
+            {"received_high_resolution_intervals_ms", preciseRepeatIntervals},
+            {"caller_checks_during_background_wait", QString::number(cancelChecks_.load() - checksAfterDown)}};
         typed("repeat_f6_up", {key(VK_F6, true)});
         check("repeat_owned_state_cleared", session_->state().empty());
         const auto stopped = receiver_.count(WM_KEYDOWN, VK_F6);
@@ -848,8 +896,10 @@ private:
     bool activationKnown_ = false;
     bool prepared_ = false;
     int failures_ = 0;
+    std::atomic<std::uint64_t> cancelChecks_{0}, cancelCostNs_{0};
     QJsonArray cases_, calls_;
     QJsonObject precondition_, screenshot_;
+    QJsonObject repeatTiming_;
 };
 }  // namespace
 
@@ -857,6 +907,7 @@ int main(int argc, char** argv) {
     bool run = false;
     for (int i = 1; i < argc; ++i) {
         if (qstrcmp(argv[i], "--run-owned-input") == 0) run = true;
+        if (qstrcmp(argv[i], "--polling-pump-control") == 0) pollingPumpControl = true;
     }
     if (!run) {
         std::puts("SKIP: opt-in only; --run-owned-input --output-dir <owned evidence directory>");

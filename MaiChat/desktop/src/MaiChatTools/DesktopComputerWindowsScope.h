@@ -5,6 +5,8 @@
 struct WindowsInputSnapshot {
     std::shared_ptr<const DesktopNativeInputState> state = std::make_shared<const DesktopNativeInputState>();
     std::shared_ptr<const DesktopNativeInput> scope = std::make_shared<const DesktopNativeInput>();
+    std::shared_ptr<DesktopComputerWindowsPen> pen;
+    std::shared_ptr<DesktopComputerWindowsTouch> touch;
 };
 
 class InputScope {
@@ -19,7 +21,8 @@ public:
             input_.isCanceled = {};
             return {};
         }
-        const bool owned = !std::atomic_load(&snapshot_->state)->empty();
+        const bool owned = !std::atomic_load(&snapshot_->state)->empty() || (pen_ && !pen_->state().empty()) ||
+                           (touch_ && !touch_->state().empty());
         auto selected = input.desktopScope ? nullptr : input.expectedWindowId
             ? reinterpret_cast<HWND>(std::uintptr_t(input.expectedWindowId)) : GetForegroundWindow();
         if (owned) {
@@ -79,7 +82,18 @@ public:
         if (touch_) {
             const auto error = touch_->releaseAll();
             if (!first && error) first = error;
-            if (touch_->state().empty()) touch_.reset();
+            if (!error && touch_->state().empty()) {
+                touch_.reset();
+                std::atomic_store(&snapshot_->touch, touch_);
+            }
+        }
+        if (pen_) {
+            const auto error = pen_->releaseAll();
+            if (!first && error) first = error;
+            if (!error && pen_->state().empty()) {
+                pen_.reset();
+                std::atomic_store(&snapshot_->pen, pen_);
+            }
         }
         publish();
         return first;
@@ -471,11 +485,6 @@ private:
             }
             for (const auto& alias : entry.aliases) if (alias.raw) state.rawKeys.push_back(*alias.raw);
         }
-        if (touch_) {
-            const auto pointer = touch_->state();
-            state.touchPointers = pointer.touchPointers;
-            state.devices = pointer.devices;
-        }
         std::atomic_store(&snapshot_->state, std::make_shared<const DesktopNativeInputState>(std::move(state)));
     }
     DesktopNativeInput input_;
@@ -487,4 +496,5 @@ private:
     std::uint64_t sequence_ = 0;
     std::int64_t verticalRemainder_ = 0, horizontalRemainder_ = 0;
     std::shared_ptr<DesktopComputerWindowsTouch> touch_;
+    std::shared_ptr<DesktopComputerWindowsPen> pen_;
 };

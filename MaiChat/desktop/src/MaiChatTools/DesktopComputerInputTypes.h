@@ -156,8 +156,11 @@ struct DesktopInputOptions {
     DesktopInputProfile defaultProfile = DesktopInputProfile::Auto;
     bool highResolutionScroll = true;
     bool keyboardRepeat = true;
+    // Non-negative signed-int configuration domain, expressed in milliseconds.
     std::uint32_t repeatDelayMs = 500;
-    std::uint32_t repeatPeriodMs = 40;
+    // Keep fractional periods such as Sunshine's default 24.9 Hz. Validation
+    // accepts positive finite values up to INT32_MAX milliseconds.
+    double repeatPeriodMs = 1000.0 / 24.9;
     // -1 disables controller Back-to-Home emulation.
     std::int32_t backButtonTimeoutMs = -1;
     // Original and replacement 16-bit Sunshine key codes, applied before down.

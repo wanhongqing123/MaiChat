@@ -87,8 +87,11 @@ private:
 std::shared_ptr<DesktopWindowsTouchTransport> makeDesktopWindowsTouchNativeTransportForTesting(
     std::shared_ptr<DesktopWindowsTouchNativeTrace> trace, bool visualFeedback = true, bool explicitQpc = false);
 
-// A zero refresh interval is an explicit recording-test mode. Production uses
-// periodic updates; caller callbacks, cancellation closures and Qt are absent.
+// A zero interval is an explicit recording mode: the seed report advances
+// without wall time and periodic updates are disabled. Production uses its
+// ordinary 50ms source report cycle, not a startup sleep or delivery fence.
+// All transport calls run on the resident writer; no caller closure is kept
+// for periodic reports.
 std::shared_ptr<DesktopComputerWindowsTouch> makeDesktopComputerWindowsTouchWithTransport(
     std::shared_ptr<DesktopWindowsTouchTransport> transport,
-    std::chrono::milliseconds refreshInterval = std::chrono::milliseconds(16));
+    std::chrono::milliseconds refreshInterval = std::chrono::milliseconds(50));

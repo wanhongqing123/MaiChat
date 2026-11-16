@@ -219,8 +219,8 @@ MaiError options(const Json& value, DesktopInputOptions& output) {
         if (value.contains(name))
             return {MaiErrorCode::NotSupported, "virtual controller input_options are deferred"};
     if (!fields(value, {"keyboard_enabled", "mouse_enabled", "native_pen_touch_enabled", "always_send_scan_codes",
-                         "right_alt_to_meta", "high_resolution_scroll", "keyboard_repeat", "repeat_delay_ms",
-                         "repeat_period_ms", "key_bindings"}) ||
+                        "right_alt_to_meta", "high_resolution_scroll", "keyboard_repeat", "repeat_delay_ms",
+                        "repeat_period_ms", "key_bindings"}) ||
         !boolField(value, "keyboard_enabled", output.keyboardEnabled) ||
         !boolField(value, "mouse_enabled", output.mouseEnabled) ||
         !boolField(value, "native_pen_touch_enabled", output.nativePenTouchEnabled) ||
@@ -229,7 +229,7 @@ MaiError options(const Json& value, DesktopInputOptions& output) {
         !boolField(value, "high_resolution_scroll", output.highResolutionScroll) ||
         !boolField(value, "keyboard_repeat", output.keyboardRepeat) ||
         !unsignedField(value, "repeat_delay_ms", output.repeatDelayMs) ||
-        !unsignedField(value, "repeat_period_ms", output.repeatPeriodMs))
+        !numberField(value, "repeat_period_ms", output.repeatPeriodMs))
         return invalid("invalid input_options fields");
     if (value.contains("key_bindings")) {
         const auto& bindings = value["key_bindings"];
@@ -364,7 +364,9 @@ std::string maiDesktopComputerInputSchema(const std::string& legacySchema) {
         "touch", {{"contacts", {{"type", "array"}, {"minItems", 1}, {"maxItems", 10}, {"items", contactSchema()}}}},
         {"contacts"}));
     variants.back()["description"] =
-        "System touch input candidate; native delivery has not been accepted. Check input_capabilities before use.";
+        "System touch input, up to ten owned contacts. Check input_capabilities before use. Contacts are admitted "
+        "through full peer frames and the system source report schedule; this batch is not an atomic simultaneous "
+        "gesture or acknowledgement from the target application. Observation does not release held contacts.";
     auto penProperties = contactSchema()["properties"];
     penProperties.erase("pointer_id");
     penProperties["phase"]["enum"].push_back("button_only");
@@ -376,7 +378,9 @@ std::string maiDesktopComputerInputSchema(const std::string& legacySchema) {
                              {"description", "Degrees 0..90; null or 255 means unknown."}};
     variants.push_back(eventSchema("pen", penProperties, {"phase"}));
     variants.back()["description"] =
-        "System pen input candidate; native delivery has not been accepted. Check input_capabilities before use.";
+        "System pen input. Check input_capabilities before use. Logical side buttons share one native barrel bit; "
+        "tilt/azimuth map to native tilt, not shaft twist. Hover distance and contact ellipse have no Windows mapping. "
+        "Dispatch is not acknowledgement from the target application.";
     properties["events"] = {{"type", "array"},
                             {"minItems", 1},
                             {"maxItems", 256},
@@ -394,8 +398,9 @@ std::string maiDesktopComputerInputSchema(const std::string& legacySchema) {
           {"right_alt_to_meta", {{"type", "boolean"}}},
           {"high_resolution_scroll", {{"type", "boolean"}}},
           {"keyboard_repeat", {{"type", "boolean"}}},
-          {"repeat_delay_ms", integerSchema(0, 5000)},
-          {"repeat_period_ms", integerSchema(1, 1000)},
+          {"repeat_delay_ms", integerSchema(0, std::numeric_limits<std::int32_t>::max())},
+          {"repeat_period_ms",
+           {{"type", "number"}, {"exclusiveMinimum", 0}, {"maximum", std::numeric_limits<std::int32_t>::max()}}},
           {"key_bindings",
            {{"type", "array"},
             {"maxItems", 65535},

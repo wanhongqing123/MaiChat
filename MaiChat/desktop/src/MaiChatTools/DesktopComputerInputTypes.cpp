@@ -1,6 +1,7 @@
 #include "MaiChatTools/DesktopComputerInputTypes.h"
 
 #include <cmath>
+#include <limits>
 #include <unordered_set>
 
 namespace {
@@ -233,9 +234,11 @@ MaiError maiDesktopValidateInputEvents(const std::vector<DesktopInputEvent>& eve
 MaiError maiDesktopValidateInputOptions(const DesktopInputOptions& options) {
     if (!knownDriver(options.driver)) return invalid("unknown input driver");
     if (maiDesktopInputProfileName(options.defaultProfile).empty()) return invalid("unknown default controller profile");
-    if (options.repeatDelayMs > 5000) return invalid("repeat delay must be 0..5000 ms");
-    if (options.repeatPeriodMs == 0 || options.repeatPeriodMs > 1000)
-        return invalid("repeat period must be 1..1000 ms");
+    constexpr auto maximumRepeatMs = std::uint32_t(std::numeric_limits<std::int32_t>::max());
+    if (options.repeatDelayMs > maximumRepeatMs) return invalid("repeat delay must be 0..2147483647 ms");
+    if (!std::isfinite(options.repeatPeriodMs) || options.repeatPeriodMs <= 0 ||
+        options.repeatPeriodMs > maximumRepeatMs)
+        return invalid("repeat period must be positive and finite, at most 2147483647 ms");
     if (options.backButtonTimeoutMs < -1 || options.backButtonTimeoutMs > 5000)
         return invalid("Back button timeout must be -1..5000 ms");
     std::unordered_set<std::uint16_t> originals;
@@ -276,6 +279,11 @@ DesktopInputRawKey maiDesktopRemapInputKey(const DesktopInputRawKey& source, con
     auto result = source;
     const bool legacyNormalized = (source.code & 0x8000) != 0;
     auto code = std::uint16_t(legacyNormalized ? source.code & 0xff : source.code);
+    // Non-normalized client editing scancodes are canonicalized before user
+    // bindings. The legacy prefix and ordinary normalized codes still mean
+    // F11-F14; unsupported dedicated keys must never become those function keys.
+    if (!legacyNormalized && (source.flags & 1U) && code >= 0x7a && code <= 0x7d)
+        code = std::uint16_t(0x100 + (code - 0x7a));
     bool mapped = false;
     for (const auto& binding : options.keyBindings) {
         if (binding[0] != code) continue;

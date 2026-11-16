@@ -2812,7 +2812,7 @@ void verifyModelOptionsOmissionInheritsButOrdinaryDefaultsReset() {
             CHECK(controller->perform(context.sessionId, reset));
         }
         CHECK(native->options().keyboardRepeat && native->options().highResolutionScroll);
-        CHECK(native->options().repeatDelayMs == 500 && native->options().repeatPeriodMs == 40);
+        CHECK(native->options().repeatDelayMs == 500 && native->options().repeatPeriodMs == 1000.0 / 24.9);
         CHECK(native->options().keyBindings.empty() && !native->options().inheritExisting);
         CHECK(backend->lastInputSession == native && backend->inputSessionCreations == 1);
         CHECK(native->state().buttonsDown == std::vector<std::string>{"left"});
@@ -3030,6 +3030,33 @@ void verifyInputEventsControllerAndTool() {
     }
 }
 
+void verifyFractionalRepeatConfigurationCodec() {
+    const std::string events = R"([{"type":"relative_move","delta_x":1,"delta_y":0}])";
+    const auto schema = Json::parse(maiDesktopComputerInputSchema(R"({"properties":{"action":{"enum":["move"]}}})"));
+    const auto configuration = schema["properties"]["input_options"]["properties"];
+    CHECK(configuration["repeat_delay_ms"]["maximum"] == 2147483647);
+    CHECK(configuration["repeat_period_ms"]["type"] == "number");
+    CHECK(configuration["repeat_period_ms"].value("exclusiveMinimum", -1) == 0);
+    CHECK(configuration["repeat_period_ms"]["maximum"] == 2147483647);
+    for (const double period : {1.5, 1000.0 / 24.9, 1500.25, 2147483647.0}) {
+        const auto parsed = maiDesktopParseInputBatch(events, Json{{"repeat_period_ms", period}}.dump());
+        CHECK(parsed);
+        if (parsed) CHECK(parsed.value().options.repeatPeriodMs == period);
+    }
+    const auto delayed = maiDesktopParseInputBatch(events, R"({"repeat_delay_ms":2147483647})");
+    CHECK(delayed && delayed.value().options.repeatDelayMs == 2147483647);
+    const auto reset = maiDesktopParseInputBatch(events, "{}");
+    CHECK(reset && !reset.value().options.inheritExisting && reset.value().options.repeatPeriodMs == 1000.0 / 24.9);
+    for (const char* bad :
+         {R"({"repeat_period_ms":0})", R"({"repeat_period_ms":-0.25})", R"({"repeat_period_ms":2147483648})",
+          R"({"repeat_period_ms":1e309})", R"({"repeat_period_ms":"Infinity"})", R"({"repeat_delay_ms":2147483648})",
+          R"({"repeat_delay_ms":0.5})"}) {
+        const auto parsed = maiDesktopParseInputBatch(events, bad);
+        CHECK(!parsed);
+        if (!parsed) CHECK(parsed.error().code() == MaiErrorCode::InvalidInput);
+    }
+}
+
 void verifyDeferredVirtualInputContract() {
     const auto schema = Json::parse(maiDesktopComputerInputSchema(
         R"({"type":"object","properties":{"action":{"type":"string","enum":["move","input_state","reset_inputs","release_all"]}}})"));
@@ -3232,6 +3259,7 @@ int main(int argc, char** argv) {
     verifyResetInputsRequiresNoObservationAndClearsKeysAndMouse();
     verifyInputEventsControllerAndTool();
     verifyDeferredVirtualInputContract();
+    verifyFractionalRepeatConfigurationCodec();
     verifyInputEventsProtocolDiscovery();
     verifyPublicContract();
     verifyKeyGrammar();

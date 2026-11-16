@@ -34,6 +34,13 @@ DesktopInputFeedbackBatch DesktopNativeInputSession::feedback(std::uint64_t afte
 
 namespace {
 using Clock = std::chrono::steady_clock;
+Clock::duration repeatPeriodDuration(double milliseconds) {
+    const auto ticks =
+        std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>{milliseconds});
+    // Validation guarantees a finite positive period. Keep a sub-tick value
+    // positive after conversion without rounding other fractional periods to ms.
+    return (std::max)(Clock::duration{1}, ticks);
+}
 // Host/native callbacks may reenter on this same thread. A non-recursive
 // mutex's try_lock is not a portable reentry test; claim admission atomically
 // instead, including reset and autonomous repeat dispatch.
@@ -139,9 +146,11 @@ public:
         if (worker_.joinable()) worker_.join();
     }
     MaiError input(const DesktopNativeInput& input) override {
+        // Capture before admission: a release that wins during admission must
+        // revoke this request, rather than become its replacement generation.
+        const auto generation = epoch_.load();
         OperationAdmission operation(operationActive_);
         if (!operation.owns_lock()) return busy();
-        const auto generation = epoch_.load();
         if (cleanupDepth_.load()) return busy();
         ActiveCall active(publicInFlight_);
         publicRevision_.fetch_add(1);
@@ -182,9 +191,9 @@ public:
     }
     MaiError inputEvents(const std::vector<DesktopInputEvent>& events, const DesktopNativeInput& scope,
                          const DesktopInputPort& port, const DesktopInputOptions& requested) override {
+        const auto generation = epoch_.load();
         OperationAdmission operation(operationActive_);
         if (!operation.owns_lock()) return busy();
-        const auto generation = epoch_.load();
         if (cleanupDepth_.load()) return busy();
         ActiveCall active(publicInFlight_);
         publicRevision_.fetch_add(1);
@@ -245,6 +254,8 @@ public:
             const auto before = native_->state();
             auto prepared = source;
             prepared.delayMs = 0;  // Consume delay here; native receives one already scheduled event.
+            // Slow native dispatch must not charge the initial repeat delay twice.
+            const auto dispatchedAt = Clock::now();
             const auto error = native_->inputEvents({prepared}, guard, port, options);
             if (error) return fail(error, generation);
             if (!releasing && guard.isCanceled())
@@ -263,7 +274,7 @@ public:
                         repeat_->kind = DesktopInputEventKind::RawKey;
                         repeat_->key = source.key;
                         repeat_->key.repeat = true;  // Original source identity; native reuses its frozen binding.
-                        nextRepeat_ = Clock::now() + std::chrono::milliseconds(options.repeatDelayMs);
+                        nextRepeat_ = dispatchedAt + std::chrono::milliseconds(options.repeatDelayMs);
                     }
                 }
                 if (repeat_ && !ownsRaw(after, repeat_->key)) repeat_.reset();
@@ -412,7 +423,7 @@ private:
                 failAsync(lock, sent);
                 continue;
             }
-            nextRepeat_ = Clock::now() + std::chrono::milliseconds(options.repeatPeriodMs);
+            nextRepeat_ = Clock::now() + repeatPeriodDuration(options.repeatPeriodMs);
         }
     }
     void failAsync(std::unique_lock<std::mutex>& lock, const MaiError& failure) {

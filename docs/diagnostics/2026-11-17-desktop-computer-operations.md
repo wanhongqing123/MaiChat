@@ -1,8 +1,10 @@
 # desktop_computer 当前操作清单
 
-日期：2026-11-17。依据原生输入源码提交 `09506aa9`（修订基于 `3134495e`）；它已合入本机 main，尚未替换已安装的 Windows App。
+日期：2026-11-17。依据本机 main 的原生输入实现及本轮键盘/Pen 修订；窗口发现修订基于 `b7001a6d`。尚未替换已安装的 Windows App，实际测试产物见同日 keyboard-and-pen 诊断记录。
 
-当前模型公开 **25 个 action、8 种 input_events type、10 个 input_options 字段**。其中 6 种输入原语属于普通键鼠；Touch/Pen 另列系统输入候选。虚拟手柄、硬件 HID 模拟和控制器反馈已由用户明确暂缓，不是当前能力承诺。
+模型调用的是同一个 `desktop_computer` 工具。`action` 选择要做什么；`input_events` 是其中一个动作，它再用 `type` 指定按下、移动、滚动等细操作。`input_options` 只调整这些操作的方式，不是另一套工具。
+
+当前公开 **25 个 action、8 种 input_events type、10 个 input_options 字段**。普通键鼠、Touch 和 Pen 均使用系统 API，并已通过本机开发构建的实际窗口测试。虚拟手柄、硬件 HID 模拟和控制器反馈已由用户明确暂缓，不是当前能力承诺。
 
 ## 25 个公开 action
 
@@ -49,14 +51,14 @@
 
 来源：`DesktopComputerInputProtocol.cpp:325` 的 6 个 schema 分支；原生执行在 `DesktopComputerWindows.cpp` 的 `InputScope::dispatchTyped`，与命名动作共享一个输入作用域和持有表。
 
-## input_events：2 种系统输入候选
+## input_events：Touch 与 Pen
 
-下面两种仍公开语法，**不列为已完成的普通键鼠能力，也不列为已经通过原生验收**。调用前须检查 `input_capabilities`。
+下面两种公开系统指针语法。调用前须检查 `input_capabilities`；接口存在、系统 API 可用与应用实际收到输入是不同的结果。
 
-7. `touch`：触摸接触点批次。`contacts` 为 1～10 项，每项包含 `phase`、32 位无符号 `pointer_id`，定位阶段需要 `x_ratio` / `y_ratio`；还可携带 `pressure_or_distance`、`contact_area_major`、`contact_area_minor`（均为 0～1）和 `rotation`（0～360 度，`null` / 65535 表示未知）。阶段为 `hover`、`down`、`up`、`move`、`cancel`、`hover_leave`、`cancel_all`。当前 Windows 源已有项目自有 User32 触摸适配器，但 capabilities 的 `available=false`，持续触摸原生验收尚未通过。不能把数组语法当成已验收的同帧多点送达。
-8. `pen`：笔输入候选。阶段包含上述 7 项及 `button_only`；`tool_type` 为 0=未知、1=笔、2=橡皮，`buttons` 为 0～7；`tilt` 为 0～90 度，`null` / 255 表示未知；位置、压力/距离、接触轴和旋转使用同类字段。当前 Windows 原生适配器待完成，返回 `NotSupported`，capabilities 的 `implemented=false`、`available=false`。
+7. `touch`：触摸接触点批次。`contacts` 为 1～10 项，每项包含 `phase`、32 位无符号 `pointer_id`，定位阶段需要 `x_ratio` / `y_ratio`；还可携带 `pressure_or_distance`、`contact_area_major`、`contact_area_minor`（均为 0～1）和 `rotation`（0～360 度，`null` / 65535 表示未知）。阶段为 `hover`、`down`、`up`、`move`、`cancel`、`hover_leave`、`cancel_all`。Windows 使用项目自有 User32 实现，`implemented=true`，`available` 检查所需系统 API。`pointer_id` 是调用者管理的接触点身份，不是 Windows 的原生指针编号；同一接触点后续沿用它即可。按住期间可观察或截图；单点 up/cancel 保留其他接触点。整批先校验，再按系统报告周期建立或更新完整接触点帧，不承诺所有 down 在同一瞬间发生。实际双点持续、十点、压力/接触面/方向以及满槽同批 up+down 均已收到对应原生事件。
+8. `pen`：笔输入。阶段包含上述 7 项及 `button_only`；`tool_type` 为 0=未知、1=笔、2=橡皮，`buttons` 为 0～7；`tilt` 为 0～90 度，`null` / 255 表示未知。Windows 使用项目自有 User32 适配器，`implemented=true`；`available` 检查所需的三个系统 API。定位、接触压力、倾斜/方位角、橡皮端、悬停和释放已在同一普通/工具会话的真实窗口中测试。三位逻辑侧键按 OR 映射到 Windows 的一个 barrel 位，不是三个独立硬件键；悬停距离、接触椭圆和笔杆自转没有此后端的原生映射。`button_only` 使用已接受的原生位置，按下前重新检查该位置所属窗口；释放不依赖新的位置。
 
-释放和取消阶段只消费其身份/阶段所需的数据；陈旧但有限的几何值不应阻止清理。候选 DTO 的存在不等于平台实现或可用性。
+释放和取消阶段只消费其身份/阶段所需的数据；陈旧但有限的几何值不应阻止清理。DTO 的存在不等于平台实现或可用性。
 
 来源：`DesktopComputerInputProtocol.cpp:363`、`DesktopComputerInputTypes.cpp:93`，以及 `DesktopComputerWindows.cpp` 中 Touch/Pen 分支和 `WindowsInputSession::capabilities()`。
 
@@ -66,16 +68,18 @@
 
 1. `keyboard_enabled`：键盘输入开关，默认 `true`。
 2. `mouse_enabled`：鼠标/指针输入开关，默认 `true`。
-3. `native_pen_touch_enabled`：Touch/Pen 候选输入开关，默认 `true`；开启不能使尚未可用的平台能力自动可用。
+3. `native_pen_touch_enabled`：Touch/Pen 输入开关，默认 `true`；开启不能使尚未可用的平台能力自动可用。
 4. `always_send_scan_codes`：Windows raw key 尽可能使用扫描码，默认 `true`；具体键码空间仍由 raw key 的字段确定。
 5. `right_alt_to_meta`：将右 Alt 映射为 Meta，默认 `false`。
 6. `high_resolution_scroll`：保留细滚动量，默认 `true`；关闭时使用按轴余数累计。
 7. `keyboard_repeat`：raw key 的自动重复开关，默认 `true`。
-8. `repeat_delay_ms`：首次重复前延迟，0～5000 ms，默认 500 ms；0 禁止该自动重复计时。
-9. `repeat_period_ms`：重复间隔，1～1000 ms，默认 40 ms。
+8. `repeat_delay_ms`：首次重复前延迟，0～2147483647 的整数毫秒，默认 500 ms；0 禁止该自动重复计时。首次计时从原生 down 开始派发时起算。
+9. `repeat_period_ms`：重复间隔，为大于 0、有限且不超过 2147483647 的毫秒数，允许小数；默认 `1000/24.9`，约 40.16064 ms。后续周期从上次派发完成起算，不补发积压的重复键。
 10. `key_bindings`：原始键码与替换键码的二元数组，默认空。模型入口最多 65535 项，每项两个 1～65535 的整数，原始键码不能重复；首次 down 应用映射，已持有键的 up 使用原绑定。
 
 `inheritExisting` 是宿主内部元数据，不是模型可传字段。配置只影响输入策略，不是驱动安装或模型设置。
+
+非归一化编辑键码先转换到专用编辑键身份，再应用 `key_bindings`；未配置且系统不能映射的专用键明确返回不支持，不会误发 F11～F14，也不会擅自改成 Ctrl 组合键。重复和释放仍使用首次 down 的绑定。
 
 来源：`DesktopComputerInputProtocol.cpp:215` / `:387`、`DesktopComputerInputTypes.h` 的 `DesktopInputOptions`、`DesktopComputerInputTypes.cpp:233` 的统一校验；Common 和 Windows 原生入口都调用该校验。
 
@@ -116,6 +120,6 @@
 
 ## 验证边界
 
-本清单依据源码和纯合同。延期配置校验的真实纯 C++ 用例从 512 项检查中的 18 项失败变为 0 项失败；日志在 `.cache/desktop-native-options-deferred-20261117/`。Windows fake 接收器的合同测试、线程 DPI 检查以及编译通过，都不能代替真实窗口收到输入的证明。本文不把候选 Touch/Pen 或普通输入标为本轮实机验收通过。
+延期配置校验的早期纯 C++ 用例从 512 项检查中的 18 项失败变为 0 项失败；日志在 `.cache/desktop-native-options-deferred-20261117/`。这只验证配置拒绝规则。Windows recording 合同、DPI 检查和编译结果均不代替真实窗口收到输入的证明；实际输入验证单独列在下面。
 
-Root 的 Windows 最终回归已通过：同一原生会话接收器 71 项零失败，含五鼠标键、双轴细滚轮、相对移动、Unicode、修饰键组合、按住跨截图/移动/另一入口松开和最终清理；另有两进程真实输入/UIA 读回、Agent 到自有原生编辑器的回归。五组合同亦通过（DTO 512、Common 188、Windows recording 184 项均零失败）。记录及源码/产物 SHA 见 `2026-11-17-native-input-dependency-removal.md` 与其 evidence manifest。它们验证开发构建，未替换安装中的 Windows App；Touch/Pen、虚拟设备及实时 repeat 频率不据此验收。
+此前 SDK 移除批次的 71 项实际键鼠、两进程输入/UIA、ScriptModel Agent 回归及 512/188/184 项合同结果保存在 `2026-11-17-native-input-dependency-removal.md`，属于该次产物记录。本轮最终正常回归为 DTO 577、Common 241、Windows recording 323、Touch recording 319、Pen recording 262 项零失败；实际键鼠 71 项、Touch 62 项和 Pen 产品链均零失败、无 skip。完整 9 组回归、整屏输入、跨进程编辑器及 ScriptModel Agent 原生链路也全部通过。统一证据见 `2026-11-17-desktop-input-final-verification.md`。这些验证开发构建；虚拟设备和实时 repeat 保证不据此验收，也不宣称所有第三方应用均已实测。

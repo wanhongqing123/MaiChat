@@ -111,6 +111,13 @@ run recorded 27 admission retries for F6 up, then required the actual up, empty
 state and a 600 ms quiet window. Measured repeat dispatch on this host was about
 230 ms; this is not proof of a 15 ms end-to-end repeat period.
 
+Later same-executable testing on 2026-11-17 isolated that observation to the
+owned receiver's polling Qt event pump. A continuous event loop received
+16/31 ms coarse intervals while the retained polling control received
+219/250 ms. The new keyboard scheduling/configuration and actual pen results
+are recorded separately in `2026-11-17-desktop-input-keyboard-and-pen.md`;
+the earlier table below remains the evidence for its original artifacts.
+
 Final SDK-free normal build and runtime results:
 
 | Check | Result | Evidence |
@@ -150,9 +157,11 @@ repair neither uses it for ordinary input nor uninstalls it. A libvirtualhid
 broker/driver was never installed or activated. No additional driver, service,
 layout/IME switch, device pairing or system permission was introduced here.
 
-Touch/Pen remain separate system-input candidates with incomplete native
-acceptance. Earlier sustained-touch failures are not relabeled as fixed or as
-mouse-drag failures. Deferred controller/profile/feedback DTOs are not active
+Touch and Pen have since passed their new system-API product-chain regressions;
+see the same-day native-touch and keyboard-and-pen records for their exact
+scope and artifact identities. Earlier
+sustained-touch failures are not relabeled as fixed or as mouse-drag failures.
+Deferred controller/profile/feedback DTOs are not active
 providers; unsupported requests must fail explicitly. Full current tool actions
 are listed in `2026-11-17-desktop-computer-operations.md`.
 

@@ -14,10 +14,12 @@
 #include <QWindow>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPointF>
 
 #include <algorithm>
 #include <cstdio>
 #include <atomic>
+#include <cmath>
 #include <optional>
 #include <thread>
 
@@ -43,6 +45,40 @@ namespace {
 int unavailable(const char* reason) {
     std::fprintf(stderr, "computer test SKIP: %s; native click/type was not fully verified\n", reason);
     return 77;
+}
+
+std::optional<QPointF> fixtureNativePoint(QWidget& window, QWidget& widget, const QPoint& point) {
+#if defined(Q_OS_WIN)
+    // Qt widget positions are logical pixels, while observed Windows bounds
+    // use physical pixels. Map through this owned HWND's real client rectangle
+    // before normalizing; subtracting its physical origin from mapToGlobal()
+    // mixes the two spaces on a scaled display.
+    const QPoint clientPoint = widget.mapTo(&window, point);
+    const HWND handle = reinterpret_cast<HWND>(window.winId());
+    const auto previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (!previous) return std::nullopt;
+    struct RestoreDpi {
+        DPI_AWARENESS_CONTEXT previous;
+        ~RestoreDpi() { SetThreadDpiAwarenessContext(previous); }
+    } restore{previous};
+    RECT client{};
+    if (!GetClientRect(handle, &client) || window.width() <= 0 || window.height() <= 0) return std::nullopt;
+    POINT nativePoint{
+        LONG(std::lround(clientPoint.x() * double(client.right - client.left) / window.width())),
+        LONG(std::lround(clientPoint.y() * double(client.bottom - client.top) / window.height()))};
+    if (!ClientToScreen(handle, &nativePoint)) return std::nullopt;
+    return QPointF(nativePoint.x, nativePoint.y);
+#else
+    return QPointF(widget.mapToGlobal(point));
+#endif
+}
+
+QPointF fixtureRatios(const QPointF& point, const nlohmann::json& observation) {
+    const auto& bounds = observation["bounds"];
+    // The ordinary API maps both endpoints inclusively, matching the current
+    // observation rather than image pixels or an earlier enumeration result.
+    return {(point.x() - bounds["x"].get<double>()) / (bounds["width"].get<double>() - 1),
+            (point.y() - bounds["y"].get<double>()) / (bounds["height"].get<double>() - 1)};
 }
 
 #if defined(Q_OS_WIN)
@@ -308,9 +344,18 @@ int main(int argc, char** argv) {
         return unavailable("Windows denied the verified fixture foreground; no mouse input was sent");
     }
 #endif
-    const QPoint inputCenter = input->mapToGlobal(input->rect().center());
-    const double inputX = (inputCenter.x() - native.x) / native.width;
-    const double inputY = (inputCenter.y() - native.y) / native.height;
+    const auto inputCenter = fixtureNativePoint(window, *input, input->rect().center());
+    CHECK(inputCenter);
+    CHECK(snapshot["bounds"]["width"].get<double>() > 1 && snapshot["bounds"]["height"].get<double>() > 1);
+    const auto inputRatios = fixtureRatios(*inputCenter, snapshot);
+    const double inputX = inputRatios.x();
+    const double inputY = inputRatios.y();
+    CHECK(std::isfinite(inputX) && inputX >= 0 && inputX <= 1);
+    CHECK(std::isfinite(inputY) && inputY >= 0 && inputY <= 1);
+    std::fprintf(stderr, "computer own point: physical=(%.0f,%.0f) bounds=(%.0f,%.0f,%.0f,%.0f) ratio=(%.6f,%.6f)\n",
+                 inputCenter->x(), inputCenter->y(), snapshot["bounds"]["x"].get<double>(),
+                 snapshot["bounds"]["y"].get<double>(), snapshot["bounds"]["width"].get<double>(),
+                 snapshot["bounds"]["height"].get<double>(), inputX, inputY);
     const MaiError clicked = controller->act("owner", "click",
         snapshot["snapshot_id"], native.id, inputX, inputY, "", "", 0);
     if (clicked) {
@@ -373,12 +418,21 @@ int main(int argc, char** argv) {
         else if (step == 8) action.key = "Enter";
         else if (step == 9) action.expectedText = finalText.toUtf8().toStdString();
         if (step == 5 || step == 6 || step == 7) {
-            const QPoint start = input->mapToGlobal(QPoint(12, input->height() / 2));
-            const QPoint end = input->mapToGlobal(QPoint(130, input->height() / 2));
-            action.xRatio = (start.x() - native.x) / native.width;
-            action.yRatio = (start.y() - native.y) / native.height;
-            action.toXRatio = (end.x() - native.x) / native.width;
-            action.toYRatio = (end.y() - native.y) / native.height;
+            const auto start = fixtureNativePoint(window, *input, QPoint(12, input->height() / 2));
+            const auto end = fixtureNativePoint(window, *input, QPoint(130, input->height() / 2));
+            CHECK(start && end);
+            CHECK(freshSnapshot["bounds"]["width"].get<double>() > 1 &&
+                  freshSnapshot["bounds"]["height"].get<double>() > 1);
+            const auto startRatios = fixtureRatios(*start, freshSnapshot);
+            const auto endRatios = fixtureRatios(*end, freshSnapshot);
+            action.xRatio = startRatios.x();
+            action.yRatio = startRatios.y();
+            action.toXRatio = endRatios.x();
+            action.toYRatio = endRatios.y();
+            CHECK(std::isfinite(action.xRatio) && action.xRatio >= 0 && action.xRatio <= 1);
+            CHECK(std::isfinite(action.yRatio) && action.yRatio >= 0 && action.yRatio <= 1);
+            CHECK(std::isfinite(action.toXRatio) && action.toXRatio >= 0 && action.toXRatio <= 1);
+            CHECK(std::isfinite(action.toYRatio) && action.toYRatio >= 0 && action.toYRatio <= 1);
             action.durationMs = 100;
         }
         const auto performed = controller->perform("owner", action);

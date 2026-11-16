@@ -1236,6 +1236,13 @@ void DesktopComputerAgentIntegrationTest::nativePromptTraversesRealAgentAndReads
     panel.openSession(session);
     panel.show();
     QVERIFY(QTest::qWaitForWindowExposed(&panel));
+#if defined(Q_OS_WIN)
+    // Showing the parent panel can take focus from the verified child. Make
+    // one ordinary activation request for that owned PID/HWND; the readiness
+    // loop below still requires actual foreground and released controls.
+    const auto activated = backend->activateForInput(target);
+    if (activated) return failOrSkipNativeReadiness(activated);
+#endif
     const QString readyPath = QDir(directory.isEmpty() ? workspace.path() : directory)
         .filePath(QStringLiteral("creation-native-ready.json"));
     const auto foregroundReady = waitForOwnedNativeForeground(*backend, target, owned.process, readyPath);

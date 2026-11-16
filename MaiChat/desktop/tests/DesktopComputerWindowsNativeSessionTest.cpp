@@ -1,11 +1,18 @@
 #include "MaiChatTools/DesktopComputerWindowsInputInternal.h"
+#include "MaiChatTools/DesktopComputerWindowsPen.h"
+#include "MaiChatTools/DesktopComputerWindowsTouch.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <future>
+#include <mutex>
+#include <map>
+#include <optional>
 #include <set>
 #include <thread>
+#include <utility>
 
 namespace {
 int checks = 0, failures = 0;
@@ -31,9 +38,14 @@ struct Fake {
     int emits = 0, failAt = -1, layoutCalls = 0;
     std::function<void(const INPUT&)> onEmit;
     std::function<void()> onMove, onCursor;
+    std::function<void(POINT)> onHitTest;
+    std::function<bool(POINT)> hitPoint;
     std::shared_ptr<DesktopNativeInputSession> session;
-    Fake() {
+    explicit Fake(std::shared_ptr<DesktopComputerWindowsPen> pen = {},
+                  std::shared_ptr<DesktopComputerWindowsTouch> touch = {}) {
         DesktopWindowsInputHooks hooks;
+        hooks.pen = std::move(pen);
+        hooks.touch = std::move(touch);
         hooks.emitInput = [this](const INPUT& input) {
             ++emits;
             if (emits == failAt || (failUps && input.type == INPUT_KEYBOARD && (input.ki.dwFlags & KEYEVENTF_KEYUP))) return UINT(0);
@@ -44,8 +56,11 @@ struct Fake {
         hooks.move = [this](POINT value) { point = value; moves.push_back(value); if (onMove) onMove(); return MaiError{}; };
         hooks.cursor = [this] { if (onCursor) onCursor(); return MaiResult<POINT>{point}; };
         hooks.validate = [this](const DesktopNativeInput&) { return valid ? MaiError{} : MaiError{MaiErrorCode::Busy, "fake focus changed"}; };
-        hooks.hitTest = [this](const DesktopNativeInput& scope, POINT) {
-            return hit || scope.desktopScope ? MaiError{} : MaiError{MaiErrorCode::Busy, "fake foreign sibling"};
+        hooks.hitTest = [this](const DesktopNativeInput& scope, POINT point) {
+            if (onHitTest) onHitTest(point);
+            return (hit && (!hitPoint || hitPoint(point))) || scope.desktopScope
+                       ? MaiError{}
+                       : MaiError{MaiErrorCode::Busy, "fake foreign sibling"};
         };
         hooks.keyState = [this](int key) { return foreignKeys.count(key) ? SHORT(-32768) : SHORT(0); };
         hooks.layout = [this] { ++layoutCalls; return std::uintptr_t(GetKeyboardLayout(0)); };
@@ -66,6 +81,660 @@ struct Fake {
         return session->input(input);
     }
 };
+
+// This adapter records the native boundary, not Windows delivery. Its child
+// state can change without a parent dispatch, as a real source's async cleanup
+// may do. No caller callback is retained and no native source is ever created.
+class RecordingPen final : public DesktopComputerWindowsPen {
+public:
+    MaiError dispatch(const DesktopInputPen& pen, const DesktopInputPort& port,
+                      std::function<bool()> isCanceled = {}) override {
+        requests.push_back(pen);
+        ports.push_back(port);
+        hadCancellation = bool(isCanceled);
+        if (beforeEffect) beforeEffect();
+        if (isCanceled && isCanceled()) {
+            observedCancellation = true;
+            return {MaiErrorCode::Canceled, "recording pen dispatch canceled"};
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (pen.phase == DesktopInputPhase::Up || pen.phase == DesktopInputPhase::Cancel ||
+            pen.phase == DesktopInputPhase::HoverLeave || pen.phase == DesktopInputPhase::CancelAll) {
+            held_ = {};
+        } else {
+            if (held_.input.empty()) ++sourceCreations;
+            held_.input.penActive = true;
+            held_.input.devices = {"recording-system-pen"};
+            if (pen.phase == DesktopInputPhase::Down || pen.phase == DesktopInputPhase::Move ||
+                pen.phase == DesktopInputPhase::Hover)
+                held_.position = std::pair<std::int32_t, std::int32_t>{
+                    std::int32_t(std::llround(port.x + pen.x * (port.width - 1))),
+                    std::int32_t(std::llround(port.y + pen.y * (port.height - 1)))};
+        }
+        return {};
+    }
+    DesktopNativeInputState state() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return held_.input;
+    }
+    std::optional<std::pair<std::int32_t, std::int32_t>> position() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return held_.position;
+    }
+    MaiError validate() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++validations;
+        return fault_;
+    }
+    MaiError releaseAll() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++releases;
+        if (releaseError) return releaseError;
+        held_ = {};
+        return {};
+    }
+    void clearFromChild(MaiError fault = {}) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        held_ = {};
+        fault_ = std::move(fault);
+    }
+    std::vector<DesktopInputPen> requests;
+    std::vector<DesktopInputPort> ports;
+    int sourceCreations = 0, releases = 0;
+    mutable int validations = 0;
+    bool hadCancellation = false, observedCancellation = false;
+    MaiError releaseError;
+    std::function<void()> beforeEffect;
+
+private:
+    mutable std::mutex mutex_;
+    struct Published {
+        DesktopNativeInputState input;
+        std::optional<std::pair<std::int32_t, std::int32_t>> position;
+    } held_;
+    MaiError fault_;
+};
+
+// One recording contact ledger, not an OS source. The simulated source wait
+// precedes the synchronous guard so a stale parent preflight is observable.
+class RecordingTouch final : public DesktopComputerWindowsTouch {
+public:
+    MaiError dispatch(const std::vector<DesktopInputTouch>& contacts, const DesktopInputPort& port,
+                      std::function<bool()> isCanceled = {}) override {
+        requests.push_back(contacts);
+        ports.push_back(port);
+        hadCancellation = bool(isCanceled);
+        if (beforeEffect) beforeEffect();  // Simulates waiting for a source report before effects.
+        if (isCanceled && isCanceled()) {
+            observedCancellation = true;
+            return {MaiErrorCode::Canceled, "recording touch guard closed"};
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        const bool wasEmpty = owned_.empty();
+        bool positioned = false;
+        for (const auto& contact : contacts) {
+            if (contact.phase == DesktopInputPhase::CancelAll)
+                owned_.clear();
+            else if (contact.phase == DesktopInputPhase::Up || contact.phase == DesktopInputPhase::Cancel ||
+                     contact.phase == DesktopInputPhase::HoverLeave)
+                owned_.erase(contact.pointerId);
+            else {
+                positioned = true;
+                owned_[contact.pointerId] = {std::int32_t(std::llround(port.x + contact.x * (port.width - 1))),
+                                             std::int32_t(std::llround(port.y + contact.y * (port.height - 1)))};
+            }
+        }
+        if (positioned) ++effects;
+        if (wasEmpty && !owned_.empty()) ++sourceCreations;
+        return {};
+    }
+    DesktopNativeInputState state() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        DesktopNativeInputState state;
+        for (const auto& entry : owned_) state.touchPointers.push_back(entry.first);
+        if (!owned_.empty()) state.devices = {"recording-system-touch"};
+        return state;
+    }
+    std::vector<std::pair<std::int32_t, std::int32_t>> positions() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::pair<std::int32_t, std::int32_t>> result;
+        for (const auto& entry : owned_) result.push_back(entry.second);
+        return result;
+    }
+    MaiError validate() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++validations;
+        return fault_;
+    }
+    MaiError releaseAll() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++releases;
+        if (releaseError) return fault_ = releaseError;
+        owned_.clear();
+        fault_ = {};
+        return {};
+    }
+    void clearFromChild(MaiError fault = {}) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        owned_.clear();
+        fault_ = std::move(fault);
+    }
+    std::vector<std::vector<DesktopInputTouch>> requests;
+    std::vector<DesktopInputPort> ports;
+    int sourceCreations = 0, effects = 0, releases = 0;
+    mutable int validations = 0;
+    bool hadCancellation = false, observedCancellation = false;
+    MaiError releaseError;
+    std::function<void()> beforeEffect;
+
+private:
+    mutable std::mutex mutex_;
+    std::map<std::uint32_t, std::pair<std::int32_t, std::int32_t>> owned_;
+    MaiError fault_;
+};
+
+DesktopInputEvent touchEvent(DesktopInputPhase phase = DesktopInputPhase::Down) {
+    DesktopInputEvent event;
+    event.kind = DesktopInputEventKind::Touch;
+    for (unsigned index = 0; index < 2; ++index) {
+        DesktopInputTouch contact;
+        contact.phase = phase;
+        contact.pointerId = index ? 0xffffffffU : 17U;
+        contact.x = index ? .75f : .25f;
+        contact.y = .5f;
+        contact.pressureOrDistance = .75f;
+        contact.contactAreaMajor = .2f;
+        contact.contactAreaMinor = .1f;
+        contact.rotation = 45;
+        event.contacts.push_back(contact);
+    }
+    return event;
+}
+
+DesktopInputEvent penEvent(DesktopInputPhase phase = DesktopInputPhase::Down) {
+    DesktopInputEvent event;
+    event.kind = DesktopInputEventKind::Pen;
+    event.pen.phase = phase;
+    event.pen.toolType = 1;
+    event.pen.buttons = phase == DesktopInputPhase::Down || phase == DesktopInputPhase::Move ||
+                                phase == DesktopInputPhase::Hover || phase == DesktopInputPhase::ButtonOnly
+                            ? 3
+                            : 0;
+    event.pen.x = .25f;
+    event.pen.y = .75f;
+    event.pen.pressureOrDistance = .6f;
+    event.pen.tilt = 30;
+    event.pen.rotation = 45;
+    return event;
+}
+
+DesktopInputPort penPort() {
+    DesktopInputPort port;
+    port.x = -1600;
+    port.y = 90;
+    port.width = 800;
+    port.height = 600;
+    port.environmentX = -1600;
+    port.environmentY = 0;
+    port.environmentWidth = 3520;
+    port.environmentHeight = 1080;
+    port.outputName = "recording-pen-output";
+    return port;
+}
+
+void penRoutingCancellationAndCapability() {
+    auto pen = std::make_shared<RecordingPen>();
+    Fake fake(pen);
+    const auto capabilities = fake.session->capabilities();
+    const auto feature = std::find_if(capabilities.features.begin(), capabilities.features.end(),
+                                      [](const auto& value) { return value.name == "pen"; });
+    check(feature != capabilities.features.end() && feature->implemented,
+          "system pen has an implemented native route without claiming target acknowledgement");
+    check(pen->requests.empty() && pen->sourceCreations == 0 && pen->releases == 0,
+          "pen capability discovery does not dispatch or create a recording source");
+    auto token = std::make_shared<int>(1);
+    std::weak_ptr<int> lifetime = token;
+    DesktopNativeInput scope;
+    scope.isCanceled = [token] { return false; };
+    const auto port = penPort();
+    const auto down = penEvent();
+    check(!fake.session->inputEvents({down}, scope, port, {}),
+          "native session routes pen down to the explicit adapter");
+    check(pen->requests.size() == 1 && pen->requests[0].phase == DesktopInputPhase::Down &&
+              pen->requests[0].toolType == 1 && pen->requests[0].buttons == 3 && pen->requests[0].x == .25f &&
+              pen->requests[0].pressureOrDistance == .6f && pen->requests[0].tilt == 30 &&
+              pen->requests[0].rotation == 45,
+          "pen routing preserves typed fields instead of converting them to mouse events");
+    check(pen->ports.size() == 1 && pen->ports[0].x == -1600 && pen->ports[0].height == 600 &&
+              pen->ports[0].environmentWidth == 3520 && pen->ports[0].outputName == port.outputName,
+          "pen routing preserves the observed port and environment metadata");
+    check(pen->hadCancellation && fake.events.empty() && fake.moves.empty(),
+          "pen receives the cancellation guard without keyboard or mouse effects");
+    scope.isCanceled = {};
+    token.reset();
+    check(lifetime.expired(), "pen routing never retains the per-call cancellation owner");
+    bool canceled = false;
+    scope.isCanceled = [&] { return canceled; };
+    pen->beforeEffect = [&] { canceled = true; };
+    const auto result = fake.session->inputEvents({penEvent(DesktopInputPhase::Move)}, scope, port, {});
+    check(result.code() == MaiErrorCode::Canceled && pen->observedCancellation,
+          "pen adapter observes cancellation through the same native session guard");
+    check(fake.session->state().empty() && pen->releases > 0,
+          "failed pen dispatch cleans the owned source without retained active state");
+    pen->beforeEffect = {};
+}
+
+void penChildStateAndEmptyFaultRemainObservable() {
+    auto pen = std::make_shared<RecordingPen>();
+    Fake fake(pen);
+    check(!fake.send(raw(0x8011)), "mixed pen and keyboard ownership setup");
+    check(!fake.session->inputEvents({penEvent()}, {}, penPort(), {}), "mixed native session accepts its pen source");
+    auto state = fake.session->state();
+    check(state.rawKeys.size() == 1 && state.penActive &&
+              state.devices == std::vector<std::string>{"recording-system-pen"},
+          "native state merges the live pen child without replacing the keyboard ledger");
+    pen->clearFromChild();
+    state = fake.session->state();
+    check(state.rawKeys.size() == 1 && !state.penActive && state.devices.empty(),
+          "child asynchronous clear cannot leave stale parent pen or device state");
+    check(!fake.send(raw(0x8011, true)), "mixed key still has its original targeted up");
+    pen->clearFromChild({MaiErrorCode::Internal, "recording pen asynchronous fault"});
+    const auto fault = fake.session->validate();
+    check(fake.session->state().empty() && fault.code() == MaiErrorCode::Internal &&
+              fault.message() == "recording pen asynchronous fault" && pen->validations > 0,
+          "native validation sees the child fault before its empty-state early return");
+}
+
+void penCleanupAndTargetBinding() {
+    auto pen = std::make_shared<RecordingPen>();
+    Fake fake(pen);
+    DesktopNativeInput first;
+    first.expectedWindowId = 101;
+    first.expectedProcessId = 5001;
+    check(!fake.session->inputEvents({penEvent()}, first, penPort(), {}), "owned pen target setup");
+    auto other = first;
+    other.expectedWindowId = 202;
+    const auto before = pen->requests.size();
+    const auto changed = fake.session->inputEvents({penEvent(DesktopInputPhase::Move)}, other, penPort(), {});
+    check(changed.code() == MaiErrorCode::Busy && pen->requests.size() == before && fake.session->state().penActive,
+          "held pen cannot be rebound or dispatched to another window");
+    check(!fake.session->inputEvents({raw(0x8011)}, first, {}, {}), "pen and key share the original owned target");
+    const auto emitted = fake.events.size();
+    fake.valid = fake.hit = false;
+    fake.foreignKeys.insert(VK_LSHIFT);
+    pen->releaseError = {MaiErrorCode::Internal, "recording pen cleanup failed"};
+    check(fake.session->releaseAll().code() == MaiErrorCode::Internal && fake.events.size() == emitted + 1 &&
+              (fake.events.back().ki.dwFlags & KEYEVENTF_KEYUP),
+          "focus-independent cleanup still releases its key when pen cleanup fails");
+    check(fake.session->state().rawKeys.empty() && fake.session->state().penActive && pen->releases > 0,
+          "failed pen cleanup retains the live source for retry");
+    pen->releaseError = {};
+    check(!fake.session->releaseAll() && fake.session->state().empty() && fake.foreignKeys.count(VK_LSHIFT) == 1 &&
+              fake.events.size() == emitted + 1,
+          "cleanup retry releases only its pen and never manufactures another key up");
+}
+
+void penUnknownUpAndKeyboardHookBoundary() {
+    Fake keyboardOnly;
+    keyboardOnly.valid = keyboardOnly.hit = false;
+    for (const auto phase : {DesktopInputPhase::Up, DesktopInputPhase::Cancel, DesktopInputPhase::HoverLeave,
+                             DesktopInputPhase::CancelAll})
+        check(
+            !keyboardOnly.session->inputEvents({penEvent(phase)}, {}, {}, {}) && keyboardOnly.session->state().empty(),
+            "unknown pen cleanup succeeds without creating a real source");
+    keyboardOnly.valid = keyboardOnly.hit = true;
+    check(keyboardOnly.session->inputEvents({penEvent()}, {}, penPort(), {}).code() == MaiErrorCode::NotSupported &&
+              keyboardOnly.events.empty() && keyboardOnly.moves.empty() && keyboardOnly.session->state().empty(),
+          "keyboard-only recording hooks never enable a real pen source");
+    auto pen = std::make_shared<RecordingPen>();
+    Fake explicitAdapter(pen);
+    check(!explicitAdapter.session->inputEvents({penEvent(DesktopInputPhase::Up)}, {}, {}, {}) &&
+              pen->sourceCreations == 0 && explicitAdapter.session->state().empty(),
+          "unknown up also leaves an explicit recording pen unallocated");
+}
+
+void penButtonOnlyRechecksItsOwnedPhysicalPoint() {
+    std::vector<POINT> hits;
+    auto pen = std::make_shared<RecordingPen>();
+    Fake fake(pen);
+    auto hover = penEvent(DesktopInputPhase::Hover);
+    hover.pen.buttons = 0;
+    check(!fake.session->inputEvents({hover}, {}, penPort(), {}), "hover establishes an owned physical pen point");
+    const auto position = pen->position();
+    check(bool(position), "recording child publishes the same owned point as its state");
+    fake.valid = true;
+    fake.hit = false;
+    fake.onHitTest = [&](POINT point) { hits.push_back(point); };
+    const auto calls = pen->requests.size();
+    auto button = penEvent(DesktopInputPhase::ButtonOnly);
+    button.pen.buttons = 1;
+    button.pen.x = .9f;
+    button.pen.y = .1f;  // Irrelevant geometry must not move the hover point.
+    const auto result = fake.session->inputEvents({button}, {}, {}, {});
+    check(result.code() == MaiErrorCode::Busy && pen->requests.size() == calls,
+          "barrel press is rejected before child dispatch when the cached point belongs to a foreign window");
+    check(position && !hits.empty() && hits.back().x == position->first && hits.back().y == position->second,
+          "barrel preflight hit-tests the authoritative child point rather than stale button-only geometry");
+    check(fake.events.empty() && fake.moves.empty(), "rejected barrel press emits no keyboard or mouse replacement");
+
+    auto upPen = std::make_shared<RecordingPen>();
+    Fake upTarget(upPen);
+    auto upHover = penEvent(DesktopInputPhase::Hover);
+    upHover.pen.buttons = 0;
+    check(!upTarget.session->inputEvents({upHover}, {}, penPort(), {}), "barrel-bearing up cached hover setup");
+    auto barrelUp = penEvent(DesktopInputPhase::Up);
+    barrelUp.pen.buttons = 7;
+    upTarget.hit = false;
+    const auto upCalls = upPen->requests.size();
+    const auto upResult = upTarget.session->inputEvents({barrelUp}, {}, {}, {});
+    check(upResult.code() == MaiErrorCode::Busy && upPen->requests.size() == upCalls,
+          "up carrying a nonzero barrel state is not cleanup and must reject a foreign cached point");
+
+    auto cleanupPen = std::make_shared<RecordingPen>();
+    Fake cleanup(cleanupPen);
+    check(!cleanup.session->inputEvents({hover}, {}, penPort(), {}), "barrel cleanup owns its initial hover source");
+    const auto original = cleanupPen->position();
+    cleanup.valid = cleanup.hit = false;
+    int cancelReads = 0;
+    DesktopNativeInput canceled;
+    canceled.isCanceled = [&] {
+        ++cancelReads;
+        return true;
+    };
+    button.pen.buttons = 0;
+    check(!cleanup.session->inputEvents({button}, canceled, {}, {}) && cleanupPen->requests.size() == 2 &&
+              cleanupPen->position() == original && !cleanupPen->hadCancellation,
+          "zero-button cleanup remains focus-independent and preserves the original physical point");
+    auto up = penEvent(DesktopInputPhase::Up);
+    up.pen.buttons = 0;
+    check(!cleanup.session->inputEvents({up}, canceled, {}, {}) && cleanupPen->requests.size() == 3 &&
+              cleanup.session->state().empty() && !cleanupPen->position() && cancelReads == 0 &&
+              cleanupPen->sourceCreations == 1 && cleanup.events.empty() && cleanup.moves.empty(),
+          "terminal up cleans only its original source despite lost focus and canceled caller");
+}
+
+void penHoverWatchdogSeesForeignCoverage() {
+    std::vector<POINT> hits;
+    auto pen = std::make_shared<RecordingPen>();
+    Fake fake(pen);
+    DesktopNativeInput scope;
+    scope.expectedWindowId = 101;
+    scope.expectedProcessId = 5001;
+    auto hover = penEvent(DesktopInputPhase::Hover);
+    hover.pen.buttons = 0;
+    check(!fake.session->inputEvents({hover}, scope, penPort(), {}), "hover watchdog owns a window-bound source");
+    const auto position = pen->position();
+    const auto dispatched = pen->requests.size();
+    fake.valid = true;
+    fake.hit = false;
+    fake.onHitTest = [&](POINT point) { hits.push_back(point); };
+    const auto invalid = fake.session->validate();
+    check(invalid.code() == MaiErrorCode::Busy && position && !hits.empty() && hits.back().x == position->first &&
+              hits.back().y == position->second,
+          "hover watchdog rejects foreign coverage using the live child's physical point");
+    check(pen->requests.size() == dispatched && fake.events.empty() && fake.moves.empty(),
+          "hover watchdog validation does not dispatch or replace input");
+    for (const auto phase : {DesktopInputPhase::Up, DesktopInputPhase::Cancel}) {
+        auto cleanup = penEvent(phase);
+        cleanup.pen.buttons = 0;
+        check(!fake.session->inputEvents({cleanup}, {}, {}, {}) && fake.session->state().empty(),
+              "zero-button terminal cleanup remains independent of the foreign hover hit");
+    }
+}
+
+void penHoverWatchdogPreservesDisplayScope() {
+    auto pen = std::make_shared<RecordingPen>();
+    Fake fake(pen);
+    DesktopNativeInput display;
+    display.desktopScope = true;
+    display.display = {22, -1600, 0, 800, 900, false};
+    auto hover = penEvent(DesktopInputPhase::Hover);
+    hover.pen.buttons = 0;
+    check(!fake.session->inputEvents({hover}, display, penPort(), {}),
+          "display hover has its explicitly broad target scope");
+    const auto dispatched = pen->requests.size();
+    fake.valid = true;
+    fake.hit = false;
+    check(!fake.session->validate() && fake.session->state().penActive && pen->requests.size() == dispatched,
+          "display hover validation does not apply a selected-window hit restriction");
+    check(fake.events.empty() && fake.moves.empty(), "display hover watchdog remains a read-only validation");
+    fake.valid = false;
+    check(!fake.session->releaseAll() && fake.session->state().empty(),
+          "display hover still releases after focus validation fails");
+}
+
+void touchUnknownCleanupAndKeyboardHookBoundary() {
+    Fake keyboardOnly;
+    keyboardOnly.valid = keyboardOnly.hit = false;
+    DesktopInputOptions disabled;
+    disabled.mouseEnabled = disabled.nativePenTouchEnabled = false;
+    for (const auto phase : {DesktopInputPhase::Up, DesktopInputPhase::Cancel, DesktopInputPhase::HoverLeave,
+                             DesktopInputPhase::CancelAll})
+        check(!keyboardOnly.session->inputEvents({touchEvent(phase)}, {}, {}, disabled) &&
+                  keyboardOnly.session->state().empty(),
+              "unknown touch cleanup does not create a source or need enabled options/focus");
+    keyboardOnly.valid = keyboardOnly.hit = true;
+    check(keyboardOnly.session->inputEvents({touchEvent()}, {}, penPort(), {}).code() == MaiErrorCode::NotSupported &&
+              keyboardOnly.events.empty() && keyboardOnly.moves.empty() && keyboardOnly.session->state().empty(),
+          "keyboard-only hooks cannot enable real touch injection");
+    auto touch = std::make_shared<RecordingTouch>();
+    Fake explicitAdapter({}, touch);
+    check(!explicitAdapter.session->inputEvents({touchEvent(DesktopInputPhase::Up)}, {}, {}, {}) &&
+              touch->sourceCreations == 0 && explicitAdapter.session->state().empty(),
+          "unknown up also leaves an explicit touch adapter unallocated");
+}
+
+void touchRoutesWholeFrameAndKeepsTheOwnedTarget() {
+    auto touch = std::make_shared<RecordingTouch>();
+    Fake fake({}, touch);
+    DesktopNativeInput scope;
+    scope.expectedWindowId = 101;
+    scope.expectedProcessId = 5001;
+    check(!fake.session->inputEvents({raw(0x8011)}, scope, {}, {}), "touch combination owns its Control key");
+    const auto keys = fake.events.size();
+    auto token = std::make_shared<int>(1);
+    std::weak_ptr<int> lifetime = token;
+    scope.isCanceled = [token] { return false; };
+    const auto down = touchEvent();
+    const auto port = penPort();
+    check(!fake.session->inputEvents({down}, scope, port, {}),
+          "same native session routes an entire touch contact batch");
+    check(touch->requests.size() == 1 && touch->requests[0].size() == 2 && touch->requests[0][0].pointerId == 17 &&
+              touch->requests[0][1].pointerId == 0xffffffffU && touch->requests[0][1].pressureOrDistance == .75f &&
+              touch->requests[0][1].rotation == 45,
+          "touch adapter receives original opaque contact identities and typed fields together");
+    check(touch->ports.size() == 1 && touch->ports[0].x == port.x &&
+              touch->ports[0].environmentWidth == port.environmentWidth &&
+              touch->ports[0].outputName == port.outputName,
+          "touch routing preserves the observed viewport and virtual desktop");
+    const auto state = fake.session->state();
+    check(state.rawKeys.size() == 1 && state.touchPointers.size() == 2 &&
+              state.devices == std::vector<std::string>{"recording-system-touch"} && touch->hadCancellation &&
+              fake.events.size() == keys && fake.moves.empty(),
+          "live touch ownership merges with Control without keyboard or mouse substitution");
+    scope.isCanceled = {};
+    token.reset();
+    check(lifetime.expired(), "touch dispatch never retains its caller cancellation owner");
+    auto other = scope;
+    other.expectedWindowId = 202;
+    const auto calls = touch->requests.size();
+    const auto changed = fake.session->inputEvents({touchEvent(DesktopInputPhase::Move)}, other, port, {});
+    check(changed.code() == MaiErrorCode::Busy && touch->requests.size() == calls &&
+              fake.session->state().rawKeys.size() == 1 && fake.session->state().touchPointers.size() == 2,
+          "held touch and Control cannot silently rebind to another window");
+}
+
+void touchChildStateAndFaultStayLive() {
+    auto touch = std::make_shared<RecordingTouch>();
+    Fake fake({}, touch);
+    check(!fake.send(raw(0x8011)) && !fake.session->inputEvents({touchEvent()}, {}, penPort(), {}),
+          "live touch snapshot owns contacts beside its keyboard source");
+    check(fake.session->state().touchPointers.size() == 2, "touch contacts are projected before an asynchronous clear");
+    touch->clearFromChild({MaiErrorCode::Internal, "recording touch asynchronous fault"});
+    auto state = fake.session->state();
+    check(state.rawKeys.size() == 1 && state.touchPointers.empty() && state.devices.empty(),
+          "asynchronous child cleanup cannot leave cached parent touch contacts or devices");
+    check(!fake.send(raw(0x8011, true)), "child cleanup does not steal the original keyboard up binding");
+    const auto fault = fake.session->validate();
+    check(fake.session->state().empty() && fault.code() == MaiErrorCode::Internal &&
+              fault.message() == "recording touch asynchronous fault" && touch->validations > 0,
+          "empty native state cannot hide the child touch fault");
+}
+
+void touchCleanupIgnoresFocusOptionsAndCallerCancellation() {
+    auto touch = std::make_shared<RecordingTouch>();
+    Fake fake({}, touch);
+    check(!fake.send(raw(0x8011)) && !fake.session->inputEvents({touchEvent()}, {}, penPort(), {}),
+          "touch cleanup owns two contacts and an independent Control key");
+    fake.valid = fake.hit = false;
+    DesktopInputOptions disabled;
+    disabled.mouseEnabled = disabled.nativePenTouchEnabled = disabled.keyboardEnabled = false;
+    int cancelReads = 0;
+    DesktopNativeInput canceled;
+    canceled.isCanceled = [&] {
+        ++cancelReads;
+        return true;
+    };
+    auto up = touchEvent(DesktopInputPhase::Up);
+    up.contacts.resize(1);
+    up.contacts[0].x = -4;  // Cleanup must not reinterpret stale geometry or an empty port.
+    check(!fake.session->inputEvents({up}, canceled, {}, disabled),
+          "disabled pointer cleanup still releases its requested contact");
+    auto state = fake.session->state();
+    check(state.rawKeys.size() == 1 && state.touchPointers == std::vector<std::uint32_t>{0xffffffffU} &&
+              !touch->hadCancellation && touch->sourceCreations == 1,
+          "partial touch cleanup keeps its peer and Control, without a new source or callback");
+    check(!fake.session->inputEvents({touchEvent(DesktopInputPhase::CancelAll)}, canceled, {}, disabled) &&
+              fake.session->state().touchPointers.empty() && fake.session->state().rawKeys.size() == 1 &&
+              cancelReads == 0,
+          "cancel-all cleans only its remaining touch contacts despite canceled caller and lost focus");
+    check(!fake.session->inputEvents({raw(0x8011, true)}, canceled, {}, disabled) && fake.session->state().empty(),
+          "targeted keyboard cleanup remains independent of touch options");
+}
+
+void touchFailedReleaseKeepsItsRetrySource() {
+    auto touch = std::make_shared<RecordingTouch>();
+    Fake fake({}, touch);
+    check(!fake.send(raw(0x8011)) && !fake.session->inputEvents({touchEvent()}, {}, penPort(), {}),
+          "failed touch release has a source and key to clean");
+    const auto keys = fake.events.size();
+    fake.valid = fake.hit = false;
+    fake.foreignKeys.insert(VK_LSHIFT);
+    touch->releaseError = {MaiErrorCode::Internal, "recording touch cleanup failed"};
+    check(fake.session->releaseAll().code() == MaiErrorCode::Internal && fake.events.size() == keys + 1 &&
+              (fake.events.back().ki.dwFlags & KEYEVENTF_KEYUP),
+          "touch cleanup failure does not prevent releasing its own keyboard binding");
+    check(
+        fake.session->state().rawKeys.empty() && fake.session->state().touchPointers.size() == 2 && touch->releases > 0,
+        "failed release retains the live touch child and original positions for retry");
+    touch->releaseError = {};
+    check(!fake.session->releaseAll() && fake.session->state().empty() && fake.events.size() == keys + 1 &&
+              fake.foreignKeys.count(VK_LSHIFT) == 1,
+          "retry retires only its touch source without another or foreign keyboard up");
+}
+
+void touchPreflightsEveryPositionBeforeChildDispatch() {
+    {
+        auto touch = std::make_shared<RecordingTouch>();
+        Fake fake({}, touch);
+        auto invalid = touchEvent();
+        invalid.contacts.back().x = 2;
+        check(fake.session->inputEvents({invalid}, {}, penPort(), {}).code() == MaiErrorCode::InvalidInput &&
+                  touch->requests.empty() && touch->effects == 0 && fake.events.empty(),
+              "invalid final contact rejects the entire native batch before child dispatch");
+    }
+    std::vector<POINT> hits;
+    auto touch = std::make_shared<RecordingTouch>();
+    Fake fake({}, touch);
+    fake.hitPoint = [](POINT point) { return point.x < -1200; };  // Only the last contact is foreign.
+    fake.onHitTest = [&](POINT point) { hits.push_back(point); };
+    const auto foreign = fake.session->inputEvents({touchEvent()}, {}, penPort(), {});
+    check(foreign.code() == MaiErrorCode::Busy && hits.size() >= 2 && touch->requests.empty() && touch->effects == 0 &&
+              touch->sourceCreations == 0 && fake.events.empty() && fake.moves.empty(),
+          "foreign final contact is hit-tested before any child dispatch or first-contact effect");
+}
+
+void touchSourceWaitRechecksTargetInsteadOfOnlyCallerCancel() {
+    for (const bool focus : {false, true}) {
+        bool lateForeign = false;
+        auto touch = std::make_shared<RecordingTouch>();
+        Fake fake({}, touch);
+        fake.hitPoint = [&](POINT point) { return !lateForeign || point.x < -1200; };
+        touch->beforeEffect = [&] {
+            if (focus)
+                fake.valid = false;
+            else
+                lateForeign = true;
+        };
+        int callerReads = 0;
+        DesktopNativeInput scope;
+        scope.expectedWindowId = 101;
+        scope.expectedProcessId = 5001;
+        scope.isCanceled = [&] {
+            ++callerReads;
+            return false;
+        };
+        const auto stopped = fake.session->inputEvents({touchEvent()}, scope, penPort(), {});
+        check((stopped.code() == MaiErrorCode::Busy || stopped.code() == MaiErrorCode::Canceled) &&
+                  touch->requests.size() == 1 && touch->hadCancellation && touch->observedCancellation &&
+                  callerReads > 0,
+              "source wait guard rechecks focus and every point although the caller never requests cancel");
+        check(touch->effects == 0 && touch->sourceCreations == 0 && fake.session->state().empty() &&
+                  fake.events.empty() && fake.moves.empty(),
+              "a target invalidated during source wait cannot produce a late touch or replacement input");
+        touch->beforeEffect = {};
+    }
+}
+
+void touchMidDispatchCancellationCleansContactsAndKeys() {
+    bool canceled = false;
+    auto touch = std::make_shared<RecordingTouch>();
+    Fake fake({}, touch);
+    check(!fake.send(raw(0x8011)) && !fake.session->inputEvents({touchEvent()}, {}, penPort(), {}),
+          "mid-dispatch cancellation owns touch contacts beside its key");
+    const auto effects = touch->effects;
+    touch->beforeEffect = [&] { canceled = true; };
+    DesktopNativeInput scope;
+    scope.isCanceled = [&] { return canceled; };
+    const auto result = fake.session->inputEvents({touchEvent(DesktopInputPhase::Move)}, scope, penPort(), {});
+    check(result.code() == MaiErrorCode::Canceled && touch->observedCancellation && touch->effects == effects &&
+              touch->releases > 0 && fake.session->state().empty() && fake.events.size() == 2 &&
+              (fake.events.back().ki.dwFlags & KEYEVENTF_KEYUP),
+          "touch cancellation guard cleans its original contacts and key without a late move");
+    touch->beforeEffect = {};
+}
+
+void touchWatchdogChecksEveryLivePointAndPreservesDisplayScope() {
+    {
+        std::vector<POINT> hits;
+        auto touch = std::make_shared<RecordingTouch>();
+        Fake fake({}, touch);
+        check(!fake.session->inputEvents({touchEvent()}, {}, penPort(), {}), "touch watchdog owns two physical points");
+        const auto dispatched = touch->requests.size();
+        fake.hitPoint = [](POINT point) { return point.x < -1200; };
+        fake.onHitTest = [&](POINT point) { hits.push_back(point); };
+        check(fake.session->validate().code() == MaiErrorCode::Busy && hits.size() >= 2 &&
+                  touch->requests.size() == dispatched && touch->positions().size() == 2 && fake.events.empty() &&
+                  fake.moves.empty(),
+              "watchdog validates all child-owned touch positions without dispatching cleanup itself");
+        check(!fake.session->releaseAll() && fake.session->state().empty(),
+              "watchdog failure still permits explicit touch cleanup");
+    }
+    auto touch = std::make_shared<RecordingTouch>();
+    Fake fake({}, touch);
+    DesktopNativeInput display;
+    display.desktopScope = true;
+    display.display = {22, -1600, 0, 800, 900, false};
+    check(!fake.session->inputEvents({touchEvent()}, display, penPort(), {}),
+          "display touch owns its explicitly broad target");
+    const auto dispatched = touch->requests.size();
+    fake.hitPoint = [](POINT) { return false; };
+    check(!fake.session->validate() && fake.session->state().touchPointers.size() == 2 &&
+              touch->requests.size() == dispatched,
+          "display touch watchdog does not require a selected-window hit");
+    check(!fake.session->releaseAll() && fake.session->state().empty(),
+          "display touch child retires through the same native cleanup");
+}
 
 void rawIdentityAndBinding() {
     Fake fake;
@@ -378,7 +1047,7 @@ void mouseAliasesMappingAndPreflight() {
     auto native = raw(VK_F11);
     native.key.flags = 1;
     const auto f11 = maiDesktopWindowsResolveRawKey(native.key, options, std::uintptr_t(GetKeyboardLayout(0)));
-    check(f11 && f11.value().down.ki.wVk == VK_F11, "non-normalized F11 remains a Windows VK without SDK portable remapping");
+    check(f11 && f11.value().down.ki.wVk == VK_F11, "effective explicitly selected F11 retains Windows VK emission");
     native.key = {};
     native.key.code = VK_F24;
     const auto f24 = maiDesktopWindowsResolveRawKey(native.key, {}, std::uintptr_t(GetKeyboardLayout(0)));
@@ -387,6 +1056,64 @@ void mouseAliasesMappingAndPreflight() {
     check(bool(attention.send(raw(VK_DELETE, false, 0, 6))) && attention.events.empty(),
           "raw Ctrl Alt Delete cannot bypass legacy secure-attention rejection");
 }
+void editingKeysDoNotEmitUnrequestedFunctionKeys() {
+    constexpr WORD functionScans[]{0x57, 0x58, 0x64, 0x65};
+    for (std::uint16_t offset = 0; offset < 4; ++offset) {
+        const auto source = std::uint16_t(0x7a + offset);
+        const auto canonical = std::uint16_t(0x100 + offset);
+        Fake unsupported;
+        check(!unsupported.send(raw(source, true, 1)) && unsupported.events.empty(),
+              "unknown editing-key up is an owned no-op");
+        check(unsupported.send(raw(source, false, 1)).code() == MaiErrorCode::NotSupported &&
+                  unsupported.events.empty() && unsupported.session->state().empty(),
+              "unmapped non-normalized editing key never emits F11-F14 or a shortcut");
+        Fake dedicated;
+        check(dedicated.send(raw(canonical, false, 1)).code() == MaiErrorCode::NotSupported && dedicated.events.empty(),
+              "dedicated editing code has no implicit native mapping");
+
+        Fake normalized;
+        check(!normalized.send(raw(source)) && normalized.events.size() == 1 &&
+                  normalized.events[0].ki.wScan == functionScans[offset],
+              "ordinary normalized F11-F14 retain physical scan identity");
+        check(!normalized.send(raw(source, true)) && normalized.session->state().empty(),
+              "ordinary function key retains paired up");
+        Fake prefixed;
+        DesktopInputOptions virtualKey;
+        virtualKey.alwaysSendScanCodes = false;
+        const auto prefixedCode = std::uint16_t(0x8000 | source);
+        check(!prefixed.send(raw(prefixedCode, false, 1), virtualKey) && prefixed.events.size() == 1 &&
+                  prefixed.events[0].ki.wVk == source,
+              "legacy prefix preserves F11-F14 even with the non-normalized flag");
+        check(!prefixed.send(raw(prefixedCode, true, 1)) && prefixed.events.size() == 2 &&
+                  prefixed.events.back().ki.wVk == source && prefixed.session->state().empty(),
+              "prefixed function up uses its frozen VK binding across option changes");
+
+        Fake selected;
+        DesktopInputOptions mapping;
+        mapping.alwaysSendScanCodes = false;
+        mapping.keyBindings = {{{canonical, 'A'}}};
+        check(!selected.send(raw(source, false, 1), mapping), "explicit canonical editing-key binding can select A");
+        check(selected.events.size() == 1 && selected.events[0].ki.wVk == 'A',
+              "user-selected editing binding emits exactly the requested native A");
+        const auto held = selected.session->state().rawKeys;
+        check(held.size() == 1 && held[0].code == source && held[0].flags == 1,
+              "canonicalization does not replace the original source ledger identity");
+        const auto resolutions = selected.layoutCalls;
+        mapping.keyBindings = {{{canonical, 'B'}}};
+        mapping.alwaysSendScanCodes = true;
+        check(!selected.send(raw(source, false, 1), mapping) && selected.events.size() == 1,
+              "duplicate editing source never rebinds or emits another down");
+        auto repeat = raw(source, false, 1);
+        repeat.key.repeat = true;
+        check(!selected.send(repeat, mapping) && selected.events.size() == 2 && selected.events.back().ki.wVk == 'A',
+              "editing source repeat uses its original explicit native binding");
+        check(!selected.send(raw(source, true, 1), mapping) && selected.events.size() == 3 &&
+                  selected.events.back().ki.wVk == 'A' && (selected.events.back().ki.dwFlags & KEYEVENTF_KEYUP) &&
+                  selected.session->state().empty() && selected.layoutCalls == resolutions,
+              "editing source up pairs the first binding without layout resolution");
+    }
+}
+
 void targetAndNativeEndpoints() {
     Fake target;
     DesktopNativeInput first, other;
@@ -644,12 +1371,29 @@ int main() {
     nonblockingSnapshotAndRelease();
     neutralAndSecureIntent();
     mouseAliasesMappingAndPreflight();
+    editingKeysDoNotEmitUnrequestedFunctionKeys();
     targetAndNativeEndpoints();
     wheelRechecksTargetAndThreadDpi();
     atomicHeldKeyAndPointerModifiers();
     cancellationCallbackCannotEmitAfterRevocation();
     sameThreadCallerReentry();
     revocationDuringPendingCleanup();
+    penRoutingCancellationAndCapability();
+    penChildStateAndEmptyFaultRemainObservable();
+    penCleanupAndTargetBinding();
+    penUnknownUpAndKeyboardHookBoundary();
+    penButtonOnlyRechecksItsOwnedPhysicalPoint();
+    penHoverWatchdogSeesForeignCoverage();
+    penHoverWatchdogPreservesDisplayScope();
+    touchUnknownCleanupAndKeyboardHookBoundary();
+    touchRoutesWholeFrameAndKeepsTheOwnedTarget();
+    touchChildStateAndFaultStayLive();
+    touchCleanupIgnoresFocusOptionsAndCallerCancellation();
+    touchFailedReleaseKeepsItsRetrySource();
+    touchPreflightsEveryPositionBeforeChildDispatch();
+    touchSourceWaitRechecksTargetInsteadOfOnlyCallerCancel();
+    touchMidDispatchCancellationCleansContactsAndKeys();
+    touchWatchdogChecksEveryLivePointAndPreservesDisplayScope();
     std::printf("DesktopComputerWindowsNativeSessionTest: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

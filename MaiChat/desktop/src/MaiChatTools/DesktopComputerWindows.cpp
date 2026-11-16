@@ -2,6 +2,7 @@
 #include "MaiChatTools/DesktopComputerKeys.h"
 #include "MaiChatTools/DesktopComputerWindowsInputInternal.h"
 #include "MaiChatTools/DesktopComputerWindowsTouch.h"
+#include "MaiChatTools/DesktopComputerWindowsPen.h"
 
 #include <windows.h>
 #include <dwmapi.h>
@@ -776,6 +777,18 @@ MouseBinding mouseBinding(DesktopMouseButton button) {
     return {};
 }
 
+bool nativeCleanupEvent(const DesktopInputEvent& event) {
+    // These terminal phases consume the cached source only. UP with a nonzero
+    // barrel state can introduce a button press and must retain the ordinary
+    // target/token classification instead of being mistaken for cleanup.
+    if (event.kind == DesktopInputEventKind::Pen) {
+        const auto phase = event.pen.phase;
+        if (phase == DesktopInputPhase::Cancel || phase == DesktopInputPhase::CancelAll ||
+            phase == DesktopInputPhase::HoverLeave)
+            return true;
+    }
+    return maiDesktopInputEventsOnlyRelease({event});
+}
 
 MaiError InputScope::dispatchTyped(const DesktopInputEvent& event, const DesktopInputPort& port,
                                   const DesktopInputOptions& options) {
@@ -811,16 +824,109 @@ MaiError InputScope::dispatchTyped(const DesktopInputEvent& event, const Desktop
         return unicode(event.text);
     }
     if (event.kind == Kind::Touch) {
-        if (!options.mouseEnabled || !options.nativePenTouchEnabled)
-            return {MaiErrorCode::NotConfigured, "native touch input is disabled"};
-        if (hooks_.emitInput) return {MaiErrorCode::NotSupported, "pointer devices require their explicit native test transport"};
-        if (!touch_) touch_ = makeDesktopComputerWindowsTouch();
-        const auto result = touch_->dispatch(event.contacts, port);
+        const bool releasing = nativeCleanupEvent(event);
+        if (!touch_ && releasing) return {};
+        std::vector<POINT> planned;
+        if (!releasing) {
+            if (!options.mouseEnabled || !options.nativePenTouchEnabled)
+                return {MaiErrorCode::NotConfigured, "native touch input is disabled"};
+            if (const auto ready = validate()) return ready;
+            if (const auto modifiers = pointerModifiers()) return modifiers;
+            // Validate every new position before admitting the first contact.
+            // Cleanup-only contacts consume their original cached geometry.
+            for (const auto& contact : event.contacts) {
+                if (contact.phase != DesktopInputPhase::Down && contact.phase != DesktopInputPhase::Move &&
+                    contact.phase != DesktopInputPhase::Hover)
+                    continue;
+                const auto x = port.x + contact.x * (port.width - 1);
+                const auto y = port.y + contact.y * (port.height - 1);
+                if (port.width < 1 || port.height < 1 || !validPoint(x, y))
+                    return {MaiErrorCode::InvalidInput, "touch position needs valid observed native bounds"};
+                const POINT point{LONG(std::llround(x)), LONG(std::llround(y))};
+                if (const auto hit = validatePoint(point)) return hit;
+                planned.push_back(point);
+            }
+        }
+        if (!touch_) {
+            if (hooks_.touch)
+                touch_ = hooks_.touch;
+            else {
+                if (hooks_.emitInput)
+                    return {MaiErrorCode::NotSupported, "touch requires its explicit native test transport"};
+                touch_ = makeDesktopComputerWindowsTouch();
+            }
+            std::atomic_store(&snapshot_->touch, touch_);
+        }
+        MaiError guardError;
+        const auto guard = [this, &planned, &guardError] {
+            if (guardError) return true;
+            if (const auto ready = validate()) {
+                guardError = ready;
+                return true;
+            }
+            for (const auto point : planned)
+                if (const auto hit = validatePoint(point)) {
+                    guardError = hit;
+                    return true;
+                }
+            for (const auto& point : touch_->positions())
+                if (const auto hit = validatePoint({LONG(point.first), LONG(point.second)})) {
+                    guardError = hit;
+                    return true;
+                }
+            return false;
+        };
+        // The source may wait for its next ordinary report before adding a
+        // contact. Recheck the target at each effect during that synchronous
+        // command; the source discards this stack-bound guard before response.
+        const auto result = touch_->dispatch(event.contacts, port, releasing ? std::function<bool()>{} : guard);
+        publish();
+        if (guardError) {
+            if (result && result.code() != guardError.code())
+                return {guardError.code(), guardError.message() + "; native touch: " + result.message()};
+            return guardError;
+        }
+        return result;
+    }
+    if (event.kind == Kind::Pen) {
+        const bool releasing = nativeCleanupEvent(event);
+        if (!pen_ && releasing) return {};  // Unknown cleanup never creates a system source.
+        if (!releasing) {
+            if (!options.mouseEnabled || !options.nativePenTouchEnabled)
+                return {MaiErrorCode::NotConfigured, "native pen input is disabled"};
+            if (const auto ready = validate()) return ready;
+            if (const auto modifiers = pointerModifiers()) return modifiers;
+            if (event.pen.phase == DesktopInputPhase::Down || event.pen.phase == DesktopInputPhase::Move ||
+                event.pen.phase == DesktopInputPhase::Hover) {
+                const auto x = port.x + event.pen.x * (port.width - 1);
+                const auto y = port.y + event.pen.y * (port.height - 1);
+                if (port.width < 1 || port.height < 1 || !validPoint(x, y))
+                    return {MaiErrorCode::InvalidInput, "pen position needs valid observed native bounds"};
+                if (const auto hit = validatePoint({LONG(std::llround(x)), LONG(std::llround(y))})) return hit;
+            } else if ((event.pen.phase == DesktopInputPhase::ButtonOnly || event.pen.phase == DesktopInputPhase::Up) &&
+                       event.pen.buttons != 0) {
+                // Button-only input uses the source's last accepted physical
+                // point. An unchanged foreground window does not establish
+                // ownership when another window now covers that point.
+                const auto point = pen_ ? pen_->position() : std::nullopt;
+                if (!point) return {MaiErrorCode::InvalidInput, "pen button press needs an owned native position"};
+                if (const auto hit = validatePoint({LONG(point->first), LONG(point->second)})) return hit;
+            }
+        }
+        if (!pen_) {
+            if (hooks_.pen)
+                pen_ = hooks_.pen;
+            else {
+                if (hooks_.emitInput)
+                    return {MaiErrorCode::NotSupported, "pen requires its explicit native test transport"};
+                pen_ = makeDesktopComputerWindowsPen();
+            }
+            std::atomic_store(&snapshot_->pen, pen_);
+        }
+        const auto result = pen_->dispatch(event.pen, port, releasing ? std::function<bool()>{} : input_.isCanceled);
         publish();
         return result;
     }
-    if (event.kind == Kind::Pen)
-        return {MaiErrorCode::NotSupported, "native pen system API adapter is a pending candidate"};
     if (event.kind != Kind::RelativeMove && event.kind != Kind::AbsoluteMove && event.kind != Kind::Wheel)
         return {MaiErrorCode::NotSupported, "virtual devices are deferred in this native input session"};
     if (!options.mouseEnabled) return {MaiErrorCode::NotConfigured, "mouse input is disabled"};
@@ -1042,22 +1148,72 @@ public:
         scope.kind = std::any_of(events.begin(), events.end(), [](const auto& event) {
             return event.kind == DesktopInputEventKind::RawKey || event.kind == DesktopInputEventKind::UnicodeText;
         }) ? DesktopNativeInputKind::Key : DesktopNativeInputKind::Move;
-        return perform(scope, maiDesktopInputEventsOnlyRelease(events), [&](InputScope& owner) {
+        return perform(scope, std::all_of(events.begin(), events.end(), nativeCleanupEvent), [&](InputScope& owner) {
             for (const auto& event : events) {
                 // Common consumes batch delays/repeat timing. This native seam
                 // receives prepared events and never silently drops a delay.
-                if (event.delayMs) return MaiError{MaiErrorCode::InvalidInput, "native input requires a prepared event with consumed delay"};
-                if (!maiDesktopInputEventsOnlyRelease({event}))
+                if (event.delayMs)
+                    return MaiError{MaiErrorCode::InvalidInput,
+                                    "native input requires a prepared event with consumed delay"};
+                if (!nativeCleanupEvent(event))
                     if (const auto ready = owner.validate()) return ready;
                 if (const auto error = owner.dispatchTyped(event, port, options)) return error;
             }
             return MaiError{};
         });
     }
-    DesktopNativeInputState state() const override { return *std::atomic_load(&snapshot_->state); }
+    DesktopNativeInputState state() const override {
+        auto result = *std::atomic_load(&snapshot_->state);
+        if (const auto touch = std::atomic_load(&snapshot_->touch)) {
+            const auto pointer = touch->state();
+            result.touchPointers = pointer.touchPointers;
+            result.devices.insert(result.devices.end(), pointer.devices.begin(), pointer.devices.end());
+        }
+        // The pen owns its live state and asynchronous cleanup. Merge its
+        // immutable snapshot, rather than leaving a stale parent-held copy.
+        if (const auto pen = std::atomic_load(&snapshot_->pen)) {
+            const auto pointer = pen->state();
+            result.penActive = pointer.penActive;
+            result.devices.insert(result.devices.end(), pointer.devices.begin(), pointer.devices.end());
+        }
+        return result;
+    }
     MaiError validate() const override {
+        const auto pen = std::atomic_load(&snapshot_->pen);
+        if (pen)
+            if (const auto fault = pen->validate()) return fault;
+        const auto touch = std::atomic_load(&snapshot_->touch);
+        if (touch)
+            if (const auto fault = touch->validate()) return fault;
         if (state().empty()) return {};
         const auto scope = std::atomic_load(&snapshot_->scope);
+        if (touch && !scope->desktopScope) {
+            for (const auto& point : touch->positions()) {
+                const POINT physical{LONG(point.first), LONG(point.second)};
+                if (hooks_.hitTest) {
+                    if (const auto hit = hooks_.hitTest(*scope, physical)) return hit;
+                } else {
+                    DpiScope dpi;
+                    InputScope watched(*scope);
+                    if (const auto hit = watched.validatePoint(physical)) return hit;
+                }
+            }
+        }
+        if (pen && !scope->desktopScope) {
+            if (const auto point = pen->position()) {
+                // Foreground identity can remain unchanged while a no-activate
+                // window covers a hovering source. Let the existing owner
+                // watchdog retire that source, without retaining a call guard.
+                const POINT physical{LONG(point->first), LONG(point->second)};
+                if (hooks_.hitTest) {
+                    if (const auto hit = hooks_.hitTest(*scope, physical)) return hit;
+                } else {
+                    DpiScope dpi;
+                    InputScope watched(*scope);
+                    if (const auto hit = watched.validatePoint(physical)) return hit;
+                }
+            }
+        }
         return hooks_.validate ? hooks_.validate(*scope) : maiDesktopWindowsValidateInputScope(*scope);
     }
     MaiError resetControls() override {
@@ -1087,9 +1243,18 @@ public:
         result.baseline = "Windows native SendInput / User32";
         for (const auto* name : {"absolute_move", "relative_move", "mouse_button", "wheel", "raw_key", "unicode_text"})
             result.features.push_back({name, true, true, "win32_native", "System native input; application acknowledgement is separate", {}});
-        result.features.push_back({"touch", true, false, "win32_synthetic_touch_frame", "System API candidate",
-            "Continuous-touch native acceptance has not passed on this host"});
-        result.features.push_back({"pen", false, false, "win32_synthetic_pen", "System API candidate", "Native pen adapter is pending"});
+        const auto user32 = GetModuleHandleW(L"user32.dll");
+        const bool pointerAvailable = user32 && GetProcAddress(user32, "CreateSyntheticPointerDevice") &&
+                                      GetProcAddress(user32, "InjectSyntheticPointerInput") &&
+                                      GetProcAddress(user32, "DestroySyntheticPointerDevice");
+        result.features.push_back({"touch", true, pointerAvailable, "win32_synthetic_touch_frame",
+                                   "System touch input; receiver acknowledgement is separate",
+                                   "Windows 10 1809+; up to 10 contacts, full peer frames and ordinary 50 ms source "
+                                   "reports; no hardware driver"});
+        result.features.push_back({"pen", true, pointerAvailable, "win32_synthetic_pen",
+                                   "System pen input; receiver acknowledgement is separate",
+                                   "Windows10 1809+; native position, pressure, tilt, eraser and one OR-combined "
+                                   "barrel bit; no distance/ellipse/shaft-twist mapping"});
         return result;
     }
 private:

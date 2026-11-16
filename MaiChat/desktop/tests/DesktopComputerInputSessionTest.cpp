@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <condition_variable>
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -358,15 +360,107 @@ void repeatUsesOnlyNativeSourceProjection() {
     std::this_thread::sleep_for(std::chrono::milliseconds(35));
     CHECK(native->transitions().size() == count && session->state().empty());
 }
-void disablingRepeatStopsSchedulingWithoutInventingAnUp() {
+void firstRepeatDelayStartsBeforeSlowNativeDispatch() {
     auto native = std::make_shared<Native>();
     auto session = wrap(native);
+    DesktopInputOptions options;
+    options.repeatDelayMs = 400;
+    options.repeatPeriodMs = 40;
+    std::mutex barrier;
+    std::condition_variable changed;
+    bool downEntered = false, returnDown = false, repeated = false;
+    Clock::time_point enteredAt{}, returnedAt{}, repeatedAt{};
+    native->afterTyped = [&] {
+        const auto event = native->events().back();
+        std::unique_lock<std::mutex> lock(barrier);
+        if (event.key.repeat) {
+            if (!repeated) repeatedAt = Clock::now();
+            repeated = true;
+            changed.notify_all();
+        } else if (!downEntered) {
+            downEntered = true;
+            enteredAt = Clock::now();
+            changed.notify_all();
+            changed.wait(lock, [&] { return returnDown; });
+            returnedAt = Clock::now();
+        }
+    };
+    MaiError result;
+    std::thread pending([&] { result = session->inputEvents({raw(0x75)}, {}, {}, options); });
+    {
+        std::unique_lock<std::mutex> lock(barrier);
+        CHECK(changed.wait_for(lock, std::chrono::seconds(1), [&] { return downEntered; }));
+        // The initial repeat deadline has elapsed before native returns. A
+        // barrier preserves that ordering without making native inject input.
+        const auto afterDelay = enteredAt + std::chrono::milliseconds(options.repeatDelayMs + 100);
+        while (downEntered && Clock::now() < afterDelay) changed.wait_until(lock, afterDelay);
+        returnDown = true;
+        changed.notify_all();
+    }
+    pending.join();
+    CHECK(!result);
+    {
+        std::unique_lock<std::mutex> lock(barrier);
+        // A due repeat may wait for the worker, but must not wait another full
+        // initial delay after the slow dispatch completes. The private virtual
+        // clock audit separately proves the deadline without wall-clock bounds.
+        CHECK(changed.wait_until(lock, returnedAt + std::chrono::milliseconds(options.repeatDelayMs / 2),
+                                 [&] { return repeated; }));
+        if (repeated) CHECK(repeatedAt >= returnedAt);
+    }
+    CHECK(!session->releaseAll());
+    CHECK(session->state().empty());
+    session.reset();  // Join any repeat callback before its captured barrier is destroyed.
+}
+void disablingRepeatStopsSchedulingWithoutInventingAnUp() {
+    std::mutex barrier;
+    std::condition_variable changed;
+    bool repeatEntered = false, finishRepeat = false;
+    auto native = std::make_shared<Native>();
+    auto session = wrap(native);
+    native->afterTyped = [&] {
+        const auto events = native->events();
+        if (events.empty() || !events.back().key.repeat) return;
+        std::unique_lock<std::mutex> lock(barrier);
+        if (repeatEntered) return;
+        repeatEntered = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return finishRepeat; });
+    };
     DesktopInputOptions options;
     options.repeatDelayMs = 10;
     options.repeatPeriodMs = 10;
     CHECK(!session->inputEvents({raw(0x41)}, {}, {}, options));
     CHECK(waitUntil([&] { return native->events().size() > 1; }));
-    CHECK(!session->inputEvents({relative()}, {}, {}, noRepeat()));
+    {
+        std::unique_lock<std::mutex> lock(barrier);
+        CHECK(changed.wait_for(lock, std::chrono::seconds(1), [&] { return repeatEntered; }));
+    }
+    const auto before = native->events().size();
+    const auto disabled = session->inputEvents({relative()}, {}, {}, noRepeat());
+    std::printf("Repeat-disable first admission: code=%d error=%s\n", int(disabled.code()), disabled.message().c_str());
+    CHECK(disabled.code() == MaiErrorCode::Busy &&
+          disabled.message() == "another ordinary input operation or cleanup is in flight");
+    CHECK(native->events().size() == before && native->options().keyboardRepeat);
+    {
+        std::lock_guard<std::mutex> lock(barrier);
+        finishRepeat = true;
+        changed.notify_all();
+    }
+    // Only this exact policy admission refusal has no effects. A native Busy,
+    // target failure or Internal result must fail rather than be retried.
+    auto admitted = disabled;
+    const auto deadline = Clock::now() + std::chrono::milliseconds(500);
+    while (admitted.code() == MaiErrorCode::Busy &&
+           admitted.message() == "another ordinary input operation or cleanup is in flight" &&
+           Clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        admitted = session->inputEvents({relative()}, {}, {}, noRepeat());
+    }
+    CHECK(!admitted);
+    const auto events = native->events();
+    CHECK(std::count_if(events.begin(), events.end(),
+                        [](const auto& event) { return event.kind == Kind::RelativeMove; }) == 1);
     const auto count = native->transitions().size();
     std::this_thread::sleep_for(std::chrono::milliseconds(35));
     CHECK(native->transitions().size() == count && session->state().rawKeys.size() == 1);
@@ -531,20 +625,50 @@ void operationSerializationAndBusyReset() {
 void resetStopsRepeatAndKeepsScopeValidation() {
     auto native = std::make_shared<Native>();
     std::atomic<bool> targetValid{true};
+    std::mutex repeatBarrier;
+    std::condition_variable repeatChanged;
+    bool repeatEntered = false, returnRepeat = false;
     auto session = wrap(
         native, [&](const auto&) { return targetValid ? MaiError{} : MaiError{MaiErrorCode::Busy, "target lost"}; });
     DesktopInputOptions options;
     options.repeatDelayMs = 10;
     options.repeatPeriodMs = 10;
+    native->afterTyped = [&] {
+        if (native->events().size() <= 1) return;
+        std::unique_lock<std::mutex> lock(repeatBarrier);
+        repeatEntered = true;
+        repeatChanged.notify_all();
+        repeatChanged.wait(lock, [&] { return returnRepeat; });
+    };
     CHECK(!session->inputEvents({raw(0x41)}, {}, {}, options));
     CHECK(waitUntil([&] { return native->events().size() > 1; }));
-    CHECK(!session->resetControls());
+    {
+        std::unique_lock<std::mutex> lock(repeatBarrier);
+        CHECK(repeatChanged.wait_for(lock, std::chrono::milliseconds(400), [&] { return repeatEntered; }));
+    }
+    CHECK(session->resetControls().code() == MaiErrorCode::Busy && native->resets == 0);
+    {
+        std::lock_guard<std::mutex> lock(repeatBarrier);
+        returnRepeat = true;
+        repeatChanged.notify_all();
+    }
+    MaiError reset;
+    bool settled = false;
+    CHECK(waitUntil([&] {
+        if (settled) return true;
+        reset = session->resetControls();
+        settled = reset.code() != MaiErrorCode::Busy ||
+                  reset.message() != "another ordinary input operation or cleanup is in flight";
+        return settled;
+    }));
+    CHECK(!reset);
     const auto count = native->events().size();
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     CHECK(native->events().size() == count && native->resets == 1 && session->state().empty());
     targetValid = false;
     CHECK(session->validate());
     CHECK(!session->resetControls());
+    native->afterTyped = {};
 }
 void scopeAndWatchdogValidationStayOutsidePolicyLock() {
     auto native = std::make_shared<Native>();
@@ -717,6 +841,39 @@ void freshLegacyHoldDoesNotInheritAResolvedAsyncFailure() {
     CHECK(!session->input(legacy) && session->state().empty());
 }
 
+void fractionalRepeatPolicyAndDefaultReset() {
+    for (const double period : {17.5, 1500.25, 2147483647.0, std::numeric_limits<double>::denorm_min()}) {
+        auto native = std::make_shared<Native>();
+        auto session = wrap(native);
+        auto options = noRepeat();
+        options.repeatDelayMs = 2147483647;
+        options.repeatPeriodMs = static_cast<decltype(options.repeatPeriodMs)>(period);
+        const auto configured = session->inputEvents({relative()}, {}, {}, options);
+        CHECK(!configured);
+        if (configured) continue;
+        CHECK(native->options().repeatDelayMs == 2147483647 && native->options().repeatPeriodMs == period);
+        DesktopInputOptions inherited;
+        inherited.inheritExisting = true;
+        CHECK(!session->inputEvents({relative()}, {}, {}, inherited));
+        CHECK(native->options().repeatPeriodMs == period && native->options().repeatDelayMs == 2147483647);
+        CHECK(!session->inputEvents({relative()}, {}, {}, {}));
+        CHECK(native->options().repeatPeriodMs == 1000.0 / 24.9 && native->options().repeatDelayMs == 500);
+    }
+    for (const double period : {0.5, 1500.25, 2147483647.0, std::numeric_limits<double>::denorm_min()}) {
+        auto native = std::make_shared<Native>();
+        auto session = wrap(native);
+        DesktopInputOptions options;
+        options.repeatDelayMs = 1;
+        options.repeatPeriodMs = static_cast<decltype(options.repeatPeriodMs)>(period);
+        const auto pressed = session->inputEvents({raw(0x41)}, {}, {}, options);
+        CHECK(!pressed);
+        if (pressed) continue;
+        CHECK(waitUntil([&] { return native->events().size() > 1; }));
+        CHECK(native->options().repeatPeriodMs == period);
+        CHECK(!session->releaseAll() && session->state().empty());
+    }
+}
+
 void reenterReadInputResetAndRelease(const std::shared_ptr<DesktopNativeInputSession>& session, bool held) {
     CHECK(session->state().empty() != held);
     CHECK(!session->validate());
@@ -807,6 +964,7 @@ int main() {
     preflightAndCleanupFailures();
     nativeOwnsAliasesAndFrozenBindings();
     repeatUsesOnlyNativeSourceProjection();
+    firstRepeatDelayStartsBeforeSlowNativeDispatch();
     disablingRepeatStopsSchedulingWithoutInventingAnUp();
     policyLeavesSecureIntentToTheNative();
     delaysAndCancellation();
@@ -822,6 +980,7 @@ int main() {
     staleWatchSnapshotCannotRejectAReplacementScope();
     freshLegacyHoldDoesNotInheritAResolvedAsyncFailure();
     callerCallbacksCanReenterWithoutOwnedMutexAttempts();
+    fractionalRepeatPolicyAndDefaultReset();
     validatorAndNativeCallbacksCanReenter();
 #if defined(MAI_COMMON_MUTEX_AUDIT)
     CHECK(commonMutexReentryAttempts() == 0);
