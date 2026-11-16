@@ -35,6 +35,9 @@
 #include <QSplitter>
 #include <QSplitterHandle>
 #include <QMouseEvent>
+#include <QNativeGestureEvent>
+#include <QPointingDevice>
+#include <QPropertyAnimation>
 #include <QStringList>
 #include <QStackedWidget>
 #include <QDir>
@@ -405,6 +408,14 @@ private slots:
     void fileBubbleOffersContextMenu();
     void imageBubbleOffersContextMenu();
     void imageBubbleUsesNativePixmapPreview();
+    void imagePreviewZoomsAndPans_data();
+    void imagePreviewZoomsAndPans();
+    void imagePreviewZoomKeepsHighDpiSourceAcrossResize();
+    void imagePreviewPreciseZeroPixelDoesNotZoom();
+    void imagePreviewZoomConvergesWhileClosing_data();
+    void imagePreviewZoomConvergesWhileClosing();
+    void imagePreviewCloseProgressContinuesWhenGeometryStops_data();
+    void imagePreviewCloseProgressContinuesWhenGeometryStops();
     void imagePreviewUsesWhiteCanvasOnlyForActualTransparency();
     void maximizedImageBubbleOpensOnlyOnePreview();
     void imagePreviewKeepsTheSameVisibleWindowDuringAnimation();
@@ -5111,6 +5122,355 @@ void MainWindowLayoutTest::imageBubbleOffersContextMenu() {
 }
 
 // 静态像素回归使用真实预览 Dialog；Alpha 通道容器不能直接等同于透明内容。
+void MainWindowLayoutTest::imagePreviewZoomsAndPans_data() {
+    QTest::addColumn<bool>("nativePinch");
+    QTest::newRow("mouse-wheel-and-drag") << false;
+    QTest::newRow("native-pinch-and-trackpad-pan") << true;
+}
+
+void MainWindowLayoutTest::imagePreviewZoomsAndPans() {
+    QFETCH(bool, nativePinch);
+    QImage pixels(640, 480, QImage::Format_RGB32);
+    {
+        QPainter painter(&pixels);
+        painter.fillRect(QRect(0, 0, 320, 240), Qt::red);
+        painter.fillRect(QRect(320, 0, 320, 240), Qt::green);
+        painter.fillRect(QRect(0, 240, 320, 240), Qt::blue);
+        painter.fillRect(QRect(320, 240, 320, 240), Qt::yellow);
+    }
+    QPixmap original = QPixmap::fromImage(pixels);
+    original.setDevicePixelRatio(nativePinch ? 2 : 1);
+    ImagePreviewDialog preview(original);
+    preview.resize(320, 240);
+    preview.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&preview));
+    const WId identity = preview.winId();
+    const auto captureEvidence = [&](const QString& stage) {
+        const QString directory = qEnvironmentVariable("MAICHAT_IMAGE_ZOOM_EVIDENCE_DIR");
+        if (directory.isEmpty()) return;
+        QVERIFY(QDir().mkpath(directory));
+        QVERIFY(preview.grab().save(QDir(directory).filePath(QString::fromLatin1(QTest::currentDataTag()) +
+                                                             QStringLiteral("-") + stage + QStringLiteral(".png"))));
+    };
+    const auto sample = [&] {
+        const QPixmap frame = preview.grab();
+        return frame.toImage().pixelColor(qRound(170 * frame.devicePixelRatioF()),
+                                          qRound(130 * frame.devicePixelRatioF()));
+    };
+    QCOMPARE(sample(), QColor(Qt::yellow));
+    captureEvidence(QStringLiteral("fit"));
+    const QPointF anchor(80, 60);
+    const QPointF global = preview.mapToGlobal(anchor.toPoint());
+    if (nativePinch) {
+        // Use Cocoa's public Qt event contract, including its begin/end sequence.
+        // This reaches a real native window; it does not claim hardware touch injection.
+        for (const auto type : {Qt::BeginNativeGesture, Qt::ZoomNativeGesture, Qt::EndNativeGesture}) {
+            QNativeGestureEvent event(type, QPointingDevice::primaryPointingDevice(), 2, anchor, anchor, global,
+                                      type == Qt::ZoomNativeGesture ? 1.0 : 0.0, {});
+            QApplication::sendEvent(&preview, &event);
+        }
+    } else {
+        QWheelEvent event(anchor, global, {}, QPoint(0, 480), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(&preview, &event);
+    }
+    QCOMPARE(sample(), QColor(Qt::red));
+    captureEvidence(QStringLiteral("zoom"));
+    QCOMPARE(preview.winId(), identity);
+    if (nativePinch) {
+        QWheelEvent event(anchor, global, QPoint(-140, -100), {}, Qt::NoButton, Qt::NoModifier, Qt::ScrollUpdate,
+                          false);
+        QApplication::sendEvent(&preview, &event);
+    } else {
+        QTest::mousePress(&preview, Qt::LeftButton, Qt::NoModifier, QPoint(160, 120));
+        QMouseEvent move(QEvent::MouseMove, QPointF(20, 20), preview.mapToGlobal(QPoint(20, 20)), Qt::NoButton,
+                         Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&preview, &move);
+        QTest::mouseRelease(&preview, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
+    }
+    QVERIFY2(preview.isVisible(), "A pan must not trigger the original click-to-close path");
+    QCOMPARE(sample(), QColor(Qt::yellow));
+    captureEvidence(QStringLiteral("pan"));
+    QTest::mouseClick(&preview, Qt::LeftButton);
+    QVERIFY(preview.isVisible());
+    QTest::mouseDClick(&preview, Qt::LeftButton);
+    QVERIFY(preview.isVisible());
+    QCOMPARE(sample(), QColor(Qt::yellow));
+    captureEvidence(QStringLiteral("reset"));
+    QCOMPARE(preview.sourceImage().cacheKey(), original.cacheKey());
+    QCOMPARE(preview.winId(), identity);
+    // At fit size the original one-click close remains available.
+    QTest::mouseClick(&preview, Qt::LeftButton);
+    QVERIFY(!preview.isVisible());
+}
+
+void MainWindowLayoutTest::imagePreviewZoomKeepsHighDpiSourceAcrossResize() {
+    QPixmap original(640, 480);
+    original.fill(Qt::red);
+    original.setDevicePixelRatio(2);
+    ImagePreviewDialog preview(original);
+    preview.resize(320, 240);
+    preview.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&preview));
+    const auto pinch = [&](qreal value) {
+        const QPointF point(100, 70);
+        QNativeGestureEvent event(Qt::ZoomNativeGesture, QPointingDevice::primaryPointingDevice(), 2, point, point,
+                                  preview.mapToGlobal(point.toPoint()), value, {});
+        QApplication::sendEvent(&preview, &event);
+    };
+    pinch(1000);
+    preview.resize(420, 280);
+    QCoreApplication::processEvents();
+    QTest::mousePress(&preview, Qt::LeftButton, Qt::NoModifier, QPoint(200, 140));
+    QMouseEvent move(QEvent::MouseMove, QPointF(-20000, -20000), QPointF(-20000, -20000), Qt::NoButton, Qt::LeftButton,
+                     Qt::NoModifier);
+    QApplication::sendEvent(&preview, &move);
+    QTest::mouseRelease(&preview, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
+    const QPixmap frame = preview.grab();
+    const QImage capture = frame.toImage();
+    for (const QPoint point : {QPoint(20, 20), QPoint(400, 20), QPoint(20, 260), QPoint(400, 260)})
+        QCOMPARE(capture.pixelColor(qRound(point.x() * frame.devicePixelRatioF()),
+                                    qRound(point.y() * frame.devicePixelRatioF())),
+                 QColor(Qt::red));
+    QVERIFY(preview.isVisible());
+    QCOMPARE(preview.sourceImage().size(), QSize(640, 480));
+    QCOMPARE(preview.sourceImage().devicePixelRatioF(), 2.0);
+    QCOMPARE(preview.sourceImage().cacheKey(), original.cacheKey());
+    pinch(-0.999999999);
+    QTest::mouseClick(&preview, Qt::LeftButton);
+    QVERIFY(!preview.isVisible());
+}
+
+void MainWindowLayoutTest::imagePreviewPreciseZeroPixelDoesNotZoom() {
+    QPixmap original(640, 480);
+    original.fill(Qt::red);
+    ImagePreviewDialog preview(original);
+    preview.resize(320, 240);
+    preview.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&preview));
+    const QPointF point(100, 70);
+    // Cocoa can truncate a fractional precise pixel delta to zero while still
+    // reporting a nonzero angle delta. This is a pan-stream no-op, not zoom.
+    QWheelEvent event(point, preview.mapToGlobal(point.toPoint()), {}, QPoint(0, 1), Qt::NoButton, Qt::NoModifier,
+                      Qt::ScrollUpdate, false);
+    QApplication::sendEvent(&preview, &event);
+    QTest::mouseClick(&preview, Qt::LeftButton);
+    QVERIFY2(!preview.isVisible(), "Zero-pixel precise scrolling must leave fit-size click-to-close intact");
+}
+
+void MainWindowLayoutTest::imagePreviewZoomConvergesWhileClosing_data() {
+    QTest::addColumn<int>("closeKind");
+    QTest::newRow("escape") << 0;
+    QTest::newRow("enter") << 1;
+    QTest::newRow("window-close") << 2;
+}
+
+void MainWindowLayoutTest::imagePreviewZoomConvergesWhileClosing() {
+    QFETCH(int, closeKind);
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("owned-zoom-close.png"));
+    QImage image(640, 480, QImage::Format_RGB32);
+    {
+        QPainter painter(&image);
+        painter.fillRect(QRect(0, 0, 320, 240), Qt::red);
+        painter.fillRect(QRect(320, 0, 320, 240), Qt::green);
+        painter.fillRect(QRect(0, 240, 320, 240), Qt::blue);
+        painter.fillRect(QRect(320, 240, 320, 240), Qt::yellow);
+    }
+    QVERIFY(image.save(path));
+    RemoteIMApplication app(QStringLiteral("owned-zoom-close"), std::make_unique<FakeRemoteIMClient>());
+    app.addContact(QStringLiteral("owned-peer"), QStringLiteral("Owned"));
+    app.chatState().receiveImage(QStringLiteral("owned-peer"), path, 640, 480, 100);
+    app.selectPeer(QStringLiteral("owned-peer"));
+    MainWindow window(app);
+    window.resize(1200, 800);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* source = window.findChild<QLabel*>(QStringLiteral("messageImageLabel"));
+    QVERIFY(source);
+    QTRY_VERIFY(!source->pixmap().isNull() && source->isVisible() && !source->visibleRegion().isEmpty());
+    const auto cleanup = qScopeGuard([&] {
+        for (auto* dialog : window.findChildren<ImagePreviewDialog*>()) {
+            dialog->setCloseHandler({});
+            dialog->close();
+        }
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    });
+    QTest::mouseClick(source, Qt::LeftButton);
+    QPointer<ImagePreviewDialog> preview = window.findChild<ImagePreviewDialog*>(QStringLiteral("imagePreviewDialog"));
+    QVERIFY(preview && preview->isVisible());
+    QTRY_COMPARE(preview->size(), QSize(640, 480));
+    QTest::qWait(30);
+    const WId identity = preview->winId();
+    const QPointF anchor(preview->width() / 4.0, preview->height() / 4.0);
+    QNativeGestureEvent zoom(Qt::ZoomNativeGesture, QPointingDevice::primaryPointingDevice(), 2, anchor, anchor,
+                             preview->mapToGlobal(anchor.toPoint()), 1.0, {});
+    QApplication::sendEvent(preview, &zoom);
+    QWheelEvent pan(anchor, preview->mapToGlobal(anchor.toPoint()), QPoint(15, 10), {}, Qt::NoButton, Qt::NoModifier,
+                    Qt::ScrollUpdate, false);
+    QApplication::sendEvent(preview, &pan);
+    const auto boundary = [](const QImage& frame) {
+        const int row = frame.height() / 8;
+        for (int x = 0; x < frame.width(); ++x) {
+            const QColor color = frame.pixelColor(x, row);
+            if (color.green() > 200 && color.red() < 40 && color.blue() < 40) return qreal(x) / frame.width();
+        }
+        return -1.0;
+    };
+    const qreal zoomedBoundary = boundary(preview->grab().toImage());
+    QVERIFY(zoomedBoundary > 0.7);
+    if (closeKind == 0)
+        QTest::keyClick(preview, Qt::Key_Escape);
+    else if (closeKind == 1)
+        QTest::keyClick(preview, Qt::Key_Return);
+    else
+        preview->close();
+    QVERIFY2(preview && preview->isVisible(), "The same window must perform the close handoff");
+    const qreal initialBoundary = boundary(preview->grab().toImage());
+    QVERIFY2(initialBoundary > 0.7, "Closing must not reset the image transform before animation");
+    bool intermediate = false;
+    bool converged = false;
+    qreal lastBoundary = initialBoundary;
+    QList<QImage> frames;
+    QElapsedTimer timeout;
+    timeout.start();
+    while (preview && timeout.elapsed() < 1500) {
+        if (preview->isVisible()) {
+            QCOMPARE(preview->winId(), identity);
+            const QImage frame = preview->grab().toImage();
+            const qreal fraction = boundary(frame);
+            lastBoundary = fraction;
+            intermediate = intermediate || (fraction > 0.55 && fraction < 0.70);
+            converged = converged || (fraction >= 0.48 && fraction <= 0.53);
+            frames.push_back(frame);
+        }
+        QTest::qWait(7);
+    }
+    QVERIFY(preview.isNull());
+    qInfo() << "[zoom-close-transform]" << "initial" << initialBoundary << "last" << lastBoundary << "frames"
+            << frames.size() << "intermediate" << intermediate << "converged" << converged;
+    QVERIFY2(intermediate, "The image transform must converge continuously while the same native window shrinks");
+    QVERIFY2(converged, "The last visible image must approach the full source thumbnail rather than a zoomed crop");
+    QVERIFY(source->isVisible());
+    const QString evidence = qEnvironmentVariable("MAICHAT_IMAGE_ZOOM_EVIDENCE_DIR");
+    if (!evidence.isEmpty()) {
+        QVERIFY(QDir().mkpath(evidence));
+        // Compress after the animation, so evidence I/O does not stall its frames.
+        for (const qsizetype index : {qsizetype(0), frames.size() / 2, frames.size() - 1})
+            QVERIFY(frames[index].save(QDir(evidence).filePath(QStringLiteral("close-") +
+                                                               QString::fromLatin1(QTest::currentDataTag()) +
+                                                               QStringLiteral("-%1.png").arg(index))));
+    }
+}
+
+void MainWindowLayoutTest::imagePreviewCloseProgressContinuesWhenGeometryStops_data() {
+    QTest::addColumn<bool>("constantGeometry");
+    QTest::newRow("constant-geometry") << true;
+    QTest::newRow("positive-edges-shrink-up-left") << false;
+}
+
+void MainWindowLayoutTest::imagePreviewCloseProgressContinuesWhenGeometryStops() {
+    QFETCH(bool, constantGeometry);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("owned-close-plateau.png"));
+    QImage image(640, 480, QImage::Format_RGB32);
+    {
+        QPainter painter(&image);
+        painter.fillRect(QRect(0, 0, 320, 240), Qt::red);
+        painter.fillRect(QRect(320, 0, 320, 240), Qt::green);
+        painter.fillRect(QRect(0, 240, 320, 240), Qt::blue);
+        painter.fillRect(QRect(320, 240, 320, 240), Qt::yellow);
+    }
+    QVERIFY(image.save(path));
+    RemoteIMApplication app(QStringLiteral("owned-close-plateau"), std::make_unique<FakeRemoteIMClient>());
+    app.addContact(QStringLiteral("owned-peer"), QStringLiteral("Owned"));
+    app.chatState().receiveImage(QStringLiteral("owned-peer"), path, 640, 480, 100);
+    app.selectPeer(QStringLiteral("owned-peer"));
+    MainWindow window(app);
+    window.resize(1200, 800);
+    window.move(100, 100);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* source = window.findChild<QLabel*>(QStringLiteral("messageImageLabel"));
+    QVERIFY(source);
+    QTRY_VERIFY(!source->pixmap().isNull() && source->isVisible() && !source->visibleRegion().isEmpty());
+    const auto cleanup = qScopeGuard([&] {
+        for (auto* dialog : window.findChildren<ImagePreviewDialog*>()) {
+            dialog->setCloseHandler({});
+            dialog->close();
+        }
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    });
+    QTest::mouseClick(source, Qt::LeftButton);
+    QPointer<ImagePreviewDialog> preview = window.findChild<ImagePreviewDialog*>(QStringLiteral("imagePreviewDialog"));
+    QVERIFY(preview && preview->isVisible());
+    QTRY_COMPARE(preview->size(), QSize(640, 480));
+    QTest::qWait(30);
+    const WId identity = preview->winId();
+    const qint64 sourceCacheKey = preview->sourceImage().cacheKey();
+    const QPointF anchor(preview->width() / 4.0, preview->height() / 4.0);
+    QNativeGestureEvent zoom(Qt::ZoomNativeGesture, QPointingDevice::primaryPointingDevice(), 2, anchor, anchor,
+                             preview->mapToGlobal(anchor.toPoint()), 1000.0, {});
+    QApplication::sendEvent(preview, &zoom);
+    QTest::keyClick(preview, Qt::Key_Escape);
+    QVERIFY2(preview && preview->isVisible(), "The source must remain valid for an animated close");
+    QPropertyAnimation* closing = nullptr;
+    for (auto* animation : preview->findChildren<QPropertyAnimation*>()) {
+        if (animation->propertyName() == QByteArrayLiteral("geometry") &&
+            animation->state() == QAbstractAnimation::Running)
+            closing = animation;
+    }
+    QVERIFY(closing);
+    // Read the production endpoint after native framing, lazy thumbnail layout
+    // and the current screen DPR have settled. Reconstructing it before opening
+    // can describe an earlier pixmap/layout state rather than this actual close.
+    const QRect destination = closing->endValue().toRect();
+    QVERIFY(destination.left() > 0 && destination.top() > 0 && !destination.isEmpty());
+    QCOMPARE(closing->duration(), 220);
+    QCOMPARE(closing->easingCurve().type(), QEasingCurve::OutCubic);
+    // Keep the real widget and animation, but control time so timer scheduling
+    // cannot hide an integer-geometry plateau or turn this into a timing flake.
+    closing->pause();
+    closing->setCurrentTime(0);
+    // Keep the real close target and either remove geometric movement entirely,
+    // or make every positive edge shrink toward it and plateau before 220ms.
+    const QRect start = constantGeometry
+                            ? destination
+                            : QRect(destination.topLeft() + QPoint(100, 100), destination.size() + QSize(80, 60));
+    closing->setStartValue(start);
+    QCOMPARE(preview->geometry(), start);
+    const auto boundary = [&] {
+        const QImage frame = preview->grab().toImage();
+        const int row = frame.height() / 8;
+        for (int x = 0; x < frame.width(); ++x) {
+            const QColor color = frame.pixelColor(x, row);
+            if (color.green() > 200 && color.red() < 40 && color.blue() < 40)
+                return qreal(x) / frame.width();
+        }
+        return -1.0;
+    };
+    qreal intermediateBoundary = -1;
+    for (int time = 1; time <= 200; ++time) {
+        closing->setCurrentTime(time);
+        if (time == 160) intermediateBoundary = boundary();
+    }
+    const qreal plateauBoundary = boundary();
+    qInfo() << "[zoom-close-geometry-plateau]" << "constant" << constantGeometry << "start" << start
+            << "destination" << destination << "intermediate" << intermediateBoundary << "at200ms"
+            << plateauBoundary;
+    QCOMPARE(preview->geometry(), destination);
+    QVERIFY2(intermediateBoundary > 0.62 && intermediateBoundary < 0.70,
+             "Image content must converge continuously even if the geometry never changes");
+    QVERIFY2(plateauBoundary > 0.49 && plateauBoundary < 0.52,
+             "The image clock must keep advancing after integer geometry reaches its destination");
+    closing->setCurrentTime(219);
+    const qreal finalBoundary = boundary();
+    QVERIFY(finalBoundary > 0.49 && finalBoundary < 0.51);
+    QCOMPARE(preview->winId(), identity);
+    QCOMPARE(preview->sourceImage().cacheKey(), sourceCacheKey);
+    QVERIFY(preview->isVisible());
+}
+
 void MainWindowLayoutTest::imagePreviewUsesWhiteCanvasOnlyForActualTransparency() {
     const QColor foreground(32, 160, 64);
     const auto check = [&](const QImage& input, const QColor& canvas) {

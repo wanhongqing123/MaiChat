@@ -7161,7 +7161,7 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
           *closing = true;
           if (*opening) (*opening)->stop();
           // 始终移动当前同一窗口；原缩略图留在原位置，终点不会露出等待重绘的空洞。
-          auto* shrink = new QPropertyAnimation(dialog, "geometry", dialog);
+          auto* shrink = dialog->createCloseAnimation();
           shrink->setDuration(220);
           shrink->setEasingCurve(QEasingCurve::OutCubic);
           shrink->setStartValue(dialog->geometry());

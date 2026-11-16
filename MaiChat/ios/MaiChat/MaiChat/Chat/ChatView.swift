@@ -470,7 +470,8 @@ enum RemoteIMStyle {
     static let navAssistantSoft = AppAppearance.color(AppTypographyTokens.purpleSoftColor, AppTypographyTokens.purpleSoftDarkColor)
     static let navContacts = Color(red: 25 / 255.0, green: 140 / 255.0, blue: 115 / 255.0)
     static let navContactsSoft = AppAppearance.color(AppTypographyTokens.contactSoftColor, AppTypographyTokens.contactSoftDarkColor)
-    static let navProfile = Color(red: 83 / 255.0, green: 101 / 255.0, blue: 122 / 255.0)
+    // “我的”选中态沿用品牌蓝，避免灰蓝色看起来仍像未选中的图标。
+    static let navProfile = blue
     static let navProfileSoft = AppAppearance.color(AppTypographyTokens.profileSoftColor, AppTypographyTokens.profileSoftDarkColor)
 }
 
