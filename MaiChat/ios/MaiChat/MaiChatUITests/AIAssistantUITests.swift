@@ -1128,6 +1128,10 @@ final class AIAssistantUITests: XCTestCase {
         app.launchArguments = ["--ai-ui-test", "--ai-welcome-ui-test"]
         app.launch()
         XCTAssertTrue(app.staticTexts["从这里开始创作"].waitForExistence(timeout: 15))
+        XCTAssertFalse(app.staticTexts["AI 问答"].exists)
+        XCTAssertFalse(app.staticTexts["图片创作"].exists)
+        XCTAssertFalse(app.staticTexts["视频创作"].exists)
+        XCTAssertTrue(app.textViews["ai-composer"].exists)
         XCTAssertTrue(app.staticTexts["会话定时任务"].exists)
         XCTAssertTrue(app.staticTexts["二维码生成"].exists)
         XCTAssertFalse(app.staticTexts["整屏截屏"].exists)

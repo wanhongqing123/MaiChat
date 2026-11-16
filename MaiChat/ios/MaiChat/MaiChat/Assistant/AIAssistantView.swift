@@ -1235,9 +1235,7 @@ private struct AIAssistantMessageList: View {
 
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 10),
                                 GridItem(.flexible(), spacing: 10)], spacing: 10) {
-                welcomeFeature("AI 问答", icon: "text.bubble")
-                welcomeFeature("图片创作", icon: "photo")
-                welcomeFeature("视频创作", icon: "play.rectangle")
+                // 空态不列出基础聊天或已禁用的图片、视频创作入口。
                 welcomeFeature("文件处理", icon: "doc.text")
                 if aiSupportsWholeDeviceScreenCapture() {
                     welcomeFeature("整屏截屏", icon: "rectangle.on.rectangle")
