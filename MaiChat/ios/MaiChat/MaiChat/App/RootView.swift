@@ -781,11 +781,12 @@ private struct CompactTabBar: View {
     @EnvironmentObject private var appState: RemoteIMAppState
 
     var body: some View {
+        // 底部导航统一用品牌蓝表达选中状态，切换页面时保持一致的视觉反馈。
         HStack(spacing: 8) {
             TabButton(
                 title: "消息",
                 imageName: "NavMessages",
-                accent: RemoteIMStyle.navMessages,
+                accent: RemoteIMStyle.blue,
                 selected: selectedTab == .messages,
                 badgeCount: appState.totalUnreadCount
             ) {
@@ -803,7 +804,7 @@ private struct CompactTabBar: View {
             TabButton(
                 title: "创作中心",
                 imageName: "NavAssistant",
-                accent: RemoteIMStyle.navAssistant,
+                accent: RemoteIMStyle.blue,
                 selected: selectedTab == .assistant
             ) {
                 openAssistant()
@@ -811,7 +812,7 @@ private struct CompactTabBar: View {
             TabButton(
                 title: "好友列表",
                 imageName: "NavContacts",
-                accent: RemoteIMStyle.navContacts,
+                accent: RemoteIMStyle.blue,
                 selected: selectedTab == .contacts
             ) {
                 selectedTab = .contacts
@@ -819,7 +820,7 @@ private struct CompactTabBar: View {
             TabButton(
                 title: "我的",
                 imageName: "NavProfile",
-                accent: RemoteIMStyle.navProfile,
+                accent: RemoteIMStyle.blue,
                 selected: selectedTab == .me
             ) {
                 selectedTab = .me
