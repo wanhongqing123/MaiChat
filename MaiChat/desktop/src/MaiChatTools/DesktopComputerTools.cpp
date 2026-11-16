@@ -53,7 +53,11 @@ struct ObservedWindow {
 };
 
 bool currentWindowMatches(const DesktopNativeWindow& before, const DesktopNativeWindow& now) {
-    return before.id == now.id && before.processId == now.processId && before.title == now.title &&
+    // Discovery includes windows that cannot issue or retain an actionable
+    // observation. Recheck this state after capture and before using old tokens.
+    return !before.minimized && !before.cloaked && before.boundsAvailable &&
+           !now.minimized && !now.cloaked && now.boundsAvailable &&
+           before.id == now.id && before.processId == now.processId && before.title == now.title &&
            std::abs(before.x - now.x) < 3 && std::abs(before.y - now.y) < 3 && std::abs(before.width - now.width) < 3 &&
            std::abs(before.height - now.height) < 3;
 }
@@ -226,6 +230,12 @@ Json windowJson(const DesktopNativeWindow& window) {
             {"process_id", window.processId},
             {"title", window.title},
             {"application", window.application},
+            {"minimized", window.minimized},
+            {"cloaked", window.cloaked},
+            {"bounds_available", window.boundsAvailable},
+            {"tool_window", window.toolWindow},
+            {"owner_window_id", std::to_string(window.ownerId)},
+            {"class_name", window.className},
             {"bounds", {{"x", window.x}, {"y", window.y}, {"width", window.width}, {"height", window.height}}}};
 }
 
@@ -585,7 +595,9 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(
     if (count != 1)
         return {MaiErrorCode::NotFound, count == 0 ? "exact visible window title was not found"
                                                    : "window title is ambiguous; select a unique title"};
-    if (!std::isfinite(selected.width) || !std::isfinite(selected.height) || selected.width <= 0 ||
+    if (selected.minimized || selected.cloaked)
+        return {MaiErrorCode::Busy, "selected window is minimized or cloaked and cannot currently be observed"};
+    if (!selected.boundsAvailable || !std::isfinite(selected.width) || !std::isfinite(selected.height) || selected.width <= 0 ||
         selected.height <= 0)
         return {MaiErrorCode::InvalidInput, "selected window has invalid bounds"};
 
@@ -1097,7 +1109,9 @@ public:
         return "Operate the desktop through native mouse/keyboard input. Choose operations and "
                "observation timing from the task and current state; no fixed click/type sequence is required.\n"
                "CAPABILITIES: list discovers windows, list_displays discovers displays, and list_keys "
-               "lists named keys. target=display observe provides a whole-screen image and native "
+               "lists named keys. Discovery can include minimized/cloaked windows and unavailable bounds; "
+               "being listed does not mean a window can currently be observed or receive input. "
+               "Use window_id to select an untitled window. target=display observe provides a whole-screen image and native "
                "bounds; target=window observe provides window bounds and Accessibility/UIA elements "
                "without a window image. Prefer display scope for visual/cross-application work. "
                "Specify target explicitly on observe/input; omitted target means window. Click, "
@@ -1349,7 +1363,8 @@ public:
             if (!windows) return failure(windows.error());
             Json items = Json::array();
             for (const auto& window : windows.value()) items.push_back(windowJson(window));
-            Json output{{"windows", items}, {"next_step", "Observe the selected window_id before an action."}};
+            Json output{{"windows", items}, {"count", items.size()},
+                        {"next_step", "Observe the selected window_id before an action."}};
 #if defined(Q_OS_MAC)
             output["platform"] = "macos";
             output["select_all_key"] = "Cmd+A";

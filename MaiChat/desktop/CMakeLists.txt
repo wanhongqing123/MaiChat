@@ -1319,6 +1319,12 @@ add_test(NAME desktop_computer_native_integration COMMAND desktop_computer_nativ
 set_tests_properties(desktop_computer_native_integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
 
 if(WIN32)
+  add_executable(desktop_computer_window_list_native_test tests/DesktopComputerWindowListNativeTest.cpp)
+  set_target_properties(desktop_computer_window_list_native_test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+  target_compile_definitions(desktop_computer_window_list_native_test PRIVATE _WIN32_WINNT=0x0A00 NOMINMAX)
+  target_link_libraries(desktop_computer_window_list_native_test PRIVATE maichat_agent Qt6::Widgets user32)
+  add_test(NAME desktop_computer_window_list_native COMMAND desktop_computer_window_list_native_test)
+  set_tests_properties(desktop_computer_window_list_native PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
   add_executable(desktop_computer_windows_touch_test tests/DesktopComputerWindowsTouchTest.cpp)
   set_target_properties(desktop_computer_windows_touch_test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
   target_link_libraries(desktop_computer_windows_touch_test PRIVATE maichat_desktop_pointer maichat_desktop_input_types)

@@ -544,29 +544,48 @@ MaiResult<std::vector<DesktopNativeDisplay>> maiDesktopDisplays() {
 MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows() {
     DpiScope dpi;
     std::vector<DesktopNativeWindow> windows;
-    EnumWindows(
+    const BOOL enumerated = EnumWindows(
         [](HWND window, LPARAM parameter) -> BOOL {
             auto* output = reinterpret_cast<std::vector<DesktopNativeWindow>*>(parameter);
-            if (output->size() >= 200) return FALSE;
-            if (!IsWindowVisible(window) || IsIconic(window) || GetWindowTextLengthW(window) <= 0) return TRUE;
-            const int length = GetWindowTextLengthW(window);
-            std::vector<wchar_t> title(std::size_t(length + 1));
-            if (GetWindowTextW(window, title.data(), length + 1) <= 0) return TRUE;
-            RECT rectangle = visibleBounds(window);
-            const int width = rectangle.right - rectangle.left;
-            const int height = rectangle.bottom - rectangle.top;
-            if (width < 80 || height < 50) return TRUE;
+            // Discover real top-level windows independently of whether they can
+            // currently accept input. Hidden implementation windows and child
+            // controls are outside EnumWindows' visible top-level inventory.
+            if (!IsWindowVisible(window)) return TRUE;
             DWORD pid = 0;
-            GetWindowThreadProcessId(window, &pid);
-            if (pid == 0) return TRUE;
+            if (!GetWindowThreadProcessId(window, &pid) || !pid) return TRUE;
             DesktopNativeWindow candidate;
             candidate.id = std::uint64_t(reinterpret_cast<std::uintptr_t>(window));
             candidate.processId = pid;
-            candidate.title = utf8(title.data());
-            candidate.x = rectangle.left;
-            candidate.y = rectangle.top;
-            candidate.width = width;
-            candidate.height = height;
+            const int length = GetWindowTextLengthW(window);
+            if (length > 0) {
+                std::vector<wchar_t> title(std::size_t(length) + 1);
+                const int copied = GetWindowTextW(window, title.data(), int(title.size()));
+                if (copied > 0) candidate.title = utf8(std::wstring(title.data(), std::size_t(copied)));
+            }
+            // Untitled dialogs/popups retain their true empty caption. Their
+            // stable HWND/PID, native class and owner identify them instead.
+            wchar_t nativeClass[256]{};
+            const int classLength = GetClassNameW(window, nativeClass, int(std::size(nativeClass)));
+            if (classLength > 0) candidate.className = utf8(std::wstring(nativeClass, std::size_t(classLength)));
+            candidate.ownerId = std::uint64_t(reinterpret_cast<std::uintptr_t>(GetWindow(window, GW_OWNER)));
+            candidate.toolWindow = (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0;
+            candidate.minimized = IsIconic(window) != FALSE;
+            DWORD cloaked = 0;
+            if (DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked)) == S_OK)
+                candidate.cloaked = cloaked != 0;
+            // Iconic rectangles may be at -32000 and are not usable screen
+            // coordinates. Listing a minimized window must not restore it.
+            RECT rectangle{};
+            candidate.boundsAvailable = !candidate.minimized &&
+                ((DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &rectangle, sizeof(rectangle)) == S_OK &&
+                  rectangle.right > rectangle.left && rectangle.bottom > rectangle.top) ||
+                 (GetWindowRect(window, &rectangle) && rectangle.right > rectangle.left && rectangle.bottom > rectangle.top));
+            if (candidate.boundsAvailable) {
+                candidate.x = rectangle.left;
+                candidate.y = rectangle.top;
+                candidate.width = double(rectangle.right) - rectangle.left;
+                candidate.height = double(rectangle.bottom) - rectangle.top;
+            }
             HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
             if (process) {
                 wchar_t path[32768]{};
@@ -575,10 +594,15 @@ MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows() {
                     candidate.application = utf8(std::wstring(path, count));
                 CloseHandle(process);
             }
+            // Metadata queries can race destruction/handle reuse. Never
+            // publish a caption/frame together with another process identity.
+            DWORD afterPid = 0;
+            if (!GetWindowThreadProcessId(window, &afterPid) || afterPid != pid || !IsWindowVisible(window)) return TRUE;
             output->push_back(std::move(candidate));
             return TRUE;
         },
         reinterpret_cast<LPARAM>(&windows));
+    if (!enumerated) return {MaiErrorCode::Internal, "Windows could not enumerate top-level windows"};
     return windows;
 }
 

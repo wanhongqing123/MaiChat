@@ -241,6 +241,7 @@ public:
     MaiError readError;
     MaiError displayCaptureError;
     MaiError secureInputError;
+    std::function<void(int)> onWindows;
     std::function<void()> onActivate;
     std::function<void()> onCapture;
     std::function<void()> onDisplayCapture;
@@ -269,6 +270,7 @@ public:
     MaiResult<std::vector<DesktopNativeWindow>> windows() override {
         ++windowsCount;
         events.push_back("windows");
+        if (onWindows) onWindows(windowsCount);
         return visible;
     }
     MaiResult<std::vector<DesktopNativeDisplay>> displays() override {
@@ -2013,6 +2015,162 @@ void verifyKeyCatalogTool() {
     CHECK(backend->events.empty());
 }
 
+void makeWindowUnavailable(DesktopNativeWindow& window, int state) {
+    if (state == 0) window.minimized = true;
+    else if (state == 1) window.cloaked = true;
+    else window.boundsAvailable = false;
+}
+
+void verifyWindowDiscoveryMetadataAndUntitledSelection() {
+    auto backend = std::make_shared<RecordingBackend>();
+    backend->visible.clear();
+    for (std::uint64_t id = 1; id <= 205; ++id) {
+        DesktopNativeWindow window{id, 5001, "", "Fixture", 10, 20, 20, 12};
+        window.className = "OwnedUntitledProbe";
+        window.toolWindow = true;
+        window.ownerId = 9007199254740993ULL;
+        if (id == 2) window.minimized = true;
+        if (id == 3) window.cloaked = true;
+        if (id == 4) window.boundsAvailable = false;
+        backend->visible.push_back(window);
+    }
+    auto controller = std::make_shared<DesktopComputerController>(backend);
+    MaiToolRegistry registry;
+    registerDesktopComputerTools(registry, controller);
+    const auto tool = registry.find("desktop_computer");
+    CHECK(tool);
+    if (!tool) return;
+    MaiToolContext context;
+    context.sessionId = "window-discovery";
+    const auto result = tool->execute(R"({"action":"list"})", context);
+    CHECK(!result.hasError());
+    if (!result.hasError()) {
+        const auto output = Json::parse(result.output(), nullptr, false);
+        CHECK(output.is_object());
+        CHECK(output.value("count", 0) == 205);
+        CHECK(!output.contains("complete") && !output.contains("truncated"));
+        const auto windows = output.value("windows", Json::array());
+        CHECK(windows.size() == 205);
+        if (windows.size() == 205) {
+            const auto first = windows[0];
+            CHECK(first.value("title", std::string()) == "");
+            CHECK(first.value("class_name", std::string()) == "OwnedUntitledProbe");
+            CHECK(first.value("owner_window_id", std::string()) == "9007199254740993");
+            CHECK(first.value("tool_window", false));
+            CHECK(first.contains("minimized") && !first.value("minimized", true));
+            CHECK(first.contains("cloaked") && !first.value("cloaked", true));
+            CHECK(first.contains("bounds_available") && first.value("bounds_available", false));
+            CHECK(windows[1].value("minimized", false));
+            CHECK(windows[2].value("cloaked", false));
+            CHECK(windows[3].contains("bounds_available") && !windows[3].value("bounds_available", true));
+            CHECK(windows.back().value("window_id", std::string()) == "205");
+        }
+    }
+    CHECK(backend->captureCount == 0 && backend->activationCount == 0 && backend->inputSessionCreations == 0);
+    CHECK(backend->inputs.empty());
+    const auto extra = tool->execute(R"({"action":"list","limit":10})", context);
+    CHECK(extra.hasError());
+    if (extra.hasError()) CHECK(extra.error().code() == MaiErrorCode::InvalidInput);
+    QTemporaryDir workspace;
+    const auto ordinary = controller->observe("untitled", "", workspace.path().toUtf8().toStdString(), false, 1, false);
+    CHECK(ordinary);
+    if (ordinary) CHECK(!Json::parse(ordinary.value().json).value("snapshot_id", std::string()).empty());
+    context.root = workspace.path().toUtf8().toStdString();
+    const auto byId = tool->execute(R"({"action":"observe","window_id":"1","include_elements":false})", context);
+    CHECK(!byId.hasError());
+    if (!byId.hasError()) {
+        const auto output = Json::parse(byId.output());
+        CHECK(output.value("title", std::string()) == "");
+        CHECK(!output.value("snapshot_id", std::string()).empty());
+    }
+    CHECK(backend->captureCount == 0 && backend->activationCount == 0 && backend->inputSessionCreations == 0);
+    CHECK(backend->inputs.empty());
+}
+
+void verifyUnobservableDiscoveryCannotIssueWindowToken() {
+    for (int state = 0; state < 3; ++state) {
+        for (const bool image : {false, true}) {
+            Fixture fixture;
+            makeWindowUnavailable(fixture.backend->visible.front(), state);
+            const auto observed = fixture.controller.observe("owner", "", fixture.workspace.path().toUtf8().toStdString(),
+                                                               false, 101, image);
+            CHECK(!observed);
+            if (!observed) CHECK(observed.error().code() == MaiErrorCode::Busy ||
+                                 observed.error().code() == MaiErrorCode::InvalidInput);
+            CHECK(fixture.backend->captureCount == 0 && fixture.backend->activationCount == 0);
+            CHECK(fixture.backend->inputSessionCreations == 0 && fixture.backend->inputs.empty());
+        }
+        Fixture fixture;
+        makeWindowUnavailable(fixture.backend->visible.front(), state);
+        auto controller = std::make_shared<DesktopComputerController>(fixture.backend);
+        MaiToolRegistry registry;
+        registerDesktopComputerTools(registry, controller);
+        const auto tool = registry.find("desktop_computer");
+        CHECK(tool);
+        if (!tool) continue;
+        MaiToolContext context;
+        context.sessionId = "unobservable-window";
+        context.root = fixture.workspace.path().toUtf8().toStdString();
+        const auto result = tool->execute(R"({"action":"observe","window_id":"101","include_elements":false})", context);
+        CHECK(result.hasError());
+        if (result.hasError()) CHECK(result.error().code() == MaiErrorCode::Busy ||
+                                     result.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(fixture.backend->captureCount == 0 && fixture.backend->activationCount == 0);
+        CHECK(fixture.backend->inputSessionCreations == 0 && fixture.backend->inputs.empty());
+    }
+}
+
+void verifyWindowDiscoveryStateChangeDuringObservation() {
+    for (int state = 0; state < 3; ++state) {
+        for (const bool image : {false, true}) {
+            Fixture fixture;
+            if (image) fixture.backend->onCapture = [&] { makeWindowUnavailable(fixture.backend->visible.front(), state); };
+            else fixture.backend->onWindows = [&](int count) {
+                if (count == 2) makeWindowUnavailable(fixture.backend->visible.front(), state);
+            };
+            const auto observed = fixture.controller.observe("owner", "", fixture.workspace.path().toUtf8().toStdString(),
+                                                               false, 101, image);
+            CHECK(!observed);
+            if (!observed) CHECK(observed.error().code() == MaiErrorCode::Busy ||
+                                 observed.error().code() == MaiErrorCode::InvalidInput);
+            CHECK(fixture.backend->captureCount == (image ? 1 : 0));
+            CHECK(fixture.backend->activationCount == 0 && fixture.backend->inputSessionCreations == 0);
+            CHECK(fixture.backend->inputs.empty());
+        }
+    }
+}
+
+void verifyWindowDiscoveryStateRevokesInputAndHeldControls() {
+    for (int state = 0; state < 3; ++state) {
+        for (const bool held : {false, true}) {
+            Fixture fixture;
+            const auto native = held ? holdControl(fixture, false) : nullptr;
+            auto action = fixture.observe("click");
+            action.turnId = "turn-current";
+            const int captures = fixture.backend->captureCount;
+            const int activations = fixture.backend->activationCount;
+            const int sessions = fixture.backend->inputSessionCreations;
+            const int calls = native ? native->inputCalls() : 0;
+            makeWindowUnavailable(fixture.backend->visible.front(), state);
+            const auto result = fixture.controller.perform("owner", action);
+            CHECK(!result);
+            if (!result) CHECK(result.error().code() == MaiErrorCode::Busy || result.error().code() == MaiErrorCode::InvalidInput);
+            CHECK(fixture.backend->captureCount == captures && fixture.backend->activationCount == activations);
+            CHECK(fixture.backend->inputSessionCreations == sessions && fixture.backend->inputs.empty());
+            if (native) {
+                CHECK(native->inputCalls() == calls && native->releaseCalls() > 0);
+                CHECK(native->state().empty() && fixture.controller.inputState("owner").empty());
+                auto& window = fixture.backend->visible.front();
+                window.minimized = window.cloaked = false;
+                window.boundsAvailable = true;
+                const auto oldToken = fixture.controller.perform("owner", action);
+                CHECK(!oldToken);
+                CHECK(native->inputCalls() == calls && fixture.backend->activationCount == activations);
+            }
+        }
+    }
+}
+
 void verifyWindowSelection() {
     Fixture fixture;
     auto duplicate = fixture.backend->visible.front();
@@ -3081,6 +3239,10 @@ int main(int argc, char** argv) {
     verifyKeyIdentityAndCatalog();
     verifyKeyCatalogTool();
     verifySecureKeyboardInput();
+    verifyWindowDiscoveryMetadataAndUntitledSelection();
+    verifyUnobservableDiscoveryCannotIssueWindowToken();
+    verifyWindowDiscoveryStateChangeDuringObservation();
+    verifyWindowDiscoveryStateRevokesInputAndHeldControls();
     verifyWindowSelection();
     verifyScreenshotHandoff();
     verifyScreenshotDirectoryBoundary();

@@ -18,6 +18,14 @@ struct DesktopNativeWindow {
     double y = 0;
     double width = 0;
     double height = 0;
+    // Discovery includes real top-level windows that cannot currently accept
+    // pointer input. In particular, iconic coordinates are not screen bounds.
+    bool minimized = false;
+    bool cloaked = false;
+    bool boundsAvailable = true;
+    bool toolWindow = false;
+    std::uint64_t ownerId = 0;
+    std::string className;
 };
 
 struct DesktopNativeElement {
