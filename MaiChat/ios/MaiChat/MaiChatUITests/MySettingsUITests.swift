@@ -366,11 +366,15 @@ final class MySettingsUITests: XCTestCase {
     @MainActor func testMyPagesKeepWorkingPreferencesAndSafeCleanupConfirmation() {
         continueAfterFailure = false
         let app = XCUIApplication()
-        app.launchArguments = ["--ai-ui-test", "--my-settings-ui-test"]
+        app.launchArguments = ["--ai-ui-test", "--my-settings-ui-test",
+                               "-maichat.notification-preprompt-dismissed", "YES"]
         app.launch()
         defer { app.terminate() }
         XCTAssertTrue(app.buttons["personal-profile-entry"].waitForExistence(timeout: 15))
         capture(app, "my-page")
+        app.buttons["my-account-entry"].tap()
+        capture(app, "my-account-connection")
+        app.navigationBars.buttons.firstMatch.tap()
         XCTAssertFalse(app.staticTexts["500"].exists)
         XCTAssertFalse(app.buttons["升级套餐"].exists)
         app.buttons["my-theme-entry"].tap()

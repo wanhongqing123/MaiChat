@@ -27,7 +27,6 @@ struct SettingsView: View {
                                      ? appState.masterUserID : appState.maiChatAccountID)
                                     .font(AppTypography.detail)
                                     .foregroundStyle(RemoteIMStyle.textSecondary)
-                                SelfConnectionStatus(state: appState.connectionState)
                             }
                             .lineLimit(1)
                         }
@@ -115,9 +114,13 @@ private struct SelfConnectionStatus: View {
 
     var body: some View {
         HStack(spacing: 6) {
+            MySettingsText("消息连接")
+                .font(AppTypography.body)
+                .foregroundStyle(RemoteIMStyle.textPrimary)
+            Spacer(minLength: 8)
             Circle().fill(color).frame(width: 8, height: 8)
-            MySettingsText("消息\(state.rawValue)")
-                .font(AppTypography.metadata)
+            MySettingsText(state.rawValue)
+                .font(AppTypography.detail)
                 .foregroundStyle(RemoteIMStyle.textSecondary)
         }
         .accessibilityElement(children: .ignore)
@@ -304,6 +307,8 @@ private struct AccountSettingsView: View {
                     MySettingsText(displayUserID)
                         .foregroundStyle(appState.maiChatAccountID.isEmpty ? .secondary : .primary)
                 }
+                // 连接状态属于账号运行信息；个人资料卡只保留头像、昵称和账号。
+                SelfConnectionStatus(state: appState.connectionState)
                 if appState.hasUnifiedAccount {
                     NavigationLink("设置或修改登录密码") {
                         AccountPasswordView()
