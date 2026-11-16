@@ -3,6 +3,8 @@
 Date: 2026-11-17. Platform: Windows 11, normal Qt Windows QPA build.
 Starting source: `3134495e` on `main`; the input repair described here was
 uncommitted at the start of final verification.
+The verified input source was then committed as `09506aa9`. Subsequent changes
+to this record and the operation inventory contain documentation only.
 
 ## Requested behavior
 
