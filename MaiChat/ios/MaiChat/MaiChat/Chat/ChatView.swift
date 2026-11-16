@@ -1202,21 +1202,20 @@ private struct ConversationListView: View {
 
     @ViewBuilder
     private func conversationButton(_ contact: RemoteIMContact) -> some View {
-        Button {
-            searchTargetMessageID = nil
-            appState.selectContact(contact)
-            activeGroup = nil
-            activeContact = contact
-        } label: {
-            ConversationRow(
-                contact: contact,
-                latestMessage: appState.chatState.latestMessage(with: contact.userID),
-                selected: contact.userID == appState.chatState.selectedPeerID,
-                presenceStatus: appState.presenceStatus(for: contact),
-                unreadCount: appState.unreadCount(for: contact.userID)
-            )
-        }
-        .buttonStyle(.plain)
+        ConversationRow(
+            contact: contact,
+            latestMessage: appState.chatState.latestMessage(with: contact.userID),
+            selected: contact.userID == appState.chatState.selectedPeerID,
+            presenceStatus: appState.presenceStatus(for: contact),
+            unreadCount: appState.unreadCount(for: contact.userID)
+        )
+        // 行内横拖松手仍在同一行时，plain Button 会触发打开；只接受真正的轻点，
+        // 让列表滚动和侧滑操作继续由 List 处理，无障碍激活复用同一个打开动作。
+        .contentShape(Rectangle())
+        .onTapGesture { openConversation(contact) }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { openConversation(contact) }
         .accessibilityIdentifier("im-conversation-\(contact.userID)")
         .listRowInsets(EdgeInsets())
         .listRowSeparator(.hidden)
@@ -1232,23 +1231,35 @@ private struct ConversationListView: View {
     }
 
     private func groupConversationButton(_ group: RemoteIMGroup) -> some View {
-        Button {
-            searchTargetMessageID = nil
-            activeContact = nil
-            appState.selectGroup(groupID: group.groupID)
-            activeGroup = group
-        } label: {
-            GroupConversationRow(
-                group: group,
-                latestMessage: appState.chatState.latestMessage(inGroup: group.groupID),
-                unreadCount: appState.unreadCountByGroupID[group.groupID] ?? 0
-            )
-        }
-        .buttonStyle(.plain)
+        GroupConversationRow(
+            group: group,
+            latestMessage: appState.chatState.latestMessage(inGroup: group.groupID),
+            unreadCount: appState.unreadCountByGroupID[group.groupID] ?? 0
+        )
+        // 群聊与好友行采用相同轻点边界，横拖不会变成进入会话。
+        .contentShape(Rectangle())
+        .onTapGesture { openConversation(group) }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { openConversation(group) }
         .accessibilityIdentifier("im-group-conversation-\(group.groupID)")
         .listRowInsets(EdgeInsets())
         .listRowSeparator(.hidden)
         .listRowBackground(RemoteIMStyle.panelBackground)
+    }
+
+    private func openConversation(_ contact: RemoteIMContact) {
+        searchTargetMessageID = nil
+        appState.selectContact(contact)
+        activeGroup = nil
+        activeContact = contact
+    }
+
+    private func openConversation(_ group: RemoteIMGroup) {
+        searchTargetMessageID = nil
+        activeContact = nil
+        appState.selectGroup(groupID: group.groupID)
+        activeGroup = group
     }
 
     private var sortedConversations: [ConversationListItem] {
@@ -1383,11 +1394,14 @@ private struct GroupChatDetailView: View {
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 18)
+                    .background(MessageScrollPositionReader(
+                        allowsBottomFollowing: false,
+                        onUserScroll: { followsLatest = false },
+                        onNearBottomChanged: { _ in }
+                    ))
                 }
                 .scrollDismissesKeyboard(.interactively)
-                .simultaneousGesture(DragGesture(minimumDistance: 10).onChanged { _ in
-                    followsLatest = false
-                })
+                // 复用原生滚动观察器判断主动阅读，不额外注册会抢走右滑返回的 SwiftUI drag。
                 .background(RemoteIMStyle.pageBackground, ignoresSafeAreaEdges: [])
                 .overlay(alignment: .bottomTrailing) {
                     if !followsLatest && !messages.isEmpty {

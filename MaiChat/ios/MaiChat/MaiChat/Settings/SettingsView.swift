@@ -20,13 +20,19 @@ struct SettingsView: View {
                         HStack(spacing: 16) {
                             SelfProfileAvatar(size: 64)
                             VStack(alignment: .leading, spacing: 6) {
-                                MySettingsText(appState.selfDisplayName())
+                                MySettingsText(appState.maiChatNickname.isEmpty
+                                     ? appState.maiChatAccountID : appState.maiChatNickname)
                                     .font(AppTypography.conversationTitle)
                                     .foregroundStyle(RemoteIMStyle.textPrimary)
-                                MySettingsText(appState.maiChatAccountID.isEmpty
-                                     ? appState.masterUserID : appState.maiChatAccountID)
-                                    .font(AppTypography.detail)
-                                    .foregroundStyle(RemoteIMStyle.textSecondary)
+                                // 公开账号与登录会话一致；内部 IM 路由标识不作为账号兜底展示。
+                                VStack(alignment: .leading, spacing: 3) {
+                                    MySettingsText("MaiChat 账号")
+                                        .font(AppTypography.metadata)
+                                    MySettingsText(appState.maiChatAccountID)
+                                        .font(AppTypography.detail)
+                                }
+                                .foregroundStyle(RemoteIMStyle.textSecondary)
+                                .accessibilityElement(children: .combine)
                             }
                             .lineLimit(1)
                         }
@@ -185,7 +191,7 @@ private struct PersonalProfileView: View {
                                    ? "未设置" : appState.maiChatNickname)
                 }
                 .accessibilityIdentifier("account-nickname-entry")
-                LabeledContent("账号", value: appState.maiChatAccountID)
+                LabeledContent("MaiChat 账号", value: appState.maiChatAccountID)
                 NavigationLink {
                     FriendQRShareView(userID: appState.maiChatAccountID)
                 } label: {

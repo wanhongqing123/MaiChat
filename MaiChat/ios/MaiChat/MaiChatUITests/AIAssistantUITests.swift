@@ -4172,6 +4172,164 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertLessThan(conversation.frame.maxX, menu.frame.minX)
     }
 
+    @MainActor func testIMGroupReadingKeepsPositionAcrossAppendAndReturn() throws {
+        #if targetEnvironment(simulator)
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--app-bars-layout-ui-test",
+            "--typography-ui-test", "--im-list-font-ui-test", "--im-group-navigation-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launch()
+        defer { app.terminate() }
+        let group = app.buttons["im-group-conversation-font-group"]
+        XCTAssertTrue(group.waitForExistence(timeout: 15))
+        group.tap()
+        let last = app.staticTexts["群历史样本 59"]
+        XCTAssertTrue(last.waitForExistence(timeout: 10))
+        let scroll = app.scrollViews.firstMatch
+        scroll.swipeDown()
+        scroll.swipeDown()
+        let visible = app.staticTexts.matching(NSPredicate(
+            format: "label BEGINSWITH %@", "群历史样本 ")).allElementsBoundByIndex.filter(\.isHittable)
+        let anchor = try XCTUnwrap(visible.dropFirst().first)
+        let beforeY = anchor.frame.midY
+        app.buttons["fixture-append-group-message"].tap()
+        XCTAssertFalse(app.staticTexts["群追加消息样本"].isHittable)
+        XCTAssertEqual(anchor.frame.midY, beforeY, accuracy: 3,
+                       "阅读旧群消息时，追加不能把位置拉回底部")
+        let latest = app.buttons["回到最新群消息"]
+        XCTAssertTrue(latest.isHittable)
+        latest.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hittable == true"),
+            object: app.staticTexts["群追加消息样本"])], timeout: 5), .completed)
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.45))
+            .press(forDuration: 0.05, thenDragTo: app.coordinate(
+                withNormalizedOffset: CGVector(dx: 0.85, dy: 0.45)),
+                withVelocity: .slow, thenHoldForDuration: 0)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hittable == true"), object: group)],
+            timeout: 5), .completed)
+        group.tap()
+        XCTAssertTrue(app.staticTexts["群追加消息样本"].waitForExistence(timeout: 5))
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "im-group-reading-append-and-reentry"; shot.lifetime = .keepAlways; add(shot)
+        #else
+        throw XCTSkip("仅模拟器内存群消息，不操作用户会话")
+        #endif
+    }
+
+    @MainActor func testIMListRightSwipeDoesNotOpenChat() throws {
+        #if targetEnvironment(simulator)
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--app-bars-layout-ui-test", "--typography-ui-test", "--im-list-font-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launch()
+        defer { app.terminate() }
+        let conversation = app.buttons["im-conversation-bars-peer-34"]
+        XCTAssertTrue(conversation.waitForExistence(timeout: 15))
+        // 滑动从好友行内部开始，整个路径停留在同一行，而不是点击行。
+        let start = conversation.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.5))
+        let end = conversation.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
+        start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow,
+                    thenHoldForDuration: 0)
+        XCTAssertTrue(conversation.isHittable, "消息列表右滑不能打开好友聊天")
+        XCTAssertFalse(app.buttons["chatMoreMenu"].exists)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "im-list-after-right-swipe"; shot.lifetime = .keepAlways; add(shot)
+        // 保留原左滑清空入口；这里只取消确认，不清除任何样本消息。
+        conversation.swipeLeft()
+        let clear = app.buttons["清空消息"]
+        XCTAssertTrue(clear.waitForExistence(timeout: 5))
+        clear.tap()
+        XCTAssertTrue(app.staticTexts["清空聊天记录？"].waitForExistence(timeout: 5))
+        app.buttons["取消"].tap()
+        let group = app.buttons["im-group-conversation-font-group"]
+        XCTAssertTrue(group.waitForExistence(timeout: 5))
+        group.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.5))
+            .press(forDuration: 0.05, thenDragTo: group.coordinate(
+                withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)),
+                withVelocity: .slow, thenHoldForDuration: 0)
+        XCTAssertFalse(app.otherElements["im-group-header"].exists)
+        group.tap()
+        XCTAssertTrue(app.descendants(matching: .any).matching(
+            identifier: "im-group-header").firstMatch.waitForExistence(timeout: 5))
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.45))
+            .press(forDuration: 0.05, thenDragTo: app.coordinate(
+                withNormalizedOffset: CGVector(dx: 0.85, dy: 0.45)),
+                withVelocity: .slow, thenHoldForDuration: 0)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hittable == true"), object: conversation)],
+            timeout: 5), .completed)
+        conversation.tap()
+        XCTAssertTrue(app.buttons["chatMoreMenu"].waitForExistence(timeout: 10),
+                      "真正点击好友仍应进入聊天")
+        #else
+        throw XCTSkip("仅使用模拟器自有消息，不操作用户会话")
+        #endif
+    }
+
+    @MainActor func testIMRightSwipeReturnsToList() throws {
+        #if targetEnvironment(simulator)
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--app-bars-layout-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launch()
+        defer { app.terminate() }
+        let conversation = app.buttons["im-conversation-bars-peer-34"]
+        XCTAssertTrue(conversation.waitForExistence(timeout: 15))
+        let initialY = conversation.frame.minY
+        app.swipeUp()
+        XCTAssertTrue(!conversation.isHittable || abs(conversation.frame.minY - initialY) > 20,
+                      "消息列表上下滚动不能被轻点识别器拦住")
+        app.swipeDown()
+        XCTAssertTrue(conversation.isHittable)
+        conversation.tap()
+        let menu = app.buttons["chatMoreMenu"]
+        XCTAssertTrue(menu.waitForExistence(timeout: 10))
+        let before = XCTAttachment(screenshot: app.screenshot())
+        before.name = "im-before-real-right-swipe"; before.lifetime = .keepAlways; add(before)
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.45))
+        let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.45))
+        start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow,
+                    thenHoldForDuration: 0)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hittable == true"), object: conversation)],
+            timeout: 5), .completed, "右滑完成后必须回到消息列表")
+        let after = XCTAttachment(screenshot: app.screenshot())
+        after.name = "im-after-real-right-swipe"; after.lifetime = .keepAlways; add(after)
+        // 再进入缓存聊天页，从正文中间滑动，并覆盖带输入草稿的返回。
+        for withKeyboard in [false, true] {
+            conversation.tap()
+            XCTAssertTrue(menu.waitForExistence(timeout: 10))
+            let composer = app.textViews["message-composer-text-view"]
+            if withKeyboard {
+                composer.tap()
+                composer.typeText("Keep swipe draft")
+            }
+            let middle = app.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.35))
+            let right = app.coordinate(withNormalizedOffset: CGVector(dx: 0.94, dy: 0.35))
+            middle.press(forDuration: 0.05, thenDragTo: right, withVelocity: .slow,
+                         thenHoldForDuration: 0)
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "hittable == true"), object: conversation)],
+                timeout: 5), .completed)
+            if withKeyboard {
+                conversation.tap()
+                XCTAssertTrue(menu.waitForExistence(timeout: 10))
+                XCTAssertEqual(composer.value as? String, "Keep swipe draft")
+            }
+        }
+        #else
+        throw XCTSkip("仅使用模拟器自有消息，不操作用户会话")
+        #endif
+    }
+
     func testPortraitIMStillNavigatesIntoChat() throws {
         XCUIDevice.shared.orientation = .portrait
         let app = XCUIApplication()

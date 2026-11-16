@@ -356,6 +356,14 @@ private struct AppBarsLayoutUITestRoot: View {
                 if ProcessInfo.processInfo.arguments.contains("--notification-dnd-contract-ui-test") {
                     RemoteIMDNDContractProbe()
                 }
+                if ProcessInfo.processInfo.arguments.contains("--im-group-navigation-ui-test") {
+                    // 隔离群聊阅读/追加验收只更新内存样本，不发送消息或读取用户历史。
+                    Button("追加群消息样本") {
+                        appState.chatState.receiveGroupText("群追加消息样本", groupID: "font-group",
+                            fromUserID: "bars-peer-34", now: Date(timeIntervalSince1970: 2000))
+                    }
+                    .accessibilityIdentifier("fixture-append-group-message")
+                }
                 if ProcessInfo.processInfo.arguments.contains("--tool-order-ui-test") {
                     Button("追加下一段工具") {
                         toolOrderStage += 1
@@ -414,6 +422,12 @@ private struct AppBarsLayoutUITestRoot: View {
                                                      contacts: contacts, messages: messages)
                 appState.hasCompletedInitialLogin = true
                 appState.configureTypographyUITestFriends()
+                if ProcessInfo.processInfo.arguments.contains("--im-group-navigation-ui-test") {
+                    for index in 0..<60 {
+                        appState.chatState.receiveGroupText("群历史样本 \(index)", groupID: "font-group",
+                            fromUserID: "bars-peer-34", now: Date(timeIntervalSince1970: Double(1000 + index)))
+                    }
+                }
                 AIAssistantModel.shared.installHistoryUITestFixture(markdown: markdown)
                 if ProcessInfo.processInfo.arguments.contains("--tool-order-ui-test") {
                     AIAssistantModel.shared.installToolOrderUITestFixture(stage: 0)
