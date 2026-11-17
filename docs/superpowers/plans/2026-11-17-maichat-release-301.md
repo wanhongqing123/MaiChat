@@ -21,12 +21,12 @@ existing release, asset and tag.
   thumbnails and their complete Markdown/PDF/platform/UI dependency graph.
 - [x] Verify/apply Mac's latest six navigation files once against exact before
   blobs; all postimages match `5d4dedbf...` packet.
-- [ ] Close reproduced loading-first-Paint geometry and UTF-8 truncated-EOF
+- [x] Close reproduced loading-first-Paint geometry and UTF-8 truncated-EOF
   regressions; close the completed-future full-page retention lifetime defect.
-- [ ] Run fresh normal renderer, Markdown, file-delivery UI, Starter and affected
+- [x] Run fresh normal renderer, Markdown, file-delivery UI, Starter and affected
   MainWindow selectors. Inspect owned captures. Do not substitute old 2.2.65
   peer runtime evidence or ready-only UI tests for this integrated source.
-- [ ] Commit only reviewed Desktop integration directly on main. Preserve raw
+- [x] Commit only reviewed Desktop integration directly on main. Preserve raw
   `.gitignore`, MobileAgent adapter/tests and all unrelated platform WIP.
 - [ ] Set the single Desktop CMake version to `3.0.1`, commit and push the
   final common source. Record full commit/component trees and five model hashes.
@@ -77,3 +77,9 @@ existing release, asset and tag.
 Evidence root: `.cache/maichat-release-20261117/`. GitHub plugin lacks Release
 asset upload/publication APIs; use the existing authenticated `gh` workflow for
 that explicitly authorized action. No archives or chunks are sent over IM.
+
+The first common candidate `a5d81db3` passed Windows packaging and six isolated
+startup runs. The clean Mac build then exposed an omitted upstream SoundTouch
+header. Those Windows assets remain historical evidence and must not be uploaded;
+the source is frozen again only after the missing input is restored and reviewed.
+Both final platforms must identify the subsequent common commit.

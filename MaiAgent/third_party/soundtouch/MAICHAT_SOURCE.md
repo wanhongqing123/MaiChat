@@ -11,3 +11,8 @@
 不参与编译的示例 `.so`、`.dll`、`.ico` 和 Gradle wrapper `.jar`。播放器以 16 位整数 PCM
 构建 SoundTouch，通过 `setTempo` 实现变速不变调。
 Git 以文本自动归一化保存上游文件的换行符，检出时按平台还原。
+
+`include/soundtouch_config.h` 是发布包自带的非 autotools 构建空配置头，
+仅含说明注释，不定义样本类型或平台宏。该文件必须随源码跟踪；上游的
+`*config*` 忽略规则会把它漏掉，导致干净 macOS 构建在 `STTypes.h` 包含处失败。
+播放器的整数样本选项仍由现有 CMake 定义控制，不从旧构建目录复制配置。
