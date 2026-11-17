@@ -23,3 +23,11 @@
 ## 证据与范围
 
 私有目录 `/private/tmp/maichat-settings-checkbox-align-20261118` 保留before、final、六种对照、源码指纹、编译/链接参数、初始错误目标名/缺私有probe头文件等检查失败和最终结果。所有窗口为自有假账号/临时偏好数据，未读取用户消息、凭据或设置，不新开TCC授权，不动后台服务、播放器色彩或系统亮度。主线由协调端串行聚合本轮三生产文件和本记录。
+
+### 补充：复用普通 main.cpp 字体初始化
+
+私有同页面consumer按原main.cpp注册同14项字体，并设置PreferNoHinting、同UiZoom字体栈与16px标准正文。编译0/8.689s、链接0/0.597s、普通页面/像素/标签点击/Space用例0/2.757s（Qt业务1项，init/cleanup后总3/0）。未见字体注册失败。
+
+此时实际中文glyph变为Noto Sans SC 16px，ascent18.5469、descent4.59375、QTextLine高24，screen72 logicalDPI/DPR2；两indicator相对墨迹中心均-1逻辑px，仍满足原1.5阈值。之前PingFang数据仅为未执行字体注册的QtTest fixture，不作为现装App fallback。
+
+生产3源、原4件packet和57b17b44未改；本次源已核等57b并FF同步，Mac工作区clean，原4件stash备份保留。
