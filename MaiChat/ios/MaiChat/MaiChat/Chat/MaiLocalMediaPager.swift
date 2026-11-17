@@ -45,7 +45,8 @@ struct MaiLocalMediaPager: UIViewControllerRepresentable {
 }
 
 @MainActor
-final class MaiLocalMediaPagerController: UIViewController, UIGestureRecognizerDelegate {
+final class MaiLocalMediaPagerController: UIViewController, UIGestureRecognizerDelegate, MaiPlayerOrientationHost {
+    let playerOrientation = MaiPlayerOrientation()
     private var sequence: MaiMediaSequence
     private let initialItem: MaiMediaItem
     private let startSeconds: Double
@@ -385,6 +386,7 @@ final class MaiLocalMediaPagerController: UIViewController, UIGestureRecognizerD
 
     func dispose() {
         guard !disposed else { return }
+        playerOrientation.restore()
         disposed = true
         maiLocalMediaTrace("disposed")
         // SwiftUI 可能在关闭后暂时保留 UIViewController，立即释放模态焦点和触摸隔离。

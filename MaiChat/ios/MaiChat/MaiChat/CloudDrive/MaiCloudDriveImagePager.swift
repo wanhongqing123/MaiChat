@@ -51,7 +51,8 @@ struct MaiCloudDriveMediaPager: UIViewControllerRepresentable {
 @MainActor
 final class MaiCloudDriveMediaPagerController: UIViewController,
                                                UIPageViewControllerDataSource,
-                                               UIPageViewControllerDelegate {
+                                               UIPageViewControllerDelegate, MaiPlayerOrientationHost {
+    let playerOrientation = MaiPlayerOrientation()
     private var items: [MaiCloudDriveVideo]
     private let loader: @MainActor (MaiCloudDriveVideo) async throws -> URL
     private let videoLoader: @MainActor (MaiCloudDriveVideo) async throws -> MaiCloudVodSession
@@ -501,6 +502,7 @@ final class MaiCloudDriveMediaPagerController: UIViewController,
 
     func dispose() {
         guard !disposed else { return }
+        playerOrientation.restore()
         disposed = true
         for task in tasks.values { task.cancel() }
         tasks.removeAll()

@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		C6A026111600000000000001 /* DocumentFileCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6A026111600000000000002 /* DocumentFileCard.swift */; };
 		02E79EF06353052B990EE9E1 /* AIMobileScreenCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C33E4A86A3C9C3DBBB7077 /* AIMobileScreenCapture.swift */; };
 		0329ABDC04BBAC38945C24FA /* AIMobileHostToolProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29776A2C7E5D525FFA6CED8D /* AIMobileHostToolProvider.swift */; };
 		048332DE76BAF3E98167876D /* AppPageTitle.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2E42E45D8966090A859C27 /* AppPageTitle.swift */; };
@@ -232,6 +233,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		C6A026111600000000000002 /* DocumentFileCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentFileCard.swift; sourceTree = "<group>"; };
 		0075BCCB2188B8EB8E6F11FA /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		0194E7C7F438293A088E45E0 /* MarkdownPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownPresentationTests.swift; sourceTree = "<group>"; };
 		04A1DB55011531B9A3C95610 /* AIPrimaryModelUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIPrimaryModelUITestSupport.swift; sourceTree = "<group>"; };
@@ -602,6 +604,7 @@
 			isa = PBXGroup;
 			children = (
 				A781F92B5DE618E07394EA0C /* ChatView.swift */,
+				C6A026111600000000000002 /* DocumentFileCard.swift */,
 				C846ED66C1F881705954E761 /* ComposerDraftState.swift */,
 				749D3372E6EB0A110EDC7FB3 /* MaiFfplayVideoView.swift */,
 				28D8AD58B83B7A86314F546A /* MaiLocalMediaPager.swift */,
@@ -1210,6 +1213,7 @@
 				434A790BCD491455A07E569F /* CameraUITestSupport.swift in Sources */,
 				E44DBB9A1A87C51D55D00A3B /* ChatUITestFixtures.swift in Sources */,
 				0877D888456B3E24B13A6ED3 /* ChatView.swift in Sources */,
+				C6A026111600000000000001 /* DocumentFileCard.swift in Sources */,
 				195CBD2427916B9BDE4CA2D4 /* CloudDriveUITestFixtures.swift in Sources */,
 				523851CFD4281968BC40232D /* CloudImagePagerUITestFixtures.swift in Sources */,
 				2FA099751A7A133A032E55F8 /* ComposerDraftState.swift in Sources */,

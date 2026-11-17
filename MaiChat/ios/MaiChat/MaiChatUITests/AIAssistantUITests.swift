@@ -3652,6 +3652,59 @@ final class AIAssistantUITests: XCTestCase {
         assertMediaHasNoTitle(app)
     }
 
+    func testPlayerManualLandscapeKeepsPausedPositionAndRestoresOrientation() throws {
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-image-mixed-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launchEnvironment["MAICHAT_MEDIA_VIDEO_FIRST"] = "1"
+        app.launch()
+        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
+        let video = app.images["ffplay-video-surface"]
+        waitForPreview(video, named: "ffplay-seek-sample.mp4", timeout: 20)
+        app.buttons["ffplay-pause"].tap()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.7))
+        let time = app.staticTexts["ffplay-time"].label
+        let rotate = app.buttons["ffplay-orientation"]
+        XCTAssertTrue(rotate.waitForExistence(timeout: 5), "竖屏握持时也要有横屏播放入口")
+        rotate.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in app.frame.width > app.frame.height }, object: app)], timeout: 8), .completed)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in rotate.isEnabled && video.frame.width > video.frame.height &&
+                abs(video.frame.width - app.frame.width) < 2 }, object: video)], timeout: 8), .completed)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        XCTAssertEqual(app.buttons["ffplay-pause"].label, "播放视频")
+        XCTAssertEqual(app.staticTexts["ffplay-time"].label, time)
+        let image = XCTAttachment(screenshot: app.screenshot())
+        image.name = "player-manual-landscape-paused"
+        image.lifetime = .keepAlways
+        add(image)
+        let whole = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        whole.name = "player-manual-landscape-whole-display"
+        whole.lifetime = .keepAlways
+        add(whole)
+        let metrics = XCTAttachment(string: "app=\(app.frame) video=\(video.frame) rotate=\(rotate.frame) screen=\(XCUIScreen.main.screenshot().image.size) orientation=\(XCUIScreen.main.screenshot().image.imageOrientation.rawValue)")
+        metrics.name = "player-landscape-geometry"
+        metrics.lifetime = .keepAlways
+        add(metrics)
+        RunLoop.current.run(until: Date().addingTimeInterval(3)) // 留给独立simctl整屏采集同一稳定帧。
+        rotate.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in app.frame.height > app.frame.width }, object: app)], timeout: 8), .completed)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"), object: rotate)], timeout: 8), .completed)
+        XCTAssertEqual(app.staticTexts["ffplay-time"].label, time)
+        rotate.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in app.frame.width > app.frame.height }, object: app)], timeout: 8), .completed)
+        app.buttons["ffplay-close"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in app.frame.height > app.frame.width }, object: app)], timeout: 8), .completed)
+        XCTAssertTrue(app.buttons["创作中心"].isHittable)
+    }
+
     func testFullScreenMediaPagerRotatesAndBrowsesWithoutReplayingCurrentVideo() throws {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
@@ -3673,14 +3726,18 @@ final class AIAssistantUITests: XCTestCase {
         let time = app.staticTexts["ffplay-time"].label
         XCUIDevice.shared.orientation = .landscapeLeft
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-            predicate: NSPredicate { _, _ in app.frame.width > app.frame.height }, object: app)],
+            predicate: NSPredicate { _, _ in XCUIScreen.main.screenshot().image.size.width > XCUIScreen.main.screenshot().image.size.height }, object: app)],
             timeout: 8), .completed)
+        let whole = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        whole.name = "player-device-landscape-whole-display"
+        whole.lifetime = .keepAlways
+        add(whole)
         XCTAssertEqual(pause.label, "播放视频")
         XCTAssertEqual(app.staticTexts["ffplay-time"].label, time,
                        "旋转必须保持同一全屏容器，不能重播当前视频")
         XCUIDevice.shared.orientation = .portrait
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-            predicate: NSPredicate { _, _ in app.frame.height > app.frame.width }, object: app)],
+            predicate: NSPredicate { _, _ in XCUIScreen.main.screenshot().image.size.height > XCUIScreen.main.screenshot().image.size.width }, object: app)],
             timeout: 8), .completed)
         for tab in tabs { XCTAssertFalse(tab.isHittable) }
         let left = app.coordinate(withNormalizedOffset: CGVector(dx: 0.80, dy: 0.40))

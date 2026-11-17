@@ -269,6 +269,9 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     private var activitySequence: [String: Int] = [:]
     private var transientErrorTask: Task<Void, Never>?
     private let avatarUploader: any MaiAccountAvatarUploading
+    // 列表加载可注入隔离数据源；普通宿主未注入时仍使用同一个账号客户端。
+    private let friendRequestsLoader: (@Sendable () async throws -> [MaiChatFriendRequest])?
+    private let acceptedFriendsLoader: (@Sendable () async throws -> [MaiChatFriend])?
     private var avatarMutations: [UUID: MaiAvatarMutationRequest] = [:]
     private let messagePageSize = 20
 
@@ -277,12 +280,16 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         historyStore: LocalChatHistoryStore = LocalChatHistoryStore(),
         client: RemoteIMClient = TencentIMClient(),
         avatarUploader: any MaiAccountAvatarUploading = MaiAccountAvatarUploader(),
+        friendRequestsLoader: (@Sendable () async throws -> [MaiChatFriendRequest])? = nil,
+        acceptedFriendsLoader: (@Sendable () async throws -> [MaiChatFriend])? = nil,
         loadedSettings: StoredRemoteIMSettings
     ) {
         self.settingsStore = settingsStore
         self.client = client
         self.historyDatabasePath = historyStore.persistentDatabasePath
         self.avatarUploader = avatarUploader
+        self.friendRequestsLoader = friendRequestsLoader
+        self.acceptedFriendsLoader = acceptedFriendsLoader
         self.remoteDesktop = RemoteDesktopSession(client: client)
 
         var settings = loadedSettings
@@ -1512,14 +1519,17 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     func refreshFriendRequests() async {
+        guard !Task.isCancelled else { return }
         guard hasUnifiedAccount else {
             pendingFriendRequests = []
             return
         }
         let identity = remoteDiagnosticsIdentity
         do {
-            let requests = try await accountAuth.friendRequests()
-            guard remoteDiagnosticsIdentity == identity else { return }
+            let requests: [MaiChatFriendRequest]
+            if let friendRequestsLoader { requests = try await friendRequestsLoader() }
+            else { requests = try await accountAuth.friendRequests() }
+            guard !Task.isCancelled, remoteDiagnosticsIdentity == identity else { return }
             friendRequestIDByIMID = Dictionary(uniqueKeysWithValues:
                 requests.map { ($0.imUserId, $0.id) })
             pendingFriendRequests = requests.map { request in
@@ -1527,22 +1537,27 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
                     displayName: request.nickname ?? request.accountId,
                     avatarURL: nil, message: "")
             }
+        } catch is CancellationError {
+            // 离开好友页会正常取消SwiftUI任务，不把导航取消当成请求失败。
         } catch {
-            if remoteDiagnosticsIdentity == identity {
+            if !Task.isCancelled && remoteDiagnosticsIdentity == identity {
                 showTransientError("获取好友申请失败，请稍后重试")
             }
         }
     }
 
     func refreshAcceptedFriends() async {
+        guard !Task.isCancelled else { return }
 #if targetEnvironment(simulator)
-        if groupUIFixtureMode { return }
+        if groupUIFixtureMode && acceptedFriendsLoader == nil { return }
 #endif
         guard hasUnifiedAccount else { return }
         let identity = remoteDiagnosticsIdentity
         do {
-            let friends = try await accountAuth.friends()
-            guard remoteDiagnosticsIdentity == identity else { return }
+            let friends: [MaiChatFriend]
+            if let acceptedFriendsLoader { friends = try await acceptedFriendsLoader() }
+            else { friends = try await accountAuth.friends() }
+            guard !Task.isCancelled, remoteDiagnosticsIdentity == identity else { return }
             imSessionAcceptedFriendsLoaded = true
             acceptedFriendIMIDs = Set(friends.map(\.imUserId))
             pendingFriendSyncIMIDs = Set(friends.filter {
@@ -1566,7 +1581,10 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
             }
             if changed { settingsStore.save(currentStoredSettings()) }
             if !added.isEmpty { await refreshProfiles(userIDs: added) }
+        } catch is CancellationError {
+            // 与申请刷新共用取消边界；过期结果不回写当前账号或弹跨页提示。
         } catch {
+            guard !Task.isCancelled, remoteDiagnosticsIdentity == identity else { return }
             logIM(level: .warning, event: "friend-list-refresh-failed")
             showTransientError("获取好友列表失败，请稍后重试")
         }

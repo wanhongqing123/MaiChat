@@ -2,6 +2,41 @@
 import XCTest
 
 final class MySettingsUITests: XCTestCase {
+    @MainActor func testRapidTabSwitchDoesNotReportCanceledFriendRefresh() {
+        for phase in ["friends", "requests"] {
+            let app = XCUIApplication()
+            app.launchArguments = ["--ai-ui-test", "--friend-refresh-ui-test", "--im-group-ui-test"]
+            app.launchEnvironment["MAICHAT_FRIEND_REFRESH_PHASE"] = phase
+            app.launch()
+            defer { app.terminate() }
+            if app.buttons["稍后"].waitForExistence(timeout: 3) { app.buttons["稍后"].tap() }
+            app.buttons["好友列表"].tap()
+            let status = app.staticTexts["friend-refresh-phase"]
+            let started = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "started-" + phase), object: status)
+            XCTAssertEqual(XCTWaiter.wait(for: [started], timeout: 8), .completed)
+            app.buttons["云盘"].tap()
+            let cancelled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "cancelled-" + phase), object: status)
+            XCTAssertEqual(XCTWaiter.wait(for: [cancelled], timeout: 8), .completed)
+            app.buttons["消息"].firstMatch.tap()
+            XCTAssertEqual(app.staticTexts["friend-refresh-errors"].label, "0", "正常切页取消不能弹出好友请求错误")
+            app.terminate()
+        }
+    }
+
+    @MainActor func testVisibleFriendRequestFailureStillShowsError() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--friend-refresh-ui-test", "--im-group-ui-test"]
+        app.launchEnvironment["MAICHAT_FRIEND_REFRESH_PHASE"] = "requests"
+        app.launch()
+        defer { app.terminate() }
+        if app.buttons["稍后"].waitForExistence(timeout: 3) { app.buttons["稍后"].tap() }
+        app.buttons["好友列表"].tap()
+        let started = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'started-requests'"), object: app.staticTexts["friend-refresh-phase"])
+        XCTAssertEqual(XCTWaiter.wait(for: [started], timeout: 8), .completed)
+        app.buttons["friend-refresh-fail"].tap()
+        XCTAssertTrue(app.staticTexts["获取好友申请失败，请稍后重试"].waitForExistence(timeout: 5))
+    }
+
     @MainActor func testNotificationStalePermitCannotRegressBadge() {
         runNotificationContract("stale-permit")
     }

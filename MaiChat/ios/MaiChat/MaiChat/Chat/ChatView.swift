@@ -3405,6 +3405,7 @@ private func dismissKeyboard() {
 }
 
 private struct MessageBubbleView: View {
+    @EnvironmentObject private var appState: RemoteIMAppState
     let message: RemoteIMMessage
     let approvalDecisionState: ApprovalDecisionDisplayState
     let isVideoDownloading: Bool
@@ -3422,6 +3423,7 @@ private struct MessageBubbleView: View {
     @State private var isActionPressing = false
     @State private var requestsAccessibilityActions = false
     @State private var textSelectionController = MessageTextSelectionController()
+    @State private var filePreviewRevision: UInt64 = 0
 
     var body: some View {
         MessageBubbleLayout(isOutgoing: message.direction == .outgoing,
@@ -3480,7 +3482,10 @@ private struct MessageBubbleView: View {
     private var attachmentCaption: String? {
         guard message.imageAttachment != nil || message.fileAttachment != nil
             || message.videoAttachment != nil || message.voiceAttachment != nil else { return nil }
-        let clean = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // SDK的“[文件] 文件名”是占位文本，文件卡已经显示名称；真实配文独立保留。
+        let text = message.fileAttachment == nil ? message.text : (message.mediaCaption ?? message.text)
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let file = message.fileAttachment, clean == "[文件] " + file.fileName { return nil }
         guard !clean.isEmpty,
               !clean.hasPrefix("[图片消息]"),
               !clean.hasPrefix("[文件消息]"),
@@ -3548,10 +3553,18 @@ private struct MessageBubbleView: View {
                 } else if let fileAttachment = message.fileAttachment {
                     VStack(alignment: .leading, spacing: 8) {
                         if message.captionAbove { attachmentCaptionView }
-                        Button(action: previewFile) {
-                            FileBubbleContent(attachment: fileAttachment)
+                        Button {
+                            filePreviewRevision &+= 1
+                            previewFile()
+                        } label: {
+                            DocumentFileCardContent(request: DocumentFileCardRequest(attachment: fileAttachment,
+                                owner: appState.chatState.ownerUserID, messageID: message.id),
+                                thumbnailIdentifier: "im-document-thumbnail-" +
+                                    (fileAttachment.fileName as NSString).pathExtension.lowercased() + "-" + message.id.uuidString,
+                                revision: appState.mediaFileRevision &+ filePreviewRevision, decorated: false)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("im-file-artifact-" + message.id.uuidString)
                         if !message.captionAbove { attachmentCaptionView }
                     }
                 } else if let voiceAttachment = message.voiceAttachment {
@@ -4328,9 +4341,14 @@ struct ImagePreviewBackdrop: View {
     }
 }
 
-private struct RemoteIMFilePreviewItem: Identifiable {
+struct RemoteIMFilePreviewItem: Identifiable {
     let id: UUID
     let attachment: RemoteIMFileAttachment
+
+    init(attachment: RemoteIMFileAttachment) {
+        id = UUID()
+        self.attachment = attachment
+    }
 
     init?(message: RemoteIMMessage) {
         guard let attachment = message.fileAttachment else { return nil }
@@ -4339,9 +4357,10 @@ private struct RemoteIMFilePreviewItem: Identifiable {
     }
 }
 
-private struct FullScreenFilePreviewView: View {
+struct FullScreenFilePreviewView: View {
     let item: RemoteIMFilePreviewItem
     let close: () -> Void
+    var closeIdentifier = "document-file-preview-close"
     @State private var loaded = false
     @State private var integrityError: String?
     @State private var previewText = ""
@@ -4356,18 +4375,16 @@ private struct FullScreenFilePreviewView: View {
                         Image(systemName: "exclamationmark.shield")
                             .font(AppTypography.symbol(size: 34, weight: .semibold))
                             .foregroundStyle(.red)
-                        Text("Diff 校验失败")
+                        Text(isGitDiff ? "Diff 校验失败" : "文件无法预览")
                             .font(AppTypography.heading)
                         Text(integrityError)
                             .font(AppTypography.detail)
                             .foregroundStyle(RemoteIMStyle.textSecondary)
                     }
                     .padding(24)
-                } else if item.attachment.mimeType == "text/html" {
+                } else if isHTML {
                     RemoteIMHTMLPreview(filePath: item.attachment.localFilePath, html: previewText)
-                } else if item.attachment.mimeType == "text/markdown" ||
-                            item.attachment.fileName.lowercased().hasSuffix(".md")
-                {
+                } else if isMarkdown {
                     RemoteIMMarkdownFilePreview(text: previewText)
                 } else {
                     RemoteIMQuickLookPreview(filePath: item.attachment.localFilePath)
@@ -4384,6 +4401,7 @@ private struct FullScreenFilePreviewView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("关闭", action: close)
+                        .accessibilityIdentifier(closeIdentifier)
                 }
             }
         }
@@ -4391,15 +4409,25 @@ private struct FullScreenFilePreviewView: View {
     }
 
     private var isGitDiff: Bool {
-        RemoteIMGitDiffDisplayPolicy.isGitDiff(item.attachment)
+        isHTML && RemoteIMGitDiffDisplayPolicy.expectedSHA256(fileName: item.attachment.fileName) != nil
+    }
+
+    private var documentMIME: String {
+        item.attachment.mimeType.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+    }
+    private var isHTML: Bool {
+        documentMIME == "text/html" || ["html", "htm"].contains((item.attachment.fileName as NSString).pathExtension.lowercased())
+    }
+    private var isMarkdown: Bool {
+        documentMIME == "text/markdown" || ["md", "markdown"].contains((item.attachment.fileName as NSString).pathExtension.lowercased())
     }
 
     private func loadPreview() async {
         loaded = false
         let path = item.attachment.localFilePath
         let expected = isGitDiff ? RemoteIMGitDiffDisplayPolicy.expectedSHA256(fileName: item.attachment.fileName) : nil
-        let readsText = item.attachment.mimeType == "text/html" || item.attachment.mimeType == "text/markdown"
-            || item.attachment.fileName.lowercased().hasSuffix(".md")
+        let readsText = isHTML || isMarkdown
+        let preparesMarkdown = isMarkdown && !isHTML
         do {
             let result = try await RemoteIMBackgroundWork.fileCancellable { cancellation -> (String?, String) in
                 let url = URL(fileURLWithPath: path)
@@ -4414,10 +4442,30 @@ private struct FullScreenFilePreviewView: View {
                     let actual = hash.finalize().map { String(format: "%02x", $0) }.joined()
                     if actual != expected { return ("文件内容与发送方提供的 SHA256 不一致，已停止渲染。", "") }
                 }
-                return (nil, readsText ? try String(contentsOf: url, encoding: .utf8) : "")
+                if readsText {
+                    // 完整文本预览同样有界，不能在共享入口一次读入任意大的HTML/MD。
+                    // 超限仍保留工具栏分享，用户可保存原文件到外部应用查看。
+                    try cancellation.check()
+                    let handle = try FileHandle(forReadingFrom: url)
+                    defer { try? handle.close() }
+                    let bytes = try handle.seekToEnd()
+                    guard bytes <= 8 * 1024 * 1024 else {
+                        throw NSError(domain: "MaiChat.DocumentPreview", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "文件超过 8 MB，请通过分享保存后查看。"])
+                    }
+                    try handle.seek(toOffset: 0)
+                    let data = try handle.read(upToCount: Int(bytes) + 1) ?? Data()
+                    guard data.count == Int(bytes) else {
+                        throw NSError(domain: "MaiChat.DocumentPreview", code: 2,
+                            userInfo: [NSLocalizedDescriptionKey: "文件读取期间已变化，请重新打开。"])
+                    }
+                    guard let text = String(data: data, encoding: .utf8) else { throw CocoaError(.fileReadInapplicableStringEncoding) }
+                    return (nil, text)
+                }
+                return (nil, "")
             }
             guard !Task.isCancelled else { return }
-            if result.0 == nil, readsText, item.attachment.mimeType != "text/html" {
+            if result.0 == nil, preparesMarkdown {
                 try await MarkdownPreparation.prepare([result.1])
             }
             guard !Task.isCancelled else { return }
@@ -4898,6 +4946,9 @@ private final class MarkdownRenderCache: @unchecked Sendable {
     private let values = NSCache<NSString, PreparedMarkdownBox>()
     private init() { values.countLimit = 256; values.totalCostLimit = 4 * 1024 * 1024 }
     func cached(_ text: String) -> PreparedMarkdown? { values.object(forKey: text as NSString)?.value }
+    #if DEBUG
+    func removeForThumbnailTest(_ text: String) { values.removeObject(forKey: text as NSString) }
+    #endif
     func prepare(_ text: String) -> PreparedMarkdown {
         dispatchPrecondition(condition: .notOnQueue(.main))
         if let cached = cached(text) { return cached }
@@ -4928,6 +4979,9 @@ private final class MarkdownRenderCache: @unchecked Sendable {
 }
 
 enum MarkdownPreparation {
+    #if DEBUG
+    static func evictForThumbnailTest(_ text: String) { MarkdownRenderCache.shared.removeForThumbnailTest(text) }
+    #endif
     static func prepare(_ texts: [String]) async throws {
         try await RemoteIMBackgroundWork.parseCancellable { cancellation in
             for text in texts {
@@ -4956,6 +5010,7 @@ struct MarkdownLikeText: View {
     private let bodyFont: AppFontStyle
     private let assistantTypography: Bool
     @State private var prepared: PreparedMarkdown?
+    private let retainedDocument: PreparedMarkdown?
     private let trailingTimestamp: String?
 
     private let retainsPreviousWhilePreparing: Bool
@@ -4968,13 +5023,33 @@ struct MarkdownLikeText: View {
         self.source = text
         self.bodyFont = bodyFont
         self.assistantTypography = assistantTypography
+        self.retainedDocument = nil
         _prepared = State(initialValue: MarkdownRenderCache.shared.cached(text))
         self.trailingTimestamp = trailingTimestamp
     }
 
+    // 离屏呈现必须直接持有这次准备结果；NSCache可在await返回前后随时驱逐条目，
+    // 不能用“先预热cache、再构造View”作为图像渲染的可靠交付协议。
+    @MainActor static func preparedDocument(_ text: String,
+        bodyFont: AppFontStyle = AppTypography.body) async throws -> MarkdownLikeText {
+        let document = try await RemoteIMBackgroundWork.parse { MarkdownRenderCache.shared.prepare(text) }
+        try Task.checkCancellation()
+        return MarkdownLikeText(document: document, bodyFont: bodyFont)
+    }
+
+    private init(document: PreparedMarkdown, bodyFont: AppFontStyle) {
+        source = document.source
+        self.bodyFont = bodyFont
+        assistantTypography = false
+        retainsPreviousWhilePreparing = false
+        trailingTimestamp = nil
+        retainedDocument = document
+        _prepared = State(initialValue: document)
+    }
+
     var body: some View {
         let document =
-            (prepared?.source == source ? prepared : nil) ?? MarkdownRenderCache.shared.cached(source)
+            retainedDocument ?? (prepared?.source == source ? prepared : nil) ?? MarkdownRenderCache.shared.cached(source)
             ?? (retainsPreviousWhilePreparing ? prepared : nil)
         let blocks = document?.blocks ?? []
         return VStack(alignment: .leading,

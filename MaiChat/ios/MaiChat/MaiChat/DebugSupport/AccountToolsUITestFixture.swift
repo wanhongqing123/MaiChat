@@ -123,6 +123,65 @@ private final class AccountTestIMClient: RemoteIMClient {
     func updateApplicationBadgeCount(_ count: Int) {}
 }
 
+// 用可取消的受控列表请求驱动普通五页导航，不联系账号服务或读取真实消息。
+@MainActor
+private final class FriendRefreshUITestProbe: ObservableObject {
+    @Published var phase = "idle"
+    private var pending: [UUID: CheckedContinuation<Void, Error>] = [:]
+    enum Failure: Error { case expected }
+    func wait(_ name: String) async throws {
+        try Task.checkCancellation()
+        guard ProcessInfo.processInfo.environment["MAICHAT_FRIEND_REFRESH_PHASE"] == name else { return }
+        phase = "started-" + name
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in pending[id] = c }
+        } onCancel: { Task { @MainActor in self.cancel(id, name: name) } }
+    }
+    private func cancel(_ id: UUID, name: String) {
+        guard let c = pending.removeValue(forKey: id) else { return }
+        phase = "cancelled-" + name
+        c.resume(throwing: CancellationError())
+    }
+    func fail() {
+        let values = Array(pending.values); pending.removeAll()
+        phase = "failed"
+        values.forEach { $0.resume(throwing: Failure.expected) }
+    }
+}
+
+struct FriendRefreshUITestRoot: View {
+    @StateObject private var state: RemoteIMAppState
+    @StateObject private var probe: FriendRefreshUITestProbe
+    @State private var errors = 0
+    init() {
+        let probe = FriendRefreshUITestProbe()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("owned-friend-refresh-" + UUID().uuidString)
+        let defaults = UserDefaults(suiteName: "owned-friend-refresh-" + UUID().uuidString)!
+        let state = RemoteIMAppState(settingsStore: LocalSettingsStore(defaults: defaults),
+            historyStore: LocalChatHistoryStore(baseDirectoryURL: root), client: AccountTestIMClient(),
+            avatarUploader: AccountTestAvatarUploader(),
+            friendRequestsLoader: { try await probe.wait("requests"); return [] },
+            acceptedFriendsLoader: { try await probe.wait("friends"); return [] }, loadedSettings: .empty)
+        state.configureGroupUITestFixture()
+        _state = StateObject(wrappedValue: state)
+        _probe = StateObject(wrappedValue: probe)
+    }
+    var body: some View {
+        RootView().environmentObject(state)
+            .overlay(alignment: .topLeading) {
+                VStack {
+                    Text(probe.phase).accessibilityIdentifier("friend-refresh-phase")
+                    Text(String(errors)).accessibilityIdentifier("friend-refresh-errors")
+                    Button("结束请求为失败") { probe.fail() }.accessibilityIdentifier("friend-refresh-fail")
+                }.font(.caption2).padding(4).background(Color.yellow).padding(.top, 110)
+            }
+            .onChange(of: state.errorMessage) { message in
+                if message?.hasPrefix("获取好友") == true { errors += 1 }
+            }
+    }
+}
+
 struct AgentFileArtifactUITestRoot: View {
     @StateObject private var state: RemoteIMAppState
     @State private var started = false
@@ -136,7 +195,10 @@ struct AgentFileArtifactUITestRoot: View {
     }
 
     var body: some View {
-        AIAssistantView().environmentObject(state).onAppear {
+        Group {
+            if ProcessInfo.processInfo.arguments.contains("--im-document-cards-ui-test") { RootView() }
+            else { AIAssistantView() }
+        }.environmentObject(state).onAppear {
             guard !started else { return }
             started = true
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("owned-file-artifacts-" + UUID().uuidString)
@@ -145,13 +207,67 @@ struct AgentFileArtifactUITestRoot: View {
                 let pdf = directory.appendingPathComponent("本轮报告.pdf")
                 let bytes = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 320, height: 440)).pdfData { context in
                     context.beginPage()
+                    UIColor(red: 0.9, green: 0.05, blue: 0.04, alpha: 1).setFill()
+                    context.cgContext.fill(CGRect(x: 20, y: 20, width: 280, height: 20))
                     ("Owned file preview" as NSString).draw(at: CGPoint(x: 30, y: 50),
                         withAttributes: [.font: UIFont.systemFont(ofSize: 20)])
                 }
                 try bytes.write(to: pdf)
                 let archive = directory.appendingPathComponent("资料归档.zip")
                 try Data("PK-owned-ui-fixture".utf8).write(to: archive)
-                AIAssistantModel.shared.installFileArtifactUITestFixture(workspace: directory, files: [pdf, archive])
+                let usesReport = ProcessInfo.processInfo.environment["MAICHAT_DOCUMENT_REPORT"] == "1"
+                let markdown = directory.appendingPathComponent(usesReport ? "2026-11-16-maichat-directory-plan-readable.md" : "文档首屏.md")
+                var markdownText = "# 文件交付预览\n\n这是已经交付到当前会话的 Markdown 文档。\n\n- 保留真实正文\n- 点击打开完整预览\n\n**内容缩略图**"
+                if ProcessInfo.processInfo.environment["MAICHAT_DOCUMENT_OVERSIZE"] == "1" {
+                    // 尾部单元格改变整表列宽；前64KiB单独解析不等同于全文的首屏。
+                    let row = "|A|" + String(repeating: "B", count: 90) + "|\n"
+                    markdownText = "|A|B|\n|---|---|\n" + String(repeating: row, count: 750) +
+                        "|" + String(repeating: "W", count: 500) + "|tail|\n"
+                    // 超出当前256KiB完整读取预算；空白不制造额外的大量UI节点。
+                    markdownText = String(repeating: " ", count: 256 * 1024) + "\n\n" + markdownText
+                }
+                if usesReport {
+                    let source = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                        .appendingPathComponent("owned-report-ui-fixture.md")
+                    markdownText = try String(contentsOf: source, encoding: .utf8)
+                }
+                try Data(markdownText.utf8).write(to: markdown)
+                var files = usesReport ? [markdown] : [pdf, markdown, archive]
+                if ProcessInfo.processInfo.arguments.contains("--document-html-ui-test") {
+                    let name = ProcessInfo.processInfo.environment["MAICHAT_DOCUMENT_INVALID_DIFF"] == "1"
+                        ? "remote-im-diff-" + String(repeating: "0", count: 64) + ".html" : "页面首屏.html"
+                    let html = directory.appendingPathComponent(name)
+                    let source = """
+                    <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+                    <style>body{margin:0;font:20px sans-serif;background:white}header{background:#00cc44;height:32px}h1{font-size:24px;margin:14px}p{margin:14px}</style></head>
+                    <body><header></header><h1>HTML 内容预览</h1><p>显示网页排版后的首屏。</p>
+                    <script>document.body.style.background='red'</script></body></html>
+                    """
+                    try Data(source.utf8).write(to: html)
+                    files.append(html)
+                }
+                AIAssistantModel.shared.installFileArtifactUITestFixture(workspace: directory,
+                    files: files)
+                if ProcessInfo.processInfo.arguments.contains("--im-document-cards-ui-test") {
+                    let owner = "owned-document-owner", peer = "owned-document-peer"
+                    let direction: RemoteIMMessageDirection = ProcessInfo.processInfo.environment["MAICHAT_DOCUMENT_SIDE"] == "outgoing" ? .outgoing : .incoming
+                    let messages = files.enumerated().map { index, file in
+                        let ext = file.pathExtension
+                        let mime = ext == "pdf" ? "application/pdf" : ext == "md" ? "text/markdown" : ext == "html" ? "text/html" : "application/zip"
+                        return RemoteIMMessage(fromUserID: direction == .incoming ? peer : owner,
+                            toUserID: direction == .incoming ? owner : peer, text: "[文件] " + file.lastPathComponent,
+                            mediaCaption: ProcessInfo.processInfo.environment["MAICHAT_DOCUMENT_REAL_CAPTION"] == "1"
+                                ? "请查看这份目录方案。" : nil,
+                            fileAttachment: RemoteIMFileAttachment(localFilePath: file.path,
+                                fileName: file.lastPathComponent, mimeType: mime,
+                                sizeBytes: (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize),
+                            direction: direction, status: .sent, createdAt: Date(timeIntervalSince1970: Double(100 + index)))
+                    }
+                    state.masterUserID = owner
+                    state.chatState = MasterChatState(ownerUserID: owner,
+                        contacts: [RemoteIMContact(userID: peer, displayName: "文档预览好友")], messages: messages)
+                    state.hasCompletedInitialLogin = true
+                }
             } catch {
                 AIAssistantModel.shared.showTransientError("自有文件卡片样本准备失败")
             }

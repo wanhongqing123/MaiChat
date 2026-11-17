@@ -1594,6 +1594,7 @@ struct AIMessageRow: View, Equatable {
     var openBrowser: () -> Void = {}
     @State private var pdfPreview: AIPDFPreviewItem?
     @State private var pdfPreviewError = false
+    @State private var filePreviewRevisions: [String: UInt64] = [:]
     @State private var videoPreview: AIVideoPreviewItem?
     @State private var mediaSaveError: String?
     @State private var cloudUploadNotice: String?
@@ -1854,6 +1855,8 @@ struct AIMessageRow: View, Equatable {
                 output: tool.output, workspacePath: workspacePath) {
                 VStack(alignment: .leading, spacing: 6) {
                     Button {
+                        // 打开时重新核文档版本，文件已变化/丢失时不继续保留旧缩略图。
+                        filePreviewRevisions[tool.id, default: 0] &+= 1
                         Task { @MainActor in
                             let root = workspacePath
                             let url = try? await RemoteIMBackgroundWork.file {
@@ -1863,11 +1866,9 @@ struct AIMessageRow: View, Equatable {
                             else { pdfPreviewError = true }
                         }
                     } label: {
-                        FileBubbleContent(attachment: RemoteIMFileAttachment(
-                            localFilePath: file.url.path, fileName: file.name, mimeType: file.mimeType,
-                            sizeBytes: Int(file.bytes)))
-                            .padding(12)
-                            .background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 12))
+                        DocumentFileCardContent(request: DocumentFileCardRequest(file: file, workspace: workspacePath, partID: tool.id),
+                            thumbnailIdentifier: "agent-document-thumbnail-" + tool.id,
+                            revision: filePreviewRevisions[tool.id, default: 0])
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("agent-file-artifact-" + tool.id)
@@ -2503,6 +2504,7 @@ private struct AIAgentMediaArtifact: Identifiable {
     let outputJSON: String
 }
 
+
 private struct AIPDFPreviewItem: Identifiable {
     let url: URL
     var id: String { url.path }
@@ -2518,8 +2520,14 @@ private struct AIPDFPreviewScreen: View {
     let close: () -> Void
 
     var body: some View {
-        NavigationStack {
-            RemoteIMQuickLookPreview(filePath: item.url.path)
+        if ["html", "htm"].contains(item.url.pathExtension.lowercased()) {
+            // 当前交付入口的QuickLook对HTML可呈现空白；复用IM已有的完整预览。
+            FullScreenFilePreviewView(item: RemoteIMFilePreviewItem(attachment:
+                RemoteIMFileAttachment(localFilePath: item.url.path, fileName: item.url.lastPathComponent,
+                    mimeType: "text/html")), close: close, closeIdentifier: "ai-file-preview-close")
+        } else {
+            NavigationStack {
+                RemoteIMQuickLookPreview(filePath: item.url.path)
                 .appNavigationTitle(item.url.lastPathComponent)
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -2531,6 +2539,7 @@ private struct AIPDFPreviewScreen: View {
                             .accessibilityIdentifier("ai-file-preview-close")
                     }
                 }
+            }
         }
     }
 }

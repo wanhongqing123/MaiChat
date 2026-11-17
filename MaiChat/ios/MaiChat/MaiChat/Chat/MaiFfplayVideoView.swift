@@ -11,6 +11,45 @@ enum MaiMediaKind: Equatable {
     case video
 }
 
+// 屏幕方向由整个媒体呈现持有，翻页不归还；关闭呈现后才恢复首次手动切换前的方向。
+@MainActor
+protocol MaiPlayerOrientationHost: AnyObject {
+    var playerOrientation: MaiPlayerOrientation { get }
+}
+
+@MainActor
+final class MaiPlayerOrientation {
+    private weak var scene: UIWindowScene?
+    private var previous: UIInterfaceOrientationMask?
+
+    func toggle(in scene: UIWindowScene, failed: @escaping @MainActor () -> Void) {
+        if previous == nil {
+            self.scene = scene
+            switch scene.interfaceOrientation {
+            case .landscapeLeft: previous = .landscapeLeft
+            case .landscapeRight: previous = .landscapeRight
+            case .portraitUpsideDown: previous = .portraitUpsideDown
+            default: previous = .portrait
+            }
+        }
+        let target: UIInterfaceOrientationMask = scene.interfaceOrientation.isLandscape ? .portrait : .landscapeRight
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: target)) { _ in
+            Task { @MainActor in failed() }
+        }
+    }
+
+    func restore() {
+        guard let scene, let previous else { return }
+        self.previous = nil
+        self.scene = nil
+        // 给正在移除的全屏宿主完成本轮生命周期，避免把旋转请求绑到已销毁的view。
+        Task { @MainActor [weak scene] in
+            guard let scene, scene.activationState == .foregroundActive else { return }
+            scene.requestGeometryUpdate(.iOS(interfaceOrientations: previous))
+        }
+    }
+}
+
 struct MaiMediaItem: Equatable {
     let kind: MaiMediaKind
     let path: String
@@ -398,6 +437,8 @@ final class MaiFfplayVideoController: UIViewController {
     private let saveButton = UIButton(type: .system)
     private let speedButton = UIButton(type: .system)
     private let speedChoices = UIStackView()
+    private let orientation = MaiPlayerOrientation()
+    private let orientationButton = UIButton(type: .system)
     private let saveStatusLabel = UILabel()
     private var playbackTimer: Timer?
     private var playing = true
@@ -522,7 +563,17 @@ final class MaiFfplayVideoController: UIViewController {
             saveButton.isHidden = true
             copyButton.isHidden = true
         }
-        let actions = UIStackView(arrangedSubviews: [shareButton, saveButton, speedButton, copyButton])
+        orientationButton.setImage(UIImage(systemName: "rotate.right"), for: .normal)
+        orientationButton.tintColor = .white
+        orientationButton.backgroundColor = UIColor.white.withAlphaComponent(0.18)
+        orientationButton.layer.cornerRadius = 25
+        orientationButton.accessibilityIdentifier = "ffplay-orientation"
+        orientationButton.accessibilityLabel = "横屏播放"
+        orientationButton.addTarget(self, action: #selector(toggleOrientation), for: .touchUpInside)
+        orientationButton.translatesAutoresizingMaskIntoConstraints = false
+        orientationButton.widthAnchor.constraint(equalToConstant: 50).isActive = true
+        orientationButton.heightAnchor.constraint(equalToConstant: 50).isActive = true
+        let actions = UIStackView(arrangedSubviews: [shareButton, saveButton, speedButton, copyButton, orientationButton])
         actions.axis = .horizontal
         actions.spacing = 12
         actions.translatesAutoresizingMaskIntoConstraints = false
@@ -587,10 +638,10 @@ final class MaiFfplayVideoController: UIViewController {
             metalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             errorLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             errorLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            controls.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            controls.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            controls.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            controls.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             controls.bottomAnchor.constraint(equalTo: actions.topAnchor, constant: -4),
-            actions.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
+            actions.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -18),
             actions.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor,
                                            constant: -4),
             speedChoices.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
@@ -604,7 +655,7 @@ final class MaiFfplayVideoController: UIViewController {
             saveStatusLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor,
                                                   constant: -32),
             saveStatusLabel.heightAnchor.constraint(equalToConstant: 40),
-            closeButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
+            closeButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 18),
             closeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor,
                                              constant: 12),
             closeButton.widthAnchor.constraint(equalToConstant: 50),
@@ -613,6 +664,38 @@ final class MaiFfplayVideoController: UIViewController {
         controlViews = [controls, actions]
         // 所有宿主复用触摸互锁；拖动及菜单操作期间不得把用户正在操作的控件隐藏。
         observeControlTouches(in: view)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        orientationButton.accessibilityLabel = view.window?.windowScene?.interfaceOrientation.isLandscape == true
+            ? "竖屏播放" : "横屏播放"
+    }
+
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        // 方向动画中暂不接收第二次点击；完成后才报告可操作，避免只看scene尺寸已变
+        // 就把尚在旋转/裁切中的画面当作稳定横屏。
+        orientationButton.isEnabled = false
+        coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+            self?.view.layoutIfNeeded()
+            self?.orientationButton.isEnabled = true
+        }
+    }
+
+    @objc private func toggleOrientation() {
+        guard let scene = view.window?.windowScene else { return }
+        var owner = parent
+        var scope = orientation
+        while let current = owner {
+            if let host = current as? MaiPlayerOrientationHost { scope = host.playerOrientation; break }
+            owner = current.parent
+        }
+        scope.toggle(in: scene) { [weak self] in
+            self?.errorLabel.text = "无法切换屏幕方向，请稍后重试"
+            self?.errorLabel.isHidden = false
+            self?.revealControls()
+        }
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -674,6 +757,7 @@ final class MaiFfplayVideoController: UIViewController {
 
     func stop() {
         hostActive = false
+        orientation.restore()
         controlTouches = 0
         controlsHideTask?.cancel()
         controlsHideTask = nil

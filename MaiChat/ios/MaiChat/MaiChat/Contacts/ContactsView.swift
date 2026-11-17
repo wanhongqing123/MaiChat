@@ -42,6 +42,7 @@ struct ContactsView: View {
                 .remoteIMNavigationBarMaterial()
                 .task {
                     await appState.refreshAcceptedFriends()
+                    guard !Task.isCancelled else { return }
                     await appState.refreshFriendRequests()
                 }
             }
@@ -396,6 +397,7 @@ private struct ContactList: View {
             .listStyle(.plain)
             .refreshable {
                 await appState.refreshAcceptedFriends()
+                guard !Task.isCancelled else { return }
                 await appState.refreshFriendRequests()
             }
             .scrollContentBackground(.hidden)

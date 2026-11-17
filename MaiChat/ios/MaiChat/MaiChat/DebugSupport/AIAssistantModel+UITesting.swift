@@ -909,10 +909,13 @@ extension AIAssistantModel {
             let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
             let value: [String: Any] = ["delivery": "current_ai_session", "type": "file",
                 "path": file.lastPathComponent, "name": file.lastPathComponent,
-                "mime_type": index == 0 ? "application/pdf" : "application/zip", "bytes": size,
-                "caption": index == 0 ? "本轮报告，点击可预览或分享。" : "整理后的资料归档。"]
+                "mime_type": file.pathExtension == "pdf" ? "application/pdf" :
+                    file.pathExtension == "md" ? "text/markdown" :
+                    file.pathExtension == "html" ? "text/html" : "application/zip", "bytes": size,
+                "caption": index == 0 ? "本轮报告，点击可预览或分享。" :
+                    file.pathExtension == "md" ? "文档正文首屏，点击查看全文。" : "整理后的资料归档。"]
             guard let data = try? JSONSerialization.data(withJSONObject: value) else { return nil }
-            return AIPart(id: index == 0 ? "owned-file-pdf-part" : "owned-file-zip-part", kind: "tool",
+            return AIPart(id: "owned-file-" + file.pathExtension + "-part", kind: "tool",
                 tool: "agent_send_file", input: "{}", output: String(decoding: data, as: UTF8.self),
                 state: "completed")
         }
