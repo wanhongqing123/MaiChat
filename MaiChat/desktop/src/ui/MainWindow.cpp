@@ -3413,7 +3413,7 @@ void MainWindow::buildUi() {
 }
 
 void MainWindow::applyStyle() {
-  UiZoom::setStyle(this, QStringLiteral(R"(
+  QString style = QStringLiteral(R"(
         QMainWindow, #root {
             background: #f6f9fc;
             color: #172033;
@@ -3792,7 +3792,36 @@ void MainWindow::applyStyle() {
         QSplitter::handle:hover {
             background: transparent;
         }
-    )"));
+    )");
+#ifdef Q_OS_MACOS
+  // Cocoa's native checkbox indicator sits above Qt's pixel-font label. Paint
+  // these two indicators in the same QSS content box; keep QCheckBox's normal
+  // text hit target, keyboard handling, accessibility and preference signals.
+  style += QStringLiteral(R"(
+        #settingsDoNotDisturb, #remoteControlToggle { spacing: 6px; }
+        #settingsDoNotDisturb::indicator, #remoteControlToggle::indicator {
+            width: 14px;
+            height: 14px;
+            border: 1px solid transparent;
+            border-radius: 5px;
+            background: #e6e6e6;
+        }
+        #settingsDoNotDisturb::indicator:checked, #remoteControlToggle::indicator:checked {
+            background: #008bd2;
+            image: url(:/maichat/icons/settings-check.svg);
+        }
+        #settingsDoNotDisturb::indicator:focus, #remoteControlToggle::indicator:focus {
+            border-color: #008bd2;
+        }
+        #settingsDoNotDisturb::indicator:disabled, #remoteControlToggle::indicator:disabled {
+            background: #f0f0f0;
+        }
+        #settingsDoNotDisturb::indicator:checked:disabled, #remoteControlToggle::indicator:checked:disabled {
+            background: #9ebed0;
+        }
+    )");
+#endif
+  UiZoom::setStyle(this, style);
 }
 
 void MainWindow::bindSignals() {

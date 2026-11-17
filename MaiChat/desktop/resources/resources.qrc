@@ -39,6 +39,7 @@
     <file alias="users.svg">icons/tabler/users.svg</file>
     <file alias="device-desktop.svg">icons/tabler/device-desktop.svg</file>
     <file alias="settings.svg">icons/tabler/settings.svg</file>
+    <file alias="settings-check.svg">icons/settings-check.svg</file>
     <file alias="message-circle-filled.svg">icons/tabler/message-circle-filled.svg</file>
     <file alias="creative-studio-filled.svg">icons/creative-studio-filled.svg</file>
     <file alias="users-filled.svg">icons/tabler/users-filled.svg</file>
