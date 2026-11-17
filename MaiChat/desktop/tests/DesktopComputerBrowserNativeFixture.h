@@ -4,8 +4,16 @@
 
 #include <QStandardPaths>
 #include <QUrl>
+#include <QImage>
+#include <QScopeGuard>
+#include <mutex>
+#include <optional>
+
+#include "MaiTool.h"
 
 #include <atomic>
+#include <cmath>
+#include <exception>
 #include <limits>
 #include <thread>
 
@@ -16,6 +24,118 @@
 #endif
 
 namespace {
+
+// Output-only page oracle; all input coordinates come from actual native PNGs.
+static constexpr const char* ownedSliderDocument = R"MAI_SLIDER_HTML(<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MaiChat owned native slider __NONCE__</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; min-height: 100%; background: #263147; color: white;
+    font: 24px sans-serif; user-select: none; }
+  main { width: min(900px, 78vw); margin: 64px auto; }
+  h1 { font-size: 28px; }
+  #slider { position: relative; height: 180px; margin-top: 48px; touch-action: none; }
+  #rail { position: absolute; left: 18px; right: 18px; top: 86px;
+    height: 8px; background: #8b9cb8; }
+  #goal { position: absolute; top: 42px; width: 8px; height: 96px;
+    background: #df8547; transform: translateX(-50%); pointer-events: none; }
+  #handle { position: absolute; top: 66px; width: 36px; height: 48px;
+    background: #28af77; transform: translateX(-50%); cursor: grab;
+    touch-action: none; }
+  #handle.held { cursor: grabbing; }
+  #state { min-height: 80px; }
+</style>
+<main>
+  <h1>MaiChat owned browser slider</h1>
+  <p>Local input regression. This page is not a CAPTCHA.</p>
+  <div id="slider" aria-label="Owned slider test">
+    <div id="rail"></div><div id="goal" aria-label="Visible target"></div>
+    <div id="handle" role="slider" aria-label="Visible draggable handle"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="15"></div>
+  </div>
+  <p id="state">Waiting for a real pointer press.</p>
+</main>
+<script>
+(() => {
+  const slider = document.getElementById('slider');
+  const handle = document.getElementById('handle');
+  const goal = document.getElementById('goal');
+  const label = document.getElementById('state');
+  const endpoint = '__STATE_ENDPOINT__';
+  const instance = '__RUN_ID__';
+  let queue = Promise.resolve(), serial = 0;
+  let held = false, downs = 0, ups = 0, moves = 0, cancels = 0, untrusted = 0;
+  let center = 0, goalCenter = 0, offset = 0, verdict = 'pending';
+  const clamp = x => Math.max(18, Math.min(slider.clientWidth - 18, x));
+  function aligned() {
+    const a = handle.getBoundingClientRect(), b = goal.getBoundingClientRect();
+    return Math.abs((a.left + a.right - b.left - b.right) / 2) <= 2;
+  }
+  function publish(kind) {
+    // This is an output oracle only: no target or pointer coordinates are
+    // exported. Test inputs must come from real captured image pixels.
+    const state = { instance, sequence: ++serial, kind, held, downs, ups,
+      moves, cancels, untrusted, aligned: aligned(), verdict };
+    queue = queue.then(() => fetch(endpoint, { method: 'POST',
+      credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(state) })).catch(() => {});
+  }
+  function paint() {
+    handle.style.left = center + 'px';
+    goal.style.left = goalCenter + 'px';
+    handle.setAttribute('aria-valuenow', String(Math.round(center / slider.clientWidth * 100)));
+    label.textContent = `Held: ${held}; releases: ${ups}; aligned: ${aligned()}; result: ${verdict}`;
+  }
+  center = clamp(slider.clientWidth * 0.15);
+  goalCenter = clamp(slider.clientWidth * 0.77);
+  paint();
+  window.addEventListener('resize', () => {
+    if (held) {
+      cancels++; held = false; verdict = 'resized'; paint(); publish('cancel');
+    } else if (downs === 0) {
+      center = clamp(slider.clientWidth * 0.15);
+      goalCenter = clamp(slider.clientWidth * 0.77);
+      paint(); publish('ready');
+    }
+  });
+  handle.addEventListener('pointerdown', event => {
+    if (!event.isTrusted) { untrusted++; publish('untrusted'); return; }
+    if (event.button !== 0 || held) return;
+    held = true; downs++; verdict = 'pending';
+    const box = slider.getBoundingClientRect();
+    offset = event.clientX - box.left - center;
+    handle.setPointerCapture(event.pointerId);
+    handle.classList.add('held'); event.preventDefault();
+    paint(); publish('down');
+  });
+  handle.addEventListener('pointermove', event => {
+    if (!held) return;
+    if (!event.isTrusted) { untrusted++; publish('untrusted'); return; }
+    if (!(event.buttons & 1)) { cancels++; held = false; verdict = 'lost-button';
+      paint(); publish('lost-button'); return; }
+    moves++;
+    center = clamp(event.clientX - slider.getBoundingClientRect().left - offset);
+    paint(); publish('move');
+  });
+  handle.addEventListener('pointerup', event => {
+    if (!held || event.button !== 0) return;
+    if (!event.isTrusted) { untrusted++; publish('untrusted'); return; }
+    held = false; ups++;
+    verdict = aligned() && cancels === 0 && untrusted === 0 ? 'success' : 'unaligned';
+    handle.classList.remove('held'); paint(); publish('up');
+  });
+  handle.addEventListener('pointercancel', () => {
+    if (!held) return;
+    cancels++; held = false; verdict = 'canceled'; paint(); publish('cancel');
+  });
+  requestAnimationFrame(() => requestAnimationFrame(() => publish('ready')));
+})();
+</script>
+</html>
+)MAI_SLIDER_HTML";
 
 struct BrowserLoopbackFixture {
     httplib::Server server;
@@ -28,6 +148,37 @@ struct BrowserLoopbackFixture {
     const std::string cookie = "maichat_fixture_" + nonce + "=" + nonce;
     const std::string secondMarker = "MaiChat owned browser SECOND BODY " + nonce;
     int port = 0;
+    bool sliderMode = false;
+    std::atomic<int> sliderLoads{0};
+    mutable std::mutex sliderMutex;
+    std::string sliderInstance;
+    Json sliderState = Json::object();
+
+    Json sliderSnapshot() const {
+        std::lock_guard<std::mutex> lock(sliderMutex);
+        return sliderState;
+    }
+    void respondSlider(httplib::Response& response) {
+        const std::string instance = nonce + "-" + std::to_string(++sliderLoads);
+        {
+            std::lock_guard<std::mutex> lock(sliderMutex);
+            sliderInstance = instance;
+            sliderState = {{"instance", instance}, {"kind", "loading"}, {"sequence", 0}};
+        }
+        std::string html = ownedSliderDocument;
+        const auto replace = [&](const std::string& token, const std::string& value) {
+            for (std::size_t position = 0; (position = html.find(token, position)) != std::string::npos;)
+                html.replace(position, token.size(), value), position += value.size();
+        };
+        replace("__NONCE__", nonce);
+        replace("__RUN_ID__", instance);
+        replace("__STATE_ENDPOINT__", base + "/slider-state");
+        response.set_header("Cache-Control", "no-store");
+        response.set_header("Connection", "close");
+        response.set_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'");
+        response.set_content(html, "text/html; charset=utf-8");
+    }
 
     bool requestIsLocal(const httplib::Request& request, const std::string& path) const {
         return request.remote_addr == "127.0.0.1" && request.target == path &&
@@ -47,6 +198,7 @@ struct BrowserLoopbackFixture {
         return false;
     }
     void respond(httplib::Response& response, bool second) {
+        if (sliderMode) { respondSlider(response); return; }
         const std::string marker = second ? secondMarker : "MaiChat owned browser FIRST " + nonce;
         const std::string title = "MaiChat owned browser tab " + std::string(second ? "SECOND " : "FIRST ") + nonce;
         const std::string ready = base + (second ? "/second-ready" : "/first-ready");
@@ -104,6 +256,34 @@ struct BrowserLoopbackFixture {
                 response.status = 204;
             });
         }
+        server.Post(base + "/slider-state", [this](const httplib::Request& request, httplib::Response& response) {
+            if (!sliderMode || !requestIsLocal(request, base + "/slider-state") || !hasCookie(request)) {
+                response.status = 403;
+                return;
+            }
+            const Json value = Json::parse(request.body, nullptr, false);
+            if (!value.is_object() || value.size() != 11 || !value.contains("instance") ||
+                !value["instance"].is_string() || !value.contains("sequence") ||
+                !value["sequence"].is_number_unsigned() || !value.contains("kind") || !value["kind"].is_string() ||
+                !value.contains("held") || !value["held"].is_boolean() || !value.contains("aligned") ||
+                !value["aligned"].is_boolean() || !value.contains("verdict") || !value["verdict"].is_string()) {
+                response.status = 400;
+                return;
+            }
+            for (const char* field : {"downs", "ups", "moves", "cancels", "untrusted"})
+                if (!value.contains(field) || !value[field].is_number_unsigned() || value[field].get<std::uint64_t>() > 100000) {
+                    response.status = 400;
+                    return;
+                }
+            std::lock_guard<std::mutex> lock(sliderMutex);
+            if (value["instance"] != sliderInstance) { response.status = 409; return; }
+            if (value["sequence"].get<std::uint64_t>() > sliderState.value("sequence", std::uint64_t(0))) {
+                sliderState = value;
+                if (value["kind"] == "ready") ++firstReady;
+            }
+            response.set_header("Connection", "close");
+            response.status = 204;
+        });
         // The browser's per-process proxy points here too. This server never
         // forwards HTTP/CONNECT traffic; non-fixture routes are rejected.
         server.set_error_handler([this](const httplib::Request&, httplib::Response& response) {
@@ -145,9 +325,12 @@ struct BrowserLoopbackFixture {
 };
 
 #if defined(Q_OS_WIN)
-QString installedFixtureBrowser() {
-    for (const auto& name : {QStringLiteral("Google/Chrome/Application/chrome.exe"),
-                             QStringLiteral("Microsoft/Edge/Application/msedge.exe")})
+QString installedFixtureBrowser(bool edgeOnly = false) {
+    const QStringList candidates = edgeOnly
+        ? QStringList{QStringLiteral("Microsoft/Edge/Application/msedge.exe")}
+        : QStringList{QStringLiteral("Google/Chrome/Application/chrome.exe"),
+                      QStringLiteral("Microsoft/Edge/Application/msedge.exe")};
+    for (const auto& name : candidates)
         for (const auto& base : {qEnvironmentVariable("ProgramFiles"), qEnvironmentVariable("ProgramFiles(x86)")}) {
             const QFileInfo candidate(QDir(base).filePath(name));
             if (!base.isEmpty() && candidate.isFile()) return candidate.canonicalFilePath();
@@ -320,14 +503,187 @@ bool browserVisibleFrameCovers(HWND window, const DesktopNativeDisplay& display)
 }
 #endif
 
-int runBrowserWorkflow() {
+#if defined(Q_OS_WIN)
+bool runOwnedBrowserSlider(const std::shared_ptr<DesktopComputerController>& controller,
+                           BrowserLoopbackFixture& server, const DesktopNativeDisplay& display,
+                           const QString& workspace, const std::string& session,
+                           const std::function<bool()>& canceled,
+                           const std::function<bool(const char*, const DesktopComputerObservation&)>& preserve,
+                           Json& trace, Json& failures) {
+    const auto fail = [&](const std::string& reason) { failures.push_back(reason); return false; };
+    std::atomic<bool> canceledInput{false};
+    QTimer guard;
+    guard.setInterval(20);
+    QObject::connect(&guard, &QTimer::timeout, [&] { if (canceled()) canceledInput = true; });
+    guard.start();
+    MaiToolContext context;
+    context.sessionId = session;
+    context.turnId = "owned-browser-slider-turn";
+    context.root = workspace.toStdString();
+    context.model = "glm-5.3-flash";  // Static tool capability context, not a model request.
+    context.cancel = &canceledInput;
+    MaiToolRegistry registry;
+    registerDesktopComputerTools(registry, controller);
+    MaiTool* computer = registry.find("desktop_computer");
+    if (!computer) return fail("production desktop_computer tool was not registered");
+    const auto release = qScopeGuard([&] { controller->releaseInput(session); });
+    const auto call = [&](const char* stage, const Json& arguments) -> std::optional<MaiToolResult> {
+        if (canceled() || canceledInput) { fail(std::string(stage) + ": owned scope changed"); return {}; }
+        std::optional<MaiToolResult> result;
+        std::atomic<bool> finished{false};
+        std::thread worker([&] {
+            try { result.emplace(computer->execute(arguments.dump(), context)); }
+            catch (...) { canceledInput = true; }
+            finished = true;
+        });
+        QElapsedTimer elapsed;
+        elapsed.start();
+        while (!finished.load()) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+            if (elapsed.elapsed() > 15000) canceledInput = true;
+            QThread::msleep(2);
+        }
+        worker.join();
+        if (!result || result->hasError() || canceledInput || canceled()) {
+            fail(std::string(stage) + ": " + (result && result->hasError()
+                ? result->error().message() : "native tool canceled or did not return"));
+            return {};
+        }
+        trace.push_back({{"stage", stage}, {"entry", "registered desktop_computer"},
+                         {"arguments", arguments}, {"output", result->output()}});
+        return result;
+    };
+    const auto nativeHeld = [&] {
+        const auto state = controller->inputState(session);
+        return std::find(state.buttonsDown.begin(), state.buttonsDown.end(), "left") != state.buttonsDown.end();
+    };
+    const auto center = [](const QImage& image, QRgb color) {
+        QRect bounds;
+        for (int y = 0; y < image.height(); ++y)
+            for (int x = 0; x < image.width(); ++x)
+                if ((image.pixel(x, y) & 0xffffff) == (color & 0xffffff)) bounds |= QRect(x, y, 1, 1);
+        return bounds.isEmpty() ? QPointF(-1, -1) : QRectF(bounds).center();
+    };
+    Json snapshot;
+    QImage pixels;
+    QPointF handle, target;
+    std::uint64_t lastFrame = 0;
+    int heldCaptures = 0;
+    const auto observe = [&](const char* stage, bool held, bool requireChangedFrame = true) {
+        const std::string previousSnapshot = snapshot.is_object()
+            ? snapshot.value("snapshot_id", std::string()) : std::string();
+        auto result = call(stage, {{"action", "observe"}, {"target", "display"},
+            {"display_id", std::to_string(display.id)}, {"wait_ms", 120}});
+        if (!result || result->images().size() != 1) return fail(std::string(stage) + ": no actual browser PNG");
+        snapshot = Json::parse(result->output(), nullptr, false);
+        pixels = QImage(QString::fromStdString(result->images().front().path));
+        if (!snapshot.is_object() || !snapshot.contains("snapshot_id") || pixels.width() < 2 || pixels.height() < 2)
+            return fail(std::string(stage) + ": invalid observation binding");
+        const auto frame = snapshot.value("frame_sequence", std::uint64_t(0));
+        // Desktop Duplication emits no new content frame for a static aligned
+        // page. A separate final observation still needs a new binding, but
+        // must not fabricate visual change just to confirm existing pixels.
+        if (!frame || frame < lastFrame || (requireChangedFrame && frame == lastFrame) ||
+            snapshot.value("snapshot_id", std::string()) == previousSnapshot)
+            return fail(std::string(stage) + ": observation frame or binding was not valid");
+        lastFrame = frame;
+        if (!preserve(stage, {result->output(), result->images().front().path})) return false;
+        handle = center(pixels, qRgb(0x28, 0xaf, 0x77));
+        target = center(pixels, qRgb(0xdf, 0x85, 0x47));
+        if (handle.x() < 0 || target.x() < 0) return fail(std::string(stage) + ": visible markers not found in PNG");
+        const auto oracle = server.sliderSnapshot();
+        if (held) {
+            ++heldCaptures;
+            if (!nativeHeld() || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000) ||
+                !oracle.value("held", false) || oracle.value("ups", -1) != 0)
+                return fail(std::string(stage) + ": capture released the owned button or page capture");
+        }
+        trace.push_back({{"stage", std::string(stage) + "-pixels"},
+            {"handle_png_x", handle.x()}, {"handle_png_y", handle.y()},
+            {"target_png_x", target.x()}, {"target_png_y", target.y()},
+            {"png_width", pixels.width()}, {"png_height", pixels.height()},
+            {"owned_native_left", nativeHeld()}, {"page_oracle", oracle}});
+        return true;
+    };
+    const auto pointAction = [&](const char* stage, const char* kind, const QPointF& destination) {
+        Json arguments{{"action", kind}, {"target", "display"},
+            {"display_id", std::to_string(display.id)}, {"snapshot_id", snapshot.at("snapshot_id")},
+            {"x_ratio", destination.x() / (pixels.width() - 1)},
+            {"y_ratio", destination.y() / (pixels.height() - 1)}};
+        if (std::string(kind) == "mouse_down") arguments["button"] = "left";
+        return bool(call(stage, arguments));
+    };
+    try {
+        if (!OwnedDocumentDesktop::physicalInputReleased() || !observe("slider-initial", false))
+            return fail("owned browser slider was not initially input-ready");
+
+        // A one-shot drag intentionally stops short. Dispatch success is not a
+        // substitute for the page's alignment result on the ensuing real up.
+        auto negative = call("slider-negative-drag", {{"action", "drag"}, {"target", "display"},
+            {"display_id", std::to_string(display.id)}, {"snapshot_id", snapshot.at("snapshot_id")},
+            {"x_ratio", handle.x() / (pixels.width() - 1)}, {"y_ratio", handle.y() / (pixels.height() - 1)},
+            {"to_x_ratio", (target.x() - 32) / (pixels.width() - 1)},
+            {"to_y_ratio", target.y() / (pixels.height() - 1)}, {"duration_ms", 200}});
+        if (!negative || !waitUntil([&] { return server.sliderSnapshot().value("ups", 0) == 1; }) ||
+            server.sliderSnapshot().value("verdict", std::string()) != "unaligned" || nativeHeld())
+            return fail("short atomic drag did not produce the expected unaligned negative result");
+        if (!observe("slider-negative-released", false)) return false;
+        const int oldLoad = server.sliderLoads.load();
+        auto reloaded = call("slider-owned-reload", {{"action", "key"}, {"target", "display"},
+            {"display_id", std::to_string(display.id)}, {"snapshot_id", snapshot.at("snapshot_id")}, {"key", "Ctrl+R"}});
+        if (!reloaded || !waitUntil([&] {
+                const auto oracle = server.sliderSnapshot();
+                return server.sliderLoads.load() > oldLoad && oracle.value("kind", std::string()) == "ready";
+            })) return fail("owned native reload did not establish a fresh slider instance");
+        if (!observe("slider-positive-start", false) || !pointAction("slider-left-down", "mouse_down", handle))
+            return false;
+        if (!waitUntil([&] { return server.sliderSnapshot().value("held", false); }))
+            return fail("native left-down did not reach the owned browser page");
+        if (!observe("slider-held-first", true)) return false;
+        if (!pointAction("slider-held-short-move", "move", {target.x() - 32, target.y()}) ||
+            !observe("slider-held-short", true)) return false;
+        for (int adjustment = 0; adjustment < 8 &&
+             (std::abs(target.x() - handle.x()) > 2 || std::abs(target.y() - handle.y()) > 2); ++adjustment) {
+            const auto step = [](double delta) { return (std::max)(-8.0, (std::min)(8.0, delta)); };
+            const QPointF next(handle.x() + step(target.x() - handle.x()),
+                               handle.y() + step(target.y() - handle.y()));
+            const std::string stage = "slider-held-micro-" + std::to_string(adjustment);
+            if (!pointAction(stage.c_str(), "move", next) || !observe(stage.c_str(), true)) return false;
+        }
+        if (!observe("slider-held-alignment-confirm", true, false) || heldCaptures < 2 ||
+            std::abs(target.x() - handle.x()) > 2 || std::abs(target.y() - handle.y()) > 2 ||
+            !waitUntil([&] {
+                const auto oracle = server.sliderSnapshot();
+                return oracle.value("held", false) && oracle.value("ups", -1) == 0 &&
+                       oracle.value("aligned", false) && oracle.value("untrusted", -1) == 0;
+            })) return fail("pixel alignment and held page state were not confirmed before mouse-up");
+        trace.push_back({{"stage", "slider-before-explicit-up"}, {"held_captures", heldCaptures},
+            {"pixel_alignment_confirmed", true}, {"owned_left", nativeHeld()},
+            {"page_oracle", server.sliderSnapshot()}});
+        auto up = call("slider-explicit-up", {{"action", "mouse_up"}, {"button", "left"},
+            {"target", "display"}, {"display_id", std::to_string(display.id)}});
+        if (!up || !waitUntil([&] {
+                const auto oracle = server.sliderSnapshot();
+                return oracle.value("ups", 0) == 1 && !oracle.value("held", true) &&
+                       oracle.value("verdict", std::string()) == "success";
+            }) || nativeHeld()) return fail("aligned native release did not yield the page success verdict");
+        return observe("slider-released-success", false);
+    } catch (const std::exception& error) {
+        return fail(std::string("owned browser slider exception: ") + error.what());
+    } catch (...) {
+        return fail("owned browser slider failed with an unknown exception");
+    }
+}
+#endif
+
+int runBrowserWorkflow(bool sliderWorkflow = false) {
     if (qEnvironmentVariable("MAICHAT_RUN_COMPUTER_DISPLAY_NATIVE") != QStringLiteral("1"))
         return skip("set the explicit owned-desktop opt-in to run the private browser workflow");
 #if !defined(Q_OS_WIN)
     return skip("private native browser identity checks require Windows");
 #else
     if (QApplication::platformName() != QStringLiteral("windows")) return skip("real Windows QPA required");
-    const QString program = installedFixtureBrowser();
+    const QString program = installedFixtureBrowser(sliderWorkflow);
     if (program.isEmpty()) return skip("an installed Chrome or Edge binary was not found");
     QTemporaryDir workspace;
     if (!workspace.isValid()) return 1;
@@ -342,6 +698,7 @@ int runBrowserWorkflow() {
         if (!QDir().mkpath(evidence)) return 1;
     }
     BrowserLoopbackFixture server;
+    server.sliderMode = sliderWorkflow;
     if (!server.listen()) return skip("owned loopback HTTP fixture could not listen");
     // These flags affect only the disposable browser. They suppress background
     // traffic and send HTTP(S) proxy traffic to a local server that never
@@ -417,7 +774,8 @@ int runBrowserWorkflow() {
             15000) ||
         !browser.profileIntact() || server.firstReady.load() == 0)
         return beforeInputExit("fresh profile marker and first local page were not established");
-    DesktopComputerController controller;
+    auto controllerOwner = std::make_shared<DesktopComputerController>();
+    auto& controller = *controllerOwner;
     const auto displays = controller.displays();
     if (!displays) return beforeInputExit(displays.error().message().c_str());
     DesktopNativeWindow target;
@@ -586,7 +944,7 @@ int runBrowserWorkflow() {
     if (!evidence.isEmpty() && !writeJson(QDir(evidence).filePath(QStringLiteral("browser-readiness.json")), startup))
         return beforeInputExit("browser readiness evidence could not be written", 1);
     if (!ready) return beforeInputExit("owned browser foreground/coverage/input conditions were not ready");
-    const std::string session = "owned-browser-workflow";
+    const std::string session = sliderWorkflow ? "owned-browser-slider-workflow" : "owned-browser-workflow";
     captureAttempted = true;
     auto observed = controller.observeDisplay(session, workspace.path().toStdString(), display.id, canceled);
     if (!observed) return beforeInputExit(observed.error().message().c_str());
@@ -728,52 +1086,58 @@ int runBrowserWorkflow() {
                          {"matched", matched && scopeIntact}});
         return matched && scopeIntact ? true : fail(std::string(stage) + ": exact owned URL was not read back");
     };
-    bool passed = preserve("first-page", observed.value()) && action("first-address-focus", "key", "Ctrl+L") &&
-                  urlReadback("first-url", server.url(false)) && action("second-url-type", "type", server.url(true)) &&
-                  urlReadback("typed-second-url", server.url(true)) && action("navigate-second", "key", "Enter");
-    if (passed) {
-        bool scopeIntact = true;
-        const bool loaded = waitUntil([&] {
-            if (canceled()) {
-                scopeIntact = false;
-                return true;
-            }
-            return server.secondReady.load() > 0 && server.secondCookie.load();
-        });
-        if (!loaded || !scopeIntact)
-            passed = fail("second local page/cookie proof did not complete in the same owned browser");
-    }
-    if (passed)
-        passed = action("second-address-focus", "key", "Ctrl+L") &&
-                 urlReadback("navigated-second-url", server.url(true)) && action("return-to-page", "key", "Escape");
+    bool passed = false;
     bool pageMarker = false;
-    if (passed) {
-        bool markerScopeIntact = true;
-        pageMarker = waitUntil([&] {
-            if (canceled()) {
-                markerScopeIntact = false;
-                return true;
-            }
-            const auto elements = maiDesktopElements(target);
-            if (elements)
-                for (const auto& element : elements.value())
-                    if (element.label == server.secondMarker && element.width > 0 && element.height > 0 &&
-                        element.x + element.width > display.x && element.y + element.height > display.y &&
-                        element.x < display.x + display.width && element.y < display.y + display.height)
-                        return true;
-            return false;
-        });
-        pageMarker = pageMarker && markerScopeIntact;
-        if (!pageMarker || canceled())
-            passed = fail("second page marker was not present in the owned native accessibility tree");
-    }
-    if (passed) {
-        const auto final =
-            controller.observeDisplay(session, workspace.path().toStdString(), display.id, canceled, 0, 0, 500);
-        if (!final)
-            passed = fail(final.error().message());
-        else
-            passed = preserve("second-page-normal-wait-500ms", final.value());
+    if (sliderWorkflow) {
+        passed = runOwnedBrowserSlider(controllerOwner, server, display, workspace.path(), session,
+                                       canceled, preserve, trace, failures);
+    } else {
+        passed = preserve("first-page", observed.value()) && action("first-address-focus", "key", "Ctrl+L") &&
+                      urlReadback("first-url", server.url(false)) && action("second-url-type", "type", server.url(true)) &&
+                      urlReadback("typed-second-url", server.url(true)) && action("navigate-second", "key", "Enter");
+        if (passed) {
+            bool scopeIntact = true;
+            const bool loaded = waitUntil([&] {
+                if (canceled()) {
+                    scopeIntact = false;
+                    return true;
+                }
+                return server.secondReady.load() > 0 && server.secondCookie.load();
+            });
+            if (!loaded || !scopeIntact)
+                passed = fail("second local page/cookie proof did not complete in the same owned browser");
+        }
+        if (passed)
+            passed = action("second-address-focus", "key", "Ctrl+L") &&
+                     urlReadback("navigated-second-url", server.url(true)) && action("return-to-page", "key", "Escape");
+        if (passed) {
+            bool markerScopeIntact = true;
+            pageMarker = waitUntil([&] {
+                if (canceled()) {
+                    markerScopeIntact = false;
+                    return true;
+                }
+                const auto elements = maiDesktopElements(target);
+                if (elements)
+                    for (const auto& element : elements.value())
+                        if (element.label == server.secondMarker && element.width > 0 && element.height > 0 &&
+                            element.x + element.width > display.x && element.y + element.height > display.y &&
+                            element.x < display.x + display.width && element.y < display.y + display.height)
+                            return true;
+                return false;
+            });
+            pageMarker = pageMarker && markerScopeIntact;
+            if (!pageMarker || canceled())
+                passed = fail("second page marker was not present in the owned native accessibility tree");
+        }
+        if (passed) {
+            const auto final =
+                controller.observeDisplay(session, workspace.path().toStdString(), display.id, canceled, 0, 0, 500);
+            if (!final)
+                passed = fail(final.error().message());
+            else
+                passed = preserve("second-page-normal-wait-500ms", final.value());
+        }
     }
     const auto capture = maiScreenshotCaptureState();
     if (capture.workerStarts != 1 || capture.sessionStarts != 1 || capture.framesReceived < std::uint64_t(captures))
@@ -783,7 +1147,8 @@ int runBrowserWorkflow() {
     const bool stopped = browser.close();
     const bool removed = stopped && profile.remove();
     if (!stopped || !removed) passed = fail("owned browser job/profile cleanup did not complete");
-    const Json receipt{{"workflow", "native_private_browser_address_bar_navigation"},
+    Json receipt{{"workflow", sliderWorkflow ? "native_private_browser_screenshot_held_slider" :
+                                    "native_private_browser_address_bar_navigation"},
                        {"visual_model", false},
                        {"startup", startup},
                        {"same_process_profile", sameIdentity},
@@ -798,12 +1163,21 @@ int runBrowserWorkflow() {
                        {"session_starts", capture.sessionStarts},
                        {"frames_received", capture.framesReceived},
                        {"exit_code", passed ? 0 : 1}};
+    if (sliderWorkflow) {
+        receipt["page_oracle"] = server.sliderSnapshot();
+        receipt["tool_entry"] = "registered desktop_computer";
+        receipt["input_source"] = "native tool actions, no DOM/CDP input";
+        receipt["external_captcha_acceptance"] = false;
+    }
     if (!evidence.isEmpty()) {
-        if (!writeJson(QDir(evidence).filePath(QStringLiteral("browser-workflow-receipt.json")), receipt))
+        const QString receiptName = sliderWorkflow ? QStringLiteral("browser-slider-workflow-receipt.json") :
+                                                    QStringLiteral("browser-workflow-receipt.json");
+        if (!writeJson(QDir(evidence).filePath(receiptName), receipt))
             passed = false;
         std::fprintf(stderr, "native private browser evidence=%s\n", evidence.toUtf8().constData());
     }
-    std::fprintf(stderr, "native private browser same-profile/Ctrl+L/cookie/UIA exit=%d; visual_model=false\n",
+    std::fprintf(stderr, sliderWorkflow ? "native owned browser held-slider exit=%d; visual_model=false external_captcha=false\n" :
+                                         "native private browser same-profile/Ctrl+L/cookie/UIA exit=%d; visual_model=false\n",
                  passed ? 0 : 1);
     return passed ? 0 : 1;
 #endif

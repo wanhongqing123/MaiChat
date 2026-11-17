@@ -1038,5 +1038,7 @@ int main(int argc, char** argv) {
         return childDocumentEditor(arguments[2], arguments[3], arguments[4]);
     if (arguments.size() == 2 && arguments[1] == QStringLiteral("--workflow")) return runDocumentWorkflow();
     if (arguments.size() == 2 && arguments[1] == QStringLiteral("--browser-workflow")) return runBrowserWorkflow();
+    if (arguments.size() == 2 && arguments[1] == QStringLiteral("--browser-slider-workflow"))
+        return runBrowserWorkflow(true);
     return arguments.size() == 1 ? runParent() : 1;
 }

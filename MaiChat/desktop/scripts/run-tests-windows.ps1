@@ -64,10 +64,20 @@ if ($TestFunction.Count -gt 0) {
     if ($testCommand.Count -eq 0) { throw "Selected CTest has no executable command" }
     $testArguments = @($testCommand | Select-Object -Skip 1) + $TestFunction
     Push-Location -LiteralPath $buildPath
+    $previousErrorAction = $ErrorActionPreference
     try {
+        # Windows PowerShell can wrap native stderr as NativeCommandError when
+        # a caller captures merged streams. Diagnostics alone must not replace
+        # the process exit code, while a launch failure must still fail.
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = $null
         & $testCommand[0] @testArguments
         $testExit = $LASTEXITCODE
-    } finally { Pop-Location }
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+        Pop-Location
+    }
+    if ($null -eq $testExit) { throw "Focused native test did not return an exit code" }
     exit $testExit
 }
 
