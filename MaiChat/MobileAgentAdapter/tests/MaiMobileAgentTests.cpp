@@ -1569,7 +1569,118 @@ static void paidMediaPausedRequestContract() {
         "PASS: normal Mobile model request hides Wan video and paid images, retains local image tools and Kling video");
 }
 
+// Exercise the ordinary import and snapshot APIs; private source metadata must
+// not become user-facing text or file capabilities on either local/remote wire.
+static void importedHistoryDisplayContract() {
+    const auto directory = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8(MaiIdGenerator::generate("mobile_history_display_")));
+    CHECK(!MaiFileSystem::createDirectories(directory));
+    const std::string database = directory.append(MaiFilePath::fromUtf8("agent.sqlite")).toUtf8();
+    const std::string historyPath = directory.append(MaiFilePath::fromUtf8("history.sqlite")).toUtf8();
+    const std::string originalText = "Owned mobile history\nSecond line; literal \\n";
+    sqlite3* history = nullptr;
+    CHECK(sqlite3_open(historyPath.c_str(), &history) == SQLITE_OK);
+    CHECK(sqlite3_exec(history,
+        "CREATE TABLE messages(id TEXT PRIMARY KEY,from_user TEXT,to_user TEXT,peer TEXT,"
+        "direction INTEGER,status INTEGER,text TEXT,created_at INTEGER,caption_above INTEGER DEFAULT 0,"
+        "has_image INTEGER DEFAULT 0,image_path TEXT DEFAULT '',image_w INTEGER DEFAULT 0,"
+        "image_h INTEGER DEFAULT 0,image_bytes INTEGER DEFAULT 0,has_voice INTEGER DEFAULT 0,"
+        "voice_path TEXT DEFAULT '',voice_seconds INTEGER DEFAULT 0,has_file INTEGER DEFAULT 0,"
+        "file_path TEXT DEFAULT '',file_name TEXT DEFAULT '',file_mime TEXT DEFAULT '',file_bytes INTEGER DEFAULT 0,"
+        "has_video INTEGER DEFAULT 0,video_path TEXT DEFAULT '',video_name TEXT DEFAULT '',video_cover TEXT DEFAULT '',"
+        "video_seconds INTEGER DEFAULT 0,video_bytes INTEGER DEFAULT 0,quote_msg_id TEXT DEFAULT '',"
+        "quote_sender TEXT DEFAULT '',quote_digest TEXT DEFAULT '',quote_kind TEXT DEFAULT '');",
+        nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_stmt* insert = nullptr;
+    CHECK(sqlite3_prepare_v2(history,
+        "INSERT INTO messages(id,from_user,to_user,peer,direction,status,text,created_at,has_file,"
+        "file_path,file_name,file_mime,file_bytes) VALUES('owned-history-row','owned-peer','owned-owner',"
+        "'owned-peer',0,2,?1,42,1,'/never-read/mobile-private.bin','metadata-only.bin','application/octet-stream',3)",
+        -1, &insert, nullptr) == SQLITE_OK);
+    CHECK(sqlite3_bind_text(insert, 1, originalText.data(), static_cast<int>(originalText.size()), SQLITE_TRANSIENT) == SQLITE_OK);
+    CHECK(sqlite3_step(insert) == SQLITE_DONE);
+    sqlite3_finalize(insert);
+    sqlite3_close(history);
+    void* mobile = maiMobileAgentCreate();
+    CHECK(mobile != nullptr);
+    std::string session;
+    const Json config{{"op", "configure"}, {"database", database}, {"workspace", directory.toUtf8()},
+                      {"baseUrl", "http://127.0.0.1:1"}, {"apiKey", "owned-unused"}, {"model", "test"}};
+    const auto verify = [&] {
+        for (const auto& response : {
+                call(mobile, {{"op", "snapshot"}, {"session", session}, {"force", true}}),
+                call(mobile, {{"op", "remote_snapshot"}, {"session", session}, {"limit", 20}}),
+                call(mobile, {{"op", "messages_page"}, {"session", session}, {"limit", 20}})}) {
+            CHECK(response.at("ok") == true);
+            CHECK(response.at("messages").size() == 1);
+            const auto& shown = response.at("messages").front();
+            CHECK(shown.at("role") == "user" && shown.at("completed").get<std::int64_t>() > 0);
+            CHECK(shown.at("parts").size() == 1);
+            CHECK(shown.at("parts").front().at("kind") == "text");
+            CHECK(shown.at("parts").front().at("text") == originalText);
+            const auto& hint = shown.at("historyDisplay");
+            CHECK(hint.at("state") == "available" && hint.at("readOnly") == true);
+            CHECK(hint.at("direction") == "incoming" && hint.at("media").size() == 1);
+            CHECK(hint.at("media").front().at("name") == "metadata-only.bin");
+            const auto wire = shown.dump();
+            CHECK(wire.find("Imported conversation context.") == std::string::npos);
+            CHECK(wire.find("historical_record") == std::string::npos);
+            CHECK(wire.find("/never-read/") == std::string::npos);
+            CHECK(wire.find("owner_user_id") == std::string::npos);
+        }
+    };
+    try {
+        CHECK(call(mobile, config).at("ok") == true);
+        session = call(mobile, {{"op", "create"}}).at("id");
+        const auto activated = call(mobile, {{"op", "im_session_binding"}, {"action", "activate"},
+            {"sdk_app_id", "100"}, {"owner_id", "owned-owner"}, {"auth_generation", "1"},
+            {"friends", Json::array({"owned-peer"})},
+            {"history_source", {{"profile", "desktop"}, {"path", historyPath}, {"provenance", "owner_only_legacy"}}}});
+        CHECK(activated.at("ok") == true);
+        const auto request = [&](Json value) {
+            value["op"] = "im_session_binding";
+            value["scope"] = activated.at("scope");
+            value["bridge_id"] = activated.at("bridge_id");
+            return call(mobile, value);
+        };
+        const auto bound = request({{"action", "bind"}, {"peer_id", "owned-peer"}, {"session_id", session},
+            {"expected_workspace_key", MaiFileSystem::resolve(directory).toUtf8()}});
+        CHECK(bound.at("ok") == true && bound.at("history_tasks").size() == 1);
+        const auto task = bound.at("history_tasks").front();
+        const auto opened = callIMHistorySnapshot({{"action", "open"}, {"task", task}});
+        CHECK(opened.at("ok") == true);
+        const auto snapshot = opened.at("snapshot_id");
+        CHECK(request({{"action", "history_opened"}, {"task", task}, {"snapshot_id", snapshot}}).at("ok") == true);
+        const auto page = callIMHistorySnapshot({{"action", "read"}, {"snapshot_id", snapshot}});
+        CHECK(page.at("ok") == true && page.at("records").size() == 1 && page.at("has_more") == false);
+        CHECK(request({{"action", "history_chunk"}, {"task", task}, {"page", page}}).at("page_accepted") == true);
+        CHECK(callIMHistorySnapshot({{"action", "close"}, {"snapshot_id", snapshot}}).at("ok") == true);
+        CHECK(request({{"action", "list"}}).at("bindings").front().at("history_state") == "ready");
+        verify();
+        maiMobileAgentDestroy(mobile);
+        mobile = maiMobileAgentCreate();
+        CHECK(mobile && call(mobile, config).at("ok") == true);
+        verify();
+        std::puts("PASS: Mobile imported history is passive display metadata, not the model envelope");
+    } catch (...) {
+        maiMobileAgentDestroy(mobile);
+        MaiFileSystem::removeRecursively(directory);
+        throw;
+    }
+    maiMobileAgentDestroy(mobile);
+    MaiFileSystem::removeRecursively(directory);
+}
+
 int main(int argc, char** argv) {
+    const bool historyDisplayOnly = argc == 2 && std::strcmp(argv[1], "--history-display-only") == 0;
+    if (argc == 1 || historyDisplayOnly) {
+        try { importedHistoryDisplayContract(); }
+        catch (const std::exception& error) {
+            std::fprintf(stderr, "FAIL: Mobile imported history display: %s\n", error.what());
+            return 1;
+        }
+        if (historyDisplayOnly) return 0;
+    }
     const bool wanPausedOnly = argc == 2 && std::strcmp(argv[1], "--wan-video-paused-only") == 0;
     const bool imagePausedOnly = argc == 2 && std::strcmp(argv[1], "--paid-image-paused-only") == 0;
     if (argc == 1 || wanPausedOnly || imagePausedOnly) {

@@ -52,6 +52,7 @@
 #include "MaiTimeTool.h"
 #include "MaiTodoWriteTool.h"
 #include "MaiToolOutputTool.h"
+#include "MaiIMHistoryFormat.h"
 #include "MaiVideoGeometryTool.h"
 #include "MaiVideoMatting.h"
 #include "MaiVideoMattingTool.h"
@@ -81,6 +82,25 @@
 using Json = nlohmann::json;
 
 namespace {
+
+Json historyDisplayJson(const MaiIMHistoryDisplay& display) {
+    Json value{{"state", display.state == MaiIMHistoryDisplayState::Available ? "available" : "unavailable"},
+               {"readOnly", true}};
+    if (display.state != MaiIMHistoryDisplayState::Available) return value;
+    const auto& record = display.record;
+    value["direction"] = record.direction == MaiIMHistoryDirection::Incoming ? "incoming"
+                         : record.direction == MaiIMHistoryDirection::Outgoing ? "outgoing" : "unknown";
+    value["kind"] = record.kind;
+    value["captionAbove"] = record.captionAbove;
+    if (record.quote) value["quote"] = {{"digest", record.quote->digest}, {"kind", record.quote->kind}};
+    value["media"] = Json::array();
+    for (const auto& item : record.media)
+        value["media"].push_back({{"kind", item.kind}, {"name", item.name}, {"mimeType", item.mimeType},
+            {"sizeBytes", std::to_string(item.sizeBytes)}, {"durationMillis", std::to_string(item.durationMillis)},
+            {"width", item.width}, {"height", item.height},
+            {"referenceMetadataPresent", item.referenceMetadataPresent}, {"metadataUnavailable", item.metadataUnavailable}});
+    return value;
+}
 
 // 保留核心错误类型给宿主队列判断“明确未受理”。不能把未知异常或附件错误猜成Busy后重播。
 class NativeOperationFailure final : public std::runtime_error {
@@ -1211,6 +1231,21 @@ struct MaiMobileAgent {
         for (const auto& message : source)
             if (message.id > latestId) latestId = message.id;
         for (const auto& message : source) {
+            const auto history = maiProjectIMHistoryForDisplay(message);
+            if (history.state != MaiIMHistoryDisplayState::NotImported) {
+                // The persisted User/Text envelope remains model context. This
+                // is a passive UI projection only; never expose paths or turn it
+                // into assistant/tool input. A corrupt whole row is sanitized.
+                const auto& anchor = message.parts.empty() ? message.id : message.parts.front().id;
+                Json displayParts = Json::array({{{"id", anchor}, {"created", message.created}, {"kind", "text"},
+                    {"text", history.state == MaiIMHistoryDisplayState::Available
+                                 ? history.record.text : "Historical message unavailable"}}});
+                messages.push_back({{"id", message.id}, {"sessionId", sessionId},
+                    {"role", maiRoleToString(message.role)}, {"created", message.created},
+                    {"completed", message.completed}, {"active", false}, {"parts", std::move(displayParts)},
+                    {"historyDisplay", historyDisplayJson(history)}});
+                continue;
+            }
             Json parts = Json::array();
             for (const auto& part : message.parts) {
                 Json value = {{"id", part.id}, {"created", part.created}};
