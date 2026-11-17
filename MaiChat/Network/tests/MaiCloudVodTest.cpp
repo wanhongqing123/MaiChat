@@ -206,15 +206,22 @@ void testRefresh(const std::string& base, const char* caPath, uint64_t size) {
 }
 
 void testLargeSeek(const std::string& base, const char* caPath) {
-    constexpr uint64_t size = 1'900'000'001;
+    constexpr uint64_t size = 19'000'000'001;
     const std::string url = base + "/oss/large-virtual?sig=valid";
     MaiCloudVodOptions options = optionsFor(url, caPath, size);
     MaiCloudVodResult result{};
     MaiCloudVod* source = mai_cloud_vod_open(&options, &result);
     require(source && mai_cloud_vod_size(source) == size,
             "64-bit virtual source failed to open");
+    verifyBytes(source, 4'294'967'313, 73);
     verifyBytes(source, size - 97, 97);
     mai_cloud_vod_close(source);
+    const Metrics beforeReject = metrics(base, caPath);
+    options.expected_size_bytes = 20'000'000'001;
+    require(mai_cloud_vod_open(&options, &result) == nullptr &&
+            result.status == MAI_CLOUD_VOD_INVALID_ARGUMENT &&
+            metrics(base, caPath).ranges == beforeReject.ranges,
+            "VOD above20GB was fetched before policy rejection");
 }
 
 void testSmallStrictRange(const std::string& base, const char* caPath) {
@@ -257,6 +264,29 @@ void testCloudDrive(const std::string& base, const char* caPath,
     require(metrics(base, caPath).auth == 2,
             "shared helper did not renew the expired play link");
     mai_cloud_vod_close(source);
+}
+
+void testSessionPolicy(const std::string& base, const char* caPath) {
+    const std::string auth = base + "/auth";
+    MaiCloudDriveOptions account{};
+    account.auth_base_url_utf8 = auth.c_str();
+    account.account_token_utf8 = "local-token";
+    account.ca_path_utf8 = caPath;
+    account.proxy_url_utf8 = "";
+    account.signed_upload_host_suffix_utf8 = "localhost";
+    account.owner_device_slot_utf8 = "windows";
+    account.owner_login_session_id_utf8 = "login_a";
+    account.session_id_utf8 = "session_a";
+    const Metrics before = metrics(base, caPath);
+    MaiCloudVodResult result{};
+    MaiCloudVod* source = mai_cloud_vod_open_cloud_drive(&account,
+        "323e4567-e89b-42d3-a456-426614174000", nullptr, nullptr, &result);
+    const bool rejected = source == nullptr;
+    if (source) mai_cloud_vod_close(source);
+    require(rejected && (result.status == MAI_CLOUD_VOD_TOO_LARGE ||
+                         result.status == MAI_CLOUD_VOD_INVALID_RESPONSE) &&
+            metrics(base, caPath).ranges == before.ranges,
+            "Session 3GB play-link inherited cloud20GB policy or reached OSS before rejection");
 }
 
 void testCancellation(const std::string& base, const char* caPath,
@@ -380,6 +410,7 @@ int main(int argc, char** argv) {
     testLargeSeek(base, argv[2]);
     testSmallStrictRange(base, argv[2]);
     testCloudDrive(base, argv[2], size);
+    testSessionPolicy(base, argv[2]);
     testCancellation(base, argv[2], size);
     testRestartableInterrupt(base, argv[2], size);
     testRenewalInterrupt(base, argv[2], size);

@@ -1,5 +1,6 @@
 #include "ui/CloudDriveDialog.h"
 #include "MaiCloudVod.h"
+#include "ui/DesktopCloudDriveThumbnail.h"
 #include "ui/ImagePreviewDialog.h"
 #include "ui/MainWindow.h"
 #include "ui/MaiFfplayVideoDialog.h"
@@ -15,6 +16,7 @@
 #include <QCryptographicHash>
 #include <QFutureWatcher>
 #include <QImage>
+#include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
 #include <QFrame>
@@ -23,6 +25,7 @@
 #include <QStandardPaths>
 #include <QStackedWidget>
 #include <QThread>
+#include <QTemporaryDir>
 #include <QTimer>
 #include <QtTest>
 
@@ -171,6 +174,151 @@ void openMedia(QWidget& parent, const QString& type) {
     QTest::mouseDClick(thumbnail, Qt::LeftButton);
 }
 
+QByteArray readOwnedBytes(const QString& path) {
+    QFile file(path);
+    require(file.open(QIODevice::ReadOnly), "could not read owned thumbnail fixture");
+    return file.readAll();
+}
+
+void writeOwnedBytes(const QString& path, const QByteArray& bytes) {
+    QFile file(path);
+    require(file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size(),
+            "could not write owned thumbnail fixture");
+}
+
+void verifyPreparedCloudImage(const QString& directory) {
+    QTemporaryDir owned(QDir(directory).filePath(QStringLiteral("cloud-helper-XXXXXX")));
+    require(owned.isValid(), "could not create owned image helper fixture directory");
+    const QString source = owned.path() + QStringLiteral("/cloud-thumbnail-source.jpg");
+    const QString checkpoint = owned.path() + QStringLiteral("/prepared-image.maicloud.json");
+    const QString jpeg = checkpoint + QStringLiteral(".thumbnail.jpg");
+    const QString metadata = checkpoint + QStringLiteral(".thumbnail.meta");
+    QImage original(960, 480, QImage::Format_RGB32);
+    original.fill(QColor(36, 148, 202));
+    require(original.save(source, "JPEG"), "could not create cloud thumbnail source");
+    const QByteArray originalBytes = readOwnedBytes(source);
+    auto prepared = prepareDesktopCloudDriveImage(source, checkpoint, QFileInfo(source).fileName());
+    require(prepared.error.isEmpty() && prepared.image && prepared.thumbnailPath == jpeg,
+            "ordinary cloud image helper did not prepare an owned JPEG");
+    require(prepared.encodedOriginal == originalBytes,
+            "thumbnail and original did not share an immutable image snapshot");
+    require(QFileInfo(jpeg).isFile() && QFileInfo(metadata).isFile() && QFileInfo(jpeg).size() <= 2'000'000,
+            "thumbnail was not atomically retained beside its checkpoint");
+    QImage thumbnail(jpeg);
+    require(!thumbnail.isNull() && thumbnail.width() == 320 && thumbnail.height() == 160,
+            "prepared JPEG did not retain aspect ratio within the 320-pixel bound");
+    const QByteArray jpegBytes = readOwnedBytes(jpeg);
+    writeOwnedBytes(checkpoint, QJsonDocument(QJsonObject{
+        {QStringLiteral("version"), 1},
+        {QStringLiteral("video_id"), QStringLiteral("10000000-1111-2222-3333-444444444444")},
+        {QStringLiteral("upload_id"), QStringLiteral("owned-original")},
+        {QStringLiteral("file_size"), originalBytes.size()},
+        {QStringLiteral("file_sha256"), QString::fromLatin1(
+            QCryptographicHash::hash(originalBytes, QCryptographicHash::Sha256).toHex())},
+        {QStringLiteral("source_id"), source},
+        {QStringLiteral("name"), QFileInfo(source).fileName()},
+        {QStringLiteral("content_type"), QStringLiteral("image/jpeg")},
+        {QStringLiteral("room_key"), QString()},
+        {QStringLiteral("part_size"), 8 * 1024 * 1024}, {QStringLiteral("parts_total"), 1},
+        {QStringLiteral("completed"), false},
+        {QStringLiteral("thumbnail"), QJsonObject{
+            {QStringLiteral("upload_id"), QStringLiteral("owned-upload")},
+            {QStringLiteral("size_bytes"), jpegBytes.size()},
+            {QStringLiteral("file_sha256"), QString::fromLatin1(
+                QCryptographicHash::hash(jpegBytes, QCryptographicHash::Sha256).toHex())},
+            {QStringLiteral("completed"), false}}}}).toJson(QJsonDocument::Compact));
+    require(finishDesktopCloudDriveImage(checkpoint, false) && QFileInfo(jpeg).isFile() &&
+                QFileInfo(metadata).isFile(), "pause removed resumable cloud thumbnail data");
+    auto resumed = prepareDesktopCloudDriveImage(source, checkpoint, QFileInfo(source).fileName());
+    require(resumed.error.isEmpty() && resumed.thumbnailPath == jpeg && readOwnedBytes(jpeg) == jpegBytes,
+            "resume regenerated or changed the retained thumbnail");
+    resumed = {};
+    require(QFile::remove(metadata), "could not remove owned thumbnail metadata fixture");
+    QByteArray corruptedJpeg = jpegBytes;
+    corruptedJpeg[corruptedJpeg.size() - 1] = char(corruptedJpeg.back() ^ 1);
+    writeOwnedBytes(jpeg, corruptedJpeg);
+    require(!prepareDesktopCloudDriveImage(source, checkpoint, QFileInfo(source).fileName()).error.isEmpty() &&
+                !QFileInfo::exists(metadata),
+            "corrupt retained JPEG was treated as recoverable missing metadata");
+    writeOwnedBytes(jpeg, jpegBytes);
+    auto recoveredMetadata = prepareDesktopCloudDriveImage(source, checkpoint, QFileInfo(source).fileName());
+    require(recoveredMetadata.error.isEmpty() && recoveredMetadata.thumbnailPath == jpeg &&
+                readOwnedBytes(jpeg) == jpegBytes && QFileInfo::exists(metadata),
+            "verified retained JPEG without host metadata did not reconstruct its owned binding");
+    recoveredMetadata = {};
+    require(QFile::remove(jpeg), "could not remove owned thumbnail JPEG fixture");
+    auto missingJpeg = prepareDesktopCloudDriveImage(source, checkpoint, QFileInfo(source).fileName());
+    require(missingJpeg.error.isEmpty() && missingJpeg.thumbnailPath.isEmpty() &&
+                QFileInfo::exists(metadata) && !QFileInfo::exists(jpeg),
+            "missing JPEG with a matching receipt was regenerated or blocked authoritative recovery");
+    missingJpeg = {};
+    writeOwnedBytes(jpeg, jpegBytes);
+    original.fill(Qt::red);
+    require(original.save(source, "JPEG"), "could not modify owned source fixture");
+    require(!prepareDesktopCloudDriveImage(source, checkpoint, QFileInfo(source).fileName()).error.isEmpty() &&
+                readOwnedBytes(jpeg) == jpegBytes,
+            "changed original reused or overwrote another thumbnail identity");
+    writeOwnedBytes(source, originalBytes);
+    require(finishDesktopCloudDriveImage(checkpoint, true) && !QFileInfo::exists(jpeg) &&
+                !QFileInfo::exists(metadata) && QFileInfo::exists(source) && QFileInfo::exists(checkpoint),
+            "confirmed completion did not clean only the owned auxiliary files");
+    auto missingLocalThumbnail = prepareDesktopCloudDriveImage(source, checkpoint, QFileInfo(source).fileName());
+    require(missingLocalThumbnail.error.isEmpty() && missingLocalThumbnail.image &&
+                missingLocalThumbnail.encodedOriginal == originalBytes &&
+                missingLocalThumbnail.thumbnailPath.isEmpty() &&
+                !QFileInfo::exists(jpeg) && !QFileInfo::exists(metadata),
+            "missing persisted thumbnail could not reach the shared authoritative-ready recovery path");
+    missingLocalThumbnail = {};
+    original.fill(Qt::red);
+    require(original.save(source, "JPEG"), "could not change owned missing-thumbnail original fixture");
+    require(!prepareDesktopCloudDriveImage(source, checkpoint, QFileInfo(source).fileName()).error.isEmpty(),
+            "missing auxiliary files bypassed the checkpoint's original source binding");
+    writeOwnedBytes(source, originalBytes);
+    prepared = {};
+    require(QFile::remove(checkpoint), "could not remove owned completed checkpoint fixture");
+
+    // Old, small checkpoint records retain their original no-thumbnail contract.
+    writeOwnedBytes(checkpoint, QByteArray("{\"version\":1}"));
+    auto legacy = prepareDesktopCloudDriveImage(source, checkpoint, QFileInfo(source).fileName());
+    require(legacy.error.isEmpty() && legacy.image && legacy.thumbnailPath.isEmpty() &&
+                !QFileInfo::exists(jpeg) && !QFileInfo::exists(metadata),
+            "legacy checkpoint was attached to a different upload protocol");
+    legacy = {};
+    require(QFile::remove(checkpoint), "could not remove owned legacy checkpoint fixture");
+    require(prepareDesktopCloudDriveImage(source, checkpoint, QFileInfo(source).fileName()).error.isEmpty() &&
+                finishDesktopCloudDriveImage(checkpoint, false) && !QFileInfo::exists(jpeg) &&
+                !QFileInfo::exists(metadata) && QFileInfo::exists(source),
+            "pre-initialization failure retained unregistered auxiliary data or removed original media");
+    const QString broken = owned.path() + QStringLiteral("/cloud-invalid-thumbnail-source.jpg");
+    writeOwnedBytes(broken, QByteArray("not an image"));
+    require(!prepareDesktopCloudDriveImage(broken, checkpoint, QFileInfo(broken).fileName()).error.isEmpty() &&
+                !QFileInfo::exists(jpeg) && !QFileInfo::exists(metadata),
+            "invalid image became a prepared cloud upload");
+
+    const QString firstCheckpoint = owned.path() + QStringLiteral("/first.maicloud.json");
+    const QString secondCheckpoint = owned.path() + QStringLiteral("/second.maicloud.json");
+    const QString thirdCheckpoint = owned.path() + QStringLiteral("/third.maicloud.json");
+    auto first = prepareDesktopCloudDriveImage(source, firstCheckpoint, QFileInfo(source).fileName());
+    auto borrowed = first;
+    first = {};
+    auto second = prepareDesktopCloudDriveImage(source, secondCheckpoint, QFileInfo(source).fileName());
+    require(borrowed.error.isEmpty() && second.error.isEmpty(), "two bounded image snapshots were not admitted");
+    auto blocked = prepareDesktopCloudDriveImage(source, thirdCheckpoint, QFileInfo(source).fileName());
+    require(blocked.resourceBusy && !blocked.error.isEmpty() && blocked.encodedOriginal.isEmpty() &&
+                !QFileInfo::exists(thirdCheckpoint + QStringLiteral(".thumbnail.jpg")),
+            "third cloud image bypassed the shared snapshot memory bound");
+    borrowed = {};
+    auto afterRelease = prepareDesktopCloudDriveImage(source, thirdCheckpoint, QFileInfo(source).fileName());
+    require(afterRelease.error.isEmpty() && !afterRelease.resourceBusy,
+            "dropping the final borrowed snapshot did not release its memory slot");
+    afterRelease = {};
+    second = {};
+    require(finishDesktopCloudDriveImage(firstCheckpoint, false) &&
+                finishDesktopCloudDriveImage(secondCheckpoint, false) &&
+                finishDesktopCloudDriveImage(thirdCheckpoint, false),
+            "bounded snapshot fixtures did not release owned auxiliary files");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -191,6 +339,8 @@ int main(int argc, char** argv) {
     QImage imageFixture(320, 180, QImage::Format_RGB32);
     imageFixture.fill(QColor(28, 138, 211));
     require(imageFixture.save(imageSource, "JPEG"), "could not create image fixture");
+    if (!qEnvironmentVariableIsSet("MAICHAT_CLOUD_413_ONLY")) verifyPreparedCloudImage(screenshots);
+    if (qEnvironmentVariableIsSet("MAICHAT_CLOUD_HELPER_ONLY")) return 0;
 
     DesktopVideoCircleAccess access;
     access.authBaseUrl = base + QStringLiteral("/auth");
@@ -200,6 +350,28 @@ int main(int argc, char** argv) {
     access.caPem = ca.readAll();
     access.signedUploadHostSuffix = QStringLiteral("localhost");
     access.proxyUrl = QStringLiteral("");
+    if (qEnvironmentVariableIsSet("MAICHAT_CLOUD_413_ONLY")) {
+        access.authBaseUrl = base + QStringLiteral("/quota-rejection");
+        QString shownError;
+        CloudDriveDialog rejected([access] { return access; },
+            [] { return QStringLiteral("author"); }, {});
+        rejected.setErrorHandler([&shownError](const QString& error) { shownError = error; });
+        rejected.openDrive();
+        QElapsedTimer wait;
+        wait.start();
+        while (shownError.isEmpty() && wait.elapsed() < 5000) {
+            QApplication::processEvents();
+            QThread::msleep(10);
+        }
+        std::cerr << "[owned-cloud-ui-413] " << shownError.toUtf8().constData() << std::endl;
+        require(!shownError.isEmpty() && shownError.contains(QStringLiteral("空间")) &&
+                    !shownError.contains(QStringLiteral("10 GB")) &&
+                    !shownError.contains(QStringLiteral("2 GB")) &&
+                    !shownError.contains(QStringLiteral("20 MB")),
+                "ordinary cloud 413 error retained a fixed historical account quota or media cap");
+        rejected.close();
+        return 0;
+    }
     require(CloudDriveDialog::availability(access) == 1,
             "cloud feature gate did not accept available account API");
     DesktopVideoCircleAccess disabled = access;
@@ -216,6 +388,18 @@ int main(int argc, char** argv) {
             playedName = name;
         });
     dialog.openDrive();
+    // The page stays concise; size policy is reported only for an attempted
+    // upload, rather than left in persistent labels or an obsolete tooltip.
+    for (QLabel* label : dialog.findChildren<QLabel*>()) {
+        require(!label->text().contains(QStringLiteral("仅自己可见")) &&
+                    !label->text().contains(QStringLiteral("2 GB")) &&
+                    !label->text().contains(QStringLiteral("20 MB")),
+                "persistent cloud privacy or old file-size hint remains");
+    }
+    const auto* uploadAction =
+        dialog.findChild<QPushButton*>(QStringLiteral("cloudDriveUpload"));
+    require(uploadAction && uploadAction->toolTip() == QStringLiteral("上传图片或视频"),
+            "cloud upload tooltip retains obsolete file-size policy");
     require(!dialog.findChild<QProgressBar*>(QStringLiteral("cloudDriveProgress")) &&
             !dialog.findChild<QLabel*>(QStringLiteral("cloudDriveStatus")) &&
             !dialog.findChild<QPushButton*>(QStringLiteral("cloudDrivePause")),
@@ -329,9 +513,32 @@ int main(int argc, char** argv) {
                 "cloud did not open the shared independent player window");
         auto* buffering = player->findChild<QWidget*>(QStringLiteral("ffplayBufferingIndicator"));
         auto* error = player->findChild<QLabel*>(QStringLiteral("ffplayErrorLabel"));
-        require(buffering && error && !error->isVisible(), "buffering was shown as an error banner");
+        require(buffering && error, "playback loading or error widget is unavailable");
+        // prepareAndShow publishes the active session while its owner is still
+        // hidden awaiting the real video size. Inspect the user-visible phase,
+        // not an allocated hidden window whose children cannot be isVisible().
+        std::cerr << "[owned-cloud-player-before-map] ownerVisible=" << player->isVisible()
+                  << " indicatorVisible=" << buffering->isVisible()
+                  << " indicatorExplicitHidden=" << buffering->isHidden()
+                  << " hasFrame=" << player->hasPresentedFrame() << std::endl;
+        QElapsedTimer mapped;
+        mapped.start();
+        while (player && !player->isVisible() && mapped.elapsed() < 15000) QTest::qWait(20);
+        const auto requireOwnedPlayer = [&](bool condition, const char* message) {
+            if (!condition && player) {
+                player->close();
+                QTest::qWait(20);
+            }
+            require(condition, message);
+        };
+        requireOwnedPlayer(player && player->isVisible(), "prepared cloud player did not map its owner window");
+        std::cerr << "[owned-cloud-player-mapped] ownerVisible=" << player->isVisible()
+                  << " indicatorVisible=" << buffering->isVisible()
+                  << " indicatorExplicitHidden=" << buffering->isHidden()
+                  << " hasFrame=" << player->hasPresentedFrame() << std::endl;
+        requireOwnedPlayer(!error->isVisible(), "buffering was shown as an error banner");
         if (!player->hasPresentedFrame()) {
-            require(buffering->isVisible(), "first-frame loading indicator was missing");
+            requireOwnedPlayer(buffering->isVisible(), "first-frame loading indicator was missing");
             // 只记录实际加载控件，避开 QWidget::grab 中不可靠的原生视频 backingstore。
             const QImage icon = buffering->grab().toImage();
             int darkest = 255;

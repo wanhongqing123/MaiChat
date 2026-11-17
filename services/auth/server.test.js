@@ -7,7 +7,24 @@ const { createAuthService } = require('./service');
 const { openStore } = require('./store');
 const { createAliyunAsrCredentialIssuer } = require('./aliyun-asr-credential');
 const { createServer, start, requireDeviceSlotFromEnv,
-  videoCircleFromEnv,cloudDriveFromEnv,sessionAttachmentAuthorizerFromEnv } = require('./server');
+  videoCircleFromEnv,cloudDriveFromEnv,sessionAttachmentAuthorizerFromEnv,
+  sessionAttachmentOptionsFromEnv } = require('./server');
+
+test('cloud 20 GB policy does not raise quota or Session attachment limits', () => {
+  const env = {MAICHAT_CLOUD_DRIVE_ENABLED:'1',
+    MAICHAT_CLOUD_DRIVE_INTERNAL_KEY:'fixed-fake-internal-key-at-least-32-characters'};
+  const cloud = cloudDriveFromEnv(env,async () => { throw new Error('no network in configuration test'); });
+  assert.equal(cloud.maxVideoBytes,20_000_000_000);
+  assert.equal(cloud.quotaBytes,10_000_000_000);
+  assert.equal(typeof sessionAttachmentOptionsFromEnv,'function');
+  const session = sessionAttachmentOptionsFromEnv(env,cloud);
+  assert.equal(session.maxVideoBytes,2_000_000_000);
+  assert.equal(session.maxImageBytes,20_000_000);
+  assert.equal(session.quotaBytes,10_000_000_000);
+  assert.equal(session.signPart,cloud.signPart);
+  assert.equal(cloudDriveFromEnv({...env,MAICHAT_CLOUD_DRIVE_QUOTA_BYTES:'1000'}).quotaBytes,1000);
+  assert.throws(() => cloudDriveFromEnv({...env,MAICHAT_CLOUD_DRIVE_MAX_VIDEO_BYTES:'20000000001'}));
+});
 
 test('temporary image ownership connector uses fixed Sync loopback and only forwards the authenticated Bearer',async () => {
   const calls = [];

@@ -439,6 +439,17 @@ function openStore(filename) {
     db.exec(`CREATE INDEX IF NOT EXISTS cloud_drive_videos_folder
       ON cloud_drive_videos(owner_user_id,folder_id,status,created_at DESC,id DESC)`);
   })();
+  // Hidden JPEG resources share the original row and cleanup revision. Add only
+  // after legacy table rebuilds, retaining all old object/upload identities.
+  const thumbnailColumns = new Set(db.pragma('table_info(cloud_drive_videos)').map(column => column.name));
+  for (const [name,type] of Object.entries({
+    thumbnail_object_key:'TEXT',thumbnail_upload_id:'TEXT',
+    thumbnail_size_bytes:'INTEGER NOT NULL DEFAULT 0',thumbnail_status:'TEXT',
+    thumbnail_completion_started_at:'INTEGER'
+  })) if (!thumbnailColumns.has(name))
+    db.exec(`ALTER TABLE cloud_drive_videos ADD COLUMN ${name} ${type}`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS cloud_drive_thumbnail_key
+    ON cloud_drive_videos(thumbnail_object_key) WHERE thumbnail_object_key IS NOT NULL`);
   const phoneColumn = db.prepare('PRAGMA table_info(users)').all()
     .find(column => column.name === 'phone_e164');
   if (phoneColumn?.notnull) {

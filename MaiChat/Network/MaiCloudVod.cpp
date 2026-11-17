@@ -85,7 +85,7 @@ struct MaiCloudVod {
 
 namespace {
 
-constexpr uint64_t kMaximumBytes = 2'000'000'000;
+constexpr uint64_t kMaximumBytes = 20'000'000'000;
 constexpr uint64_t kChunkBytes = 1024 * 1024;
 constexpr size_t kCacheChunks = 8;
 constexpr size_t kMaximumUrlBytes = 16384;
@@ -612,10 +612,13 @@ bool CloudDriveRenewal::fetch(std::string* url, uint64_t* size,
     }
     *size = body["size_bytes"].get<uint64_t>();
     *url = body["read_url"].get<std::string>();
-    if (*size == 0 || *size > kMaximumBytes ||
+    // The convenience renewal also serves existing Session videos. Raising
+    // personal cloud storage must not widen that independent 2 GB policy.
+    const uint64_t maximum = options.session_id_utf8 ? 2'000'000'000 : kMaximumBytes;
+    if (*size == 0 || *size > maximum ||
         (expectedSize && expectedSize != *size) ||
         !validUrl(url->c_str(), hostSuffix)) {
-        result->status = *size > kMaximumBytes ? MAI_CLOUD_VOD_TOO_LARGE :
+        result->status = *size > maximum ? MAI_CLOUD_VOD_TOO_LARGE :
             MAI_CLOUD_VOD_INVALID_RESPONSE;
         return false;
     }

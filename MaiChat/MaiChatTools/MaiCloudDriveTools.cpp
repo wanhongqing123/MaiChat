@@ -74,8 +74,9 @@ const char* toolDescription(Action action) {
                    "requires an enabled account cloud drive.";
         case Action::Upload:
             return "Only after maichat_cloud_drive_list_media succeeds, upload an existing "
-                   "local MP4 or MOV video (maximum 2 GB) or JPEG, PNG, WebP or HEIC image "
-                   "(maximum 20 MB) to this account's private drive. Account quota is 10 GB. "
+                   "local MP4 or MOV video (maximum 20 GB) or JPEG, PNG, WebP or HEIC image "
+                   "(maximum 100 MB) to this account's private drive. Available capacity comes "
+                   "from the account's returned quota, not a fixed local allowance. "
                    "Approval follows the Agent policy. A queued result is not completion.";
         case Action::Pause:
             return "Pause an active upload by task ID from maichat_cloud_drive_list_pending_uploads. "

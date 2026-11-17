@@ -258,7 +258,9 @@ function createHandler(options = {}) {
         return jsonResponse(404, { error: 'Not found' });
       if (!internalCloudRequest(event.headers))
         return jsonResponse(403, { error: 'Internal authorization required' });
-      const body = requestBody(event,32768);
+      // Completion carries up to 2385 authoritative part records for 20 GB.
+      // Keep all other control requests small and retain the 10000-part guard.
+      const body = requestBody(event,cloudAction === '/cloud-drive/complete' ? 1024*1024 : 32768);
       const key = body?.object_key;
       const accountId = body?.account_id;
       const type = cloudContentType(key);
@@ -268,7 +270,9 @@ function createHandler(options = {}) {
             cloudAction === '/cloud-drive/verify') && body.content_type !== type) ||
           (cloudAction === '/cloud-drive/verify' &&
             (!Number.isSafeInteger(body.expected_bytes) || body.expected_bytes < 1 ||
-              body.expected_bytes > (type?.startsWith('image/') ? 20_000_000 : 2_000_000_000))) ||
+              body.expected_bytes > (key?.startsWith('cloud-drive/')
+                ? type?.startsWith('image/') ? 100_000_000 : 20_000_000_000
+                : type?.startsWith('image/') ? 20_000_000 : 2_000_000_000))) ||
           (cloudAction === '/cloud-drive/thumbnail' &&
             !type?.startsWith('image/') && !type?.startsWith('video/')) ||
           (['/cloud-drive/sign-part','/cloud-drive/list-parts',

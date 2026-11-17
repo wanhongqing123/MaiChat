@@ -35,7 +35,6 @@ final class MaiCloudDrive {
         DELETE_FOLDER = 10, MOVE_MEDIA = 11, RENAME_MEDIA = 12, DOWNLOAD_MEDIA = 13,
         SEARCH_MEDIA = 14;
     static final int OK = 0, CANCELED = 6, INSUFFICIENT_SPACE = 11;
-    static final long MAX_VIDEO_BYTES = 2_000_000_000L;
     static final long QUOTA_BYTES = 10_000_000_000L;
     static final int GATE_UNKNOWN = 0, GATE_AVAILABLE = 1,
         GATE_CLOSED = 2, GATE_RETRY = 3;
@@ -44,7 +43,7 @@ final class MaiCloudDrive {
 
     // Each UI/Agent operation owner remains serialized, so a canceled call
     // finishes before its own checkpoint is reopened. Different owners can
-    // still list pending uploads while a 2 GB transfer occupies one worker.
+    // still list pending uploads while a large transfer occupies one worker.
     private static final class SerialExecutor implements Executor {
         private final ArrayDeque<Runnable> waiting = new ArrayDeque<>();
         private Runnable running;
@@ -97,14 +96,48 @@ final class MaiCloudDrive {
         final String name;
         final String type;
         final long bytes;
+        final PreparedImage preparedImage;
         Source(Uri uri, File file, String name, String type, long bytes) {
+            this(uri, file, name, type, bytes, null);
+        }
+        private Source(Uri uri, File file, String name, String type, long bytes, PreparedImage preparedImage) {
             this.uri = uri;
             this.file = file;
             this.name = name;
             this.type = type;
             this.bytes = bytes;
+            this.preparedImage = preparedImage;
         }
         String id() { return uri == null ? file.getAbsolutePath() : uri.toString(); }
+    }
+
+    static final class PreparationFailure extends IOException {
+        final Result result;
+        PreparationFailure(Result result) { super("Image preparation failed"); this.result = result; }
+    }
+
+    private static final class PreparedImage implements AutoCloseable {
+        final File checkpoint, snapshot, thumbnail;
+        final String account, checkpointKey;
+        final MaiCloudDriveThumbnail.Lease lease;
+        private boolean claimed, closed;
+        PreparedImage(File checkpoint, File snapshot, File thumbnail, String account,
+                      MaiCloudDriveThumbnail.Lease lease) throws IOException {
+            this.checkpoint = checkpoint; this.snapshot = snapshot; this.thumbnail = thumbnail;
+            this.account = account; this.lease = lease; checkpointKey = checkpoint.getCanonicalPath();
+        }
+        synchronized boolean claim(File requested, String owner) throws IOException {
+            if (claimed || closed || !account.equals(owner) || !checkpointKey.equals(requested.getCanonicalPath()))
+                return false;
+            claimed = true;
+            return true;
+        }
+        @Override public synchronized void close() {
+            if (closed) return;
+            closed = true;
+            if (!checkpoint.exists()) deleteOwnedSnapshot(snapshot);
+            lease.close();
+        }
     }
 
     static final class MediaInfo {
@@ -192,11 +225,13 @@ final class MaiCloudDrive {
         if (result == null) return "操作失败，请重试";
         if (result.status == CANCELED) return "已暂停，可稍后续传";
         if (result.status == INSUFFICIENT_SPACE) return "设备空间不足，无法暂存这个文件";
+        if ("thumbnail_prepare_failed".equals(result.json().optString("error")))
+            return "无法生成或恢复图片缩略图，请重新选择可解码的原图";
         if (result.status == 8) return "暂存文件与上传记录不一致，请放弃旧上传后重选";
         if (result.httpStatus == 401) return "请重新登录 MaiChat";
         if (result.httpStatus == 404) return "云盘暂未开放";
         if (result.httpStatus == 410) return "上传期限已过，请重新选择文件";
-        if (result.httpStatus == 413) return "文件超过大小限制或账号已满 10 GB";
+        if (result.httpStatus == 413) return "文件超过大小限制或云盘剩余容量不足";
         if (result.httpStatus == 429) return "请求太频繁，请稍后重试";
         return "网络或服务暂不可用，请重试";
     }
@@ -224,14 +259,20 @@ final class MaiCloudDrive {
                 if (files == null) throw new IOException("无法读取云盘上传记录");
                 for (File file : files) {
                     String name = file.getName();
-                    if (!name.endsWith(".maicloud.json.source") ||
-                        name.length() <= ".maicloud.json.source".length() ||
+                    String suffix = name.endsWith(".maicloud.json.source") ? ".source" :
+                        name.endsWith(".maicloud.json.thumbnail.jpg") ? ".thumbnail.jpg" :
+                        name.endsWith(".maicloud.json.thumbnail.meta") ? ".thumbnail.meta" : null;
+                    // A process may die after publishing an auxiliary image but
+                    // before the native uploader creates its durable checkpoint.
+                    int preparing = name.indexOf(".maicloud.json.thumbnail.");
+                    if (suffix == null && preparing > 0 && name.contains(".prepare-"))
+                        suffix = name.substring(preparing + ".maicloud.json".length());
+                    if (suffix == null || name.length() <= ".maicloud.json".length() + suffix.length() ||
                         !Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)) continue;
-                    File checkpoint = new File(directory,
-                        name.substring(0, name.length() - ".source".length()));
+                    File checkpoint = new File(directory, name.substring(0, name.length() - suffix.length()));
                     if (!checkpoint.exists()) file.delete();
                 }
-                // Upload creation also enters through accountDirectory() before staging.
+                // Upload creation also enters through accountDirectory() before staging/thumbnail creation.
                 // Later callers in this process must not race the live stage→checkpoint gap.
                 scannedAccounts.add(directory.getAbsolutePath());
             }
@@ -274,8 +315,7 @@ final class MaiCloudDrive {
             throw new IOException("仅支持 MP4、MOV、JPEG、PNG、WebP 或 HEIC 文件");
         if (source.bytes <= 0 || source.bytes > info.maxBytes)
             throw new IOException(source.bytes < 0 ? "文件提供方没有给出文件大小，请从文件管理器重新选择" :
-                ("image".equals(info.mediaType) ? "单张图片不能超过 20 MB" :
-                    "单个视频不能超过 2 GB"));
+                fileLimitError(info));
         if (source.file != null && !source.file.isFile()) throw new IOException("原文件已不存在");
         return new Source(source.uri, source.file, source.name, info.contentType, source.bytes);
     }
@@ -286,6 +326,15 @@ final class MaiCloudDrive {
             NativeLibrary.ensureLoaded();
             return nativeMediaInfo(name);
         } catch (LinkageError failure) { return null; }
+    }
+
+    // The shared classifier owns cloud size policy; error copy must not retain
+    // old limits or confuse the account's configured quota with a file ceiling.
+    static String fileLimitError(MediaInfo info) {
+        long bytes = info.maxBytes;
+        String amount = bytes % 1_000_000_000L == 0 ? bytes / 1_000_000_000L + " GB" :
+            bytes % 1_000_000L == 0 ? bytes / 1_000_000L + " MB" : bytes + " B";
+        return ("image".equals(info.mediaType) ? "单张图片" : "单个视频") + "不能超过 " + amount;
     }
 
     File newCheckpoint() throws IOException {
@@ -430,6 +479,78 @@ final class MaiCloudDrive {
         upload(source, checkpoint, progress, completion, () -> { });
     }
 
+    // Agent calls this ordinary, local-only preparation on its existing tool
+    // worker before acknowledging a task. UI uses the same preparation from
+    // its serial worker. A successful handoff owns one immutable source/JPEG
+    // pair until the ordinary upload settles; no HTTP logic is duplicated.
+    Source prepareImageForUploadBlocking(Source source, File checkpoint) throws IOException {
+        if (source.type == null || !source.type.startsWith("image/")) return source;
+        if (Looper.myLooper() == Looper.getMainLooper())
+            throw new IOException("Image preparation requires a worker thread");
+        if (!checkpoint.getCanonicalFile().getParentFile().equals(accountDirectory().getCanonicalFile()))
+            throw new IOException("Upload checkpoint is outside this account");
+        if (MaiCloudDriveThumbnail.legacyCheckpoint(checkpoint)) return source;
+        NativeLibrary.ensureLoaded();
+        String account = auth.accountId();
+        long version = begin(), handle = nativeCreateCancel();
+        try {
+            if (handle == 0 || !register(version, handle))
+                throw new PreparationFailure(new Result(CANCELED, 0, 0, null));
+            PreparedImage prepared = prepareImage(source, checkpoint, account, version, handle,
+                (done, total) -> operation == version && account.equals(auth.accountId()) ? 0 : 1);
+            return new Source(source.uri, source.file, source.name, source.type, source.bytes, prepared);
+        } finally { finish(handle); }
+    }
+
+    static void discardPrepared(Source source) {
+        PreparedImage prepared = source.preparedImage;
+        if (prepared == null) return;
+        synchronized (prepared) { if (!prepared.claimed) prepared.close(); }
+    }
+
+    private static void deleteOwnedSnapshot(File snapshot) {
+        if (Files.isRegularFile(snapshot.toPath(), LinkOption.NOFOLLOW_LINKS)) snapshot.delete();
+    }
+
+    private PreparedImage prepareImage(Source source, File checkpoint, String account, long version,
+                                       long handle, NativeProgress stageBridge) throws IOException {
+        MaiCloudDriveThumbnail.Lease lease = MaiCloudDriveThumbnail.borrow(checkpoint);
+        File snapshot = new File(checkpoint + ".source");
+        try {
+            if (Files.isRegularFile(snapshot.toPath(), LinkOption.NOFOLLOW_LINKS) && !checkpoint.exists())
+                snapshot.delete();
+            if (snapshot.exists()) {
+                if (!matchingStagedSource(checkpoint, snapshot, source.bytes))
+                    throw new IOException("The retained image source is inconsistent");
+            } else {
+                try (ParcelFileDescriptor descriptor = source.file == null ?
+                        context.getContentResolver().openFileDescriptor(source.uri, "r") :
+                        ParcelFileDescriptor.open(source.file, ParcelFileDescriptor.MODE_READ_ONLY)) {
+                    if (descriptor == null) throw new IOException("The image is unavailable");
+                    Result copied = nativeStageFd(descriptor.getFd(), source.bytes,
+                        snapshot.getAbsolutePath(), handle, stageBridge);
+                    if (copied == null || !copied.ok())
+                        throw new PreparationFailure(copied == null ? new Result(5, 0, 0, null) : copied);
+                }
+            }
+            File thumbnail;
+            try {
+                thumbnail = MaiCloudDriveThumbnail.prepareFile(checkpoint, snapshot,
+                    source.name, () -> operation != version || !account.equals(auth.accountId()));
+            } catch (MaiCloudDriveThumbnail.Canceled canceled) {
+                throw new PreparationFailure(new Result(CANCELED, 0, 0, null));
+            } catch (IOException invalid) {
+                throw new PreparationFailure(new Result(1, 0, 0,
+                    "{\"error\":\"thumbnail_prepare_failed\"}".getBytes(StandardCharsets.UTF_8)));
+            }
+            return new PreparedImage(checkpoint, snapshot, thumbnail, account, lease);
+        } catch (IOException | RuntimeException | Error failure) {
+            if (!checkpoint.exists()) deleteOwnedSnapshot(snapshot);
+            lease.close();
+            throw failure;
+        }
+    }
+
     // Agent task tracking needs a worker-side terminal signal even when
     // cancel() suppresses the public UI callback for an obsolete operation.
     void upload(Source source, File checkpoint, Progress progress,
@@ -439,6 +560,8 @@ final class MaiCloudDrive {
         worker.execute(() -> {
             long handle = 0;
             Result result = new Result(2, 0, 0, null);
+            PreparedImage preparedImage = source.preparedImage;
+            boolean preparedOwned = false;
             try {
                 NativeLibrary.ensureLoaded();
                 if (!checkpoint.getCanonicalFile().getParentFile().equals(
@@ -464,7 +587,31 @@ final class MaiCloudDrive {
                         String base = testBase == null ? access.authBaseUrl : testBase;
                         String suffix = testBase == null ? null : "localhost";
                         byte[] pem = trustPem();
-                        if (source.file != null) {
+                        boolean image = source.type != null && source.type.startsWith("image/");
+                        if (image && (preparedImage != null || !MaiCloudDriveThumbnail.legacyCheckpoint(checkpoint))) {
+                            if (preparedImage == null) {
+                                NativeProgress stageBridge = (done, total) -> {
+                                    long now = SystemClock.uptimeMillis();
+                                    if (done == total || now - lastProgressAt[0] >= 150) {
+                                        lastProgressAt[0] = now;
+                                        MAIN.post(() -> {
+                                            if (operation == version && account.equals(auth.accountId()))
+                                                progress.changed(done, total, true);
+                                        });
+                                    }
+                                    return operation == version ? 0 : 1;
+                                };
+                                preparedImage = prepareImage(source, checkpoint, account, version, handle, stageBridge);
+                            }
+                            if (!preparedImage.claim(checkpoint, account))
+                                throw new IOException("Prepared image handoff is no longer owned");
+                            preparedOwned = true;
+                            result = nativeUploadFile(base, access.accountToken, pem, suffix,
+                                preparedImage.snapshot.getAbsolutePath(), checkpoint.getAbsolutePath(),
+                                source.name, source.type,
+                                preparedImage.thumbnail == null ? null : preparedImage.thumbnail.getAbsolutePath(),
+                                handle, bridge);
+                        } else if (source.file != null) {
                             File managedStage = new File(checkpoint.getAbsolutePath() + ".source");
                             File canonicalStage = managedStage.getCanonicalFile();
                             boolean discardManagedStage = canonicalStage.getParentFile().equals(
@@ -472,7 +619,7 @@ final class MaiCloudDrive {
                                 source.file.getCanonicalFile().equals(canonicalStage);
                             result = nativeUploadFile(base, access.accountToken, pem, suffix,
                                 source.file.getAbsolutePath(), checkpoint.getAbsolutePath(),
-                                source.name, source.type, handle, bridge);
+                                source.name, source.type, null, handle, bridge);
                             // Native success has already verified the checkpoint SHA;
                             // its completion removes the checkpoint before returning.
                             // Never retain this app-owned copy after completion, even
@@ -491,7 +638,7 @@ final class MaiCloudDrive {
                                 if (matchingStagedSource(checkpoint, staged, source.bytes)) {
                                     result = nativeUploadFile(base, access.accountToken, pem,
                                         suffix, staged.getAbsolutePath(), checkpoint.getAbsolutePath(),
-                                        source.name, source.type, handle, bridge);
+                                        source.name, source.type, null, handle, bridge);
                                     if (result != null && result.ok()) staged.delete();
                                 } else result = new Result(8, 0, 0, null);
                                 // Never replace a durable source: the C++ core checks its
@@ -511,7 +658,7 @@ final class MaiCloudDrive {
                                     if (seekable) {
                                         result = nativeUploadFd(base, access.accountToken, pem,
                                             suffix, descriptor.getFd(), source.id(), source.bytes,
-                                            checkpoint.getAbsolutePath(), source.name, source.type,
+                                            checkpoint.getAbsolutePath(), source.name, source.type, null,
                                             handle, bridge);
                                     } else {
                                         Progress staging = (done, total, ignored) ->
@@ -534,7 +681,7 @@ final class MaiCloudDrive {
                                             result = nativeUploadFile(base, access.accountToken,
                                                 pem, suffix, staged.getAbsolutePath(),
                                                 checkpoint.getAbsolutePath(), source.name,
-                                                source.type, handle, bridge);
+                                                source.type, null, handle, bridge);
                                         if (result != null && result.ok()) staged.delete();
                                     }
                                 }
@@ -542,9 +689,12 @@ final class MaiCloudDrive {
                         }
                     }
                 }
-            } catch (Exception | LinkageError failure) { result = new Result(5, 0, 0, null); }
+            } catch (PreparationFailure failure) { result = failure.result; }
+            catch (Exception | LinkageError failure) { result = new Result(5, 0, 0, null); }
             finally {
                 finish(handle);
+                if (preparedOwned) preparedImage.close();
+                else if (source.preparedImage != null) discardPrepared(source);
                 settled.run();
             }
             Result delivered = result == null ? new Result(2, 0, 0, null) : result;
@@ -561,6 +711,9 @@ final class MaiCloudDrive {
             long handle = 0;
             Result result = new Result(2, 0, 0, null);
             try {
+                if (!checkpoint.getCanonicalFile().getParentFile().equals(
+                        accountDirectory().getCanonicalFile()))
+                    throw new IOException("Upload checkpoint is outside this account");
                 NativeLibrary.ensureLoaded();
                 MaiChatAuthClient.CloudDriveAccess access = auth.cloudDriveAccess();
                 if (access == null) result = new Result(1, 401, 0, null);
@@ -571,6 +724,8 @@ final class MaiCloudDrive {
                             access.accountToken, trustPem(),
                             testBase == null ? null : "localhost",
                             checkpoint.getAbsolutePath(), handle);
+                    if (result != null && result.ok())
+                        MaiCloudDriveThumbnail.cleanupIfNoCheckpoint(checkpoint);
                 }
             } catch (Exception | LinkageError ignored) { }
             finally { finish(handle); }
@@ -616,10 +771,10 @@ final class MaiCloudDrive {
     private static native Result nativeListCheckpoints(String directory);
     private static native Result nativeUploadFile(String base, String token, byte[] pem,
         String hostSuffix, String source, String checkpoint, String name, String type,
-        long cancel, NativeProgress progress);
+        String thumbnail, long cancel, NativeProgress progress);
     private static native Result nativeUploadFd(String base, String token, byte[] pem,
         String hostSuffix, int fd, String stableId, long bytes, String checkpoint,
-        String name, String type, long cancel, NativeProgress progress);
+        String name, String type, String thumbnail, long cancel, NativeProgress progress);
     private static native Result nativeStageFd(int fd, long bytes, String target,
         long cancel, NativeProgress progress);
     private static native Result nativeAbort(String base, String token, byte[] pem,

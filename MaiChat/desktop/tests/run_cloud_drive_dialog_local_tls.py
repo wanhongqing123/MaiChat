@@ -14,6 +14,14 @@ from run_cloud_drive_local_tls import Fixture, Handler
 
 class DesktopHandler(Handler):
     def do_GET(self):
+        if self.path_only() == "/quota-rejection/v1/cloud-drive/folders":
+            self.reply(200, {"folders": []})
+            return
+        if self.path_only() == "/quota-rejection/v1/cloud-drive/videos":
+            self.reply(413, {"error": "Cloud drive quota exceeded", "quota": {
+                "used_bytes": 500_000_000_000, "reserved_bytes": 0,
+                "limit_bytes": 500_000_000_000}})
+            return
         if self.path_only() == "/oss/thumbnail":
             try:
                 with open(self.server.thumbnail_path, "rb") as source:

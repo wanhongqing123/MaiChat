@@ -481,10 +481,11 @@ struct MaiCloudDriveView: View {
             ProgressView(value: Double(model.quota.usedBytes + model.quota.reservedBytes),
                          total: Double(max(model.quota.limitBytes, 1)))
                 .tint(RemoteIMStyle.blue)
-            Text(model.quota.reservedBytes > 0
-                 ? "其中 \(formatBytes(model.quota.reservedBytes)) 已预留 · 视频 2 GB / 图片 20 MB"
-                 : "仅自己可见 · 视频 2 GB / 图片 20 MB")
-                .font(AppTypography.detail).foregroundStyle(RemoteIMStyle.textSecondary)
+            // 只在传输占用配额时解释预留量；常驻的隐私和文件大小说明不占用卡片空间。
+            if model.quota.reservedBytes > 0 {
+                Text("已预留 \(formatBytes(model.quota.reservedBytes))")
+                    .font(AppTypography.detail).foregroundStyle(RemoteIMStyle.textSecondary)
+            }
         }
         .padding(17)
         .background(Color(uiColor: .secondarySystemGroupedBackground),

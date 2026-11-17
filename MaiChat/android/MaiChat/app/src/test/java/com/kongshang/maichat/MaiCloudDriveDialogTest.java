@@ -19,6 +19,39 @@ import static org.junit.Assert.*;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 29)
 public final class MaiCloudDriveDialogTest {
+    @Test public void quotaCardOmitsPersistentPrivacyAndSizeHint() throws Exception {
+        Fixture fixture = fixture(true, false);
+        View card = ReflectionHelpers.callInstanceMethod(fixture.dialog, "quotaCard");
+        assertFalse(hasTextContaining(card, "仅自己可见"));
+        assertFalse(hasTextContaining(card, "2 GB"));
+        assertFalse(hasTextContaining(card, "20 MB"));
+    }
+
+    @Test public void quotaFailureDoesNotInventATenGigabyteAccountLimit() {
+        String text = MaiCloudDrive.errorText(new MaiCloudDrive.Result(1, 413, 0, null));
+        assertFalse(text, text.contains("10 GB"));
+        assertTrue(text, text.contains("容量") || text.contains("空间"));
+    }
+
+    @Test public void reservedRowExistsOnlyForAnActualReservation() throws Exception {
+        Fixture fixture = fixture(true, false);
+        View card = ReflectionHelpers.callInstanceMethod(fixture.dialog, "quotaCard");
+        ReflectionHelpers.callInstanceMethod(fixture.dialog, "updateReservedQuota",
+            ReflectionHelpers.ClassParameter.from(long.class, 1_000_000_000L));
+        assertTrue(hasTextContaining(card, "已预留"));
+        assertFalse(hasTextContaining(card, "仅自己可见"));
+        ReflectionHelpers.callInstanceMethod(fixture.dialog, "updateReservedQuota",
+            ReflectionHelpers.ClassParameter.from(long.class, 0L));
+        assertFalse(hasTextContaining(card, "已预留"));
+    }
+
+    @Test public void fileErrorsUseTheSuppliedNativePolicy() {
+        assertTrue(MaiCloudDrive.fileLimitError(new MaiCloudDrive.MediaInfo(
+            "video/mp4", "video", 20_000_000_000L)).contains("20 GB"));
+        assertTrue(MaiCloudDrive.fileLimitError(new MaiCloudDrive.MediaInfo(
+            "image/png", "image", 100_000_000L)).contains("100 MB"));
+    }
+
     @Test public void embeddedRootHeaderHasNoAddActionAndKeepsItsTitle() throws Exception {
         Fixture fixture = fixture(true, false);
         assertFalse(visible(byDescription(fixture.bar, "云盘更多操作")));
@@ -87,6 +120,16 @@ public final class MaiCloudDriveDialogTest {
             ViewGroup group = (ViewGroup) view;
             for (int index = 0; index < group.getChildCount(); index++)
                 if (hasText(group.getChildAt(index), text)) return true;
+        }
+        return false;
+    }
+
+    private static boolean hasTextContaining(View view, String text) {
+        if (view instanceof TextView && ((TextView) view).getText().toString().contains(text)) return true;
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int index = 0; index < group.getChildCount(); index++)
+                if (hasTextContaining(group.getChildAt(index), text)) return true;
         }
         return false;
     }

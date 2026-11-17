@@ -44,7 +44,7 @@ typedef struct MaiCloudVodOptions {
     // with localhost. Redirects and renewed URLs obey the same host rule.
     const char* signed_host_suffix_utf8;
     // 0 discovers the size from the first Content-Range. A nonzero value must
-    // match the response and must not exceed 2,000,000,000 bytes.
+    // match the response and must not exceed 20,000,000,000 cloud-video bytes.
     uint64_t expected_size_bytes;
     const char* ca_pem;
     size_t ca_pem_length;

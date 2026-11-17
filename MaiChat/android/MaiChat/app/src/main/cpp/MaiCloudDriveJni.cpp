@@ -9,6 +9,19 @@
 #include <string>
 #include <vector>
 
+// The cloud adapter reuses the normal image viewer's bounded decoder and
+// orientation handling instead of introducing a second source-image renderer.
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_kongshang_maichat_MessageImageLoader_nativeDecodeImage(
+    JNIEnv*, jclass, jstring, jint, jint);
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_kongshang_maichat_MaiCloudDriveThumbnail_decodeImage(
+    JNIEnv* env, jclass type, jstring path, jint width, jint height) {
+    return Java_com_kongshang_maichat_MessageImageLoader_nativeDecodeImage(
+        env, type, path, width, height);
+}
+
 namespace {
 
 bool readString(JNIEnv* env, jstring input, std::string* output) {
@@ -116,7 +129,7 @@ bool configureProxy(JNIEnv* env, ProxyContext* context) {
 }
 
 struct Call {
-    std::string base, token, payload, suffix, path, checkpoint, name, type, stableId;
+    std::string base, token, payload, suffix, path, checkpoint, name, type, stableId, thumbnail;
     std::string ownerSlot, ownerLogin, sessionId, messageId, partId;
     std::vector<char> pem;
     ProxyContext proxy;
@@ -189,11 +202,15 @@ struct FdContext { int fd; };
 
 int readAt(void* opaque, uint64_t offset, unsigned char* output, size_t count) {
     auto* source = static_cast<FdContext*>(opaque);
-    if (offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) return 0;
+    // off_t is 32-bit on armeabi-v7a unless every included header agrees on a
+    // feature macro. Explicit large-file APIs keep this adapter ABI-independent.
+    static_assert(sizeof(off64_t) >= sizeof(int64_t), "Cloud-drive offsets must be 64-bit");
+    constexpr uint64_t maximum = static_cast<uint64_t>(std::numeric_limits<off64_t>::max());
+    if (offset > maximum || count > maximum - offset) return 0;
     size_t filled = 0;
     while (filled < count) {
-        ssize_t bytes = pread(source->fd, output + filled, count - filled,
-                              static_cast<off_t>(offset + filled));
+        ssize_t bytes = pread64(source->fd, output + filled, count - filled,
+                               static_cast<off64_t>(offset + filled));
         if (bytes < 0 && errno == EINTR) continue;
         if (bytes < 0 && errno == ESPIPE) return -1;
         if (bytes <= 0) return 0;
@@ -414,7 +431,7 @@ Java_com_kongshang_maichat_MaiCloudDrive_nativeListCheckpoints(
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_kongshang_maichat_MaiCloudDrive_nativeUploadFile(
     JNIEnv* env, jclass, jstring base, jstring token, jbyteArray pem, jstring suffix,
-    jstring source, jstring checkpoint, jstring name, jstring type,
+    jstring source, jstring checkpoint, jstring name, jstring type, jstring thumbnail,
     jlong handle, jobject callback) {
     MaiCloudDriveResult result{};
     result.status = MAI_CLOUD_DRIVE_INVALID_ARGUMENT;
@@ -425,8 +442,10 @@ Java_com_kongshang_maichat_MaiCloudDrive_nativeUploadFile(
         !readString(env, checkpoint, &call.checkpoint) ||
         !readString(env, name, &call.name) ||
         !readString(env, type, &call.type) ||
+        (thumbnail && !readString(env, thumbnail, &call.thumbnail)) ||
         !handle || !configureProgress(env, callback, &progressContext))
         return complete(env, &call, &result);
+    call.options.cloud_drive_thumbnail_path_utf8 = thumbnail ? call.thumbnail.c_str() : nullptr;
     mai_cloud_drive_upload_resumable(&call.options, call.path.c_str(),
         call.checkpoint.c_str(), call.name.c_str(), call.type.c_str(),
         reinterpret_cast<MaiCloudDriveCancel*>(handle), progress, &progressContext, &result);
@@ -438,7 +457,7 @@ extern "C" JNIEXPORT jobject JNICALL
 Java_com_kongshang_maichat_MaiCloudDrive_nativeUploadFd(
     JNIEnv* env, jclass, jstring base, jstring token, jbyteArray pem, jstring suffix,
     jint fd, jstring stableId, jlong bytes, jstring checkpoint, jstring name,
-    jstring type, jlong handle, jobject callback) {
+    jstring type, jstring thumbnail, jlong handle, jobject callback) {
     MaiCloudDriveResult result{};
     result.status = MAI_CLOUD_DRIVE_INVALID_ARGUMENT;
     Call call;
@@ -448,8 +467,10 @@ Java_com_kongshang_maichat_MaiCloudDrive_nativeUploadFd(
         !readString(env, checkpoint, &call.checkpoint) ||
         !readString(env, name, &call.name) ||
         !readString(env, type, &call.type) ||
+        (thumbnail && !readString(env, thumbnail, &call.thumbnail)) ||
         !handle || !configureProgress(env, callback, &progressContext))
         return complete(env, &call, &result);
+    call.options.cloud_drive_thumbnail_path_utf8 = thumbnail ? call.thumbnail.c_str() : nullptr;
     FdContext descriptor{fd};
     MaiCloudDriveSource source{call.stableId.c_str(), static_cast<uint64_t>(bytes),
                                readAt, &descriptor};

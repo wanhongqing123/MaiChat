@@ -2,6 +2,7 @@
 """Exercise bounded HTTPS Range VOD against a disposable local TLS server."""
 
 import http.server
+import json
 import re
 import ssl
 import subprocess
@@ -15,7 +16,9 @@ from urllib.parse import urlsplit
 
 VIDEO_ID = "123e4567-e89b-42d3-a456-426614174000"
 RENEW_ID = "223e4567-e89b-42d3-a456-426614174000"
-VIRTUAL_SIZE = 1_900_000_001
+SESSION_ID = "323e4567-e89b-42d3-a456-426614174000"
+VIRTUAL_SIZE = 19_000_000_001
+SESSION_OVERSIZE = 3_000_000_000
 PAYLOAD = (bytes(range(251)) * ((12 * 1024 * 1024 + 123) // 251 + 1))[:
     12 * 1024 * 1024 + 123]
 
@@ -67,6 +70,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                           len(self.server.oss_connections),
                           self.server.oss_auth_headers)
             self.reply(200, "%d %d %d %d %d %d %d" % result, "text/plain")
+            return
+        if path == f"/auth/v1/session-attachments/{SESSION_ID}/play-link":
+            if self.headers.get("Authorization") != "Bearer local-token":
+                self.reply(401, '{"error":"auth_required"}')
+                return
+            # A valid first-party reply must not make the unchanged Session
+            # policy inherit the larger cloud Range ceiling.
+            self.reply(200, json.dumps({
+                "read_url": f"https://localhost:{self.server.server_port}/oss/session-large?sig=valid",
+                "read_expires_in": 60, "size_bytes": SESSION_OVERSIZE,
+                "content_type": "video/quicktime", "media_type": "video"}))
             return
         if path in (f"/auth/v1/cloud-drive/videos/{VIDEO_ID}/play-link",
                     f"/auth/v1/cloud-drive/videos/{RENEW_ID}/play-link"):
@@ -124,6 +138,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(403, "expired", "text/plain")
             return
         object_size = (VIRTUAL_SIZE if path == "/oss/large-virtual" else
+                       SESSION_OVERSIZE if path == "/oss/session-large" else
                        1683 if path == "/oss/reject-beyond" else
                        len(self.server.payload))
         if path == "/oss/reject-beyond" and requested_last >= object_size:
@@ -136,7 +151,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         last = min(requested_last, object_size - 1)
         payload = (bytes(range(251)) * ((last - first + 1) // 251 + 2))[
-            first % 251:first % 251 + (last - first + 1)] if path == "/oss/large-virtual" else self.server.payload[first:last + 1]
+            first % 251:first % 251 + (last - first + 1)] if path in (
+                "/oss/large-virtual", "/oss/session-large") else self.server.payload[first:last + 1]
         with self.server.lock:
             self.server.range_calls += 1
             self.server.max_range_first = max(self.server.max_range_first, first)
@@ -145,7 +161,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.server.range_start_counts.get(range_key, 0) + 1)
             same_range_calls = self.server.range_start_counts[range_key]
         self.send_response(206)
-        total = object_size if path != "/oss/oversize" else 2_000_000_001
+        total = object_size if path != "/oss/oversize" else 20_000_000_001
         self.send_header("Content-Range", f"bytes {first}-{last}/{total}")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Content-Type", "video/quicktime")

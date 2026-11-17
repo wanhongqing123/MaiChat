@@ -3,9 +3,13 @@
 // Account-bound metadata and resumable OSS multipart control. Media bytes never enter this service.
 const { randomUUID } = require('node:crypto');
 
-const DEFAULT_VIDEO_BYTES = 2_000_000_000;
-// OSS on-the-fly image processing accepts source images up to 20 MB.
-const DEFAULT_IMAGE_BYTES = 20_000_000;
+const DEFAULT_VIDEO_BYTES = 20_000_000_000;
+const DEFAULT_IMAGE_BYTES = 100_000_000;
+// Storage limits are separate from OSS processing and the existing Session policy.
+const SESSION_VIDEO_BYTES = 2_000_000_000;
+const SESSION_IMAGE_BYTES = 20_000_000;
+const OSS_IMAGE_PROCESSING_BYTES = 20_000_000;
+const THUMBNAIL_BYTES = 2_000_000;
 const DEFAULT_QUOTA_BYTES = 10_000_000_000;
 const PART_BYTES = 8 * 1024 * 1024;
 const UPLOAD_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -92,14 +96,19 @@ function validMD5(value) {
 function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
   listParts, listUploads, completeUpload, abortUpload, verifyObject, signRead,
   signThumbnail, deleteObject, authorizeAttachment,
-  newID = randomUUID, maxVideoBytes = DEFAULT_VIDEO_BYTES,
-  maxImageBytes = DEFAULT_IMAGE_BYTES,
+  newID = randomUUID, maxVideoBytes,
+  maxImageBytes,
   quotaBytes = DEFAULT_QUOTA_BYTES, allowedAccountIds = null,
   mode = 'drive' }) {
+  const videoCeiling = mode === 'session' ? SESSION_VIDEO_BYTES : DEFAULT_VIDEO_BYTES;
+  const imageCeiling = mode === 'session' ? SESSION_IMAGE_BYTES : DEFAULT_IMAGE_BYTES;
+  maxVideoBytes ??= videoCeiling;
+  maxImageBytes ??= imageCeiling;
   if (!db || !Number.isSafeInteger(maxVideoBytes) || maxVideoBytes < PART_BYTES ||
+      maxVideoBytes > videoCeiling ||
       !Number.isSafeInteger(maxImageBytes) || maxImageBytes < 1 ||
-      maxImageBytes > DEFAULT_IMAGE_BYTES ||
-      !Number.isSafeInteger(quotaBytes) || quotaBytes < maxVideoBytes ||
+      maxImageBytes > imageCeiling ||
+      !Number.isSafeInteger(quotaBytes) || quotaBytes < 1 ||
       (allowedAccountIds !== null && !(allowedAccountIds instanceof Set)) ||
       !['drive','session'].includes(mode))
     throw new Error('Invalid cloud drive configuration');
@@ -128,6 +137,18 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     row.size_bytes-(partNumber-1)*PART_BYTES);
   const own = (id,userId) => prepare(`SELECT * FROM cloud_drive_videos
     WHERE id=? AND owner_user_id=?`).get(id,userId);
+  // The JPEG is an associated physical resource, never another visible item.
+  const thumbnailResource = row => mode === 'drive' && row?.thumbnail_object_key ? {
+    ...row,object_key:row.thumbnail_object_key,upload_id:row.thumbnail_upload_id,
+    size_bytes:row.thumbnail_size_bytes,content_type:'image/jpeg',
+    status:row.thumbnail_status,name:row.thumbnail_object_key.split('/').at(-1)
+  } : null;
+  const physicalResources = row => [row,thumbnailResource(row)].filter(Boolean);
+  const thumbnailFields = mode === 'drive'
+    ? ',thumbnail_object_key,thumbnail_upload_id,thumbnail_size_bytes,thumbnail_status' : '';
+  const completionMayBeInFlight = `status='completing' OR (status='uploading' AND
+    (upload_id IS NULL${mode === 'drive' ? ` OR (thumbnail_object_key IS NOT NULL AND
+      (thumbnail_upload_id IS NULL OR thumbnail_status='completing'))` : ''}))`;
   const temporary = row => mode === 'session' && row?.retention === 'temporary';
   const expired = row => temporary(row) && row.object_expires_at <= now();
   const signingExpired = row => temporary(row) && Math.floor((row.object_expires_at-now())/1000) < 1;
@@ -210,10 +231,11 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
   }
 
   function quota(owner) {
+    const physicalBytes = mode === 'drive' ? 'size_bytes+COALESCE(thumbnail_size_bytes,0)' : 'size_bytes';
     const usage = prepare(`SELECT
-      COALESCE(SUM(CASE WHEN status='ready' THEN size_bytes ELSE 0 END),0) AS used_bytes,
+      COALESCE(SUM(CASE WHEN status='ready' THEN ${physicalBytes} ELSE 0 END),0) AS used_bytes,
       COALESCE(SUM(CASE WHEN status IN ('uploading','completing') OR cleanup_pending=1
-        THEN size_bytes ELSE 0 END),0) AS reserved_bytes
+        THEN ${physicalBytes} ELSE 0 END),0) AS reserved_bytes
       FROM cloud_drive_videos WHERE owner_user_id=?`).get(owner);
     return { ...usage, limit_bytes:quotaBytes };
   }
@@ -348,7 +370,18 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     }).immediate();
   }
 
-  async function settleDeletedCompletion(row,principal) {
+  async function settleDeletedCompletion(row,principal,associated = false) {
+    const liveReceipt = current => {
+      if (!current || current.status === 'deleted') return null;
+      const resource = associated ? thumbnailResource(current) : current;
+      return resource?.status === 'ready' ? result(200,publicReady(resource)) :
+        result(409,{error:'Upload completion is in progress'});
+    };
+    // A failed resource CAS also happens when a concurrent request already
+    // acknowledged that child. Its live parent is not a deletion tombstone.
+    // Only a truly deleted/missing parent may enter physical cleanup below.
+    const acknowledged = liveReceipt(own(row.id,principal.user_id));
+    if (acknowledged) return acknowledged;
     const timestamp = now();
     const changed = prepare(`UPDATE cloud_drive_videos SET cleanup_pending=1,
       cleanup_after=?,cleanup_hold_until=MAX(COALESCE(cleanup_hold_until,0),?),
@@ -360,12 +393,14 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       return result(404,{ error:'Video not found' });
     }
     const current = own(row.id,principal.user_id);
-    if (current?.status === 'ready') return result(200,publicReady(current));
+    const concurrentReceipt = liveReceipt(current);
+    if (concurrentReceipt) return concurrentReceipt;
     // A completed account purge can remove the row after its hold horizon.
     // Still attempt to delete any late object observed by this running handler.
     try {
       if (typeof deleteObject === 'function')
-        await deleteObject(principal.account_id,row.object_key);
+        for (const resource of physicalResources(row))
+          await deleteObject(principal.account_id,resource.object_key);
     } catch { /* operator OSS lifecycle/prefix purge remains the final fallback */ }
     return result(404,{ error:'Video not found' });
   }
@@ -375,6 +410,8 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     const bytes = body.size_bytes;
     const binding = mode === 'session' ? roomKey(body) : null;
     const isTemporary = mode === 'session' && body.purpose === 'temporary_session_image';
+    const hasThumbnail = Object.hasOwn(body,'thumbnail_size_bytes');
+    const thumbnailBytes = hasThumbnail ? body.thumbnail_size_bytes : 0;
     let generation = 0;
     if (mode === 'session' && !binding)
       return result(400,{ error:'Invalid Session binding' });
@@ -382,7 +419,10 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       return result(400,{ error:'Invalid Session attachment purpose' });
     if (!media || body.content_type !== media.contentType ||
         !Number.isSafeInteger(bytes) || bytes < 1 ||
-        bytes > (media.kind === 'image' ? maxImageBytes : maxVideoBytes))
+        bytes > (media.kind === 'image' ? maxImageBytes : maxVideoBytes) ||
+        (hasThumbnail && (mode !== 'drive' || media.kind !== 'image' ||
+          !Number.isSafeInteger(thumbnailBytes) || thumbnailBytes < 1 || thumbnailBytes > THUMBNAIL_BYTES)) ||
+        (mode === 'drive' && media.kind === 'image' && bytes > OSS_IMAGE_PROCESSING_BYTES && !hasThumbnail))
       return result(400,{ error:'Invalid cloud media upload' });
     if (isTemporary) {
       const fields = new Set(['purpose','name','size_bytes','content_type',
@@ -409,6 +449,11 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     const created = now();
     const key = `${isTemporary ? 'session-temp-images' : mode === 'session' ? 'session-attachments' : 'cloud-drive'}/${principal.account_id}/` +
       `${new Date(created).toISOString().slice(0,10)}/${id}${media.extension}`;
+    const thumbnailID = hasThumbnail ? newID() : null;
+    if (hasThumbnail && (!validID(thumbnailID) || thumbnailID === id))
+      throw new Error('Invalid associated thumbnail ID');
+    const thumbnailKey = hasThumbnail ? `cloud-drive/${principal.account_id}/` +
+      `${new Date(created).toISOString().slice(0,10)}/${thumbnailID}.jpg` : null;
     const expires = created+(isTemporary ? TEMP_IMAGE_TTL_MS : UPLOAD_TTL_MS);
     const reservation = db.transaction(() => {
       if (!prepare('SELECT 1 FROM users WHERE id=? AND disabled_at IS NULL')
@@ -428,7 +473,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         if (reused) return result(409,{error:'Image publication object identity was reused'});
       }
       const available = quota(principal.user_id);
-      if (available.used_bytes+available.reserved_bytes+bytes > quotaBytes)
+      if (available.used_bytes+available.reserved_bytes+bytes+thumbnailBytes > quotaBytes)
         return result(413,{ error:'Cloud drive quota exceeded',quota:available });
       const pending = prepare(`SELECT COUNT(*) AS count FROM cloud_drive_videos
         WHERE owner_user_id=? AND status IN ('uploading','completing')`)
@@ -441,6 +486,9 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         VALUES(?,?,?,?,?,?,'uploading',?,?${mode === 'session' ? ',?' : ''})`)
         .run(id,principal.user_id,body.name,key,bytes,media.contentType,created,
           expires,...(mode === 'session' ? [binding] : []));
+      if (hasThumbnail)
+        prepare(`UPDATE cloud_drive_videos SET thumbnail_object_key=?,thumbnail_size_bytes=?,
+          thumbnail_status='uploading' WHERE id=?`).run(thumbnailKey,thumbnailBytes,id);
       if (isTemporary) {
         db.prepare(`UPDATE session_attachments SET retention='temporary',object_expires_at=?,
           owner_slot=?,owner_login_session_id=?,session_id=?,message_id=?,part_id=? WHERE id=?`)
@@ -459,41 +507,51 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       return null;
     })();
     if (reservation) return reservation;
-    let uploadId;
-    try { uploadId = await startUpload(principal.account_id,key,media.contentType); }
-    catch { /* reservation is released below */ }
-    if (!validUploadID(uploadId)) {
-      // The OSS init request may have succeeded even if its response was lost.
-      // Keep the exact key until ListMultipartUploads can prove it is empty.
-      prepare(`UPDATE cloud_drive_videos SET status='deleted',deleted_at=?,
-        cleanup_pending=1,cleanup_after=?,cleanup_hold_until=?,
-        cleanup_revision=cleanup_revision+1
-        WHERE id=? AND owner_user_id=? AND status='uploading'
-        AND upload_id IS NULL`)
-        .run(now(),now(),now()+COMPLETION_HOLD_MS,id,principal.user_id);
-      await sweep();
-      return result(502,{ error:'Could not begin the video upload' });
-    }
-    const saved = prepare(`UPDATE cloud_drive_videos SET upload_id=?
-      WHERE id=? AND owner_user_id=? AND status='uploading' AND upload_id IS NULL`)
-      .run(uploadId,id,principal.user_id).changes;
-    if (!saved) {
-      // Deletion may have happened while OSS was creating the multipart task.
-      // Keep its returned upload ID in the tombstone so abort can be retried.
-      const retained = prepare(`UPDATE cloud_drive_videos SET upload_id=?,
-        cleanup_pending=1,cleanup_after=?,
-        cleanup_hold_until=MAX(COALESCE(cleanup_hold_until,0),?),
-        cleanup_revision=cleanup_revision+1
-        WHERE id=? AND owner_user_id=? AND status='deleted' AND upload_id IS NULL`)
-        .run(uploadId,now(),now()+COMPLETION_HOLD_MS,id,principal.user_id).changes;
-      if (retained) await sweep();
-      else {
-        try { await abortUpload(principal.account_id,key,uploadId); }
-        catch { /* OSS lifecycle fallback after a completed tombstone */ }
+    // Both immutable keys are durable before either OSS init. A lost response is
+    // reconciled by exact-key discovery for both resources, retaining quota.
+    for (const resource of physicalResources(own(id,principal.user_id))) {
+      const associated = resource.object_key === thumbnailKey;
+      const idColumn = associated ? 'thumbnail_upload_id' : 'upload_id';
+      if (own(id,principal.user_id)?.status !== 'uploading')
+        return result(409,{ error:'Upload was canceled' });
+      let uploadId;
+      try { uploadId = await startUpload(principal.account_id,resource.object_key,resource.content_type); }
+      catch { /* reconcile the ambiguous init below */ }
+      if (!validUploadID(uploadId)) {
+        // The OSS init request may have succeeded if its response was lost.
+        // Keep both exact keys until discovery can prove their absence.
+        prepare(`UPDATE cloud_drive_videos SET status='deleted',deleted_at=?,
+          cleanup_pending=1,cleanup_after=?,cleanup_hold_until=?,
+          cleanup_revision=cleanup_revision+1
+          WHERE id=? AND owner_user_id=? AND status='uploading'
+          AND ${idColumn} IS NULL`)
+          .run(now(),now(),now()+COMPLETION_HOLD_MS,id,principal.user_id);
+        await sweep();
+        return result(502,{ error:'Could not begin the video upload' });
       }
-      return result(409,{ error:'Upload was canceled' });
+      const saved = prepare(`UPDATE cloud_drive_videos SET ${idColumn}=?
+        WHERE id=? AND owner_user_id=? AND status='uploading' AND ${idColumn} IS NULL`)
+        .run(uploadId,id,principal.user_id).changes;
+      if (!saved) {
+        // Keep a late init ID in the same tombstone so abort can be retried.
+        const retained = prepare(`UPDATE cloud_drive_videos SET ${idColumn}=?,
+          cleanup_pending=1,cleanup_after=?,
+          cleanup_hold_until=MAX(COALESCE(cleanup_hold_until,0),?),
+          cleanup_revision=cleanup_revision+1
+          WHERE id=? AND owner_user_id=? AND status='deleted' AND ${idColumn} IS NULL`)
+          .run(uploadId,now(),now()+COMPLETION_HOLD_MS,id,principal.user_id).changes;
+        if (retained) await sweep();
+        else {
+          try { await abortUpload(principal.account_id,resource.object_key,uploadId); }
+          catch { /* OSS lifecycle fallback after a completed tombstone */ }
+        }
+        return result(409,{ error:'Upload was canceled' });
+      }
     }
-    return result(201,{ video_id:id,upload_id:uploadId,media_type:media.kind,
+    const initialized = own(id,principal.user_id);
+    return result(201,{ video_id:id,upload_id:initialized.upload_id,media_type:media.kind,
+      ...(hasThumbnail ? {thumbnail:{upload_id:initialized.thumbnail_upload_id,size_bytes:thumbnailBytes,
+        part_size:PART_BYTES,parts_total:1}} : {}),
       ...(mode === 'session' ? { attachment_id:id,room_key:binding } : {}),
       ...(isTemporary ? temporaryMetadata(own(id,principal.user_id)) : {}),
       part_size:PART_BYTES,
@@ -501,9 +559,12 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       quota:quota(principal.user_id) });
   }
 
-  function uploadRow(id,principal) {
+  const resourceFor = (row,associated) => row && row.status !== 'deleted'
+    ? associated ? thumbnailResource(row) : row : null;
+
+  function uploadRow(id,principal,associated = false) {
     if (!validID(id)) return result(404,{ error:'Video not found' });
-    const row = own(id,principal.user_id);
+    const row = resourceFor(own(id,principal.user_id),associated);
     if (!row || row.status === 'deleted')
       return result(404,{ error:'Video not found' });
     if (row.status === 'ready') return result(409,{ error:'Upload already completed' });
@@ -514,8 +575,8 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     return row;
   }
 
-  async function signOne(id,number,body,principal,headers) {
-    const row = uploadRow(id,principal);
+  async function signOne(id,number,body,principal,headers,associated = false) {
+    const row = uploadRow(id,principal,associated);
     if (row.statusCode) return row;
     if (signingExpired(row)) return imageExpired();
     if (row.status !== 'uploading')
@@ -542,7 +603,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         signed.upload_headers?.['Content-Length'] !== String(expected) ||
         signed.upload_headers?.['Content-MD5'] !== body.content_md5_base64)
       return result(502,{ error:'Invalid signed upload part' });
-    const current = own(id,principal.user_id);
+    const current = resourceFor(own(id,principal.user_id),associated);
     if (expired(current)) return imageExpired();
     if (current?.status !== 'uploading' || current.upload_id !== row.upload_id)
       return result(409,{ error:'Upload changed while signing' });
@@ -553,19 +614,33 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       expires_in:temporary(row) ? Math.min(300,Math.floor((row.object_expires_at-now())/1000)) : 300 });
   }
 
-  async function uploadedParts(id,principal,headers) {
+  async function uploadedParts(id,principal,headers,associated = false) {
+    const readyParts = row => result(200,{ video_id:id,status:'ready',part_size:PART_BYTES,
+      parts_total:partsTotal(row),parts:[],
+      upload_expires_at:expiresISO(row.upload_expires_at),...temporaryMetadata(row) });
     if (validID(id)) {
-      const completed = own(id,principal.user_id);
+      const completed = resourceFor(own(id,principal.user_id),associated);
       if (expired(completed)) return imageExpired();
       if (completed?.status === 'ready')
-        return result(200,{ video_id:id,status:'ready',part_size:PART_BYTES,
-          parts_total:partsTotal(completed),parts:[],
-          upload_expires_at:expiresISO(completed.upload_expires_at),...temporaryMetadata(completed) });
+        return readyParts(completed);
     }
-    const row = uploadRow(id,principal);
+    let row = uploadRow(id,principal,associated);
     if (row.statusCode) return row;
     const authorization = await authorizeImageUpload(row,principal,headers);
     if (authorization) return authorization;
+    if (row.status === 'completing') {
+      // OSS consumes the upload ID at completion. Resume must settle a lost
+      // completion reply from HEAD instead of requiring ListParts to survive.
+      const settled = await complete(id,principal,headers,associated);
+      if (settled.statusCode === 200) {
+        const completed = resourceFor(own(id,principal.user_id),associated);
+        return completed?.status === 'ready' ? readyParts(completed) :
+          result(404,{error:'Video not found'});
+      }
+      if (settled.statusCode !== 409) return settled;
+      row = uploadRow(id,principal,associated);
+      if (row.statusCode) return row;
+    }
     if (!storageReady(listParts))
       return result(503,{ error:'Upload resume is unavailable' });
     let parts;
@@ -585,28 +660,50 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       upload_expires_at:expiresISO(row.upload_expires_at),...temporaryMetadata(row) });
   }
 
-  async function complete(id,principal,headers) {
+  async function complete(id,principal,headers,associated = false) {
     if (!validID(id)) return result(404,{ error:'Video not found' });
-    const row = own(id,principal.user_id);
+    const original = own(id,principal.user_id);
+    const row = resourceFor(original,associated);
     if (expired(row)) return imageExpired();
     if (!row || row.status === 'deleted')
       return result(404,{ error:'Video not found' });
     if (row.status === 'ready') return result(200,publicReady(row));
+    if (!associated && thumbnailResource(row)) {
+      if (row.thumbnail_status !== 'ready')
+        return result(409,{ error:'Associated thumbnail is not complete' });
+      let thumbnailHead;
+      try { thumbnailHead = await verifyObject(principal.account_id,row.thumbnail_object_key,
+        row.thumbnail_size_bytes,'image/jpeg'); } catch { /* retain resumable state */ }
+      if (thumbnailHead?.exists !== true || thumbnailHead.size_bytes !== row.thumbnail_size_bytes ||
+          thumbnailHead.content_type !== 'image/jpeg')
+        return result(502,{ error:'Could not verify associated thumbnail' });
+      if (own(id,principal.user_id)?.status === 'deleted')
+        return settleDeletedCompletion(original,principal,associated);
+    }
+    // Both resources use the same multipart state machine. SQL identifiers are
+    // fixed by this internal resource flag, never supplied by a client.
+    const statusColumn = associated ? 'thumbnail_status' : 'status';
+    const completionColumn = associated ? 'thumbnail_completion_started_at' : 'completion_started_at';
+    const parentGuard = associated ? " AND status='uploading'" : '';
+    const readySet = associated ? "thumbnail_status='ready',thumbnail_completion_started_at=NULL"
+      : "status='ready',ready_at=?";
+    const readyValues = () => associated ? [id,principal.user_id] : [now(),id,principal.user_id];
     const authorization = await authorizeImageUpload(row,principal,headers);
     if (authorization) return authorization;
     if (row.upload_expires_at <= now())
       return result(410,{ error:'Upload expired' });
     if (!row.upload_id || !storageReady(listParts,completeUpload,verifyObject))
       return result(503,{ error:'Video completion is unavailable' });
-    const claimed = prepare(`UPDATE cloud_drive_videos SET status='completing',
-      completion_started_at=?
-      WHERE id=? AND owner_user_id=? AND status='uploading'`)
+    const claimed = prepare(`UPDATE cloud_drive_videos SET ${statusColumn}='completing',
+      ${completionColumn}=?
+      WHERE id=? AND owner_user_id=? AND ${statusColumn}='uploading'${parentGuard}`)
       .run(now(),id,principal.user_id).changes;
     if (!claimed) {
-      const currentRow = own(id,principal.user_id);
+      const currentBase = own(id,principal.user_id);
+      const currentRow = resourceFor(currentBase,associated);
       if (currentRow?.status === 'ready') return result(200,publicReady(currentRow));
-      if (currentRow?.status === 'deleted')
-        return settleDeletedCompletion(row,principal);
+      if (currentBase?.status === 'deleted')
+        return settleDeletedCompletion(original,principal,associated);
       if (currentRow?.status !== 'completing')
         return result(404,{ error:'Video not found' });
       // A previous completion can have succeeded even if its HTTP reply was lost.
@@ -618,32 +715,32 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
           head.content_type === row.content_type) {
         const currentAuthorization = await authorizeImageUpload(row,principal,headers);
         if (currentAuthorization) return currentAuthorization;
-        const changed = prepare(`UPDATE cloud_drive_videos SET status='ready',ready_at=?
-          WHERE id=? AND owner_user_id=? AND status='completing'`)
-          .run(now(),id,principal.user_id).changes;
+        const changed = prepare(`UPDATE cloud_drive_videos SET ${readySet}
+          WHERE id=? AND owner_user_id=? AND ${statusColumn}='completing'${parentGuard}`)
+          .run(...readyValues()).changes;
         return changed ? result(200,publicReady(row)) :
-          settleDeletedCompletion(row,principal);
+          settleDeletedCompletion(original,principal,associated);
       }
-      if (now()-(currentRow.completion_started_at || 0) > 150_000) {
+      if (now()-(currentBase[completionColumn] || 0) > 150_000) {
         try {
           await listParts(principal.account_id,row.object_key,row.upload_id);
-          prepare(`UPDATE cloud_drive_videos SET status='uploading',
-            completion_started_at=NULL WHERE id=? AND owner_user_id=?
-            AND status='completing' AND completion_started_at=?`)
-            .run(id,principal.user_id,currentRow.completion_started_at);
+          prepare(`UPDATE cloud_drive_videos SET ${statusColumn}='uploading',
+            ${completionColumn}=NULL WHERE id=? AND owner_user_id=?
+            AND ${statusColumn}='completing' AND ${completionColumn}=?${parentGuard}`)
+            .run(id,principal.user_id,currentBase[completionColumn]);
         } catch { /* an OSS completion may still be settling */ }
       }
       if (own(id,principal.user_id)?.status === 'deleted')
-        return settleDeletedCompletion(row,principal);
+        return settleDeletedCompletion(original,principal,associated);
       return result(409,{ error:'Upload completion is in progress' });
     }
     let parts;
     try { parts = await listParts(principal.account_id,row.object_key,row.upload_id); }
     catch {
-      prepare(`UPDATE cloud_drive_videos SET status='uploading'
-        ,completion_started_at=NULL WHERE id=? AND status='completing'`).run(id);
+      prepare(`UPDATE cloud_drive_videos SET ${statusColumn}='uploading'
+        ,${completionColumn}=NULL WHERE id=? AND ${statusColumn}='completing'${parentGuard}`).run(id);
       if (own(id,principal.user_id)?.status === 'deleted')
-        return settleDeletedCompletion(row,principal);
+        return settleDeletedCompletion(original,principal,associated);
       return result(502,{ error:'Could not verify uploaded parts' });
     }
     const expected = partsTotal(row);
@@ -651,10 +748,10 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         parts.some((part,index) => part.part_number !== index+1 ||
           part.size_bytes !== partBytes(row,index+1) ||
           typeof part.etag !== 'string' || !part.etag)) {
-      prepare(`UPDATE cloud_drive_videos SET status='uploading'
-        ,completion_started_at=NULL WHERE id=? AND status='completing'`).run(id);
+      prepare(`UPDATE cloud_drive_videos SET ${statusColumn}='uploading'
+        ,${completionColumn}=NULL WHERE id=? AND ${statusColumn}='completing'${parentGuard}`).run(id);
       if (own(id,principal.user_id)?.status === 'deleted')
-        return settleDeletedCompletion(row,principal);
+        return settleDeletedCompletion(original,principal,associated);
       return result(409,{ error:'Video parts are incomplete' });
     }
     if (expired(row)) { await remove(id,principal); return imageExpired(); }
@@ -665,7 +762,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     } catch {
       // Keep "completing": HEAD on the next call settles an uncertain OSS outcome.
       if (own(id,principal.user_id)?.status === 'deleted')
-        return settleDeletedCompletion(row,principal);
+        return settleDeletedCompletion(original,principal,associated);
       return result(502,{ error:'Could not finish the video upload; retry completion' });
     }
     let head;
@@ -673,28 +770,28 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       row.size_bytes,row.content_type); }
     catch {
       if (own(id,principal.user_id)?.status === 'deleted')
-        return settleDeletedCompletion(row,principal);
+        return settleDeletedCompletion(original,principal,associated);
       return result(502,{ error:'Could not verify completed video; retry completion' });
     }
     if (expired(row)) { await remove(id,principal); return imageExpired(); }
     if (head?.exists !== true || head.size_bytes !== row.size_bytes ||
         head.content_type !== row.content_type) {
       if (own(id,principal.user_id)?.status === 'deleted')
-        return settleDeletedCompletion(row,principal);
+        return settleDeletedCompletion(original,principal,associated);
       prepare(`UPDATE cloud_drive_videos SET status='deleted',deleted_at=?,
         cleanup_pending=1,cleanup_after=?,cleanup_hold_until=?,
-        cleanup_revision=cleanup_revision+1 WHERE id=? AND status='completing'`)
+        cleanup_revision=cleanup_revision+1 WHERE id=? AND ${statusColumn}='completing'${parentGuard}`)
         .run(now(),now(),now()+COMPLETION_HOLD_MS,id);
       await sweep();
       return result(502,{ error:'Completed video size or type mismatch' });
     }
     const readyAuthorization = await authorizeImageUpload(row,principal,headers);
     if (readyAuthorization) return readyAuthorization;
-    const changed = prepare(`UPDATE cloud_drive_videos SET status='ready',ready_at=?
-      WHERE id=? AND owner_user_id=? AND status='completing'`)
-      .run(now(),id,principal.user_id).changes;
+    const changed = prepare(`UPDATE cloud_drive_videos SET ${readySet}
+      WHERE id=? AND owner_user_id=? AND ${statusColumn}='completing'${parentGuard}`)
+      .run(...readyValues()).changes;
     if (!changed) {
-      return settleDeletedCompletion(row,principal);
+      return settleDeletedCompletion(original,principal,associated);
     }
     return result(200,publicReady(row));
   }
@@ -775,10 +872,14 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     if (temporary(row)) return result(404,{ error:'Thumbnail is unavailable' });
     if (!row || row.status !== 'ready')
       return result(404,{ error:'Media not found' });
-    if (!storageReady(signThumbnail))
+    const associated = thumbnailResource(row);
+    if (associated && associated.status !== 'ready')
+      return result(503,{ error:'Thumbnail is unavailable' });
+    if (!storageReady(associated ? signRead : signThumbnail))
       return result(503,{ error:'Thumbnail is unavailable' });
     let url;
-    try { url = await signThumbnail(principal.account_id,row.object_key); }
+    try { url = associated ? await signRead(principal.account_id,associated.object_key) :
+      await signThumbnail(principal.account_id,row.object_key); }
     catch { /* OSS processing errors are handled by the client placeholder. */ }
     if (typeof url !== 'string' || !url.startsWith('https://'))
       return result(502,{ error:'Could not open thumbnail' });
@@ -795,8 +896,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     if (row.status !== 'deleted')
       prepare(`UPDATE cloud_drive_videos SET status='deleted',deleted_at=?,
         cleanup_pending=1,cleanup_after=?,
-        cleanup_hold_until=CASE WHEN status='completing' OR
-          (status='uploading' AND upload_id IS NULL) THEN ? ELSE NULL END,
+        cleanup_hold_until=CASE WHEN ${completionMayBeInFlight} THEN ? ELSE NULL END,
         cleanup_revision=cleanup_revision+1
         WHERE id=? AND owner_user_id=?`)
         .run(now(),now(),now()+COMPLETION_HOLD_MS,id,principal.user_id);
@@ -812,16 +912,14 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     if (mode === 'session') {
       prepare(`UPDATE cloud_drive_videos SET status='deleted',deleted_at=?,
         cleanup_pending=1,cleanup_after=?,
-        cleanup_hold_until=CASE WHEN status='completing' OR
-          (status='uploading' AND upload_id IS NULL) THEN ? ELSE NULL END,
+        cleanup_hold_until=CASE WHEN ${completionMayBeInFlight} THEN ? ELSE NULL END,
         cleanup_revision=cleanup_revision+1 WHERE retention='temporary'
         AND object_expires_at<=? AND status<>'deleted'`)
         .run(current,current,current+COMPLETION_HOLD_MS,current);
     }
     prepare(`UPDATE cloud_drive_videos SET status='deleted',deleted_at=?,
       cleanup_pending=1,cleanup_after=?,
-      cleanup_hold_until=CASE WHEN status='completing' OR
-        (status='uploading' AND upload_id IS NULL) THEN ? ELSE NULL END,
+      cleanup_hold_until=CASE WHEN ${completionMayBeInFlight} THEN ? ELSE NULL END,
       cleanup_revision=cleanup_revision+1
       WHERE status IN ('uploading','completing') AND upload_expires_at<=?`)
       .run(current,current,current+COMPLETION_HOLD_MS,current);
@@ -829,12 +927,13 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     // one while an OSS init response may still be returning an upload ID.
     prepare(`UPDATE cloud_drive_videos SET cleanup_hold_until=?,
       cleanup_revision=cleanup_revision+1
-      WHERE status='deleted' AND cleanup_pending=1 AND upload_id IS NULL
+      WHERE status='deleted' AND cleanup_pending=1 AND (upload_id IS NULL
+        ${mode === 'drive' ? 'OR (thumbnail_object_key IS NOT NULL AND thumbnail_upload_id IS NULL)' : ''})
       AND cleanup_hold_until IS NULL`)
       .run(current+COMPLETION_HOLD_MS);
     const fields = `id,owner_user_id,object_key,upload_id,size_bytes,
       content_type,deleted_at,cleanup_pending,cleanup_hold_until,
-      cleanup_revision`;
+      cleanup_revision${thumbnailFields}`;
     // Reserve work for both queues so repeatedly failing pending rows cannot
     // starve pre-upgrade cleanup-complete tombstones forever.
     const rows = [
@@ -861,20 +960,22 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
           .get(row.owner_user_id)?.account_id;
         if (!owner || !storageReady(listUploads,abortUpload,deleteObject,
             verifyObject)) throw new Error('Cloud cleanup is unavailable');
-        if (row.upload_id) await abortUpload(owner,row.object_key,row.upload_id);
-        const active = await listUploads(owner,row.object_key);
-        if (!Array.isArray(active) || active.some(id => !validUploadID(id)) ||
-            new Set(active).size !== active.length)
-          throw new Error('Invalid active upload list');
-        for (const uploadId of active)
-          await abortUpload(owner,row.object_key,uploadId);
-        const remaining = await listUploads(owner,row.object_key);
-        if (!Array.isArray(remaining) || remaining.length !== 0)
-          throw new Error('Multipart upload is still active');
-        await deleteObject(owner,row.object_key);
-        const head = await verifyObject(owner,row.object_key,
-          row.size_bytes,row.content_type);
-        if (head?.exists !== false) throw new Error('Deleted video is still present');
+        for (const resource of physicalResources(row)) {
+          if (resource.upload_id) await abortUpload(owner,resource.object_key,resource.upload_id);
+          const active = await listUploads(owner,resource.object_key);
+          if (!Array.isArray(active) || active.some(id => !validUploadID(id)) ||
+              new Set(active).size !== active.length)
+            throw new Error('Invalid active upload list');
+          for (const uploadId of active)
+            await abortUpload(owner,resource.object_key,uploadId);
+          const remaining = await listUploads(owner,resource.object_key);
+          if (!Array.isArray(remaining) || remaining.length !== 0)
+            throw new Error('Multipart upload is still active');
+          await deleteObject(owner,resource.object_key);
+          const head = await verifyObject(owner,resource.object_key,
+            resource.size_bytes,resource.content_type);
+          if (head?.exists !== false) throw new Error('Deleted video is still present');
+        }
         if (holdUntil && current < holdUntil) {
           const nextAt = Math.min(current+CLEANUP_RETRY_MS,holdUntil);
           if (legacy) requeueLegacy(nextAt);
@@ -916,8 +1017,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
   async function cleanupAccount(userId) {
     prepare(`UPDATE cloud_drive_videos SET status='deleted',deleted_at=?,
       cleanup_pending=1,cleanup_after=?,
-      cleanup_hold_until=CASE WHEN status='completing' OR
-        (status='uploading' AND upload_id IS NULL) THEN ? ELSE NULL END,
+      cleanup_hold_until=CASE WHEN ${completionMayBeInFlight} THEN ? ELSE NULL END,
       cleanup_revision=cleanup_revision+1
       WHERE owner_user_id=? AND status<>'deleted'`)
       .run(now(),now(),now()+COMPLETION_HOLD_MS,userId);
@@ -951,8 +1051,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         .run(current,principal.user_id,body.owner_slot,body.session_id);
     const changed = prepare(`UPDATE cloud_drive_videos SET status='deleted',
       deleted_at=?,cleanup_pending=1,cleanup_after=?,
-      cleanup_hold_until=CASE WHEN status='completing' OR
-        (status='uploading' AND upload_id IS NULL) THEN ? ELSE NULL END,
+      cleanup_hold_until=CASE WHEN ${completionMayBeInFlight} THEN ? ELSE NULL END,
       cleanup_revision=cleanup_revision+1
       WHERE owner_user_id=? AND room_key=? AND status<>'deleted'`)
       .run(current,current,current+COMPLETION_HOLD_MS,
@@ -978,6 +1077,16 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     if (method === 'GET' && path === root)
       return list(principal,query?.get('before'),
         query?.has('folder_id') ? query.get('folder_id') : undefined);
+    if (mode === 'drive') {
+      const thumbnailPart = path.match(new RegExp(`^${root}/uploads/([^/]+)/thumbnail/parts/([^/]+)/sign$`));
+      if (thumbnailPart && method === 'POST')
+        return signOne(thumbnailPart[1],thumbnailPart[2],body,principal,headers,true);
+      const thumbnailUpload = path.match(new RegExp(`^${root}/uploads/([^/]+)/thumbnail/(parts|complete)$`));
+      if (thumbnailUpload?.[2] === 'parts' && method === 'GET')
+        return uploadedParts(thumbnailUpload[1],principal,headers,true);
+      if (thumbnailUpload?.[2] === 'complete' && method === 'POST')
+        return complete(thumbnailUpload[1],principal,headers,true);
+    }
     const part = path.match(new RegExp(`^${root}/uploads/([^/]+)/parts/([^/]+)/sign$`));
     if (part && method === 'POST') return signOne(part[1],part[2],body,principal,headers);
     const upload = path.match(new RegExp(`^${root}/uploads/([^/]+)(/parts|/complete)?$`));

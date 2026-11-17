@@ -38,6 +38,17 @@ OSS upload ID 与 partNumber 签发 5 分钟 PUT URL，并把该片的准确
 `Content-Length`（V4 additional header）及 `Content-MD5` 绑定进签名。
 账号服务的完成操作先校验 OSS ListParts；本服务调用 CompleteMultipartUpload 时
 要求禁止覆盖，并提供 HEAD 核验、私有 60 秒 GET、按需缩略图签名和删除。
+云盘原文件的 HEAD 校验上限是视频 20,000,000,000 字节、图片 100,000,000 字节；
+`session-attachments/` 和 `session-temp-images/` 仍保持原来的 2 GB/20 MB，
+普通素材、头像、视频圈的限制也不随云盘改变。
+新云盘图片可关联一个客户端生成、最多 2 MB 的隐藏 JPEG；其对象键仍在同账号原有
+`cloud-drive/` 前缀下，复用 init/sign/list/complete/verify/read/delete，不新增 RAM 前缀
+或媒体代理。账号服务控制两对象的归属、完整性、清理租约和总配额；JPEG 完成后关闭
+自己的 Multipart ID，避免删除后复用简单 PUT 链接。关联 JPEG 直接签私有 read URL，
+不把 100 MB 原图交给默认 20 MB 的 OSS 在线缩图能力。
+20 GB/8 MiB 最多 2385 片；内部 `/cloud-drive/complete` HTTP 适配层及 JSON handler
+都允许最多 1 MiB 元数据，并保留 10000 片和连续片号/ETag 校验。其他 HTTP 请求仍保持
+原有 4 KiB 预算。这里只签控制信息；实际图片、视频和 JPEG 均由客户端直传 OSS。
 缩略图的固定 OSS `x-oss-process` 参数参与 V4 签名：图片缩到 320 像素内并转
 JPEG，视频取第 0 毫秒画面。媒体字节不经本进程。OSS 视频截帧仅支持 H.264/H.265
 且按调用计费；调用端需要缓存和失败占位图。
@@ -45,6 +56,10 @@ JPEG，视频取第 0 毫秒画面。媒体字节不经本进程。OSS 视频截
 它分页调用 OSS ListMultipartUploads，但只返回**精确匹配该键**的 upload ID，
 不向 App 开放桶内列表。账号服务用它核对删除后的未完成分片；分页或 OSS
 核验失败时保留待清理记录，不能释放容量。
+
+发布此协议时应与支持关联 JPEG 的 Auth 配对部署，并保留旧小图片的处理回退。若需
+回退，先停止新上传并由新版 Auth 把原文件及关联 JPEG 的精确键清理确认；不能让旧版
+Auth 忽略辅助对象后删除元数据。新增元数据列保持可读，不擅自还原或删除真实云端对象。
 
 创作中心会话附件使用同一个私有桶与上述签名接口，但对象键位于独立的
 `session-attachments/<账号>/YYYY-MM-DD/<UUID>.<后缀>`。原私人云盘只列出

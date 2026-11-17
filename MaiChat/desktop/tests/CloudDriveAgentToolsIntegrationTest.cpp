@@ -74,6 +74,22 @@ int main(int argc, char** argv) {
         });
     MaiToolContext context;
     context.root = QFileInfo(source).absolutePath().toUtf8().toStdString();
+    {
+        DesktopVideoCircleAccess rejectedAccess = access;
+        rejectedAccess.authBaseUrl = QString::fromUtf8(argv[1]) + QStringLiteral("/quota-rejection");
+        MaiToolRegistry rejectedRegistry;
+        registerDesktopCloudDriveTools(rejectedRegistry, [rejectedAccess] { return rejectedAccess; }, &presenter,
+            [](const QString&, bool, std::shared_ptr<MaiCloudVod>) { return false; });
+        const auto rejected = rejectedRegistry.findForModel("maichat_cloud_drive_list_media")->execute("{}", context);
+        require(rejected.hasError() && rejected.error().code() == MaiErrorCode::InvalidInput,
+                "quota rejection did not retain its ordinary error category");
+        const QString message = QString::fromStdString(rejected.error().message());
+        std::cerr << "[owned-cloud-413-message] " << message.toStdString() << std::endl;
+        require(!message.contains(QStringLiteral("2 GB")) && !message.contains(QStringLiteral("10 GB")) &&
+                    (message.contains(QStringLiteral("space")) || message.contains(QStringLiteral("quota"))),
+                "HTTP 413 still reports obsolete file size or account quota");
+    }
+    if (qEnvironmentVariableIsSet("MAICHAT_CLOUD_413_ONLY")) return 0;
     const QJsonObject first = output(registry.findForModel("maichat_cloud_drive_list_media")->execute("{}", context));
     require(first.value(QStringLiteral("media")).toArray().isEmpty(), "private cloud fixture was not initially empty");
 
@@ -266,6 +282,19 @@ int main(int argc, char** argv) {
     require(image.save(imagePath, "PNG"), "could not create image fixture");
     MaiToolContext imageContext;
     imageContext.root = QFileInfo(imagePath).absolutePath().toUtf8().toStdString();
+    const QString invalidImagePath = QFileInfo(imagePath).absolutePath() + QStringLiteral("/cloud-invalid-image.jpg");
+    {
+        QFile invalidImage(invalidImagePath);
+        require(invalidImage.open(QIODevice::WriteOnly) && invalidImage.write("not an image") == 12,
+                "could not create invalid image fixture");
+    }
+    const auto rejectedImage = upload->execute(QJsonDocument(QJsonObject{
+        {QStringLiteral("file_path"), invalidImagePath}}).toJson(QJsonDocument::Compact).toStdString(), imageContext);
+    require(rejectedImage.hasError() && rejectedImage.error().code() == MaiErrorCode::InvalidInput,
+            "invalid image returned accepted instead of an explicit pre-upload error");
+    require(output(registry.findForModel("maichat_cloud_drive_list_pending_uploads")->execute("{}", imageContext))
+                .value(QStringLiteral("uploads")).toArray().isEmpty(),
+            "rejected image left a pending model upload task");
     const QByteArray imageArgs = QJsonDocument(QJsonObject{
         {QStringLiteral("file_path"), imagePath}}).toJson(QJsonDocument::Compact);
     require(output(upload->execute(imageArgs.toStdString(), imageContext))
@@ -371,6 +400,36 @@ int main(int argc, char** argv) {
         abort->requiresPerCallApproval("{}"), "pause/abort approval policy changed");
     require(abort->execute(taskArgs.toStdString(), largeContext).error().code() == MaiErrorCode::Busy,
             "active upload could be discarded without pausing");
+    {
+        MaiCloudDriveResult checkpointResult{};
+        const QByteArray directory = checkpointDir.toUtf8();
+        mai_cloud_drive_list_local_checkpoints(directory.constData(), &checkpointResult);
+        if (checkpointResult.response_json_utf8) {
+            const auto raw = QJsonDocument::fromJson(QByteArray(checkpointResult.response_json_utf8,
+                int(checkpointResult.response_bytes))).object().value(QStringLiteral("uploads")).toArray();
+            for (const auto& item : raw) {
+                const auto recorded = item.toObject();
+                if (recorded.value(QStringLiteral("name")) != QStringLiteral("pause-fixture.mov")) continue;
+                const QString expected = QDir(checkpointDir).filePath(taskId + QStringLiteral(".maicloud.json"));
+                const QString returned = recorded.value(QStringLiteral("checkpoint_path")).toString();
+                std::cerr << "[owned-cloud-checkpoint-alias] registered=" << expected.toUtf8().constData()
+                          << " listed=" << returned.toUtf8().constData() << " sameAbsolute="
+                          << (QFileInfo(expected).absoluteFilePath() == QFileInfo(returned).absoluteFilePath())
+                          << std::endl;
+            }
+        }
+        mai_cloud_drive_result_free(&checkpointResult);
+        const auto current = output(registry.findForModel("maichat_cloud_drive_list_pending_uploads")
+            ->execute("{}", largeContext)).value(QStringLiteral("uploads")).toArray();
+        QJsonArray states;
+        for (const auto& item : current)
+            if (item.toObject().value(QStringLiteral("task_id")) == taskId)
+                states.push_back(item.toObject().value(QStringLiteral("state")));
+        std::cerr << "[owned-cloud-active-task-states] "
+                  << QJsonDocument(states).toJson(QJsonDocument::Compact).constData() << std::endl;
+        require(states.size() == 1 && states.at(0) == QStringLiteral("uploading"),
+                "one active checkpoint was exposed through duplicate or idle task identities");
+    }
     const QJsonObject pauseResult = output(pause->execute(taskArgs.toStdString(), largeContext));
     require(pauseResult.value(QStringLiteral("state")) == QStringLiteral("pausing"),
             "pause did not request upload cancellation");
@@ -394,8 +453,10 @@ int main(int argc, char** argv) {
     require(state == QStringLiteral("paused"), "paused upload did not stop with a retained checkpoint");
     require(QFileInfo(QDir(checkpointDir).filePath(taskId + QStringLiteral(".maicloud.json"))).isFile(),
             "paused upload checkpoint was lost");
-    require(output(pause->execute(taskArgs.toStdString(), largeContext))
-                .value(QStringLiteral("state")) == QStringLiteral("paused"),
+    const QJsonObject repeatedPause = output(pause->execute(taskArgs.toStdString(), largeContext));
+    std::cerr << "[owned-cloud-repeat-pause] listedState=" << state.toStdString() << " pauseReply="
+              << QJsonDocument(repeatedPause).toJson(QJsonDocument::Compact).constData() << std::endl;
+    require(repeatedPause.value(QStringLiteral("state")) == QStringLiteral("paused"),
             "pausing an already paused task should be idempotent");
     require(output(abort->execute(taskArgs.toStdString(), largeContext))
                 .value(QStringLiteral("aborted")) == true,

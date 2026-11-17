@@ -109,10 +109,10 @@ std::string getState(const std::string& base, const std::string& caPath,
     return response;
 }
 
-void replaceByte(const std::string& path, char value) {
+void replaceByte(const std::string& path, char value, long offset = 111) {
     FILE* file = std::fopen(path.c_str(), "r+b");
     require(file != nullptr, "could not change fixture file");
-    require(std::fseek(file, 111, SEEK_SET) == 0 &&
+    require(std::fseek(file, offset, SEEK_SET) == 0 &&
             std::fwrite(&value, 1, 1, file) == 1, "could not write fixture byte");
     std::fclose(file);
 }
@@ -125,8 +125,13 @@ int readMemoryAt(void* context, uint64_t offset,
     return 1;
 }
 
-int nonSeekableRead(void*, uint64_t, unsigned char*, size_t) {
+int nonSeekableRead(void* context, uint64_t, unsigned char*, size_t) {
+    if (context) ++*static_cast<unsigned*>(context);
     return -1;
+}
+
+int cancelBeforeOriginalPart(uint64_t, uint64_t, void*) {
+    return 1;
 }
 
 struct SequentialSource {
@@ -246,6 +251,158 @@ void temporaryImages(MaiCloudDriveOptions options, const std::string& endpoint,
     std::cout << "temporary Session image binding/expiry/checkpoint/download/cancellation passed\n";
 }
 
+void associatedThumbnailCases(MaiCloudDriveOptions author, const std::string& endpoint,
+                              const std::string& caPath, const std::string& directory) {
+    const std::string thumbnailPath = directory + "/cloud-drive-thumbnail.jpg";
+    const std::string jpeg = readFile(thumbnailPath);
+    require(jpeg.size() > 32, "runner did not provide the owned valid JPEG asset");
+    author.cloud_drive_thumbnail_path_utf8 = thumbnailPath.c_str();
+    std::string originalBytes(20'000'001, 'i');
+    MaiCloudDriveSource original{"content://owned/large-original.heic",
+        uint64_t(originalBytes.size()), readMemoryAt, &originalBytes};
+    auto state = [&] { return nlohmann::json::parse(getState(endpoint, caPath)); };
+    auto setCase = [&](const char* value) {
+        const std::string route = std::string("/test/thumbnail-case?case=") + value;
+        getState(endpoint, caPath, route.c_str());
+    };
+    auto writeJpeg = [&](const std::string& bytes) {
+        std::ofstream output(thumbnailPath, std::ios::binary | std::ios::trunc);
+        output.write(bytes.data(), std::streamsize(bytes.size()));
+        require(output.good(), "could not write owned JPEG fixture");
+    };
+    auto publish = [&](const MaiCloudDriveOptions& options, const std::string& checkpoint,
+                       MaiCloudDriveProgress progress = nullptr) {
+        MaiCloudDriveResult result{};
+        mai_cloud_drive_upload_resumable_source(&options, &original, checkpoint.c_str(),
+            "Large.HEIC", "image/heic", nullptr, progress, nullptr, &result);
+        return take(&result);
+    };
+
+    setCase("");
+    const std::string pausedCheckpoint = directory + "/thumbnail-pause.maicloud.json";
+    const Call paused = publish(author, pausedCheckpoint, cancelOnSecondPart);
+    require(paused.status == MAI_CLOUD_DRIVE_CANCELED && exists(pausedCheckpoint),
+            "large image pause did not retain its composite checkpoint");
+    auto observed = state();
+    require(observed["thumbnail_status"] == "ready" && observed["thumbnail_puts"] == 1 &&
+            observed["parts"].size() == 1,
+            "associated JPEG was not completed before original partial upload");
+    const auto events = observed["thumbnail_events"].get<std::vector<std::string>>();
+    const auto completedAt = std::find(events.begin(), events.end(), "thumbnail_complete");
+    const auto originalAt = std::find(events.begin(), events.end(), "original_put");
+    require(completedAt != events.end() && originalAt != events.end() && completedAt < originalAt,
+            "original bytes reached OSS before the thumbnail completion");
+    const unsigned sessionsBeforeResume = observed["sessions"].get<unsigned>();
+    require(std::remove(thumbnailPath.c_str()) == 0, "could not remove owned ready JPEG fixture");
+    require(publish(author, pausedCheckpoint).status == MAI_CLOUD_DRIVE_OK && !exists(pausedCheckpoint),
+            "authoritative thumbnail-ready resume required a missing local JPEG");
+    observed = state();
+    require(observed["sessions"] == sessionsBeforeResume && observed["thumbnail_puts"] == 1 &&
+            observed["parts"].size() == 3 && observed["original_bytes_match"] == true,
+            "large original resumed with duplicate thumbnail or changed original bytes");
+    const Call link = request(author, MAI_CLOUD_DRIVE_THUMBNAIL_LINK,
+        R"({"video_id":"123e4567-e89b-42d3-a456-426614174000"})");
+    require(link.status == MAI_CLOUD_DRIVE_OK && link.body.find("x-oss-process") == std::string::npos,
+            "associated JPEG read reused the oversized-original OSS processing URL");
+    writeJpeg(jpeg);
+
+    setCase("lose_complete_reply");
+    const std::string lostCheckpoint = directory + "/thumbnail-lost-complete.maicloud.json";
+    const Call lost = publish(author, lostCheckpoint);
+    require(lost.status == MAI_CLOUD_DRIVE_NETWORK_ERROR && exists(lostCheckpoint),
+            "lost thumbnail completion did not retain resumable state");
+    observed = state();
+    require(observed["thumbnail_status"] == "ready" && observed["parts"].empty(),
+            "lost thumbnail response sent original bytes before a durable receipt");
+    const unsigned lostSessions = observed["sessions"].get<unsigned>();
+    require(std::remove(thumbnailPath.c_str()) == 0, "could not remove owned committed JPEG");
+    require(publish(author, lostCheckpoint).status == MAI_CLOUD_DRIVE_OK && !exists(lostCheckpoint),
+            "lost completion did not recover from server ready without its local JPEG");
+    observed = state();
+    require(observed["sessions"] == lostSessions && observed["thumbnail_puts"] == 1,
+            "lost thumbnail completion created a duplicate upload");
+    writeJpeg(jpeg);
+
+    setCase("fail_complete_before");
+    const std::string changedCheckpoint = directory + "/thumbnail-fingerprint.maicloud.json";
+    require(publish(author, changedCheckpoint).status == MAI_CLOUD_DRIVE_HTTP_ERROR &&
+            exists(changedCheckpoint), "thumbnail retry fixture failed before its checkpoint");
+    observed = state();
+    const unsigned fingerprintSessions = observed["sessions"].get<unsigned>();
+    require(observed["thumbnail_status"] == "uploading" && observed["thumbnail_puts"] == 1,
+            "fingerprint fixture was not paused at uncommitted thumbnail state");
+    // Byte 24 is inside this owned JPEG's COM payload; changing it preserves
+    // encoded geometry and length while changing the bound content fingerprint.
+    require(static_cast<unsigned char>(jpeg[20]) == 0xff &&
+            static_cast<unsigned char>(jpeg[21]) == 0xfe,
+            "owned JPEG comment fixture layout changed");
+    replaceByte(thumbnailPath, char(jpeg[24] ^ 1), 24);
+    require(publish(author, changedCheckpoint).status == MAI_CLOUD_DRIVE_CHECKPOINT_MISMATCH,
+            "changed JPEG content reused the bound thumbnail checkpoint");
+    require(state()["sessions"] == fingerprintSessions && state()["parts"].empty(),
+            "thumbnail fingerprint mismatch initialized or uploaded an original");
+    writeJpeg(jpeg);
+    setCase("");
+    require(publish(author, changedCheckpoint).status == MAI_CLOUD_DRIVE_OK,
+            "original JPEG could not resume its existing multipart identity");
+
+    for (const char* bad : {"bad_geometry", "bad_size"}) {
+        setCase(bad);
+        const std::string checkpoint = directory + "/" + bad + ".maicloud.json";
+        require(publish(author, checkpoint).status == MAI_CLOUD_DRIVE_INVALID_RESPONSE &&
+                !exists(checkpoint), "wrong thumbnail init geometry was accepted");
+        observed = state();
+        require(observed["status"] == "deleted" && observed["thumbnail_puts"] == 0,
+                "malformed thumbnail receipt left a remote reservation or sent bytes");
+    }
+    setCase("");
+    const unsigned beforeInvalid = state()["sessions"].get<unsigned>();
+    const std::string invalidCheckpoint = directory + "/invalid-jpeg.maicloud.json";
+    writeJpeg(std::string(2'000'001, 'x'));
+    require(publish(author, invalidCheckpoint).status == MAI_CLOUD_DRIVE_FILE_ERROR &&
+            !exists(invalidCheckpoint), "oversized JPEG reached remote initialization");
+    std::string tooWide = jpeg;
+    const size_t frame = tooWide.find(std::string("\xff\xc0", 2));
+    require(frame != std::string::npos && frame + 8 < tooWide.size(), "owned JPEG lost its SOF");
+    tooWide[frame + 7] = 1;
+    tooWide[frame + 8] = 65;  // Width 321, above the host thumbnail contract.
+    writeJpeg(tooWide);
+    require(publish(author, invalidCheckpoint).status == MAI_CLOUD_DRIVE_FILE_ERROR &&
+            state()["sessions"] == beforeInvalid, "over-width JPEG reached remote initialization");
+    writeJpeg(jpeg);
+
+    MaiCloudDriveOptions legacyOptions = author;
+    legacyOptions.cloud_drive_thumbnail_path_utf8 = nullptr;
+    std::string legacyBytes = "owned legacy small image";
+    MaiCloudDriveSource legacy{"content://owned/legacy.heic", uint64_t(legacyBytes.size()),
+        readMemoryAt, &legacyBytes};
+    const std::string legacyCheckpoint = directory + "/legacy-image.maicloud.json";
+    auto legacyPublish = [&](const MaiCloudDriveOptions& options, MaiCloudDriveProgress progress) {
+        MaiCloudDriveResult raw{};
+        mai_cloud_drive_upload_resumable_source(&options, &legacy, legacyCheckpoint.c_str(),
+            "legacy.heic", "image/heic", nullptr, progress, nullptr, &raw);
+        return take(&raw);
+    };
+    require(legacyPublish(legacyOptions, cancelBeforeOriginalPart).status == MAI_CLOUD_DRIVE_CANCELED &&
+            !nlohmann::json::parse(readFile(legacyCheckpoint)).contains("thumbnail"),
+            "legacy image did not keep a version-1 checkpoint without a thumbnail");
+    require(legacyPublish(author, nullptr).status == MAI_CLOUD_DRIVE_OK &&
+            state()["thumbnail_size"] == 0,
+            "new host option changed the geometry of a legacy thumbnail-free checkpoint");
+
+    setCase("unexpected_thumbnail");
+    const std::string unexpectedCheckpoint = directory + "/unexpected-thumbnail.maicloud.json";
+    MaiCloudDriveResult unexpectedRaw{};
+    mai_cloud_drive_upload_resumable_source(&legacyOptions, &legacy, unexpectedCheckpoint.c_str(),
+        "legacy.heic", "image/heic", nullptr, nullptr, nullptr, &unexpectedRaw);
+    const Call unexpected = take(&unexpectedRaw);
+    require(unexpected.status == MAI_CLOUD_DRIVE_INVALID_RESPONSE && !exists(unexpectedCheckpoint),
+            "unexpected companion response was accepted or wrote an unrelated checkpoint");
+    require(state()["status"] == "deleted" && state()["parts"].empty(),
+            "unexpected companion response leaked its newly created main reservation");
+    std::cout << "cloud thumbnail init/first/cancel/resume/identity/legacy passed\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -263,8 +420,8 @@ int main(int argc, char** argv) {
     require(mai_cloud_drive_media_info("Holiday.MOV", &media) == 1 &&
             std::strcmp(media.content_type_utf8, "video/quicktime") == 0 &&
             std::strcmp(media.media_type_utf8, "video") == 0 &&
-            media.max_size_bytes == 2'000'000'000,
-            "shared video classifier changed");
+            media.max_size_bytes == 20'000'000'000,
+            "cloud video policy must allow decimal 20GB");
     for (const auto& fixture : {
              std::pair<const char*, const char*>{"a.jpg", "image/jpeg"},
              {"a.JPEG", "image/jpeg"}, {"a.png", "image/png"},
@@ -272,8 +429,8 @@ int main(int argc, char** argv) {
         require(mai_cloud_drive_media_info(fixture.first, &media) == 1 &&
                 std::strcmp(media.content_type_utf8, fixture.second) == 0 &&
                 std::strcmp(media.media_type_utf8, "image") == 0 &&
-                media.max_size_bytes == 20'000'000,
-                "shared image classifier returned wrong MIME or cap");
+                media.max_size_bytes == 100'000'000,
+                "cloud image policy must allow decimal 100MB");
     }
     for (const char* invalid : {".png", "../a.png", "dir/a.jpg", "a.gif", " a.png"})
         require(mai_cloud_drive_media_info(invalid, &media) == 0,
@@ -291,6 +448,12 @@ int main(int argc, char** argv) {
             mai_session_attachment_media_info("bad?.jpg", &media) == 0 &&
             mai_cloud_drive_media_info("report.pdf", &media) == 0,
             "Session files leaked into personal cloud drive formats");
+    require(mai_session_attachment_media_info("clip.mov", &media) == 1 &&
+                media.max_size_bytes == 2'000'000'000,
+            "cloud video expansion must preserve the Session video limit");
+    require(mai_session_attachment_media_info("photo.png", &media) == 1 &&
+                media.max_size_bytes == 20'000'000,
+            "cloud image expansion must preserve the Session image limit");
     const std::string endpoint = argv[1];
     const std::string ca = readFile(argv[2]);
     const std::string unrelatedCa = readFile(argv[3]);
@@ -319,9 +482,24 @@ int main(int argc, char** argv) {
     MaiCloudDriveOptions viewer = author;
     viewer.account_token_utf8 = "viewer-token";
     if (argc == 6) {
-        temporaryImages(author, endpoint, argv[2], argv[4], std::string(argv[5]) == "--temporary-latency");
+        const std::string mode = argv[5];
+        if (mode == "--thumbnail")
+            associatedThumbnailCases(author, endpoint, argv[2], argv[4]);
+        else {
+            require(mode == "--temporary" || mode == "--temporary-latency", "unknown fixture mode");
+            temporaryImages(author, endpoint, argv[2], argv[4], mode == "--temporary-latency");
+        }
         return 0;
     }
+
+    // Thumbnail options belong only to personal cloud images. Reject before
+    // even reading a video/Session source, not after a remote reservation.
+    MaiCloudDriveOptions wrongThumbnail = author;
+    wrongThumbnail.cloud_drive_thumbnail_path_utf8 = "invalid-thumbnail.jpg";
+    MaiCloudDriveSource neverRead{"thumbnail-guard", 1, nonSeekableRead, nullptr};
+    require(uploadSource(wrongThumbnail, neverRead, checkpoint).status ==
+                MAI_CLOUD_DRIVE_INVALID_ARGUMENT,
+            "video accepted the cloud-image thumbnail option before source read");
 
     require(request(viewer, MAI_CLOUD_DRIVE_LIST_VIDEOS).body.find("\"videos\":[]") !=
             std::string::npos, "other account saw an unuploaded video");
@@ -593,19 +771,15 @@ int main(int argc, char** argv) {
     require(request(author, MAI_CLOUD_DRIVE_LIST_VIDEOS).body.find(id) ==
             std::string::npos, "deleted video remained in owner list");
 
-    const std::string tooLarge = std::string(argv[4]) + "/too-large.mov";
-    {
-        FILE* sparse = std::fopen(tooLarge.c_str(), "wb");
-        require(sparse != nullptr && std::fseek(sparse, 2'000'000'000, SEEK_SET) == 0 &&
-                std::fputc('x', sparse) != EOF, "could not make sparse size fixture");
-        std::fclose(sparse);
-    }
-    MaiCloudDriveResult oversized{};
-    mai_cloud_drive_upload_resumable(&author, tooLarge.c_str(), checkpoint.c_str(),
-        "too-large.mov", "video/quicktime", nullptr, nullptr, nullptr, &oversized);
-    require(oversized.status == MAI_CLOUD_DRIVE_FILE_ERROR,
-            "client accepted video larger than 2 GB");
-    mai_cloud_drive_result_free(&oversized);
+    const auto beforeOversize = nlohmann::json::parse(getState(endpoint, argv[2]));
+    unsigned oversizedReads = 0;
+    MaiCloudDriveSource oversizedVideo{"content://owned/too-large.mov",20'000'000'001,
+        nonSeekableRead,&oversizedReads};
+    require(uploadSource(author, oversizedVideo, checkpoint).status == MAI_CLOUD_DRIVE_INVALID_ARGUMENT &&
+            oversizedReads == 0 && !exists(checkpoint),
+            "video above20GB was read or initialized before policy rejection");
+    require(nlohmann::json::parse(getState(endpoint, argv[2]))["sessions"] == beforeOversize["sessions"],
+            "oversized virtual video reached the upload service");
 
     const std::string uriCheckpoint = std::string(argv[4]) + "/uri.maicloud.json";
     MaiCloudDriveSource nonSeekable{
@@ -746,20 +920,17 @@ int main(int argc, char** argv) {
                     target.c_str()).status == MAI_CLOUD_DRIVE_OK,
             "owner could not delete private image");
 
-    const std::string oversizedImage =
-        std::string(argv[4]) + "/too-large.png";
-    {
-        FILE* sparse = std::fopen(oversizedImage.c_str(), "wb");
-        require(sparse != nullptr && std::fseek(sparse, 20'000'000, SEEK_SET) == 0 &&
-                std::fputc('x', sparse) != EOF,
-                "could not make oversized image fixture");
-        std::fclose(sparse);
-    }
-    mai_cloud_drive_upload_resumable(&author, oversizedImage.c_str(),
+    const auto beforeOversizedImage = nlohmann::json::parse(getState(endpoint, argv[2]));
+    unsigned oversizedImageReads = 0;
+    MaiCloudDriveSource oversizedImage{"content://owned/too-large.png",100'000'001,
+        nonSeekableRead,&oversizedImageReads};
+    mai_cloud_drive_upload_resumable_source(&author, &oversizedImage,
         imageCheckpoint.c_str(), "too-large.png", "image/png", nullptr,
         nullptr, nullptr, &imageResult);
-    require(imageResult.status == MAI_CLOUD_DRIVE_FILE_ERROR &&
-            !exists(imageCheckpoint), "oversized image reached the upload service");
+    require(imageResult.status == MAI_CLOUD_DRIVE_INVALID_ARGUMENT && oversizedImageReads == 0 &&
+            !exists(imageCheckpoint), "image above100MB was read before policy rejection");
+    require(nlohmann::json::parse(getState(endpoint, argv[2]))["sessions"] == beforeOversizedImage["sessions"],
+            "oversized virtual image reached the upload service");
     mai_cloud_drive_result_free(&imageResult);
 
     const std::string documentPath = std::string(argv[4]) + "/notes.pdf";

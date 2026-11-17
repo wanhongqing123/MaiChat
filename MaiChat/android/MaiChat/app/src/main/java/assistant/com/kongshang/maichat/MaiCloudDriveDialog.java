@@ -233,9 +233,17 @@ final class MaiCloudDriveDialog {
         meterParams.topMargin = dp(14);
         meterParams.bottomMargin = dp(13);
         card.addView(quotaProgress, meterParams);
-        quotaNote = label("仅自己可见 · 视频 2 GB / 图片 20 MB", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
+        quotaNote = label("", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
+        quotaNote.setVisibility(View.GONE);
         card.addView(quotaNote, new LinearLayout.LayoutParams(-1, -2));
         return card;
+    }
+
+    // No persistent privacy/file-limit hint: this row exists only while the
+    // authoritative account response reports an actual reserved upload amount.
+    private void updateReservedQuota(long reserved) {
+        quotaNote.setText(reserved > 0 ? sizeText(reserved) + " 已预留" : "");
+        quotaNote.setVisibility(reserved > 0 ? View.VISIBLE : View.GONE);
     }
 
     private View symbolButton(MaiChatSymbolView.Symbol symbol, String description, Runnable action) {
@@ -390,9 +398,7 @@ final class MaiCloudDriveDialog {
                 quota.setText(sizeText(occupied) + " / " + sizeText(limit));
                 quotaProgress.setProgress((int) Math.max(0, Math.min(1000,
                     (double) occupied * 1000 / Math.max(1, limit))));
-                quotaNote.setText(reserved > 0 ? "其中 " + sizeText(reserved) +
-                    " 已预留 · 视频 2 GB / 图片 20 MB" :
-                    "仅自己可见 · 视频 2 GB / 图片 20 MB");
+                updateReservedQuota(reserved);
             }
             JSONArray page = body.optJSONArray("videos");
             if (page != null) for (int i = 0; i < page.length(); ++i) {

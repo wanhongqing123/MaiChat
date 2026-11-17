@@ -1,6 +1,7 @@
 #include "ui/UiZoom.h"
 #include "ui/DesktopRasterImage.h"
 #include "ui/CloudDriveDialog.h"
+#include "ui/DesktopCloudDriveThumbnail.h"
 
 #include "MaiCloudDriveClient.h"
 #include "MaiCloudVod.h"
@@ -53,8 +54,6 @@ static QByteArray cloudDriveTrustedRoots(const DesktopVideoCircleAccess& access)
 
 namespace {
 
-constexpr quint64 kMaxVideoBytes = 2'000'000'000ULL;
-constexpr quint64 kMaxImageBytes = 20'000'000ULL;
 constexpr quint64 kMaxThumbnailBytes = 5'000'000ULL;
 
 // 文件行负责双击和键盘打开；子按钮继续独立处理下载、删除，避免单击误开媒体。
@@ -136,7 +135,7 @@ void iconAction(QPushButton* button, QStyle::StandardPixmap icon, const QString&
 QString errorText(int status, long http) {
     if (http == 401) return QStringLiteral("登录已过期，请重新登录。");
     if (http == 404 || http == 503) return QStringLiteral("云盘暂不可用，请稍后重试。");
-    if (http == 413) return QStringLiteral("文件超出大小限制或 10 GB 账号空间已满。");
+    if (http == 413) return QStringLiteral("文件超出当前上传限制或账号可用空间不足。");
     if (http == 429) return QStringLiteral("未完成的上传太多，请稍后重试或放弃旧任务。");
     if (http == 410) return QStringLiteral("上传会话已过期，请重新上传。");
     if (http == 409) return QStringLiteral("操作未完成：可能存在同名文件夹，或文件夹还包含文件。请刷新后重试。");
@@ -308,7 +307,7 @@ CloudDriveDialog::CloudDriveDialog(AccessProvider access, AccountIdProvider acco
     connect(newFolderButton_, &QPushButton::clicked, this, &CloudDriveDialog::createFolder);
     header->addWidget(newFolderButton_);
     uploadButton_ = new QPushButton(QStringLiteral("上传"), this);
-    uploadButton_->setToolTip(QStringLiteral("上传图片或视频：图片最多 20 MB，视频最多 2 GB"));
+    uploadButton_->setToolTip(QStringLiteral("上传图片或视频"));
     uploadButton_->setObjectName(QStringLiteral("cloudDriveUpload"));
     connect(uploadButton_, &QPushButton::clicked, this, [this] {
         const QString file = QFileDialog::getOpenFileName(this, QStringLiteral("选择图片或视频"), {},
@@ -341,7 +340,7 @@ CloudDriveDialog::CloudDriveDialog(AccessProvider access, AccountIdProvider acco
     quotaBar_->setTextVisible(false);
     quotaBar_->setFixedHeight(8);
     quotaLayout->addWidget(quotaBar_);
-    // 空间仅保留用量和进度；上传限制在入口悬停时说明，不再占一整张说明卡。
+    // 空间仅保留用量和进度；大小限制由具体上传错误说明，不占常驻说明卡。
     root->addWidget(quotaCard);
     uploadScroll_ = makeScroll(&uploadRows_, this);
     // 待续传仅在有真实任务时占位；空区域不再把文件列表向下推，也无需重复分区标题。
@@ -910,10 +909,17 @@ void CloudDriveDialog::startUpload(const QString& sourcePath,
     MaiCloudDriveMediaInfo media{};
     const bool supported = mai_cloud_drive_media_info(displayName.constData(), &media) == 1;
     const bool image = supported && QByteArray(media.media_type_utf8) == QByteArray("image");
-    if (!file.isFile() || !file.isReadable() || file.size() < 1 ||
-        !supported || quint64(file.size()) > media.max_size_bytes) {
-        setStatus(QStringLiteral("请选择图片（JPEG、PNG、WebP、HEIC，最多 20 MB）"
-                                 "或视频（MP4、MOV，最多 2 GB）。"), true);
+    if (!supported) {
+        setStatus(QStringLiteral("请选择 JPEG、PNG、WebP、HEIC 图片或 MP4、MOV 视频。"), true);
+        return;
+    }
+    if (!file.isFile() || !file.isReadable() || file.size() < 1) {
+        setStatus(QStringLiteral("无法读取所选文件。"), true);
+        return;
+    }
+    if (quint64(file.size()) > media.max_size_bytes) {
+        setStatus(QStringLiteral("%1最多支持 %2。")
+            .arg(image ? QStringLiteral("图片") : QStringLiteral("视频"), humanSize(media.max_size_bytes)), true);
         return;
     }
     if (checkpointPath.isEmpty() && !AppMessageDialog::confirm(this,
@@ -958,8 +964,7 @@ void CloudDriveDialog::startUpload(const QString& sourcePath,
             refresh();
         }
     });
-    const QByteArray contentType(media.content_type_utf8);
-    watcher->setFuture(QtConcurrent::run([access, sourcePath, checkpoint, name, contentType,
+    watcher->setFuture(QtConcurrent::run([access, sourcePath, checkpoint, name,
                                          uploadFolderId,
                                          cancel] {
         Reply reply;
@@ -968,9 +973,6 @@ void CloudDriveDialog::startUpload(const QString& sourcePath,
         const QByteArray proxy = access.proxyUrl.toUtf8();
         const QByteArray host = access.signedUploadHostSuffix.toUtf8();
         const QByteArray roots = cloudDriveTrustedRoots(access);
-        const QByteArray source = sourcePath.toUtf8();
-        const QByteArray task = checkpoint.toUtf8();
-        const QByteArray display = name.toUtf8();
         MaiCloudDriveOptions options{};
         options.auth_base_url_utf8 = base.constData();
         options.account_token_utf8 = token.constData();
@@ -979,15 +981,14 @@ void CloudDriveDialog::startUpload(const QString& sourcePath,
         options.proxy_url_utf8 = access.proxyUrl.isNull() ? nullptr : proxy.constData();
         options.signed_upload_host_suffix_utf8 = host.isEmpty() ? nullptr : host.constData();
         MaiCloudDriveResult result{};
-        mai_cloud_drive_upload_resumable(&options, source.constData(), task.constData(),
-            display.constData(), contentType.constData(), cancel.get(), nullptr,
-            nullptr, &result);
+        QString localError;
+        uploadDesktopCloudDriveMedia(options, sourcePath, checkpoint, name, cancel.get(), &result, &localError);
         reply.status = result.status;
         reply.http = result.http_status;
         if (result.response_json_utf8)
             reply.body = QJsonDocument::fromJson(QByteArray(result.response_json_utf8,
                 int(result.response_bytes))).object();
-        if (!reply.ok()) reply.error = errorText(reply.status, reply.http);
+        if (!reply.ok()) reply.error = localError.isEmpty() ? errorText(reply.status, reply.http) : localError;
         mai_cloud_drive_result_free(&result);
         if (reply.ok() && !uploadFolderId.isEmpty()) {
             const QString mediaId = reply.body.value(QStringLiteral("video_id")).toString();
@@ -1095,13 +1096,13 @@ void CloudDriveDialog::saveVideo(const QString& videoId, const QString& name) {
         const qint64 size = reply.body.value(QStringLiteral("size_bytes")).toVariant().toLongLong();
         const QString type = reply.body.value(QStringLiteral("media_type")).toString();
         if (!signedUrl.startsWith(QStringLiteral("https://")) ||
-            size <= 0 || quint64(size) > kMaxVideoBytes || type != QStringLiteral("video")) {
+            size <= 0 || quint64(size) > desktopCloudDriveMaximumBytes(false) || type != QStringLiteral("video")) {
             reply.status = MAI_CLOUD_DRIVE_INVALID_ARGUMENT;
             reply.error = QStringLiteral("云盘文件信息无效，无法保存。");
             return reply;
         }
         const MaiDownloadResult downloaded = downloadCloudFile(
-            access, signedUrl, target, kMaxVideoBytes, 2 * 60 * 60 * 1000,
+            access, signedUrl, target, desktopCloudDriveMaximumBytes(false), desktopCloudDriveDownloadTimeoutMs(false),
             downloadCancel.get());
         if (downloaded.status != MAI_DOWNLOAD_OK) {
             reply.status = downloaded.status == MAI_DOWNLOAD_CANCELED ?
@@ -1166,7 +1167,7 @@ void CloudDriveDialog::startImagePreview(const QString& mediaId) {
         if (!image.reply.ok()) return image;
         const MaiDownloadResult downloaded = downloadCloudFile(access,
             image.reply.body.value(QStringLiteral("read_url")).toString(), target,
-            kMaxImageBytes, 2 * 60 * 1000, downloadCancel.get());
+            desktopCloudDriveMaximumBytes(true), desktopCloudDriveDownloadTimeoutMs(true), downloadCancel.get());
         if (downloaded.status != MAI_DOWNLOAD_OK) {
             image.reply.status = downloaded.status == MAI_DOWNLOAD_CANCELED ?
                 MAI_CLOUD_DRIVE_CANCELED : MAI_CLOUD_DRIVE_NETWORK_ERROR;
@@ -1253,6 +1254,8 @@ void CloudDriveDialog::discardUpload(const QString& checkpointPath, const QStrin
         mai_cloud_drive_abort_resumable(&options, checkpoint.constData(), cancel.get(), &result);
         reply.status = result.status;
         reply.http = result.http_status;
+        if (reply.ok() && !finishDesktopCloudDriveImage(checkpointPath, true))
+            qWarning("[cloud] discarded upload auxiliary cleanup remains pending");
         if (!reply.ok()) reply.error = errorText(reply.status, reply.http);
         mai_cloud_drive_result_free(&result);
         return reply;

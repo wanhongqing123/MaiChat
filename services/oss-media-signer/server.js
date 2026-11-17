@@ -4,8 +4,9 @@ const http = require('node:http');
 const { handler } = require('./index');
 
 const MAX_REQUEST_BYTES = 4096;
-// Completing a 2 GB multipart upload sends at most 239 authoritative OSS ETags.
-const MAX_CLOUD_COMPLETE_BYTES = 32768;
+// Only the internal completion route carries a large authoritative part list.
+// 20 GB uses 2385 fixed 8 MiB parts; public/control metadata stays at 4 KiB.
+const MAX_CLOUD_COMPLETE_BYTES = 1024 * 1024;
 
 function createServer(handle = handler) {
   return http.createServer(async (request, response) => {

@@ -112,6 +112,16 @@ typedef struct MaiCloudDriveOptions {
     int temporary_session_image;
     const char* message_id_utf8;
     const char* part_id_utf8;
+    // Cloud images may supply an owned JPEG beside the upload checkpoint.
+    // The host prepares at most 320x320 pixels and 2,000,000 bytes with its
+    // existing bounded image decoder. The path string is borrowed until this
+    // synchronous call returns; keep the file/content unchanged while an upload
+    // or resume is incomplete. Cancel pauses and retains it. Remove only after
+    // durable completion or confirmed explicit abort. Never pass this option
+    // for Session/temporary images. Cloud originals over 20,000,000 bytes need
+    // it before initialization; smaller legacy uploads may leave it null.
+    // The shared core owns signing, multipart transport and checkpoint binding.
+    const char* cloud_drive_thumbnail_path_utf8;
 } MaiCloudDriveOptions;
 
 typedef struct MaiCloudDriveResult {
@@ -203,8 +213,10 @@ void mai_cloud_drive_request(const MaiCloudDriveOptions* options,
                              const MaiCloudDriveCancel* cancel,
                              MaiCloudDriveResult* result);
 
-// Uploads MP4/MOV up to 2,000,000,000 bytes, or JPEG/PNG/WebP/HEIC up to
-// 20,000,000 bytes, through the same OSS multipart transport.
+// Cloud uploads accept MP4/MOV up to 20,000,000,000 bytes or JPEG/PNG/WebP/HEIC
+// up to 100,000,000 bytes through the same OSS multipart transport. Session
+// limits remain 2,000,000,000 / 20,000,000 bytes. Large cloud images require the
+// owned thumbnail option above; original bytes are never recompressed.
 // The client hashes the whole file, stores an atomic checkpoint at the
 // caller-provided private path, asks the account server for authoritative
 // ListParts, and PUTs only missing parts with a fresh signed URL and MD5.
@@ -230,7 +242,7 @@ void mai_cloud_drive_upload_resumable(const MaiCloudDriveOptions* options,
 
 // Same implementation with a seekable host source. On relaunch enumerate the
 // checkpoint, reopen the source from stable_id_utf8, and supply the same ID.
-// This avoids copying a 2 GB Android SAF video when its provider supports
+// This avoids copying a large Android SAF video when its provider supports
 // random reads and the URI permission is persisted by the host.
 void mai_cloud_drive_upload_resumable_source(
     const MaiCloudDriveOptions* options,

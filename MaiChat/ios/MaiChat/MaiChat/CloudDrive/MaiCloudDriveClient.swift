@@ -150,12 +150,24 @@ struct MaiCloudDriveError: LocalizedError, Sendable {
 
 final class MaiCloudDriveCancelToken: @unchecked Sendable {
     let pointer: OpaquePointer
+    private let lock = NSLock()
+    private var canceled = false
     init?() {
         guard let pointer = mai_cloud_drive_cancel_create() else { return nil }
         self.pointer = pointer
     }
     deinit { mai_cloud_drive_cancel_destroy(pointer) }
-    func cancel() { mai_cloud_drive_cancel_request(pointer) }
+    var isCanceled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return canceled
+    }
+    func cancel() {
+        lock.lock()
+        canceled = true
+        lock.unlock()
+        mai_cloud_drive_cancel_request(pointer)
+    }
 }
 
 private final class MaiCloudDriveDownloadCancelToken: @unchecked Sendable {
@@ -172,6 +184,7 @@ private final class MaiCloudDriveReadContext {
     let file: FileHandle
     let url: URL
     let scoped: Bool
+    private let readLock = NSLock()
 
     init(url: URL) throws {
         self.url = url
@@ -189,6 +202,8 @@ private final class MaiCloudDriveReadContext {
     }
 
     func read(at offset: UInt64, output: UnsafeMutablePointer<UInt8>, count: Int) -> Int32 {
+        readLock.lock()
+        defer { readLock.unlock() }
         do {
             try file.seek(toOffset: offset)
             var filled = 0
@@ -305,15 +320,22 @@ struct MaiCloudDriveClient: Sendable {
 
     private static func contentInfo(_ contentType: String)
         -> (extensionName: String, isImage: Bool, maxBytes: UInt64)? {
+        let extensionName: String
         switch contentType {
-        case "video/mp4": return ("mp4", false, 2_000_000_000)
-        case "video/quicktime": return ("mov", false, 2_000_000_000)
-        case "image/jpeg": return ("jpg", true, 20_000_000)
-        case "image/png": return ("png", true, 20_000_000)
-        case "image/webp": return ("webp", true, 20_000_000)
-        case "image/heic": return ("heic", true, 20_000_000)
+        case "video/mp4": extensionName = "mp4"
+        case "video/quicktime": extensionName = "mov"
+        case "image/jpeg": extensionName = "jpg"
+        case "image/png": extensionName = "png"
+        case "image/webp": extensionName = "webp"
+        case "image/heic": extensionName = "heic"
         default: return nil
         }
+        // 云盘读取和上传使用同一策略；Session 使用独立 media_info，不扩大其预算。
+        var info = MaiCloudDriveMediaInfo()
+        guard ("preview." + extensionName).withCString({
+            mai_cloud_drive_media_info($0, &info) != 0
+        }) else { return nil }
+        return (extensionName, contentType.hasPrefix("image/"), info.max_size_bytes)
     }
 
     static func discardStalePreviews() {
@@ -406,7 +428,10 @@ struct MaiCloudDriveClient: Sendable {
     }
 
     func abort(checkpointURL: URL) async throws {
-        guard FileManager.default.fileExists(atPath: checkpointURL.path) else { return }
+        guard FileManager.default.fileExists(atPath: checkpointURL.path) else {
+            try MaiCloudDriveImageThumbnail.removeAfterCompletionOrAbort(checkpoint: checkpointURL)
+            return
+        }
         guard let access = try await MaiChatAuthClient.shared.cloudDriveAccessIfAvailable(),
               let cancel = MaiCloudDriveCancelToken() else {
             throw MaiChatAuthError.sessionExpired
@@ -456,6 +481,8 @@ struct MaiCloudDriveClient: Sendable {
                 }
             }
         } onCancel: { cancel.cancel() }
+        // 只有共享核心确认 abort 后才移除派生文件；普通暂停不会走到这里。
+        try MaiCloudDriveImageThumbnail.removeAfterCompletionOrAbort(checkpoint: checkpointURL)
     }
 
     func playLink(videoID: String) async throws -> String {
@@ -766,87 +793,106 @@ struct MaiCloudDriveClient: Sendable {
         let signedHost = access.authBaseURL.contains("localhost") ||
             access.authBaseURL.contains("127.0.0.1") ? "localhost" : "aliyuncs.com"
         let opened: MaiCloudDriveReadContext?
-        if let bookmark = source.bookmark {
-            do {
-                var stale = false
-                let url = try URL(resolvingBookmarkData: bookmark, options: [],
-                                  relativeTo: nil, bookmarkDataIsStale: &stale)
-                opened = try MaiCloudDriveReadContext(url: url)
-            } catch {
-                return .failure(MaiCloudDriveError(
-                    status: Int32(MAI_CLOUD_DRIVE_FILE_ERROR.rawValue), httpStatus: 0,
-                    detail: "源视频已无法访问，请重新选择该文件"))
+        let thumbnail: MaiCloudDriveImageThumbnail.Prepared?
+        do {
+            let originalURL = {
+                () throws -> URL in
+                if let bookmark = source.bookmark {
+                    var stale = false
+                    return try URL(resolvingBookmarkData: bookmark, options: [],
+                                   relativeTo: nil, bookmarkDataIsStale: &stale)
+                }
+                guard let path = source.sourcePath else {
+                    throw MaiCloudDriveError(status: 0, httpStatus: 0, detail: "源文件已无法访问")
+                }
+                return URL(fileURLWithPath: path)
             }
-        } else { opened = nil }
+            if room == nil, source.contentType.hasPrefix("image/") {
+                thumbnail = try MaiCloudDriveImageThumbnail.prepare(
+                    checkpoint: checkpoint, sourceID: source.sourceID, size: source.sizeBytes,
+                    sourceURL: originalURL, isCanceled: { cancel.isCanceled })
+            } else { thumbnail = nil }
+            if let thumbnail {
+                // JPEG 和原图传输读取同一私有快照，避免外部文件被修改后两者串内容。
+                opened = try MaiCloudDriveReadContext(url: thumbnail.source)
+            } else if source.bookmark != nil {
+                opened = try MaiCloudDriveReadContext(url: originalURL())
+            } else { opened = nil }
+        } catch { return .failure(error) }
         var native = MaiCloudDriveResult()
-        access.authBaseURL.withCString { auth in
-            access.accountToken.withCString { token in
-                certificate.path.withCString { ca in
-                    signedHost.withCString { host in
-                        checkpoint.path.withCString { checkpointPath in
-                            source.name.withCString { name in
-                                source.contentType.withCString { contentType in
-                                    var options = MaiCloudDriveOptions()
-                                    options.auth_base_url_utf8 = auth
-                                    options.account_token_utf8 = token
-                                    options.ca_path_utf8 = ca
-                                    options.proxy_resolver = maiChatAttachmentProxyResolver
-                                    options.proxy_context = Unmanaged.passUnretained(proxy).toOpaque()
-                                    // 上传会交替访问账号接口和 OSS；核心仅对账号接口使用此线路。
-                                    options.first_party_route_selector = maiChatSelectFirstPartyRoute
-                                    options.first_party_route_invalidator = maiChatInvalidateFirstPartyRoute
-                                    options.signed_upload_host_suffix_utf8 = host
-                                    options.retain_completed_checkpoint = 1
-                                    let invokeUpload = {
-                                        if let opened {
-                                            source.sourceID.withCString { stableID in
-                                                var sourceInfo = MaiCloudDriveSource()
-                                                sourceInfo.stable_id_utf8 = stableID
-                                                sourceInfo.size_bytes = source.sizeBytes
-                                                sourceInfo.read_at = maiCloudDriveReadAt
-                                                sourceInfo.context = Unmanaged
-                                                    .passUnretained(opened).toOpaque()
-                                                mai_cloud_drive_upload_resumable_source(
-                                                    &options, &sourceInfo, checkpointPath,
-                                                    name, contentType, cancel.pointer,
-                                                    maiCloudDriveProgress,
-                                                    Unmanaged.passUnretained(progressContext)
-                                                        .toOpaque(), &native)
-                                            }
-                                        } else if let path = source.sourcePath {
-                                            path.withCString { filePath in
-                                                mai_cloud_drive_upload_resumable(
-                                                    &options, filePath, checkpointPath,
-                                                    name, contentType, cancel.pointer,
-                                                    maiCloudDriveProgress,
-                                                    Unmanaged.passUnretained(progressContext)
-                                                        .toOpaque(), &native)
-                                            }
-                                        }
-                                    }
-                                    let invoke = {
-                                        if let room {
-                                            room.ownerSlot.withCString { slot in
-                                                room.ownerLoginSessionID.withCString { login in
-                                                    room.sessionID.withCString { session in
-                                                        options.owner_device_slot_utf8 = slot
-                                                        options.owner_login_session_id_utf8 = login
-                                                        options.session_id_utf8 = session
-                                                        invokeUpload()
-                                                    }
+        // C API 是同步调用；整个调用树都位于 withCString 内，不能借用临时指针。
+        (thumbnail?.jpeg.path ?? "").withCString { thumbnailPath in
+            access.authBaseURL.withCString { auth in
+                access.accountToken.withCString { token in
+                    certificate.path.withCString { ca in
+                        signedHost.withCString { host in
+                            checkpoint.path.withCString { checkpointPath in
+                                source.name.withCString { name in
+                                    source.contentType.withCString { contentType in
+                                        var options = MaiCloudDriveOptions()
+                                        options.auth_base_url_utf8 = auth
+                                        options.account_token_utf8 = token
+                                        options.ca_path_utf8 = ca
+                                        options.proxy_resolver = maiChatAttachmentProxyResolver
+                                        options.proxy_context = Unmanaged.passUnretained(proxy).toOpaque()
+                                        // 上传会交替访问账号接口和 OSS；核心仅对账号接口使用此线路。
+                                        options.first_party_route_selector = maiChatSelectFirstPartyRoute
+                                        options.first_party_route_invalidator = maiChatInvalidateFirstPartyRoute
+                                        options.signed_upload_host_suffix_utf8 = host
+                                        options.retain_completed_checkpoint = 1
+                                        options.cloud_drive_thumbnail_path_utf8 =
+                                            thumbnail == nil ? nil : thumbnailPath
+                                        let invokeUpload = {
+                                            if let opened {
+                                                source.sourceID.withCString { stableID in
+                                                    var sourceInfo = MaiCloudDriveSource()
+                                                    sourceInfo.stable_id_utf8 = stableID
+                                                    sourceInfo.size_bytes = source.sizeBytes
+                                                    sourceInfo.read_at = maiCloudDriveReadAt
+                                                    sourceInfo.context = Unmanaged
+                                                        .passUnretained(opened).toOpaque()
+                                                    mai_cloud_drive_upload_resumable_source(
+                                                        &options, &sourceInfo, checkpointPath,
+                                                        name, contentType, cancel.pointer,
+                                                        maiCloudDriveProgress,
+                                                        Unmanaged.passUnretained(progressContext)
+                                                            .toOpaque(), &native)
+                                                }
+                                            } else if let path = source.sourcePath {
+                                                path.withCString { filePath in
+                                                    mai_cloud_drive_upload_resumable(
+                                                        &options, filePath, checkpointPath,
+                                                        name, contentType, cancel.pointer,
+                                                        maiCloudDriveProgress,
+                                                        Unmanaged.passUnretained(progressContext)
+                                                            .toOpaque(), &native)
                                                 }
                                             }
-                                        } else { invokeUpload() }
-                                    }
-                                    if let pem = certificate.pem {
-                                        pem.withUnsafeBytes { bytes in
-                                            options.ca_pem = bytes.baseAddress?
-                                                .assumingMemoryBound(to: CChar.self)
-                                            options.ca_pem_length = bytes.count
-                                            options.ca_path_utf8 = nil
-                                            invoke()
                                         }
-                                    } else { invoke() }
+                                        let invoke = {
+                                            if let room {
+                                                room.ownerSlot.withCString { slot in
+                                                    room.ownerLoginSessionID.withCString { login in
+                                                        room.sessionID.withCString { session in
+                                                            options.owner_device_slot_utf8 = slot
+                                                            options.owner_login_session_id_utf8 = login
+                                                            options.session_id_utf8 = session
+                                                            invokeUpload()
+                                                        }
+                                                    }
+                                                }
+                                            } else { invokeUpload() }
+                                        }
+                                        if let pem = certificate.pem {
+                                            pem.withUnsafeBytes { bytes in
+                                                options.ca_pem = bytes.baseAddress?
+                                                    .assumingMemoryBound(to: CChar.self)
+                                                options.ca_pem_length = bytes.count
+                                                options.ca_path_utf8 = nil
+                                                invoke()
+                                            }
+                                        } else { invoke() }
+                                    }
                                 }
                             }
                         }

@@ -177,6 +177,9 @@
 		6E2821272D1EED42D4514585 /* IMSessionBindingUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62F81069A9866944392256C4 /* IMSessionBindingUITestFixture.swift */; };
 		43CB001F7BE8793B746B3B1A /* IMIngressPersistenceFence.swift in Sources */ = {isa = PBXBuildFile; fileRef = D65E11DAE5DE348A9B594930 /* IMIngressPersistenceFence.swift */; };
 		DEBAA169689B377980F0F664 /* IMIngressPersistenceFence.swift in Sources */ = {isa = PBXBuildFile; fileRef = D65E11DAE5DE348A9B594930 /* IMIngressPersistenceFence.swift */; };
+		4EC464B3132940FDA0A9151C /* MaiCloudDriveImageThumbnail.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30F17AFF99114AFE91C59540 /* MaiCloudDriveImageThumbnail.swift */; };
+		FFC1CA88E11B4F5B92F23FEC /* CloudDriveImageThumbnailTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24344D16EF684517890FFB2C /* CloudDriveImageThumbnailTests.swift */; };
+		88CF8C9CD7424B75BBD6F798 /* MaiCloudDriveImageThumbnail.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30F17AFF99114AFE91C59540 /* MaiCloudDriveImageThumbnail.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -392,6 +395,8 @@
 		AA5166D8977135BFEE1CA069 /* IMSessionBinding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMSessionBinding.swift; sourceTree = "<group>"; };
 		62F81069A9866944392256C4 /* IMSessionBindingUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMSessionBindingUITestFixture.swift; sourceTree = "<group>"; };
 		D65E11DAE5DE348A9B594930 /* IMIngressPersistenceFence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMIngressPersistenceFence.swift; sourceTree = "<group>"; };
+		30F17AFF99114AFE91C59540 /* MaiCloudDriveImageThumbnail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiCloudDriveImageThumbnail.swift; sourceTree = "<group>"; };
+		24344D16EF684517890FFB2C /* CloudDriveImageThumbnailTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudDriveImageThumbnailTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -674,6 +679,7 @@
 				8F2675F0F73004CB0E64EF24 /* MaiCloudDriveClient.swift */,
 				7392F1754C193B2E75E6339C /* MaiCloudDriveImagePager.swift */,
 				41EEBD50557FEDE54CCA64F9 /* MaiCloudDriveModel.swift */,
+				30F17AFF99114AFE91C59540 /* MaiCloudDriveImageThumbnail.swift */,
 				0EFBEB437244CED3D8DC9B4D /* MaiCloudDriveProductionCanaryCredential.swift */,
 				A47856A6735559D9160BB50C /* MaiCloudDriveView.swift */,
 			);
@@ -736,6 +742,7 @@
 				CF418F1F9067998C3B21BA92 /* AILocalModelStoreTests.swift */,
 				79DE5C121104EFD753CB69F2 /* AIOutgoingMessageQueueTests.swift */,
 				FAC1BDC1E5B9CFCEB0211160 /* AppTypographyTests.swift */,
+				24344D16EF684517890FFB2C /* CloudDriveImageThumbnailTests.swift */,
 				E85A5C5C020900B2D0178B0A /* DiagnosticLogTests.swift */,
 				59C1F4DABEBD721F3CB32385 /* LocalChatHistoryStoreTests.swift */,
 				0194E7C7F438293A088E45E0 /* MarkdownPresentationTests.swift */,
@@ -1139,6 +1146,8 @@
 				59787B6FD41111DD1ABB2E4A /* AppPageTitle.swift in Sources */,
 				2DC2405C219F4F7D86E7B301 /* AppTypography.swift in Sources */,
 				ECFA3017473738D476B0EF28 /* AppTypographyTests.swift in Sources */,
+				FFC1CA88E11B4F5B92F23FEC /* CloudDriveImageThumbnailTests.swift in Sources */,
+				88CF8C9CD7424B75BBD6F798 /* MaiCloudDriveImageThumbnail.swift in Sources */,
 				0B2637847F5454F182126805 /* ComposerDraftState.swift in Sources */,
 				F0D9326831C7925F6C4FC5D6 /* DiagnosticLogTests.swift in Sources */,
 				DEBAA169689B377980F0F664 /* IMIngressPersistenceFence.swift in Sources */,
@@ -1224,6 +1233,7 @@
 				F5418DE3092242A1E77BD638 /* MaiCloudDriveClient.swift in Sources */,
 				D33D3EF1E1F564EDB44C7F7E /* MaiCloudDriveImagePager.swift in Sources */,
 				9032311C79468BE8D517F4ED /* MaiCloudDriveModel.swift in Sources */,
+				4EC464B3132940FDA0A9151C /* MaiCloudDriveImageThumbnail.swift in Sources */,
 				BBD727996B6D9BF10BBB15FC /* MaiCloudDriveProductionCanaryCredential.swift in Sources */,
 				0F2174634726BE7BB940C868 /* MaiCloudDriveView.swift in Sources */,
 				6247CB164955518ADFF0D16A /* MaiFfplayIosBridge.cpp in Sources */,
@@ -1385,7 +1395,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 202;
+				CURRENT_PROJECT_VERSION = 227;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1404,7 +1414,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				MARKETING_VERSION = 2.2.4;
+				MARKETING_VERSION = 3.0.1;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -1562,7 +1572,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 202;
+				CURRENT_PROJECT_VERSION = 227;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -1575,7 +1585,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				MARKETING_VERSION = 2.2.4;
+				MARKETING_VERSION = 3.0.1;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";

@@ -80,7 +80,7 @@ public final class MaiCloudDriveInstrumentedTest {
         File orphan = new File(directory, "cold-orphan.maicloud.json.source");
         File paused = new File(directory, "cold-paused.maicloud.json.source");
         File checkpoint = new File(directory, "cold-paused.maicloud.json");
-        assertFalse("Restart left an orphaned private 2 GB-capable copy", orphan.exists());
+        assertFalse("Restart left an orphaned private upload copy", orphan.exists());
         assertTrue("Paused upload source must survive restart", paused.exists());
         assertTrue(checkpoint.exists());
         paused.delete(); checkpoint.delete();
@@ -108,7 +108,7 @@ public final class MaiCloudDriveInstrumentedTest {
         MaiCloudDrive.Source source = client.inspect(image);
         assertEquals("image/png", source.type);
         assertEquals("image", MaiCloudDrive.mediaInfo(source.name).mediaType);
-        assertEquals(20_000_000L, MaiCloudDrive.mediaInfo(source.name).maxBytes);
+        assertEquals(100_000_000L, MaiCloudDrive.mediaInfo(source.name).maxBytes);
         assertEquals(null, MaiCloudDrive.mediaInfo("unsupported.gif"));
 
         File checkpoint = client.newCheckpoint();

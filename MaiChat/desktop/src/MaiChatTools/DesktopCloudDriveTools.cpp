@@ -1,4 +1,5 @@
 #include "MaiChatTools/DesktopCloudDriveTools.h"
+#include "ui/DesktopCloudDriveThumbnail.h"
 
 #include "MaiCloudDriveClient.h"
 #include "MaiCloudDriveTools.h"
@@ -38,8 +39,17 @@ static void initializeCloudDriveAuthCertificates() {
 
 namespace {
 
-constexpr quint64 kMaxVideoBytes = 2'000'000'000ULL;
-constexpr quint64 kMaxImageBytes = 20'000'000ULL;
+QString privatePathKey(const QString& path) {
+    // Qt and the shared native filesystem enumerator spell the same Windows
+    // checkpoint with different separators. Identity must also work before
+    // creation, so normalize lexically instead of resolving an existing file.
+    const QString absolute = QDir::cleanPath(QDir::fromNativeSeparators(QFileInfo(path).absoluteFilePath()));
+#if defined(Q_OS_WIN)
+    return absolute.toCaseFolded();
+#else
+    return absolute;
+#endif
+}
 
 QString suffixForContentType(const QString& contentType) {
     if (contentType == QStringLiteral("video/mp4")) return QStringLiteral("mp4");
@@ -76,14 +86,15 @@ public:
 
     bool begin(const ActiveTransfer& transfer) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (transfers_.contains(transfer.checkpoint)) return false;
-        transfers_.insert(transfer.checkpoint, transfer);
+        const QString key = privatePathKey(transfer.checkpoint);
+        if (transfers_.contains(key)) return false;
+        transfers_.insert(key, transfer);
         return true;
     }
 
     void end(const QString& checkpoint) {
         std::lock_guard<std::mutex> lock(mutex_);
-        transfers_.remove(checkpoint);
+        transfers_.remove(privatePathKey(checkpoint));
     }
 
     void launch(std::function<void()> work) {
@@ -141,12 +152,12 @@ public:
 
     bool contains(const QString& checkpoint) const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return transfers_.contains(checkpoint);
+        return transfers_.contains(privatePathKey(checkpoint));
     }
 
     bool isUploading(const QString& checkpoint) const {
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = transfers_.constFind(checkpoint);
+        const auto it = transfers_.constFind(privatePathKey(checkpoint));
         return it != transfers_.cend() && it->uploading;
     }
 
@@ -154,7 +165,7 @@ public:
         std::shared_ptr<MaiCloudDriveCancel> cancel;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            const auto it = transfers_.constFind(checkpoint);
+            const auto it = transfers_.constFind(privatePathKey(checkpoint));
             if (it == transfers_.cend() || !it->uploading) return false;
             cancel = it->cancel;
         }
@@ -166,7 +177,8 @@ public:
         QList<ActiveTransfer> found;
         std::lock_guard<std::mutex> lock(mutex_);
         for (const ActiveTransfer& transfer : transfers_) {
-            if (transfer.uploading && QFileInfo(transfer.checkpoint).absolutePath() == directory)
+            if (transfer.uploading &&
+                privatePathKey(QFileInfo(transfer.checkpoint).absolutePath()) == privatePathKey(directory))
                 found.append(transfer);
         }
         return found;
@@ -215,8 +227,10 @@ MaiToolResult errorResult(const MaiCloudDriveResult& result) {
     if (result.http_status == 404 || result.http_status == 503)
         return failure(MaiErrorCode::NotConfigured, "the private cloud drive is unavailable");
     if (result.http_status == 413)
+        // The server's per-account available space is independent of the
+        // shared per-file ceiling; neither is a fixed historical quota here.
         return failure(MaiErrorCode::InvalidInput,
-                       "the video is larger than 2 GB or the account's 10 GB quota is full");
+                       "the upload exceeds the current cloud-drive limit or the account's available space");
     if (result.http_status == 410)
         return failure(MaiErrorCode::NotFound, "the upload session has expired; start a new upload");
     if (result.status == MAI_CLOUD_DRIVE_CHECKPOINT_MISMATCH)
@@ -346,7 +360,7 @@ QJsonObject checkpointByTask(const QString& directory, const QString& taskId) {
         for (const QJsonValue& entry : uploads) {
             const QJsonObject upload = entry.toObject();
             const QString path = upload.value(QStringLiteral("checkpoint_path")).toString();
-            if (QFileInfo(path).absolutePath() == directory &&
+            if (privatePathKey(QFileInfo(path).absolutePath()) == privatePathKey(directory) &&
                 QFileInfo(path).fileName() == taskId + QStringLiteral(".maicloud.json")) {
                 selected = upload;
                 break;
@@ -374,10 +388,10 @@ MaiToolResult pendingUploads(const QString& directory, const std::shared_ptr<Act
     for (const QJsonValue& entry : body.value(QStringLiteral("uploads")).toArray()) {
         const QJsonObject upload = entry.toObject();
         const QString path = upload.value(QStringLiteral("checkpoint_path")).toString();
-        if (QFileInfo(path).absolutePath() != directory) continue;
+        if (privatePathKey(QFileInfo(path).absolutePath()) != privatePathKey(directory)) continue;
         const QString file = QFileInfo(path).fileName();
         if (!file.endsWith(QStringLiteral(".maicloud.json"))) continue;
-        seen.insert(path, true);
+        seen.insert(privatePathKey(path), true);
         safe.push_back(QJsonObject{{QStringLiteral("task_id"), file.left(file.size() - 14)},
                                    {QStringLiteral("name"), upload.value(QStringLiteral("name"))},
                                    {QStringLiteral("size_bytes"), upload.value(QStringLiteral("size_bytes"))},
@@ -385,7 +399,7 @@ MaiToolResult pendingUploads(const QString& directory, const std::shared_ptr<Act
                                        ? QStringLiteral("uploading") : QStringLiteral("paused")}});
     }
     for (const ActiveTransfer& active : transfers->uploadsIn(directory)) {
-        if (seen.contains(active.checkpoint)) continue;
+        if (seen.contains(privatePathKey(active.checkpoint))) continue;
         const QString file = QFileInfo(active.checkpoint).fileName();
         if (!file.endsWith(QStringLiteral(".maicloud.json"))) continue;
         safe.push_back(QJsonObject{{QStringLiteral("task_id"), file.left(file.size() - 14)},
@@ -397,20 +411,20 @@ MaiToolResult pendingUploads(const QString& directory, const std::shared_ptr<Act
         QJsonDocument(QJsonObject{{QStringLiteral("uploads"), safe}}).toJson(QJsonDocument::Compact).toStdString());
 }
 
-MaiToolResult upload(Operation& operation, const QString& source, const QString& checkpoint, const QString& name) {
+MaiToolResult upload(Operation& operation, const QString& source, const QString& checkpoint, const QString& name,
+                     const DesktopCloudDrivePreparedImage* preparedImage = nullptr) {
     MaiCloudDriveMediaInfo media{};
     const QByteArray display = name.toUtf8();
     if (!mai_cloud_drive_media_info(display.constData(), &media))
         return failure(MaiErrorCode::InvalidInput, "unsupported cloud media type");
-    const QByteArray base = source.toUtf8();
-    const QByteArray task = checkpoint.toUtf8();
-    const QByteArray mime(media.content_type_utf8);
     MaiCloudDriveResult result{};
     const MaiCloudDriveOptions options = operation.options();
-    mai_cloud_drive_upload_resumable(&options, base.constData(), task.constData(), display.constData(),
-                                     mime.constData(), operation.cancel.get(), nullptr, nullptr, &result);
+    QString localError;
+    uploadDesktopCloudDriveMedia(options, source, checkpoint, name, operation.cancel.get(), &result,
+                                 &localError, preparedImage);
     if (result.status != MAI_CLOUD_DRIVE_OK) {
-        const MaiToolResult error = errorResult(result);
+        const MaiToolResult error = localError.isEmpty() ? errorResult(result) :
+            failure(MaiErrorCode::InvalidInput, localError.toUtf8().constData());
         mai_cloud_drive_result_free(&result);
         return error;
     }
@@ -436,23 +450,35 @@ MaiToolResult queueUpload(const DesktopVideoCircleAccess& access, const QString&
             access.accountId, checkpoint, name, QFileInfo(source).size(), cancel, true}))
         return failure(MaiErrorCode::Busy, "the upload task is already active");
     try {
+        // The model receives a real pre-upload error for an undecodable image.
+        // Keep the bounded snapshot alive in the queued worker instead of
+        // re-reading a possibly changed original after returning accepted.
+        const DesktopCloudDrivePreparedImage prepared = prepareDesktopCloudDriveImage(source, checkpoint, name);
+        if (!prepared.error.isEmpty()) {
+            transfers->end(checkpoint);
+            finishDesktopCloudDriveImage(checkpoint, false);
+            return failure(prepared.resourceBusy ? MaiErrorCode::Busy : MaiErrorCode::InvalidInput,
+                           prepared.error.toUtf8().constData());
+        }
         // ActiveTransfers owns and joins the thread. The worker captures only
         // value data and a shared cancel token; it never borrows turn context.
         ActiveTransfers* owner = transfers.get();
-        transfers->launch([owner, access, source, checkpoint, name, cancel] {
+        transfers->launch([owner, access, source, checkpoint, name, cancel, prepared] {
             try {
                 MaiToolContext backgroundContext;
                 const std::function<DesktopVideoCircleAccess()> fixedAccess = [access] { return access; };
                 Operation operation(access, fixedAccess, backgroundContext, cancel);
                 if (operation.cancel && operation.downloadCancel)
-                    (void)upload(operation, source, checkpoint, name);
+                    (void)upload(operation, source, checkpoint, name, &prepared);
             } catch (...) {
                 // The checkpoint, when present, remains available for resume.
             }
+            finishDesktopCloudDriveImage(checkpoint, false);
             owner->end(checkpoint);
         });
     } catch (const std::exception&) {
         transfers->end(checkpoint);
+        finishDesktopCloudDriveImage(checkpoint, false);
         return failure(MaiErrorCode::Internal, "could not queue the upload task");
     }
     return MaiToolResult::success(QJsonDocument(QJsonObject{
@@ -608,7 +634,7 @@ void registerDesktopCloudDriveTools(MaiToolRegistry& registry, std::function<Des
                     {QStringLiteral("state"), QStringLiteral("paused")}})
                     .toJson(QJsonDocument::Compact).toStdString());
             }
-            // Avoid hashing a 2 GB file before discovering that the account feature is disabled.
+            // Check availability before preparing or hashing a large source.
             const MaiToolResult gate = request(operation, MAI_CLOUD_DRIVE_LIST_VIDEOS, {});
             if (gate.hasError()) return gate;
             if (name == "maichat_cloud_drive_upload_media") {
@@ -649,6 +675,8 @@ void registerDesktopCloudDriveTools(MaiToolRegistry& registry, std::function<Des
                 const MaiToolResult aborted = resultJson(result);
                 mai_cloud_drive_result_free(&result);
                 if (aborted.hasError()) return aborted;
+                if (!finishDesktopCloudDriveImage(checkpoint, true))
+                    qWarning("[cloud] discarded upload auxiliary cleanup remains pending");
                 const QJsonObject server = parseObject(aborted.output());
                 return MaiToolResult::success(QJsonDocument(QJsonObject{
                     {QStringLiteral("aborted"), true}, {QStringLiteral("task_id"), taskId},
@@ -681,7 +709,7 @@ void registerDesktopCloudDriveTools(MaiToolRegistry& registry, std::function<Des
                 const qint64 size = details.value(QStringLiteral("size_bytes")).toVariant().toLongLong();
                 if (!image) {
                     if (!signedUrl.startsWith(QStringLiteral("https://")) || suffix.isEmpty() ||
-                        size <= 0 || quint64(size) > kMaxVideoBytes ||
+                        size <= 0 || quint64(size) > desktopCloudDriveMaximumBytes(false) ||
                         mediaType != QStringLiteral("video"))
                         return failure(MaiErrorCode::Protocol, "cloud video link or type is invalid");
                     auto vodCancel = std::shared_ptr<MaiCloudVodCancel>(
@@ -713,7 +741,7 @@ void registerDesktopCloudDriveTools(MaiToolRegistry& registry, std::function<Des
                 }
                 const QString directory = playbackDirectory();
                 if (!signedUrl.startsWith(QStringLiteral("https://")) || directory.isEmpty() ||
-                    suffix.isEmpty() || size <= 0 || quint64(size) > (image ? kMaxImageBytes : kMaxVideoBytes) ||
+                    suffix.isEmpty() || size <= 0 || quint64(size) > desktopCloudDriveMaximumBytes(image) ||
                     mediaType != (image ? QStringLiteral("image") : QStringLiteral("video")))
                     return failure(MaiErrorCode::Protocol, "cloud media link or type is invalid");
                 const QString path = QDir(directory).filePath(QUuid::createUuid().toString(QUuid::WithoutBraces) +
@@ -723,8 +751,8 @@ void registerDesktopCloudDriveTools(MaiToolRegistry& registry, std::function<Des
                 MaiDownloadOptions options{};
                 options.url_utf8 = url.constData();
                 options.target_path_utf8 = targetPath.constData();
-                options.max_bytes = image ? kMaxImageBytes : kMaxVideoBytes;
-                options.transfer_timeout_ms = 2 * 60 * 60 * 1000;
+                options.max_bytes = desktopCloudDriveMaximumBytes(image);
+                options.transfer_timeout_ms = desktopCloudDriveDownloadTimeoutMs(image);
                 options.ca_pem = operation.roots.isEmpty() ? nullptr : operation.roots.constData();
                 options.ca_pem_length = size_t(operation.roots.size());
                 options.proxy_url_utf8 = access.proxyUrl.isNull() ? nullptr : operation.proxy.constData();

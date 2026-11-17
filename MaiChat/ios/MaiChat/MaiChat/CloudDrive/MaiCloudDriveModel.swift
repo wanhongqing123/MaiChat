@@ -314,11 +314,15 @@ struct MaiCloudDriveUploadProgress: Sendable {
         let hasScope = file.startAccessingSecurityScopedResource()
         defer { if hasScope { file.stopAccessingSecurityScopedResource() } }
         let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        guard size > 0, UInt64(size) <= info.max_size_bytes else {
+        guard size > 0 else {
+            throw MaiCloudDriveError(status: 0, httpStatus: 0, detail: "文件不能为空")
+        }
+        // 大小策略由共用上传核心提供，错误提示跟随实际校验上限，避免两端阈值分离。
+        guard UInt64(size) <= info.max_size_bytes else {
+            let limit = ByteCountFormatter.string(
+                fromByteCount: Int64(clamping: info.max_size_bytes), countStyle: .file)
             throw MaiCloudDriveError(status: 0, httpStatus: 0,
-                                     detail: kind == "image"
-                                        ? "图片必须在 20 MB 以内且不能是空文件"
-                                        : "视频必须在 2 GB 以内且不能是空文件")
+                                     detail: "\(kind == "image" ? "图片" : "视频")不能超过 \(limit)")
         }
         let id = UUID().uuidString.lowercased()
         guard !allowBookmark || hasScope ||
@@ -538,6 +542,12 @@ struct MaiCloudDriveUploadProgress: Sendable {
     @discardableResult private func finishCompletedTask(_ task: MaiCloudDriveLocalTask) -> Bool {
         guard completedCheckpoint(for: task) != nil else { return false }
         let files = FileManager.default
+        // 原件和 JPEG 的远端持久回执均由同一个 completed checkpoint 覆盖。
+        // 暂停保留缓存；完成清理失败也保留 checkpoint，供下次重试。
+        do {
+            try MaiCloudDriveImageThumbnail.removeAfterCompletionOrAbort(
+                checkpoint: checkpointURL(for: task))
+        } catch { return false }
         if task.ownsSource {
             guard let path = task.sourcePath,
                   URL(fileURLWithPath: path).standardizedFileURL

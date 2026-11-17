@@ -107,6 +107,11 @@ if(MAICHAT_NETWORK_BUILD_TESTS)
     COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cloud_drive_local_tls.py"
       "$<TARGET_FILE:mai_cloud_drive_client_test>")
+  add_test(NAME mai_cloud_drive_thumbnail_local_tls
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cloud_drive_local_tls.py"
+      "$<TARGET_FILE:mai_cloud_drive_client_test>" --thumbnail)
+  set_tests_properties(mai_cloud_drive_thumbnail_local_tls PROPERTIES TIMEOUT 100)
   # The same ordinary transfer client must preserve temporary publication
   # identity, reject expired reads locally and never reinitialize after expiry.
   add_test(NAME mai_session_image_local_tls

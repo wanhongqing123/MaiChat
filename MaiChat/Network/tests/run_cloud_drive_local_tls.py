@@ -7,6 +7,8 @@ import http.server
 import json
 import os
 import re
+import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -15,6 +17,7 @@ import threading
 import time
 import uuid
 import unicodedata
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -51,6 +54,16 @@ class Fixture(http.server.ThreadingHTTPServer):
         self.temporary_lifetime_ms = 86400000
         self.require_temporary = False
         self.temporary_read_delay = 0
+        self.thumbnail_mode = False
+        self.thumbnail_case = ""
+        self.thumbnail_size = 0
+        self.thumbnail_status = "none"
+        self.thumbnail_parts = {}
+        self.thumbnail_signs = {}
+        self.thumbnail_puts = 0
+        self.thumbnail_complete_calls = 0
+        self.thumbnail_failure_used = False
+        self.thumbnail_events = []
 
     def temporary_receipt(self):
         return dict(self.temporary_binding)
@@ -204,18 +217,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.temporary_case = parse_qs(urlsplit(self.path).query).get("case", [""])[0]
             self.reply(200, {"ok": True})
             return
+        if path == "/test/thumbnail-case":
+            self.server.thumbnail_case = parse_qs(urlsplit(self.path).query).get("case", [""])[0]
+            self.server.thumbnail_failure_used = False
+            self.reply(200, {"case": self.server.thumbnail_case})
+            return
         if path == "/test/state":
             with self.server.lock:
                 self.reply(200, {"sessions": self.server.sessions,
                     "parts": sorted(self.server.part_bytes),
                     "oss_authorization": self.server.oss_authorization,
                     "redirect_followed": self.server.redirect_followed,
-                    "status": self.server.status, "read_requests": self.server.read_requests})
+                    "status": self.server.status, "read_requests": self.server.read_requests,
+                    "thumbnail_size": self.server.thumbnail_size,
+                    "thumbnail_status": self.server.thumbnail_status,
+                    "thumbnail_puts": self.server.thumbnail_puts,
+                    "thumbnail_complete_calls": self.server.thumbnail_complete_calls,
+                    "thumbnail_events": self.server.thumbnail_events,
+                    "original_bytes_match": all(data == b"i" * len(data)
+                                                for data in self.server.part_bytes.values())})
             return
         if path == "/test/complete-calls":
             with self.server.lock:
                 calls = self.server.complete_calls
             self.reply(200, {"complete_calls": calls})
+            return
+        if path == "/oss/thumbnail" and self.server.thumbnail_mode:
+            content = b"".join(data for _, data in sorted(self.server.thumbnail_parts.items()))
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Type", "image/jpeg")
+            self.end_headers()
+            self.wfile.write(content)
             return
         if path == "/oss/play":
             with self.server.lock:
@@ -259,6 +292,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(401, {"error": "auth_required"})
             return
         if self.folder_request("GET"):
+            return
+        if path == f"/auth/v1/cloud-drive/videos/uploads/{VIDEO_ID}/thumbnail/parts":
+            if account != "author" or not self.server.thumbnail_size or self.server.status == "deleted":
+                self.reply(404, {"error": "not_found"})
+                return
+            with self.server.lock:
+                parts = [{"part_number": number, "size_bytes": len(data),
+                          "etag": hashlib.md5(data).hexdigest()}
+                         for number, data in sorted(self.server.thumbnail_parts.items())]
+                status = self.server.thumbnail_status
+            self.reply(200, {"video_id": VIDEO_ID, "status": status,
+                "part_size": PART_SIZE, "parts_total": 1,
+                "parts": [] if status == "ready" else parts,
+                "upload_expires_at": "2026-10-31T00:00:00Z"})
             return
         if path == "/auth/v1/cloud-drive/videos":
             with self.server.lock:
@@ -378,8 +425,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if account != "author" or not ready:
                 self.reply(404, {"error": "not_found"})
                 return
-            self.reply(200, {"thumbnail_url": self.origin() +
-                "/oss/thumbnail?signature=fixture&x-oss-process=image/resize,m_lfit,w_320,h_320",
+            suffix = ("/oss/thumbnail?signature=fixture" if self.server.thumbnail_size else
+                      "/oss/thumbnail?signature=fixture&x-oss-process=image/resize,m_lfit,w_320,h_320")
+            self.reply(200, {"thumbnail_url": self.origin() + suffix,
                 "thumbnail_expires_in": 60, "content_type": "image/jpeg"})
             return
         self.reply(404, {"error": "not_found"})
@@ -419,6 +467,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "owner_login_session_id": "login_a", "message_id": "message_a", "part_id": "part_a",
                     "expires_at": int(time.time() * 1000) + self.server.temporary_lifetime_ms}
             content_type = body.get("content_type")
+            has_thumbnail = "thumbnail_size_bytes" in body
+            thumbnail_size = body.get("thumbnail_size_bytes", 0)
+            image = isinstance(content_type, str) and content_type.startswith("image/")
+            size_limit = ((20_000_000 if image else 2_000_000_000) if session_mode else
+                          (100_000_000 if image else 20_000_000_000))
             if (account != "author" or content_type not in (
                     "video/mp4", "video/quicktime", "image/jpeg", "image/png",
                     "image/webp", "image/heic") and not session_mode or
@@ -427,8 +480,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "image/webp", "image/heic", "audio/mp4",
                         "application/octet-stream") or
                     not isinstance(body.get("size_bytes"), int) or
-                    not 0 < body["size_bytes"] <=
-                        (20_000_000 if content_type.startswith("image/") else 2_000_000_000)):
+                    not 0 < body["size_bytes"] <= size_limit or
+                    has_thumbnail and (session_mode or not image or type(thumbnail_size) is not int or
+                                       not 0 < thumbnail_size <= 2_000_000) or
+                    not session_mode and image and body["size_bytes"] > 20_000_000 and not has_thumbnail):
                 self.reply(400, {"error": "invalid_media"})
                 return
             with self.server.lock:
@@ -441,12 +496,95 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.server.room_key = ":".join(str(body.get(key, "")) for key in (
                     "owner_slot", "session_id")) if session_mode else ""
                 self.server.part_bytes.clear()
-            self.reply(201, {"video_id": VIDEO_ID, "upload_id": "oss-upload-1",
+                self.server.signs.clear()
+                self.server.thumbnail_size = thumbnail_size
+                self.server.thumbnail_status = "uploading" if thumbnail_size else "none"
+                self.server.thumbnail_parts.clear()
+                self.server.thumbnail_signs.clear()
+                self.server.thumbnail_puts = 0
+                self.server.thumbnail_complete_calls = 0
+                self.server.thumbnail_events = []
+            receipt = {"video_id": VIDEO_ID, "upload_id": "oss-upload-1",
                 "media_type": self.server.media_type(),
                 "room_key": self.server.room_key,
                 "part_size": PART_SIZE,
                 "parts_total": (body["size_bytes"] + PART_SIZE - 1) // PART_SIZE,
-                "upload_expires_at": "2026-10-31T00:00:00Z", **self.server.temporary_receipt()})
+                "upload_expires_at": "2026-10-31T00:00:00Z", **self.server.temporary_receipt()}
+            if thumbnail_size:
+                receipt["thumbnail"] = {"upload_id": "oss-thumbnail-1", "size_bytes": thumbnail_size,
+                                        "part_size": PART_SIZE, "parts_total": 1}
+                if self.server.thumbnail_case == "bad_geometry":
+                    receipt["thumbnail"]["part_size"] //= 2
+                elif self.server.thumbnail_case == "bad_size":
+                    receipt["thumbnail"]["size_bytes"] += 1
+            elif self.server.thumbnail_case == "unexpected_thumbnail":
+                # The main receipt is otherwise valid, so a rejecting client
+                # must release that identified new reservation, not orphan it.
+                receipt["thumbnail"] = {"upload_id": "unexpected-thumbnail",
+                    "size_bytes": 123, "part_size": PART_SIZE, "parts_total": 1}
+            self.reply(201, receipt)
+            return
+        signed_thumbnail = re.fullmatch(
+            rf"/auth/v1/cloud-drive/videos/uploads/{VIDEO_ID}/thumbnail/parts/(\d+)/sign", path)
+        if signed_thumbnail:
+            if (account != "author" or not self.server.thumbnail_size or
+                    self.server.status == "deleted"):
+                self.reply(404, {"error": "not_found"})
+                return
+            number = int(signed_thumbnail[1])
+            md5 = body.get("content_md5_base64")
+            if number != 1 or not isinstance(md5, str):
+                self.reply(400, {"error": "invalid_part"})
+                return
+            self.server.thumbnail_signs[number] = md5
+            self.reply(200, {"part_number": 1, "part_size_bytes": self.server.thumbnail_size,
+                "upload_url": self.origin() +
+                    f"/oss/cloud-drive/author/{VIDEO_ID}-thumbnail.jpg?partNumber=1&uploadId=oss-thumbnail-1&signature=fixture",
+                "upload_headers": {"Content-Length": str(self.server.thumbnail_size), "Content-MD5": md5},
+                "expires_in": 300})
+            return
+        if path == f"/auth/v1/cloud-drive/videos/uploads/{VIDEO_ID}/thumbnail/complete":
+            if account != "author" or not self.server.thumbnail_size or self.server.status == "deleted":
+                self.reply(404, {"error": "not_found"})
+                return
+            if len(self.server.thumbnail_parts.get(1, b"")) != self.server.thumbnail_size:
+                self.reply(409, {"error": "incomplete"})
+                return
+            self.server.thumbnail_complete_calls += 1
+            case = self.server.thumbnail_case
+            if not self.server.thumbnail_failure_used and case == "fail_complete_before":
+                self.server.thumbnail_failure_used = True
+                self.reply(503, {"error": "owned_thumbnail_retry"})
+                return
+            self.server.thumbnail_status = "ready"
+            self.server.thumbnail_events.append("thumbnail_complete")
+            if not self.server.thumbnail_failure_used and case == "lose_complete_reply":
+                self.server.thumbnail_failure_used = True
+                # A truncated, declared 200 response makes the committed-but-lost
+                # reply deterministic even if libcurl retries a stale socket.
+                payload = json.dumps({"video_id": VIDEO_ID, "status": "ready",
+                    "size_bytes": self.server.thumbnail_size,
+                    "content_type": "image/jpeg", "media_type": "image"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                try:
+                    self.wfile.write(payload[:len(payload) // 2])
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+                    pass
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.connection.close()
+                return
+            self.reply(200, {"video_id": VIDEO_ID, "status": "ready",
+                "name": f"{VIDEO_ID}-thumbnail.jpg", "size_bytes": self.server.thumbnail_size,
+                "content_type": "image/jpeg", "media_type": "image",
+                "folder_id": None, "created_at": 1792800000000})
             return
         signed = re.fullmatch(
             rf"/auth/v1/cloud-drive/videos/uploads/{VIDEO_ID}/parts/(\d+)/sign", path)
@@ -471,6 +609,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == f"/auth/v1/cloud-drive/videos/uploads/{VIDEO_ID}/complete":
             if account != "author":
                 self.reply(404, {"error": "not_found"})
+                return
+            if self.server.thumbnail_size and self.server.thumbnail_status != "ready":
+                self.reply(409, {"error": "associated_thumbnail_incomplete"})
                 return
             with self.server.lock:
                 expected = (self.server.size + PART_SIZE - 1) // PART_SIZE
@@ -509,8 +650,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.redirect_followed += 1
             self.reply(500, {"error": "redirect_followed"})
             return
+        thumbnail = query.get("uploadId") == ["oss-thumbnail-1"]
         if not path.startswith("/oss/cloud-drive/") or \
-                query.get("uploadId") != ["oss-upload-1"]:
+                query.get("uploadId") not in (["oss-upload-1"], ["oss-thumbnail-1"]):
             self.reply(404, {"error": "invalid_oss_path"})
             return
         if self.headers.get("Authorization") or self.headers.get("Cookie"):
@@ -527,12 +669,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             content = self.rfile.read(length)
         actual_md5 = base64.b64encode(hashlib.md5(content).digest()).decode()
-        if length != len(content) or actual_md5 != self.headers.get("Content-MD5") or \
-                actual_md5 != self.server.signs.get(number):
+        signs = self.server.thumbnail_signs if thumbnail else self.server.signs
+        expected = (self.server.thumbnail_size if thumbnail else
+                    min(PART_SIZE, self.server.size - (number - 1) * PART_SIZE))
+        if length != len(content) or length != expected or actual_md5 != self.headers.get("Content-MD5") or \
+                actual_md5 != signs.get(number):
             self.reply(400, {"error": "bad_part"})
             return
         with self.server.lock:
-            self.server.part_bytes[number] = content
+            if thumbnail:
+                self.server.thumbnail_parts[number] = content
+                self.server.thumbnail_puts += 1
+                self.server.thumbnail_events.append("thumbnail_put")
+            else:
+                if self.server.thumbnail_size and self.server.thumbnail_status != "ready":
+                    self.reply(409, {"error": "original_was_sent_before_thumbnail_complete"})
+                    return
+                self.server.part_bytes[number] = content
+                self.server.thumbnail_events.append("original_put")
         self.send_response(200)
         self.send_header("ETag", f'"{hashlib.md5(content).hexdigest()}"')
         self.send_header("Content-Length", "0")
@@ -622,6 +776,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main():
     if len(sys.argv) not in (2, 3):
         raise SystemExit("expected cloud-drive C++ test executable")
+    if sys.argv[2:] and sys.argv[2:] not in (["--temporary"], ["--temporary-latency"], ["--thumbnail"]):
+        raise SystemExit("unsupported cloud-drive fixture mode")
     with tempfile.TemporaryDirectory(prefix="maichat-cloud-test-") as directory:
         cert = os.path.join(directory, "server.pem")
         key = os.path.join(directory, "server.key")
@@ -634,7 +790,12 @@ def main():
                 "-keyout", private, "-out", crt], stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, check=True)
         server = Fixture(("127.0.0.1", 0))
-        server.require_temporary = len(sys.argv) == 3
+        server.require_temporary = sys.argv[2:] in (["--temporary"], ["--temporary-latency"])
+        server.thumbnail_mode = sys.argv[2:] == ["--thumbnail"]
+        if server.thumbnail_mode:
+            server.slow_complete = False
+            jpeg = Path(__file__).resolve().parents[2] / "android/MaiChat/app/src/androidTest/assets/cloud-drive-thumbnail.jpg"
+            shutil.copyfile(jpeg, os.path.join(directory, "cloud-drive-thumbnail.jpg"))
         if sys.argv[2:] == ["--temporary-latency"]:
             server.temporary_lifetime_ms = 4000
             server.temporary_read_delay = 1.2

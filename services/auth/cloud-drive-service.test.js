@@ -13,7 +13,7 @@ const { completeAccountDeletion } = require('./account-deletion');
 const PART_BYTES = 8*1024*1024;
 const MD5 = Buffer.alloc(16,1).toString('base64');
 
-function fixture() {
+function fixture(options = {}) {
   const db = openStore(':memory:');
   let time = Date.parse('2026-10-24T00:00:00Z');
   const owner = { user_id:'user-a',account_id:'account_a' };
@@ -98,7 +98,8 @@ function fixture() {
       if (failCleanup) throw new Error('temporary OSS failure');
       deleted.push(key);
       if (!ignoreDelete) storage.delete(key);
-    }
+    },
+    ...options
   });
   const call = (principal,method,path,body = {},query) =>
     service.handle(method,path,body,principal,query);
@@ -131,6 +132,327 @@ function fixture() {
       return { entered,release };
     } };
 }
+
+test('cloud policy accepts decimal 20 GB video and 100 MB image with an associated thumbnail', async t => {
+  const f = fixture({ quotaBytes:50_000_000_000 });
+  t.after(() => f.db.close());
+  const video = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    { name:'large.mp4',size_bytes:20_000_000_000,content_type:'video/mp4' });
+  assert.equal(video.statusCode,201);
+  assert.equal(video.body.parts_total,2385);
+  const image = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    { name:'large.heic',size_bytes:100_000_000,content_type:'image/heic',
+      thumbnail_size_bytes:12345 });
+  assert.equal(image.statusCode,201);
+  assert.deepEqual(image.body.thumbnail,{ upload_id:'upload_3',size_bytes:12345,
+    part_size:PART_BYTES,parts_total:1 });
+  assert.equal(image.body.quota.reserved_bytes,20_100_012_345);
+});
+
+test('a quota smaller than the cloud per-file ceiling remains valid and is enforced per upload', async t => {
+  const f = fixture({ quotaBytes:1000,maxVideoBytes:20_000_000_000 });
+  t.after(() => f.db.close());
+  assert.equal((await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    { name:'fits.mp4',size_bytes:1000,content_type:'video/mp4' })).statusCode,201);
+  assert.equal((await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    { name:'full.mp4',size_bytes:1,content_type:'video/mp4' })).statusCode,413);
+});
+
+test('associated JPEG is hidden, uploaded first, accounted physically and read without OSS processing', async t => {
+  const f = fixture();
+  t.after(() => f.db.close());
+  const created = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    { name:'original.png',size_bytes:1000,content_type:'image/png',thumbnail_size_bytes:123 });
+  assert.equal(created.statusCode,201);
+  assert.ok(created.body.thumbnail,'initial receipt declares the associated resource');
+  assert.equal(created.body.thumbnail.size_bytes,123);
+  const id = created.body.video_id;
+  const row = f.db.prepare('SELECT * FROM cloud_drive_videos WHERE id=?').get(id);
+  assert.match(row.thumbnail_object_key,/^cloud-drive\/account_a\/2026-10-24\/[a-f0-9-]+\.jpg$/);
+  assert.notEqual(row.thumbnail_object_key,row.object_key);
+  assert.equal(created.body.quota.reserved_bytes,1123);
+  assert.equal((await f.call(f.other,'GET',
+    `/v1/cloud-drive/videos/uploads/${id}/thumbnail/parts`)).statusCode,404);
+  const thumbParts = await f.call(f.owner,'GET',
+    `/v1/cloud-drive/videos/uploads/${id}/thumbnail/parts`);
+  assert.equal(thumbParts.statusCode,200);
+  assert.equal(thumbParts.body.parts_total,1);
+  assert.deepEqual(thumbParts.body.parts,[]);
+  const signed = await f.call(f.owner,'POST',
+    `/v1/cloud-drive/videos/uploads/${id}/thumbnail/parts/1/sign`,{ content_md5_base64:MD5 });
+  assert.equal(signed.statusCode,200);
+  assert.equal(signed.body.upload_headers['Content-Length'],'123');
+  assert.equal(signed.body.upload_headers['Content-MD5'],MD5);
+  assert.equal((await f.call(f.owner,'POST',
+    `/v1/cloud-drive/videos/uploads/${id}/thumbnail/parts/2/sign`,{ content_md5_base64:MD5 }))
+    .statusCode,400);
+  f.storage.get(row.object_key).parts.push({ part_number:1,size_bytes:1000,
+    etag:'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' });
+  assert.equal((await f.call(f.owner,'POST',
+    `/v1/cloud-drive/videos/uploads/${id}/complete`)).statusCode,409);
+  f.storage.get(row.thumbnail_object_key).parts.push({ part_number:1,size_bytes:123,
+    etag:'"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' });
+  const thumbDone = await f.call(f.owner,'POST',
+    `/v1/cloud-drive/videos/uploads/${id}/thumbnail/complete`);
+  assert.equal(thumbDone.statusCode,200);
+  assert.equal(thumbDone.body.status,'ready');
+  assert.equal(thumbDone.body.size_bytes,123);
+  assert.equal(thumbDone.body.content_type,'image/jpeg');
+  assert.equal((await f.call(f.owner,'GET','/v1/cloud-drive/videos')).body.videos.length,0);
+  const done = await f.call(f.owner,'POST',`/v1/cloud-drive/videos/uploads/${id}/complete`);
+  assert.equal(done.statusCode,200);
+  assert.equal(done.body.size_bytes,1000);
+  const list = await f.call(f.owner,'GET','/v1/cloud-drive/videos');
+  assert.equal(list.body.videos.length,1);
+  assert.equal(list.body.quota.used_bytes,1123);
+  const thumbLink = await f.call(f.owner,'GET',`/v1/cloud-drive/videos/${id}/thumbnail-link`);
+  assert.equal(thumbLink.statusCode,200);
+  assert.ok(thumbLink.body.thumbnail_url.includes(row.thumbnail_object_key));
+  assert.match(thumbLink.body.thumbnail_url,/\?read=1$/);
+  const play = await f.call(f.owner,'GET',`/v1/cloud-drive/videos/${id}/play-link`);
+  assert.ok(play.body.read_url.includes(row.object_key));
+  assert.equal((await f.call(f.owner,'DELETE',`/v1/cloud-drive/videos/${id}`)).statusCode,200);
+  assert.equal(f.storage.has(row.object_key),false);
+  assert.equal(f.storage.has(row.thumbnail_object_key),false);
+  assert.equal(f.db.prepare('SELECT 1 FROM cloud_drive_videos WHERE id=?').get(id),undefined);
+});
+
+test('cloud image bounds require a valid thumbnail while legacy and Session policy stay separate', async t => {
+  const f = fixture({ quotaBytes:50_000_000_000 });
+  t.after(() => f.db.close());
+  for (const upload of [
+    {name:'over.mp4',size_bytes:20_000_000_001,content_type:'video/mp4'},
+    {name:'over.png',size_bytes:100_000_001,content_type:'image/png',thumbnail_size_bytes:1},
+    {name:'missing.png',size_bytes:20_000_001,content_type:'image/png'},
+    ...[0,-1,2_000_001,'123'].map(value => ({name:'bad.png',size_bytes:1,
+      content_type:'image/png',thumbnail_size_bytes:value})),
+    {name:'video.mp4',size_bytes:1,content_type:'video/mp4',thumbnail_size_bytes:1}
+  ]) assert.equal((await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',upload))
+    .statusCode,400);
+  assert.equal((await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    {name:'legacy.png',size_bytes:20_000_000,content_type:'image/png'})).statusCode,201);
+  const session = fixture({mode:'session'});
+  t.after(() => session.db.close());
+  const binding = {owner_slot:'windows',owner_login_session_id:'login_a',session_id:'session_a'};
+  for (const upload of [
+    {name:'over.mp4',size_bytes:2_000_000_001,content_type:'video/mp4'},
+    {name:'over.png',size_bytes:20_000_001,content_type:'image/png'},
+    {name:'thumb.png',size_bytes:1,content_type:'image/png',thumbnail_size_bytes:1}
+  ]) assert.equal((await session.call(session.owner,'POST','/v1/session-attachments/uploads',
+    {...upload,...binding})).statusCode,400);
+});
+
+test('a mismatched thumbnail HEAD never leaves its original publishable or untracked', async t => {
+  let f;
+  f = fixture({verifyObject:async (_account,key) => {
+    const object = f.storage.get(key);
+    return object?.bytes == null ? {exists:false} : {exists:true,
+      size_bytes:object.bytes+(key.endsWith('.jpg') ? 1 : 0),content_type:object.type};
+  }});
+  t.after(() => f.db.close());
+  const created = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    {name:'original.png',size_bytes:1000,content_type:'image/png',thumbnail_size_bytes:123});
+  const id = created.body.video_id;
+  const row = f.db.prepare('SELECT * FROM cloud_drive_videos WHERE id=?').get(id);
+  f.storage.get(row.thumbnail_object_key).parts.push({part_number:1,size_bytes:123,
+    etag:'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'});
+  assert.equal((await f.call(f.owner,'POST',
+    `/v1/cloud-drive/videos/uploads/${id}/thumbnail/complete`)).statusCode,502);
+  assert.equal(f.db.prepare('SELECT status FROM cloud_drive_videos WHERE id=?').get(id).status,'deleted');
+  assert.equal(f.storage.has(row.object_key),false);
+  assert.equal(f.storage.has(row.thumbnail_object_key),false);
+  assert.equal((await f.call(f.owner,'GET','/v1/cloud-drive/videos')).body.quota.reserved_bytes,1123);
+  f.advance(24*60*60_000+1);
+  assert.equal((await f.service.sweep()).cleaned,1);
+});
+
+test('partial thumbnail cleanup failure retains both-resource reservation', async t => {
+  let failThumbnail = true;
+  let f;
+  f = fixture({deleteObject:async (_account,key) => {
+    if (key.endsWith('.jpg') && failThumbnail) throw new Error('owned thumbnail deletion failure');
+    f.storage.delete(key);
+  }});
+  t.after(() => f.db.close());
+  const created = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    {name:'original.png',size_bytes:1000,content_type:'image/png',thumbnail_size_bytes:123});
+  const id = created.body.video_id;
+  const row = f.db.prepare('SELECT * FROM cloud_drive_videos WHERE id=?').get(id);
+  assert.equal((await f.call(f.owner,'DELETE',`/v1/cloud-drive/videos/uploads/${id}`)).statusCode,202);
+  assert.equal(f.storage.has(row.object_key),false);
+  assert.equal(f.storage.has(row.thumbnail_object_key),true);
+  assert.equal((await f.call(f.owner,'GET','/v1/cloud-drive/videos')).body.quota.reserved_bytes,1123);
+  failThumbnail = false;
+  assert.equal((await f.service.sweep()).cleaned,1);
+  assert.equal(f.storage.has(row.thumbnail_object_key),false);
+});
+
+test('deletion during late thumbnail completion retains exact-key cleanup', async t => {
+  const f = fixture();
+  t.after(() => f.db.close());
+  const created = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    {name:'original.png',size_bytes:1000,content_type:'image/png',thumbnail_size_bytes:123});
+  const id = created.body.video_id;
+  const row = f.db.prepare('SELECT * FROM cloud_drive_videos WHERE id=?').get(id);
+  f.storage.get(row.thumbnail_object_key).parts.push({part_number:1,size_bytes:123,
+    etag:'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'});
+  const gate = f.deferComplete();
+  const completing = f.call(f.owner,'POST',`/v1/cloud-drive/videos/uploads/${id}/thumbnail/complete`);
+  await gate.entered;
+  assert.equal((await f.call(f.owner,'DELETE',`/v1/cloud-drive/videos/uploads/${id}`)).statusCode,202);
+  assert.equal((await f.call(f.owner,'GET','/v1/cloud-drive/videos')).body.quota.reserved_bytes,1123);
+  gate.release();
+  assert.equal((await completing).statusCode,404);
+  assert.equal(f.storage.has(row.object_key),false);
+  assert.equal(f.storage.has(row.thumbnail_object_key),false);
+  f.advance(24*60*60_000+1);
+  assert.equal((await f.service.sweep()).cleaned,1);
+});
+
+test('a lost thumbnail init response retains both keys until exact-key cleanup and hold finish', async t => {
+  let starts = 0;
+  let f;
+  f = fixture({startUpload:async (_account,key) => {
+    const uploadId = `owned_upload_${++starts}`;
+    f.storage.set(key,{parts:[],bytes:null,type:null});
+    f.activeUploads.set(uploadId,key);
+    return starts === 2 ? undefined : uploadId;
+  }});
+  t.after(() => f.db.close());
+  const created = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    {name:'original.png',size_bytes:1000,content_type:'image/png',thumbnail_size_bytes:123});
+  assert.equal(created.statusCode,502);
+  const row = f.db.prepare('SELECT * FROM cloud_drive_videos').get();
+  assert.equal(row.status,'deleted');
+  assert.equal(row.thumbnail_upload_id,null);
+  assert.equal(f.activeUploads.size,0);
+  assert.ok(f.listed.includes(row.object_key));
+  assert.ok(f.listed.includes(row.thumbnail_object_key));
+  assert.equal((await f.call(f.owner,'GET','/v1/cloud-drive/videos')).body.quota.reserved_bytes,1123);
+  f.advance(24*60*60_000+1);
+  assert.equal((await f.service.sweep()).cleaned,1);
+});
+
+test('resume discovers a completed thumbnail after its completion reply was lost', async t => {
+  let f;
+  f = fixture({
+    listParts:async (_account,key,uploadId) => {
+      if (!f.activeUploads.has(uploadId)) throw new Error('NoSuchUpload');
+      return f.storage.get(key).parts;
+    },
+    completeUpload:async (_account,key,uploadId,parts) => {
+      const object = f.storage.get(key);
+      object.bytes = parts.reduce((sum,part) => sum+part.size_bytes,0);
+      object.type = 'image/jpeg';
+      f.activeUploads.delete(uploadId);
+      throw new Error('owned completion response lost after commit');
+    }
+  });
+  t.after(() => f.db.close());
+  const created = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    {name:'original.png',size_bytes:1000,content_type:'image/png',thumbnail_size_bytes:123});
+  const id = created.body.video_id;
+  const row = f.db.prepare('SELECT * FROM cloud_drive_videos WHERE id=?').get(id);
+  f.storage.get(row.thumbnail_object_key).parts.push({part_number:1,size_bytes:123,
+    etag:'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'});
+  assert.equal((await f.call(f.owner,'POST',
+    `/v1/cloud-drive/videos/uploads/${id}/thumbnail/complete`)).statusCode,502);
+  const resumed = await f.call(f.owner,'GET',`/v1/cloud-drive/videos/uploads/${id}/thumbnail/parts`);
+  assert.equal(resumed.statusCode,200);
+  assert.equal(resumed.body.status,'ready');
+  assert.equal(resumed.body.parts_total,1);
+  assert.equal(resumed.body.part_size,PART_BYTES);
+  assert.deepEqual(resumed.body.parts,[]);
+  assert.equal(f.db.prepare('SELECT status,thumbnail_status FROM cloud_drive_videos WHERE id=?')
+    .get(id).status,'uploading');
+});
+
+test('account cleanup waits for the hidden JPEG and releases the combined reservation only after absence', async t => {
+  let failThumbnail = true;
+  let f;
+  f = fixture({deleteObject:async (_account,key) => {
+    if (key.endsWith('.jpg') && failThumbnail) throw new Error('owned hidden resource failure');
+    f.storage.delete(key);
+  }});
+  t.after(() => f.db.close());
+  const created = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    {name:'original.png',size_bytes:1000,content_type:'image/png',thumbnail_size_bytes:123});
+  const row = f.db.prepare('SELECT * FROM cloud_drive_videos WHERE id=?').get(created.body.video_id);
+  assert.equal((await f.service.cleanupAccount(f.owner.user_id)).pending,1);
+  assert.equal(f.storage.has(row.object_key),false);
+  assert.equal(f.storage.has(row.thumbnail_object_key),true);
+  assert.equal((await f.call(f.owner,'GET','/v1/cloud-drive/videos')).body.quota.reserved_bytes,1123);
+  failThumbnail = false;
+  assert.equal((await f.service.cleanupAccount(f.owner.user_id)).pending,0);
+  assert.equal(f.storage.has(row.thumbnail_object_key),false);
+  assert.equal(f.db.prepare('SELECT 1 FROM cloud_drive_videos WHERE id=?').get(row.id),undefined);
+});
+
+test('associated thumbnail init returning after deletion is retained in the same guarded tombstone', async t => {
+  let entered,release;
+  const inThumbnailInit = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  let starts = 0;
+  let f;
+  f = fixture({startUpload:async (_account,key) => {
+    const uploadId = `owned_upload_${++starts}`;
+    f.storage.set(key,{parts:[],bytes:null,type:null});
+    f.activeUploads.set(uploadId,key);
+    if (key.endsWith('.jpg')) { entered();await gate; }
+    return uploadId;
+  }});
+  t.after(() => f.db.close());
+  const starting = f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    {name:'original.png',size_bytes:1000,content_type:'image/png',thumbnail_size_bytes:123});
+  await inThumbnailInit;
+  const row = f.db.prepare('SELECT * FROM cloud_drive_videos').get();
+  assert.equal((await f.call(f.owner,'DELETE',`/v1/cloud-drive/videos/uploads/${row.id}`)).statusCode,202);
+  const revision = f.db.prepare('SELECT cleanup_revision FROM cloud_drive_videos WHERE id=?')
+    .get(row.id).cleanup_revision;
+  release();
+  assert.equal((await starting).statusCode,409);
+  const held = f.db.prepare('SELECT * FROM cloud_drive_videos WHERE id=?').get(row.id);
+  assert.equal(held.thumbnail_upload_id,'owned_upload_2');
+  assert.ok(held.cleanup_revision>revision);
+  assert.equal(f.activeUploads.size,0);
+  assert.equal(f.storage.has(row.thumbnail_object_key),false);
+  f.advance(24*60*60_000+1);
+  assert.equal((await f.service.sweep()).cleaned,1);
+});
+
+test('concurrent thumbnail completion settles a child-ready live parent without deleting either resource', async t => {
+  const f = fixture();
+  t.after(() => f.db.close());
+  const created = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
+    {name:'original.png',size_bytes:1000,content_type:'image/png',thumbnail_size_bytes:123});
+  const id = created.body.video_id;
+  const row = f.db.prepare('SELECT * FROM cloud_drive_videos WHERE id=?').get(id);
+  f.storage.get(row.thumbnail_object_key).parts.push({part_number:1,size_bytes:123,
+    etag:'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'});
+  // A has committed OSS but waits in its first HEAD. B can prove that commit
+  // and change only the child to ready before A attempts its own ready CAS.
+  const gate = f.deferVerifyOnce();
+  const first = f.call(f.owner,'POST',`/v1/cloud-drive/videos/uploads/${id}/thumbnail/complete`);
+  await gate.entered;
+  try {
+    const second = await f.call(f.owner,'POST',`/v1/cloud-drive/videos/uploads/${id}/thumbnail/complete`);
+    assert.equal(second.statusCode,200);
+    assert.equal(second.body.status,'ready');
+  } finally { gate.release(); }
+  const settled = await first;
+  t.diagnostic(JSON.stringify({firstStatus:settled.statusCode,
+    deletedObjects:f.deleted.length,originalStillPresent:f.storage.has(row.object_key),
+    jpegStillPresent:f.storage.has(row.thumbnail_object_key)}));
+  assert.equal(settled.statusCode,200);
+  assert.equal(settled.body.content_type,'image/jpeg');
+  assert.equal(settled.body.size_bytes,123);
+  const current = f.db.prepare('SELECT status,thumbnail_status FROM cloud_drive_videos WHERE id=?').get(id);
+  assert.deepEqual(current,{status:'uploading',thumbnail_status:'ready'});
+  assert.equal(f.storage.has(row.object_key),true);
+  assert.equal(f.storage.has(row.thumbnail_object_key),true);
+  assert.deepEqual(f.deleted,[]);
+  assert.equal((await f.call(f.owner,'GET','/v1/cloud-drive/videos')).body.quota.reserved_bytes,1123);
+});
 
 test('account allowlist hides API but never blocks account cleanup', async t => {
   const f = fixture();
@@ -281,13 +603,13 @@ test('private images share multipart quota and expose account-bound thumbnails',
     .body.quota.used_bytes,(formats.length-1)*1234);
 });
 
-test('image MIME and 20 MB cap reject malformed files without reserving quota', async t => {
+test('image MIME, required thumbnail and cloud ceilings reject malformed files without reserving quota', async t => {
   const f = fixture();
   t.after(() => f.db.close());
   for (const upload of [
     { name:'wrong.jpg',size_bytes:1,content_type:'image/png' },
     { name:'oversize.png',size_bytes:20_000_001,content_type:'image/png' },
-    { name:'movie.mp4',size_bytes:2_000_000_001,content_type:'video/mp4' },
+    { name:'movie.mp4',size_bytes:20_000_000_001,content_type:'video/mp4' },
     { name:'unsafe.svg',size_bytes:100,content_type:'image/svg+xml' }
   ]) assert.equal((await f.call(f.owner,'POST',
     '/v1/cloud-drive/videos/uploads',upload)).statusCode,400);
@@ -362,11 +684,11 @@ test('old video schema migrates active uploads and tombstones without changing I
   reopened.close();
 });
 
-test('2 GB file limit and 10 GB account reservation are atomic across concurrent init', async t => {
+test('20 GB file limit and unchanged 10 GB account reservation are atomic across concurrent init', async t => {
   const f = fixture();
   t.after(() => f.db.close());
   const invalid = await f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',
-    { name:'oversized.mp4',size_bytes:2_000_000_001,content_type:'video/mp4' });
+    { name:'oversized.mp4',size_bytes:20_000_000_001,content_type:'video/mp4' });
   assert.equal(invalid.statusCode,400);
   const starts = await Promise.all(Array.from({length:6},(_,i) =>
     f.call(f.owner,'POST','/v1/cloud-drive/videos/uploads',

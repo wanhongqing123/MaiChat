@@ -20,6 +20,48 @@ const call = (handler,action,body,key = SECRET) => handler({
 });
 const parse = response => JSON.parse(response.body);
 
+test('private cloud verification accepts 20 GB and 100 MB without changing Session limits', async () => {
+  const handler = createHandler({env:ENV,makeClient:() => ({
+    head:async () => ({res:{headers:{'content-length':'20000000000','content-type':'video/quicktime'}}})
+  })});
+  assert.equal((await call(handler,'verify',{expected_bytes:20_000_000_000,
+    content_type:'video/quicktime'})).statusCode,200);
+  assert.equal((await call(handler,'verify',{expected_bytes:20_000_000_001,
+    content_type:'video/quicktime'})).statusCode,400);
+  const image = KEY.replace(/\.mov$/,'.heic');
+  assert.equal((await call(handler,'verify',{object_key:image,expected_bytes:100_000_000,
+    content_type:'image/heic'})).statusCode,200);
+  assert.equal((await call(handler,'verify',{object_key:image,expected_bytes:100_000_001,
+    content_type:'image/heic'})).statusCode,400);
+  assert.equal((await call(handler,'verify',{object_key:KEY.replace('cloud-drive/','session-attachments/'),
+    expected_bytes:2_000_000_001,content_type:'video/quicktime'})).statusCode,400);
+  assert.equal((await call(handler,'verify',{object_key:image.replace('cloud-drive/','session-attachments/'),
+    expected_bytes:20_000_001,content_type:'image/heic'})).statusCode,400);
+});
+
+test('internal HTTP completion accepts the 2385-part manifest under a bounded 1 MiB budget', async t => {
+  const {createServer} = require('./server');
+  let completed = 0;
+  const handler = createHandler({env:ENV,makeClient:() => ({
+    completeMultipartUpload:async (_key,_id,parts) => { completed++;assert.equal(parts.length,2385); }
+  })});
+  const server = createServer(handler);
+  await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const parts = Array.from({length:2385},(_,index) => ({part_number:index+1,
+    size_bytes:8*1024*1024,etag:'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'}));
+  const body = JSON.stringify({account_id:'account_a',object_key:KEY,upload_id:'OSSupload_123',parts});
+  assert.ok(Buffer.byteLength(body)>32768 && Buffer.byteLength(body)<1024*1024);
+  const post = (route,text) => fetch(base+route,{method:'POST',
+    headers:{'X-MaiChat-Cloud-Drive-Key':SECRET,'Content-Type':'application/json'},body:text});
+  assert.equal((await post('/cloud-drive/complete',body)).status,200);
+  assert.equal(completed,1);
+  assert.equal((await post('/cloud-drive/complete','x'.repeat(1024*1024+1))).status,413);
+  assert.equal((await post('/cloud-drive/init','x'.repeat(4097))).status,413);
+  assert.equal(completed,1);
+});
+
 test('private multipart signer binds owner, part number, length and MD5', async () => {
   const records = [];
   const handler = createHandler({ env:ENV,makeClient:() => ({
@@ -120,7 +162,7 @@ test('image uploads and thumbnails use fixed private OSS processing parameters',
     { object_key:heic,expected_bytes:20_000_000,content_type:'image/heic' }))
     .statusCode,200);
   assert.equal((await call(handler,'verify',
-    { object_key:heic,expected_bytes:20_000_001,content_type:'image/heic' }))
+    { object_key:heic,expected_bytes:100_000_001,content_type:'image/heic' }))
     .statusCode,400);
   assert.equal((await call(handler,'thumbnail',
     { object_key:KEY })).statusCode,200);

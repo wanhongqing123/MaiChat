@@ -46,8 +46,13 @@ struct MaiCloudDriveCancel {
 namespace {
 
 using json = nlohmann::json;
-constexpr uint64_t kMaxVideoBytes = 2'000'000'000;
-constexpr uint64_t kMaxImageBytes = 20'000'000;
+// Personal cloud policy is independent of Session attachments and temporary
+// publications. Their existing limits must not grow with the cloud ceiling.
+constexpr uint64_t kMaxVideoBytes = 20'000'000'000;
+constexpr uint64_t kMaxImageBytes = 100'000'000;
+constexpr uint64_t kSessionMaxVideoBytes = 2'000'000'000;
+constexpr uint64_t kSessionMaxImageBytes = 20'000'000;
+constexpr uint64_t kMaxThumbnailBytes = 2'000'000;
 constexpr uint64_t kPartBytes = 8 * 1024 * 1024;
 constexpr size_t kMaxJsonBytes = 1024 * 1024;
 constexpr size_t kMaxHeaderBytes = 16 * 1024;
@@ -88,6 +93,19 @@ struct Checkpoint {
     uint64_t partSize = 0;
     uint32_t partsTotal = 0;
     bool completed = false;
+    std::string thumbnailUploadId;
+    std::string thumbnailFingerprint;
+    uint64_t thumbnailSize = 0;
+    bool thumbnailCompleted = false;
+};
+
+// The optional JPEG is small enough to snapshot once. All signed thumbnail
+// bytes then come from the same immutable contents used for its fingerprint,
+// even if a host replaces its adjacent file while the original is uploading.
+struct ThumbnailSnapshot {
+    std::string path;
+    std::string fingerprint;
+    std::vector<unsigned char> bytes;
 };
 
 bool canceled(const MaiCloudDriveCancel* cancel) {
@@ -255,19 +273,23 @@ bool mediaInfo(const std::string& name, MaiCloudDriveMediaInfo* output,
         const size_t length = std::strlen(format.extension);
         if (lower.size() > length &&
             lower.compare(lower.size() - length, length, format.extension) == 0) {
-            *output = {format.contentType, format.mediaType, format.maxBytes};
+            const auto limit = session
+                ? (std::strcmp(format.mediaType, "image") == 0
+                    ? kSessionMaxImageBytes : kSessionMaxVideoBytes)
+                : format.maxBytes;
+            *output = {format.contentType, format.mediaType, limit};
             return true;
         }
     }
     if (session) {
         static constexpr Format extras[] = {
-            {".gif", "image/gif", "image", kMaxImageBytes},
-            {".mp3", "audio/mpeg", "audio", kMaxVideoBytes},
-            {".m4a", "audio/mp4", "audio", kMaxVideoBytes},
-            {".aac", "audio/aac", "audio", kMaxVideoBytes},
-            {".wav", "audio/wav", "audio", kMaxVideoBytes},
-            {".flac", "audio/flac", "audio", kMaxVideoBytes},
-            {".ogg", "audio/ogg", "audio", kMaxVideoBytes},
+            {".gif", "image/gif", "image", kSessionMaxImageBytes},
+            {".mp3", "audio/mpeg", "audio", kSessionMaxVideoBytes},
+            {".m4a", "audio/mp4", "audio", kSessionMaxVideoBytes},
+            {".aac", "audio/aac", "audio", kSessionMaxVideoBytes},
+            {".wav", "audio/wav", "audio", kSessionMaxVideoBytes},
+            {".flac", "audio/flac", "audio", kSessionMaxVideoBytes},
+            {".ogg", "audio/ogg", "audio", kSessionMaxVideoBytes},
         };
         for (const Format& format : extras) {
             const size_t length = std::strlen(format.extension);
@@ -282,7 +304,7 @@ bool mediaInfo(const std::string& name, MaiCloudDriveMediaInfo* output,
             lower.size() - dot - 1 <= 12 &&
             std::all_of(lower.begin() + dot + 1, lower.end(),
                         [](unsigned char c) { return std::isalnum(c); })) {
-            *output = {"application/octet-stream", "file", kMaxVideoBytes};
+            *output = {"application/octet-stream", "file", kSessionMaxVideoBytes};
             return true;
         }
     }
@@ -456,13 +478,20 @@ FILE* openFile(const char* path, const char* mode) {
     for (const char* c = mode; *c; ++c) wideMode.push_back(wchar_t(*c));
     return _wfopen(wide.c_str(), wideMode.c_str());
 #else
+#ifdef __ANDROID__
+    return fopen64(path, mode);
+#else
     return std::fopen(path, mode);
+#endif
 #endif
 }
 
 bool seekFile(FILE* file, uint64_t offset) {
 #ifdef _WIN32
     return _fseeki64(file, __int64(offset), SEEK_SET) == 0;
+#elif defined(__ANDROID__)
+    return offset <= uint64_t(std::numeric_limits<off64_t>::max()) &&
+        fseeko64(file, off64_t(offset), SEEK_SET) == 0;
 #else
     return fseeko(file, off_t(offset), SEEK_SET) == 0;
 #endif
@@ -472,6 +501,9 @@ bool fileSize(FILE* file, uint64_t* output) {
 #ifdef _WIN32
     if (_fseeki64(file, 0, SEEK_END) != 0) return false;
     const auto length = _ftelli64(file);
+#elif defined(__ANDROID__)
+    if (fseeko64(file, 0, SEEK_END) != 0) return false;
+    const auto length = ftello64(file);
 #else
     if (fseeko(file, 0, SEEK_END) != 0) return false;
     const auto length = ftello(file);
@@ -523,6 +555,75 @@ MaiCloudDriveStatus digestSource(const MaiCloudDriveSource* source,
     return MAI_CLOUD_DRIVE_OK;
 }
 
+int readThumbnailAt(void* context, uint64_t offset, unsigned char* output,
+                    size_t requested) {
+    const auto& bytes = *static_cast<const std::vector<unsigned char>*>(context);
+    if (offset > bytes.size() || requested > bytes.size() - size_t(offset)) return 0;
+    std::memcpy(output, bytes.data() + size_t(offset), requested);
+    return 1;
+}
+
+bool boundedThumbnailJpeg(const std::vector<unsigned char>& bytes) {
+    if (bytes.size() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 ||
+        bytes[bytes.size() - 2] != 0xff || bytes.back() != 0xd9) return false;
+    size_t position = 2;
+    bool frame = false;
+    while (position + 1 < bytes.size()) {
+        if (bytes[position++] != 0xff) return false;
+        while (position < bytes.size() && bytes[position] == 0xff) ++position;
+        if (position >= bytes.size()) return false;
+        const unsigned marker = bytes[position++];
+        if (marker == 0 || marker == 0xd8 || marker == 0xd9) return false;
+        if (marker == 1 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+        if (position + 2 > bytes.size()) return false;
+        const size_t length = (size_t(bytes[position]) << 8) | bytes[position + 1];
+        if (length < 2 || length > bytes.size() - position) return false;
+        if (marker == 0xda) return frame;
+        const bool startOfFrame = marker >= 0xc0 && marker <= 0xcf &&
+            marker != 0xc4 && marker != 0xc8 && marker != 0xcc;
+        if (startOfFrame) {
+            if (frame || length < 11) return false;
+            const unsigned height = (unsigned(bytes[position + 3]) << 8) | bytes[position + 4];
+            const unsigned width = (unsigned(bytes[position + 5]) << 8) | bytes[position + 6];
+            const unsigned components = bytes[position + 7];
+            if (!width || width > 320 || !height || height > 320 ||
+                components < 1 || components > 4 || length != 8 + 3 * components) return false;
+            frame = true;
+        }
+        position += length;
+    }
+    return false;
+}
+
+MaiCloudDriveStatus prepareThumbnail(const MaiCloudDriveOptions* options,
+                                     const MaiCloudDriveCancel* cancel,
+                                     ThumbnailSnapshot* snapshot) {
+    const char* path = options->cloud_drive_thumbnail_path_utf8;
+    if (!path || !*path || std::strlen(path) > 4096) return MAI_CLOUD_DRIVE_FILE_ERROR;
+#ifdef _WIN32
+    const auto wide = toWide(path);
+    const bool absolute = wide.size() >= 3 &&
+        (((wide[0] >= L'A' && wide[0] <= L'Z') || (wide[0] >= L'a' && wide[0] <= L'z')) &&
+         wide[1] == L':' && (wide[2] == L'\\' || wide[2] == L'/'));
+    if (!absolute && !(wide.size() >= 2 && wide[0] == L'\\' && wide[1] == L'\\'))
+        return MAI_CLOUD_DRIVE_FILE_ERROR;
+#else
+    if (path[0] != '/') return MAI_CLOUD_DRIVE_FILE_ERROR;
+#endif
+    if (canceled(cancel)) return MAI_CLOUD_DRIVE_CANCELED;
+    std::unique_ptr<FILE, decltype(&std::fclose)> file(openFile(path, "rb"), &std::fclose);
+    uint64_t size = 0;
+    if (!file || !fileSize(file.get(), &size) || !size || size > kMaxThumbnailBytes)
+        return MAI_CLOUD_DRIVE_FILE_ERROR;
+    snapshot->bytes.resize(size_t(size));
+    if (std::fread(snapshot->bytes.data(), 1, snapshot->bytes.size(), file.get()) != snapshot->bytes.size() ||
+        std::fgetc(file.get()) != EOF || std::ferror(file.get()) || !boundedThumbnailJpeg(snapshot->bytes))
+        return MAI_CLOUD_DRIVE_FILE_ERROR;
+    snapshot->path = path;
+    MaiCloudDriveSource source{path, size, readThumbnailAt, &snapshot->bytes};
+    return digestSource(&source, cancel, &snapshot->fingerprint);
+}
+
 MaiCloudDriveStatus readPart(const MaiCloudDriveSource* source, uint64_t offset,
                              uint64_t size,
                              std::vector<unsigned char>* output) {
@@ -551,7 +652,7 @@ bool contentMd5(const std::vector<unsigned char>& part, std::string* output) {
 }
 
 bool writeCheckpoint(const char* path, const Checkpoint& value) {
-    const json body{{"version", 1}, {"video_id", value.videoId},
+    json body{{"version", 1}, {"video_id", value.videoId},
         {"upload_id", value.uploadId}, {"file_sha256", value.fingerprint},
         {"file_size", value.size}, {"source_id", value.sourceId},
         {"name", value.name}, {"room_key", value.roomKey},
@@ -559,6 +660,12 @@ bool writeCheckpoint(const char* path, const Checkpoint& value) {
         {"parts_total", value.partsTotal}, {"completed", value.completed},
         {"owner_login_session_id", value.ownerLogin}, {"message_id", value.messageId},
         {"part_id", value.partId}, {"expires_at", value.expiresAt}};
+    if (value.thumbnailSize) {
+        body["thumbnail"] = {{"upload_id", value.thumbnailUploadId},
+            {"size_bytes", value.thumbnailSize},
+            {"file_sha256", value.thumbnailFingerprint},
+            {"completed", value.thumbnailCompleted}};
+    }
     const std::string serialized = body.dump();
     const std::string temp = std::string(path) + ".tmp";
     std::unique_ptr<FILE, decltype(&std::fclose)> file(openFile(temp.c_str(), "wb"),
@@ -633,6 +740,20 @@ bool readCheckpoint(const char* path, Checkpoint* output, bool* exists) {
         output->contentType != info.content_type_utf8 ||
         output->size > info.max_size_bytes)
         return false;
+    if (parsed.contains("thumbnail")) {
+        const auto& thumbnail = parsed["thumbnail"];
+        if (!output->roomKey.empty() || std::string(info.media_type_utf8) != "image" ||
+            !thumbnail.is_object() ||
+            !stringField(thumbnail, "upload_id", &output->thumbnailUploadId) ||
+            output->thumbnailUploadId.empty() || output->thumbnailUploadId.size() > 512 ||
+            !uintField(thumbnail, "size_bytes", 1, kMaxThumbnailBytes, &output->thumbnailSize) ||
+            !stringField(thumbnail, "file_sha256", &output->thumbnailFingerprint) ||
+            output->thumbnailFingerprint.size() != 64 ||
+            !std::all_of(output->thumbnailFingerprint.begin(), output->thumbnailFingerprint.end(),
+                [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }) ||
+            !thumbnail.contains("completed") || !thumbnail["completed"].is_boolean()) return false;
+        output->thumbnailCompleted = thumbnail["completed"].get<bool>();
+    }
     output->partsTotal = uint32_t(partTotal);
     const auto completed = parsed.find("completed");
     if (completed != parsed.end()) {
@@ -1076,7 +1197,7 @@ void uploadPart(const MaiCloudDriveOptions* options, const std::string& base,
                 const Checkpoint& checkpoint, uint32_t number,
                 uint64_t confirmedBytes, const MaiCloudDriveCancel* cancel,
                 MaiCloudDriveProgress progress, void* progressContext,
-                MaiCloudDriveResult* result) {
+                MaiCloudDriveResult* result, bool thumbnail = false) {
     resetResult(result);
     const uint64_t bytes = expectedPartBytes(checkpoint, number);
     std::vector<unsigned char> contents;
@@ -1091,7 +1212,8 @@ void uploadPart(const MaiCloudDriveOptions* options, const std::string& base,
         return;
     }
     const std::string route = apiRoot(options) + "/uploads/" +
-        checkpoint.videoId + "/parts/" + std::to_string(number) + "/sign";
+        checkpoint.videoId + (thumbnail ? "/thumbnail" : "") +
+        "/parts/" + std::to_string(number) + "/sign";
     MonotonicProgress monotonic{progress, progressContext, confirmedBytes};
     for (unsigned attempt = 0; attempt < 3; ++attempt) {
         if (canceled(cancel)) {
@@ -1136,12 +1258,13 @@ void createSession(const MaiCloudDriveOptions* options, const std::string& base,
                    const char* checkpointPath, uint64_t bytes,
                    const char* sourceId,
                    const std::string& name, const std::string& contentType,
-                   const std::string& fingerprint,
+                   const std::string& fingerprint, const ThumbnailSnapshot& thumbnail,
                    const MaiCloudDriveCancel* cancel, Checkpoint* checkpoint,
                    MaiCloudDriveResult* result) {
     MaiCloudDriveResult initial{};
     json request{{"name", name}, {"size_bytes", bytes},
                  {"content_type", contentType}};
+    if (!thumbnail.bytes.empty()) request["thumbnail_size_bytes"] = thumbnail.bytes.size();
     if (sessionMode(options)) {
         request["owner_slot"] = options->owner_device_slot_utf8;
         request["owner_login_session_id"] = options->owner_login_session_id_utf8;
@@ -1160,13 +1283,49 @@ void createSession(const MaiCloudDriveOptions* options, const std::string& base,
     }
     const json response = parseResponse(initial);
     std::string returnedRoom;
+    Checkpoint initialized;
     if (!parseInitial(response, bytes, name, contentType,
-                      fingerprint, checkpoint) ||
+                      fingerprint, &initialized) ||
         (sessionMode(options) &&
          (!stringField(response, "room_key", &returnedRoom) ||
           returnedRoom != roomKey(options)))) {
         result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE;
         mai_cloud_drive_result_free(&initial);
+        return;
+    }
+    *checkpoint = std::move(initialized);
+    // Once the main identity and geometry are validated, any rejected companion
+    // response must release that newly created reservation, requested or not.
+    const auto abortUnboundSession = [&] {
+        MaiCloudDriveResult aborted{};
+        requestInternal(options, base, apiRoot(options) + "/uploads/" + checkpoint->videoId,
+                        "DELETE", json::object(), nullptr, &aborted);
+        mai_cloud_drive_result_free(&aborted);
+    };
+    if (!thumbnail.bytes.empty()) {
+        const auto entry = response.find("thumbnail");
+        uint64_t size = 0, partSize = 0, total = 0;
+        std::string uploadId;
+        if (entry == response.end() || !entry->is_object() ||
+            !stringField(*entry, "upload_id", &uploadId) || uploadId.empty() || uploadId.size() > 512 ||
+            !uintField(*entry, "size_bytes", thumbnail.bytes.size(), thumbnail.bytes.size(), &size) ||
+            !uintField(*entry, "part_size", kPartBytes, kPartBytes, &partSize) ||
+            !uintField(*entry, "parts_total", 1, 1, &total)) {
+            // The main identity is valid and newly created, but this server did
+            // not bind the requested companion. Abort instead of leaving an
+            // unresumable reservation or publishing a broken large-image card.
+            abortUnboundSession();
+            mai_cloud_drive_result_free(&initial);
+            result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE;
+            return;
+        }
+        checkpoint->thumbnailUploadId = std::move(uploadId);
+        checkpoint->thumbnailSize = size;
+        checkpoint->thumbnailFingerprint = thumbnail.fingerprint;
+    } else if (response.contains("thumbnail")) {
+        abortUnboundSession();
+        mai_cloud_drive_result_free(&initial);
+        result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE;
         return;
     }
     checkpoint->sourceId = sourceId;
@@ -1207,10 +1366,11 @@ void createSession(const MaiCloudDriveOptions* options, const std::string& base,
 bool listParts(const MaiCloudDriveOptions* options, const std::string& base,
                const Checkpoint& checkpoint, const MaiCloudDriveCancel* cancel,
                std::vector<Part>* parts, bool* ready,
-               MaiCloudDriveResult* result) {
+               MaiCloudDriveResult* result, bool thumbnail = false) {
     MaiCloudDriveResult listed{};
     requestInternal(options, base,
-        apiRoot(options) + "/uploads/" + checkpoint.videoId + "/parts",
+        apiRoot(options) + "/uploads/" + checkpoint.videoId +
+            (thumbnail ? "/thumbnail/parts" : "/parts"),
         "GET", json::object(), cancel, &listed);
     if (listed.status != MAI_CLOUD_DRIVE_OK) {
         moveResult(result, &listed);
@@ -1245,10 +1405,77 @@ bool completeUpload(const MaiCloudDriveOptions* options, const std::string& base
     if (options->retain_completed_checkpoint) {
         Checkpoint receipt = checkpoint;
         receipt.completed = true;
+        // A ready original is acknowledged only after the service verified its
+        // declared companion, even when the earlier companion reply was lost.
+        if (receipt.thumbnailSize) receipt.thumbnailCompleted = true;
         if (!writeCheckpoint(checkpointPath, receipt))
             result->status = MAI_CLOUD_DRIVE_FILE_ERROR;
     } else if (!removeCheckpoint(checkpointPath))
         result->status = MAI_CLOUD_DRIVE_FILE_ERROR;
+    return true;
+}
+
+bool ensureThumbnail(const MaiCloudDriveOptions* options, const std::string& base,
+                     Checkpoint* checkpoint, const char* checkpointPath,
+                     ThumbnailSnapshot* snapshot, const MaiCloudDriveCancel* cancel,
+                     MaiCloudDriveResult* result) {
+    if (!checkpoint->thumbnailSize) return true;
+    Checkpoint resource;
+    resource.videoId = checkpoint->videoId;
+    resource.uploadId = checkpoint->thumbnailUploadId;
+    resource.contentType = "image/jpeg";
+    resource.size = checkpoint->thumbnailSize;
+    resource.partSize = kPartBytes;
+    resource.partsTotal = 1;
+    std::vector<Part> parts;
+    bool ready = false;
+    if (!listParts(options, base, resource, cancel, &parts, &ready, result, true)) return false;
+    if (!ready) {
+        if (snapshot->bytes.empty()) {
+            result->status = prepareThumbnail(options, cancel, snapshot);
+            if (result->status != MAI_CLOUD_DRIVE_OK) return false;
+        }
+        if (snapshot->bytes.size() != resource.size ||
+            snapshot->fingerprint != checkpoint->thumbnailFingerprint) {
+            result->status = MAI_CLOUD_DRIVE_CHECKPOINT_MISMATCH;
+            return false;
+        }
+        if (parts.empty()) {
+            MaiCloudDriveSource source{snapshot->path.c_str(), resource.size,
+                                      readThumbnailAt, &snapshot->bytes};
+            uploadPart(options, base, &source, resource, 1, 0, cancel,
+                       nullptr, nullptr, result, true);
+            if (result->status != MAI_CLOUD_DRIVE_OK) return false;
+            mai_cloud_drive_result_free(result);
+        }
+    }
+    MaiCloudDriveResult completed{};
+    requestInternal(options, base, apiRoot(options) + "/uploads/" +
+        checkpoint->videoId + "/thumbnail/complete", "POST", json::object(),
+        cancel, &completed, 200'000);
+    if (completed.status != MAI_CLOUD_DRIVE_OK) {
+        moveResult(result, &completed);
+        return false;
+    }
+    const json response = parseResponse(completed);
+    std::string id, status, type, media;
+    uint64_t size = 0;
+    const bool valid = stringField(response, "video_id", &id) && id == checkpoint->videoId &&
+        stringField(response, "status", &status) && status == "ready" &&
+        stringField(response, "content_type", &type) && type == "image/jpeg" &&
+        stringField(response, "media_type", &media) && media == "image" &&
+        uintField(response, "size_bytes", resource.size, resource.size, &size);
+    mai_cloud_drive_result_free(&completed);
+    if (!valid) {
+        result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE;
+        return false;
+    }
+    checkpoint->thumbnailCompleted = true;
+    if (!writeCheckpoint(checkpointPath, *checkpoint)) {
+        result->status = MAI_CLOUD_DRIVE_FILE_ERROR;
+        return false;
+    }
+    result->status = MAI_CLOUD_DRIVE_OK;
     return true;
 }
 
@@ -1492,7 +1719,8 @@ extern "C" void mai_cloud_drive_request(const MaiCloudDriveOptions* options,
         const bool valid = stringField(details, "read_url", &url) &&
             stringField(details, "content_type", &type) &&
             stringField(details, "media_type", &mediaType) &&
-            uintField(details, "size_bytes", 1, kMaxVideoBytes, &size);
+            uintField(details, "size_bytes", 1,
+                      temporary ? kSessionMaxImageBytes : kMaxVideoBytes, &size);
         const bool image = mediaType == "image" &&
             (type == "image/jpeg" || type == "image/png" || type == "image/webp" || type == "image/heic");
         const bool video = mediaType == "video" &&
@@ -1504,7 +1732,8 @@ extern "C" void mai_cloud_drive_request(const MaiCloudDriveOptions* options,
         }
         mai_cloud_drive_result_free(result);
         if (!valid || !matches || (!temporary && !image && !video) ||
-            (temporary && (mediaType != "image" || size != expectedSize)) || (image && size > kMaxImageBytes)) {
+            (temporary && (mediaType != "image" || size != expectedSize)) ||
+            (image && size > (temporary ? kSessionMaxImageBytes : kMaxImageBytes))) {
             result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE; return;
         }
         if (cancel && !cancel->download) { result->status = MAI_CLOUD_DRIVE_FILE_ERROR; return; }
@@ -1759,6 +1988,8 @@ extern "C" void mai_cloud_drive_upload_resumable_source(
     if (!mediaInfo(name, &info, sessionMode(options)) ||
         (temporaryImage(options) && std::string(info.media_type_utf8) != "image") ||
         contentType != info.content_type_utf8) return;
+    if (options->cloud_drive_thumbnail_path_utf8 &&
+        (sessionMode(options) || std::string(info.media_type_utf8) != "image")) return;
     std::string base;
     if (!validBase(options->auth_base_url_utf8, &base)) return;
     const uint64_t bytes = source->size_bytes;
@@ -1801,11 +2032,20 @@ extern "C" void mai_cloud_drive_upload_resumable_source(
     }
     std::vector<Part> parts;
     bool ready = false;
+    ThumbnailSnapshot thumbnail;
     for (unsigned sessionAttempt = 0; sessionAttempt < 2; ++sessionAttempt) {
         if (!exists) {
+            if (options->cloud_drive_thumbnail_path_utf8) {
+                result->status = prepareThumbnail(options, cancel, &thumbnail);
+                if (result->status != MAI_CLOUD_DRIVE_OK) return;
+            } else if (!sessionMode(options) &&
+                       std::string(info.media_type_utf8) == "image" && bytes > kSessionMaxImageBytes) {
+                result->status = MAI_CLOUD_DRIVE_FILE_ERROR;
+                return;
+            }
             createSession(options, base, checkpointPath, bytes,
                           source->stable_id_utf8, name,
-                          contentType, fingerprint, cancel, &checkpoint, result);
+                          contentType, fingerprint, thumbnail, cancel, &checkpoint, result);
             if (result->status != MAI_CLOUD_DRIVE_OK) return;
         }
         if (listParts(options, base, checkpoint, cancel, &parts, &ready, result))
@@ -1826,6 +2066,15 @@ extern "C" void mai_cloud_drive_upload_resumable_source(
         completeUpload(options, base, checkpoint, checkpointPath, cancel, result);
         return;
     }
+    if (!checkpoint.thumbnailSize && !sessionMode(options) &&
+        std::string(info.media_type_utf8) == "image" && bytes > kSessionMaxImageBytes) {
+        result->status = MAI_CLOUD_DRIVE_CHECKPOINT_MISMATCH;
+        return;
+    }
+    // The associated resource uses the same list/sign/PUT/complete helpers.
+    // Legacy small-image checkpoints have no companion and are never upgraded
+    // in the middle of an existing upload just because a new host supplied one.
+    if (!ensureThumbnail(options, base, &checkpoint, checkpointPath, &thumbnail, cancel, result)) return;
     uint64_t confirmed = 0;
     std::vector<bool> seen(checkpoint.partsTotal + 1, false);
     for (const Part& part : parts) {

@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const { openStore } = require('./store');
 const { createAuthService } = require('./service');
 const { createServer:createAuthServer,cloudDriveFromEnv,
-  cloudDriveAllowedAccountsFromEnv } = require('./server');
+  cloudDriveAllowedAccountsFromEnv,sessionAttachmentOptionsFromEnv } = require('./server');
 const { createHandler:createMediaHandler } = require('../oss-media-signer/index');
 const { createServer:createMediaServer } = require('../oss-media-signer/server');
 
@@ -14,9 +14,9 @@ test('cloud drive stays off unless explicitly enabled with signer and quota', ()
   assert.equal(cloudDriveFromEnv({ MAICHAT_CLOUD_DRIVE_ENABLED:'0' }),null);
   assert.throws(() => cloudDriveFromEnv({ MAICHAT_CLOUD_DRIVE_ENABLED:'1' }),
     /signer or quota/);
-  assert.throws(() => cloudDriveFromEnv({ MAICHAT_CLOUD_DRIVE_ENABLED:'1',
+  assert.equal(cloudDriveFromEnv({ MAICHAT_CLOUD_DRIVE_ENABLED:'1',
     MAICHAT_CLOUD_DRIVE_INTERNAL_KEY:'a'.repeat(32),
-    MAICHAT_CLOUD_DRIVE_QUOTA_BYTES:'1999999999' }),/signer or quota/);
+    MAICHAT_CLOUD_DRIVE_QUOTA_BYTES:'1999999999' }).quotaBytes,1_999_999_999);
 });
 
 test('cloud drive account allowlist accepts only complete valid account IDs', () => {
@@ -148,7 +148,7 @@ test('authenticated two-account private media upload uses OSS multipart control'
   authService = createAuthService({ db,sms:{ async send() {} },
     secret:'local-auth-hmac-key-at-least-32-characters',
     imSecret:'local-im-secret-key-at-least-32-characters',sdkAppId:123456789,
-    cloudDrive:cloudOptions,sessionAttachments:cloudOptions });
+    cloudDrive:cloudOptions,sessionAttachments:sessionAttachmentOptionsFromEnv({},cloudOptions) });
   const authServer = createAuthServer(authService);
   await new Promise(resolve => authServer.listen(0,'127.0.0.1',resolve));
   const base = `http://127.0.0.1:${authServer.address().port}`;

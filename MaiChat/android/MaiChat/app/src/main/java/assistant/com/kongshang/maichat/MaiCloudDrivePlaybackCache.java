@@ -14,7 +14,9 @@ final class MaiCloudDrivePlaybackCache {
     }
 
     static boolean hasSpace(long availableBytes, long videoBytes) {
-        return videoBytes > 0 && videoBytes <= MaiCloudDrive.MAX_VIDEO_BYTES &&
+        // Device-space admission is independent of the native media policy.
+        // Keep the reserve addition in range even for an untrusted byte count.
+        return videoBytes > 0 && videoBytes <= Long.MAX_VALUE - RESERVE_BYTES &&
             availableBytes >= videoBytes + RESERVE_BYTES;
     }
 

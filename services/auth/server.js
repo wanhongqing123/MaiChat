@@ -91,12 +91,12 @@ function cloudDriveFromEnv(env, fetcher = fetch) {
     throw new Error('MAICHAT_CLOUD_DRIVE_ENABLED must be 0 or 1');
   const secret = env.MAICHAT_CLOUD_DRIVE_INTERNAL_KEY || '';
   const port = Number(env.MAICHAT_MEDIA_PORT || 9000);
-  const maxVideoBytes = Number(env.MAICHAT_CLOUD_DRIVE_MAX_VIDEO_BYTES || 2_000_000_000);
+  const maxVideoBytes = Number(env.MAICHAT_CLOUD_DRIVE_MAX_VIDEO_BYTES || 20_000_000_000);
   const quotaBytes = Number(env.MAICHAT_CLOUD_DRIVE_QUOTA_BYTES || 10_000_000_000);
   if (secret.length < 32 || !Number.isInteger(port) || port < 1 || port > 65535 ||
       !Number.isSafeInteger(maxVideoBytes) || maxVideoBytes < 8*1024*1024 ||
-      maxVideoBytes > 2_000_000_000 || !Number.isSafeInteger(quotaBytes) ||
-      quotaBytes < maxVideoBytes)
+      maxVideoBytes > 20_000_000_000 || !Number.isSafeInteger(quotaBytes) ||
+      quotaBytes < 1)
     throw new Error('Cloud drive signer or quota is not configured');
   const allowedAccountIds = cloudDriveAllowedAccountsFromEnv(
     env.MAICHAT_CLOUD_DRIVE_ALLOWED_ACCOUNTS);
@@ -111,7 +111,7 @@ function cloudDriveFromEnv(env, fetcher = fetch) {
     return response.json();
   };
   return {
-    maxVideoBytes,quotaBytes,allowedAccountIds,
+    maxVideoBytes,maxImageBytes:100_000_000,quotaBytes,allowedAccountIds,
     authorizeAttachment:sessionAttachmentAuthorizerFromEnv(env,fetcher),
     startUpload:async (accountId,key,contentType) =>
       (await request('init',{ account_id:accountId,object_key:key,
@@ -149,6 +149,14 @@ function cloudDriveFromEnv(env, fetcher = fetch) {
       if (reply.deleted !== true) throw new Error('Cloud video object was not deleted');
     }
   };
+}
+
+function sessionAttachmentOptionsFromEnv(env,cloudDriveOptions) {
+  if (!cloudDriveOptions) return null;
+  // Reuse the existing signer transport, not the cloud-only media policy.
+  // Session/temporary images retain their original sizes and separate quota.
+  return { ...cloudDriveOptions,maxVideoBytes:2_000_000_000,maxImageBytes:20_000_000,
+    quotaBytes:Number(env.MAICHAT_SESSION_ATTACHMENT_QUOTA_BYTES || 10_000_000_000) };
 }
 
 function cloudDriveAllowedAccountsFromEnv(value) {
@@ -223,10 +231,7 @@ function start(env = process.env) {
     imSecret: env.MAICHAT_IM_SECRET_KEY,
     videoCircle: videoCircleFromEnv(env),
     cloudDrive: cloudDriveOptions,
-    sessionAttachments: cloudDriveOptions ? {
-      ...cloudDriveOptions,
-      quotaBytes:Number(env.MAICHAT_SESSION_ATTACHMENT_QUOTA_BYTES || 10_000_000_000)
-    } : null,
+    sessionAttachments: sessionAttachmentOptionsFromEnv(env,cloudDriveOptions),
     issueArkCredential: createArkCredentialIssuer(env),
     issueBailianCredential: createBailianCredentialIssuer(env),
     issueAccountModelKeys: createAccountModelKeyIssuer(env),
@@ -315,4 +320,4 @@ if (require.main === module) start();
 
 module.exports = { createServer, start, requireDeviceSlotFromEnv,
   videoCircleFromEnv, cloudDriveFromEnv, cloudDriveAllowedAccountsFromEnv,
-  sessionAttachmentAuthorizerFromEnv };
+  sessionAttachmentAuthorizerFromEnv,sessionAttachmentOptionsFromEnv };

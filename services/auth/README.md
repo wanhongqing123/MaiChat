@@ -98,21 +98,34 @@ MaiChat 账号 ID，例如 `cloud_owner,cloud_viewer`。名单外的已登录账
 空值、无效或重复账号 ID 会使账号服务拒绝启动，避免误开放。
 支持 MP4 (`video/mp4`) 与 iPhone 常见 MOV (`video/quicktime`)，以及 JPG/JPEG
 (`image/jpeg`)、PNG (`image/png`)、WebP (`image/webp`) 和 HEIC (`image/heic`)。
-单图片最多 20,000,000 字节，以满足 OSS 在线缩图的源文件 20 MB 限制。单视频最多
-2,000,000,000 字节，每账号默认 10,000,000,000 字节；`MAICHAT_CLOUD_DRIVE_QUOTA_BYTES`
-可调整账号容量，`MAICHAT_CLOUD_DRIVE_MAX_VIDEO_BYTES` 只能向下调整单文件上限。
+单图片最多 100,000,000 字节，单视频最多 20,000,000,000 字节（十进制 100 MB/20 GB）。
+每账号容量默认仍为 10,000,000,000 字节；`MAICHAT_CLOUD_DRIVE_QUOTA_BYTES` 可调整
+账号容量，`MAICHAT_CLOUD_DRIVE_MAX_VIDEO_BYTES` 只能向下调整 20 GB 单文件上限。
+账号容量小于单文件上限也是有效配置；每次上传仍以原子计算的剩余容量为准，不会因提高
+单文件上限自动扩容。Session 附件继续使用独立的 2 GB/20 MB 策略及原有会话配额。
+若现有部署显式配置了较低的 `MAICHAT_CLOUD_DRIVE_MAX_VIDEO_BYTES`，该限制仍生效；
+部署时应单独核对上传策略，不因这个版本修改账号既有容量。
+图片超过 20,000,000 字节时，初始化必须同时声明 `thumbnail_size_bytes`；客户端用现有
+图像处理能力生成最长边 320 像素、最多 2,000,000 字节的 JPEG，再按相同分片协议直传。
+较小新图片也可使用该协议，旧小图片可保留 OSS 在线缩图。
 数据库事务原子计算已完成文件、未完成上传和清理失败对象的配额。
 
 上传使用 OSS Multipart Upload，每片 8 MiB；上传会话保留 7 天，每片签名仅保留
 5 分钟。签名包含该片固定 `Content-Length` 与 `Content-MD5`，客户端只上传已签名
 片号；完成时账号服务从 OSS 重新列出所有分片，核对片号、大小与 ETag，再要求素材服务
-完成组装并 HEAD 核对最终对象。客户端不传可作为事实来源的 ETag 清单。取消、删除、
+完成组装并 HEAD 核对最终对象。客户端不传可作为事实来源的 ETag 清单。
+20 GB 文件最多 2385 片；仅内部完成请求的 JSON 预算提高到 1 MiB，两层均有限额，
+公开元数据请求的 4 KiB 上限不变。关联 JPEG 是同一媒体行的隐藏资源，服务端为它生成
+同账号 `cloud-drive/` 前缀下的另一随机 `.jpg` 对象键，原图与 JPEG 字节一起预留容量。
+客户端先完成 JPEG，再处理原文件；两者都经 HEAD 核对后才把原文件列为 ready。
+JPEG 不作为第二条可见云盘项目；缩略图接口直接签发 JPEG 的私有 GET 链接。取消、删除、
 账号注销会隐藏云盘文件并尝试 abort/delete，失败留在 `cleanup_pending`，每小时重试。
 若 OSS 正在组装分片，删除后会保留 24 小时清理租约和配额占用，期间重复
 HEAD 核验，防止迟到的 Complete 再生成未登记对象。
 清理还通过仅限内部调用的签名服务按账号与**精确对象键**分页列举未完成
 Multipart，逐个中止并重新列举确认已空；若初始化响应丢失，也能找回该键的
-upload ID。只有对象 HEAD 不存在、未完成 Multipart 列表为空、24 小时保护期
+upload ID。只有原文件及关联 JPEG 的 HEAD 都不存在、两个精确对象键的未完成 Multipart
+列表都为空、24 小时保护期
 （如适用）已结束，且清理版本号未被并发更新时，才删除该文件的数据库元数据
 并释放预留容量。OSS 核验失败则保留待清理记录和容量，每小时重试。
 对旧版已经标为 `deleted, cleanup_pending=0` 的行，后台也分批重新核对同一组
@@ -123,10 +136,13 @@ OSS 事实；核对成功可直接删除元数据，不重新占用用户容量�
 
 | 方法与路径 | 请求与结果 |
 |---|---|
-| `POST /v1/cloud-drive/videos/uploads` | `{name,size_bytes,content_type}` → `{video_id,upload_id,media_type,part_size,parts_total,upload_expires_at,quota}`；图片和视频共用此上传协议 |
+| `POST /v1/cloud-drive/videos/uploads` | `{name,size_bytes,content_type,thumbnail_size_bytes?}` → `{video_id,upload_id,media_type,part_size,parts_total,upload_expires_at,quota,thumbnail?}`；`thumbnail` 含 JPEG 的 upload_id/size_bytes/part_size/parts_total，图片和视频共用此上传协议 |
 | `POST /v1/cloud-drive/videos/uploads/{id}/parts/{number}/sign` | `{content_md5_base64}` → `{part_number,part_size_bytes,upload_url,upload_headers,expires_in}`；只向 OSS PUT 文件分片 |
 | `GET /v1/cloud-drive/videos/uploads/{id}/parts` | OSS 分片事实列表；已完成返回 `status:"ready"`；过期返回 410 |
 | `POST /v1/cloud-drive/videos/uploads/{id}/complete` | 空 JSON；服务端核对并组装，返回 `status:"ready"`，可重复调用 |
+| `GET /v1/cloud-drive/videos/uploads/{id}/thumbnail/parts` | 关联 JPEG 分片事实；响应与原分片列表一致；完成回包丢失时通过 HEAD 收敛为 ready |
+| `POST /v1/cloud-drive/videos/uploads/{id}/thumbnail/parts/1/sign` | 与原分片签名相同的 MD5/长度绑定，只允许片号 1 |
+| `POST /v1/cloud-drive/videos/uploads/{id}/thumbnail/complete` | 与原完成响应同形状，ready 表示 JPEG 完成；原文件仍需自己的 complete |
 | `DELETE /v1/cloud-drive/videos/uploads/{id}` | 取消上传，执行 OSS abort 与删除；失败返回 202 并重试 |
 | `GET /v1/cloud-drive/videos?before=&folder_id=` | 只列出本人已完成文件，50 条游标分页；省略 `folder_id` 列出全部，空字符串只列根目录，UUID 只列该目录直属文件；每项有 `media_type: image|video`、`folder_id: null|UUID`，并包含 `quota` |
 | `GET /v1/cloud-drive/videos/{id}/play-link` | 只向所有者签发 60 秒私有原文件读取 URL，并返回 `size_bytes` / `content_type` 供客户端下载前检查空间 |
@@ -240,9 +256,23 @@ capability 的代大于 0 create 返回 409，防止热回滚后的旧 Auth 把�
 幂等返回；这是安全降级，不保证新分配可用。Auth/Sync 应作为配对版本切换，不能
 以可信进程内布尔兼容推断任意旧二进制组合都能承载已进入新代的请求。
 
-缩略图由 OSS 按需处理，处理参数纳入 V4 签名，不在账号服务保存或转发媒体字节。
-图片缩图源文件上限为 20 MB；视频截帧仅支持 H.264/H.265，其他编码应显示占位图。
+关联 JPEG 由客户端直接上传 OSS，服务端不保存或转发媒体字节。旧小图片继续使用 OSS
+按需缩图（源文件默认上限 20 MB），处理参数纳入 V4 签名；新大图不依赖未知的 OSS
+图片处理配额。视频截帧仅支持 H.264/H.265，其他编码应显示占位图。
 视频截帧按调用计费，客户端应只为可见文件请求并复用未到期链接。
+
+### 20 GB / 100 MB 版本的迁移和回退边界
+
+`openStore` 在既有媒体迁移之后追加隐藏 JPEG 对象键、upload ID、字节数、状态和完成
+开始时间列；旧行的辅助字节默认 0，原 ID、原 OSS key、在途 8 MiB 分片和 Session 表不变。
+上传和清理始终共用原行的租约及 cleanup revision，两个资源清理确认前不释放合计配额。
+
+实际部署须先按现有运维流程备份 SQLite（含一致的 WAL 状态）和服务版本，并准备恢复
+记录；不要把旧客户端包或现有已发布 Release 当作已支持新缩略图字段。先部署相配的
+签名/Auth 服务和客户端，再开放新上传。这里的文档和测试不代表线上已部署或扩容。
+存在 `thumbnail_object_key` 非空行时，不能直接热回滚到不认识辅助对象的旧 Auth：旧清理
+程序可能只删除原对象并误释放配额。回退前应停止新上传，保留新版清理能力，先完成这些
+行的双对象清理或经验证的迁移，保留新增列；不能只恢复旧数据库快照而忽略 OSS 实际状态。
 
 上线前需独立验收真实 OSS 私有 Bucket、禁用版本控制、分片签名中固定 Content-Length
 是否被 OSS 实际执行、重复上传与 HEAD 类型、以及 RAM 最小权限。OSS 官方明确

@@ -205,6 +205,8 @@ public final class MaiCloudDriveAgentTools {
     }
 
     private static Failure error(MaiCloudDrive.Result result, boolean gate) {
+        if ("thumbnail_prepare_failed".equals(result.json().optString("error")))
+            return new Failure("invalid_input", "image thumbnail could not be prepared before upload");
         if (result.httpStatus == 401 || result.httpStatus == 503 ||
             (gate && result.httpStatus == 404))
             return new Failure("not_configured", "private cloud drive is unavailable");
@@ -423,17 +425,38 @@ public final class MaiCloudDriveAgentTools {
             if (active.putIfAbsent(key, task) != null)
                 throw new Failure("busy", "upload is already running");
         }
+        MaiCloudDrive.Source prepared = source;
+        boolean queued = false;
         try {
-            client.upload(source, checkpoint, (done, total, preparing) -> { },
-                result -> { }, () -> {
-                    task.settled = true;
-                    active.remove(key, task);
-                });
+            // This method already runs on the tool worker. Finish local image
+            // preparation before accepted; otherwise an invalid image would be
+            // acknowledged and its failed asynchronous task would just vanish.
+            prepared = client.prepareImageForUploadBlocking(source, checkpoint);
+            synchronized (taskLock) {
+                if (task.pausing) throw new Failure("canceled", "upload preparation was paused");
+                client.upload(prepared, checkpoint, (done, total, preparing) -> { },
+                    result -> { }, () -> {
+                        task.settled = true;
+                        active.remove(key, task);
+                    });
+                queued = true;
+            }
             return new JSONObject().put("accepted", true).put("task_id", id)
                 .put("state", "uploading");
+        } catch (MaiCloudDrive.PreparationFailure failure) {
+            active.remove(key, task);
+            throw error(failure.result, false);
+        } catch (IOException failure) {
+            active.remove(key, task);
+            throw new Failure("invalid_input", "image could not be prepared for upload");
         } catch (Exception failure) {
             active.remove(key, task);
             throw failure;
+        } catch (LinkageError unavailable) {
+            active.remove(key, task);
+            throw new Failure("internal", "local upload preparation is unavailable");
+        } finally {
+            if (!queued) MaiCloudDrive.discardPrepared(prepared);
         }
     }
 
@@ -569,7 +592,8 @@ public final class MaiCloudDriveAgentTools {
         default: throw new Failure("protocol", "cloud media type is unsupported");
         }
         boolean image = contentType.startsWith("image/");
-        long maximum = image ? 20_000_000L : MaiCloudDrive.MAX_VIDEO_BYTES;
+        MaiCloudDrive.MediaInfo policy = MaiCloudDrive.mediaInfo("preview" + suffix);
+        long maximum = policy == null ? 0 : policy.maxBytes;
         if (!url.startsWith("https://"))
             throw new Failure("protocol", "cloud media link is invalid");
         if (sizeBytes < 1 || sizeBytes > maximum ||

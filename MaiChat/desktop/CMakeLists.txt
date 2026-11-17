@@ -573,6 +573,8 @@ add_library(remote_im_desktop_ui
   src/ui/VideoCircleDialog.cpp
   src/ui/CloudDriveDialog.h
   src/ui/CloudDriveDialog.cpp
+  src/ui/DesktopCloudDriveThumbnail.h
+  src/ui/DesktopCloudDriveThumbnail.cpp
   src/ui/DesktopCameraDialog.h
   src/ui/DesktopCameraDialog.cpp
   src/ui/DesktopMusicPlayerDialog.h
