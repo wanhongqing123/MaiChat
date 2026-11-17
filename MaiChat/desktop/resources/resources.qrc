@@ -33,6 +33,8 @@
   <!-- Tabler Icons v3.x (MIT) plus MaiChat's creative-studio and player icons. -->
   <qresource prefix="/maichat/icons">
     <file alias="message-circle.svg">icons/tabler/message-circle.svg</file>
+    <file alias="cloud.svg">icons/cloud.svg</file>
+    <file alias="cloud-filled.svg">icons/cloud-filled.svg</file>
     <file alias="creative-studio.svg">icons/creative-studio.svg</file>
     <file alias="users.svg">icons/tabler/users.svg</file>
     <file alias="device-desktop.svg">icons/tabler/device-desktop.svg</file>
@@ -50,6 +52,7 @@
     <file alias="player-next.svg">icons/player-next.svg</file>
     <file alias="player-fullscreen.svg">icons/player-fullscreen.svg</file>
     <file alias="user-circle.svg">icons/tabler/user-circle.svg</file>
+    <file alias="user-circle-filled.svg">icons/tabler/user-circle-filled.svg</file>
     <file alias="tabler-license.txt">icons/tabler/LICENSE.txt</file>
   </qresource>
 </RCC>

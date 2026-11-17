@@ -1287,6 +1287,8 @@ QString navIconResource(LineIconKind kind) {
   switch (kind) {
   case LineIconKind::Messages:
     return QStringLiteral(":/maichat/icons/message-circle.svg");
+  case LineIconKind::Cloud:
+    return QStringLiteral(":/maichat/icons/cloud.svg");
   case LineIconKind::Assistant:
     return QStringLiteral(":/maichat/icons/creative-studio.svg");
   case LineIconKind::Contacts:
@@ -1304,38 +1306,14 @@ QString navIconResource(LineIconKind kind) {
   }
 }
 
-QColor navIconColor(LineIconKind kind, bool selected) {
-  switch (kind) {
-  case LineIconKind::Messages:
-  case LineIconKind::Preferences:
-    return QColor(selected ? QStringLiteral("#0879c9")
-                           : QStringLiteral("#1487d4"));
-  case LineIconKind::Assistant:
-    return QColor(selected ? QStringLiteral("#5e52b6")
-                           : QStringLiteral("#6f62c7"));
-  case LineIconKind::Cloud:
-    return QColor(selected ? QStringLiteral("#0b76bf")
-                           : QStringLiteral("#168fd0"));
-  case LineIconKind::Contacts:
-    return QColor(selected ? QStringLiteral("#117960")
-                           : QStringLiteral("#198c73"));
-  case LineIconKind::Screen:
-  case LineIconKind::ScreenConnecting:
-  case LineIconKind::ScreenDisconnect:
-    return QColor(selected ? QStringLiteral("#169fbd")
-                           : QStringLiteral("#32a9c1"));
-  case LineIconKind::Settings:
-    return QColor(selected ? QStringLiteral("#b76b35")
-                           : QStringLiteral("#b98054"));
-  default:
-    return QColor(selected ? QStringLiteral("#0879c9")
-                           : QStringLiteral("#5f6f82"));
-  }
+QColor navIconColor() {
+  // 导航统一品牌蓝，选择状态只由空心/实心形态表达，不使用灰色或分类色。
+  return QColor(QStringLiteral("#0879c9"));
 }
 
 QIcon makeNavIcon(LineIconKind kind, const QColor &color, bool filled = false) {
   QString resource = navIconResource(kind);
-  if (filled && !resource.isEmpty() && kind != LineIconKind::Settings)
+  if (filled && !resource.isEmpty())
     resource.replace(QStringLiteral(".svg"), QStringLiteral("-filled.svg"));
   if (resource.isEmpty())
     return makeLineIcon(kind, color);
@@ -1376,7 +1354,7 @@ void applyNavButtonIcon(QPushButton *button, bool selected) {
   if (!rawKind.isValid())
     return;
   const LineIconKind kind = lineIconKindFromValue(rawKind.toInt());
-  button->setIcon(makeNavIcon(kind, navIconColor(kind, selected), selected));
+  button->setIcon(makeNavIcon(kind, navIconColor(), selected));
 }
 
 // 聊天标题栏使用飞书式无边框图标按钮。
@@ -3497,12 +3475,11 @@ void MainWindow::applyStyle() {
             padding: 0;
             background: transparent;
         }
-        #messagesNavButton[selected="false"]:hover { background: #d9edfc; }
-        #cloudNavButton[selected="false"]:hover { background: #d9edfc; }
-        #agentNavButton[selected="false"]:hover { background: #e7e1ff; }
-        #contactsNavButton[selected="false"]:hover { background: #daf1e8; }
-        #settingsNavButton[selected="false"]:hover { background: #dfe6ef; }
-        #preferencesNavButton[selected="false"]:hover { background: #d9edfc; }
+        #messagesNavButton[selected="false"]:hover, #cloudNavButton[selected="false"]:hover,
+        #agentNavButton[selected="false"]:hover, #contactsNavButton[selected="false"]:hover,
+        #settingsNavButton[selected="false"]:hover, #preferencesNavButton[selected="false"]:hover {
+            background: #d9edfc;
+        }
         #messagesNavButton[selected="true"], #cloudNavButton[selected="true"],
         #agentNavButton[selected="true"], #contactsNavButton[selected="true"],
         #settingsNavButton[selected="true"], #preferencesNavButton[selected="true"] {

@@ -39,7 +39,45 @@ private slots:
     void parsesTables();
     void nestsQuotesByDepth();
     void recognizesCallouts();
+    void previewPrefixPreservesParsedStylesAndReferences();
+    void previewPrefixBoundsTreesWithoutMutatingSource();
 };
+
+void MarkdownDocumentTest::previewPrefixPreservesParsedStylesAndReferences() {
+    const QString source = QStringLiteral("> [!NOTE]\n> [**owned**][later]\n\nsecond\n\n[later]: https://example.com\n");
+    const auto full = MarkdownDocument::parse(source);
+    const auto prefix = full.prefixForPreview(1, 64);
+    QCOMPARE(prefix.blocks().size(), 1);
+    QCOMPARE(prefix.blocks()[0].callout, MarkdownCallout::Note);
+    QCOMPARE(prefix.blocks()[0].quoteIds, full.blocks()[0].quoteIds);
+    QCOMPARE(prefix.blocks()[0].spans[0].href, QStringLiteral("https://example.com"));
+    QVERIFY(prefix.blocks()[0].spans[0].styles.testFlag(MarkdownStyle::Bold));
+    QCOMPARE(prefix.source(), source);
+    QCOMPARE(full.blocks().size(), 2);
+}
+
+void MarkdownDocumentTest::previewPrefixBoundsTreesWithoutMutatingSource() {
+    const auto paragraph = MarkdownDocument::parse(QStringLiteral("**abcdef** tail\n\nnext"));
+    QCOMPARE(paragraph.prefixForPreview(1, 3).blocks()[0].spans[0].text, QStringLiteral("abc"));
+    QCOMPARE(textOf(paragraph.blocks()[0].spans), QStringLiteral("abcdef tail"));
+    QVERIFY(paragraph.prefixForPreview(0, 30).isEmpty());
+    QVERIFY(paragraph.prefixForPreview(30, 0).isEmpty());
+    const auto code = MarkdownDocument::parse(QStringLiteral("```cpp\nabcdefgh\n```"));
+    QCOMPARE(code.prefixForPreview(2, 3).blocks()[0].code, QStringLiteral("abc"));
+    QCOMPARE(code.prefixForPreview(2, 3).blocks()[0].language, QStringLiteral("cpp"));
+    const auto list = MarkdownDocument::parse(QStringLiteral("- [x] first\n- second\n- third"));
+    const auto listPrefix = list.prefixForPreview(1, 8);
+    QCOMPARE(listPrefix.blocks().size(), 1);
+    QVERIFY(listPrefix.blocks()[0].items.size() < list.blocks()[0].items.size());
+    QVERIFY(listPrefix.blocks()[0].items[0].checked);
+    const auto table = MarkdownDocument::parse(QStringLiteral("| a | b |\n|---|---|\n| c | d |\n| e | f |"));
+    QVERIFY(table.prefixForPreview(2, 6).blocks()[0].rows.size() < table.blocks()[0].rows.size());
+    const auto unicode = MarkdownDocument::parse(QString::fromUtf8("A😀B"));
+    QCOMPARE(unicode.prefixForPreview(1, 2).plainText(), QStringLiteral("A"));
+    const auto shortItems = MarkdownDocument::parse(QStringLiteral("- x\n").repeated(2000));
+    QVERIFY(!shortItems.isEmpty());
+    QVERIFY(shortItems.prefixForPreview(64, 8192).blocks()[0].items.size() <= 512);
+}
 
 void MarkdownDocumentTest::rendersInlineHtmlBreaksWithoutChangingLiterals() {
     const QString source = QStringLiteral(

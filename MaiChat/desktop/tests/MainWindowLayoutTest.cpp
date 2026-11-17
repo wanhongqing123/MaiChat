@@ -365,6 +365,9 @@ private slots:
     void leftNavigationRailIsResizableAndWider();
     void navigationIconsSitNearTopEdge();
     void cloudDriveNavigationUsesMainPageInRequestedOrder();
+    void navigationUsesOneBlueWithHollowAndFilledStates_data();
+    void navigationUsesOneBlueWithHollowAndFilledStates();
+    void cloudNavigationSelectedIconIsFilled();
     void removesRedundantChromeLabels();
     void conversationListsUseDelegateItemsForSmoothScrolling();
     void selectedConversationRowReachesTheListEdge();
@@ -3992,6 +3995,66 @@ void MainWindowLayoutTest::cloudDriveNavigationUsesMainPageInRequestedOrder() {
     QVERIFY(window.findChild<QWidget*>(QStringLiteral("settingsCloudDriveOpen")) == nullptr);
     const QByteArray capture = qgetenv("MAICHAT_CAPTURE_CLOUD_NAV");
     if (!capture.isEmpty()) QVERIFY(window.grab().save(QString::fromUtf8(capture)));
+}
+
+void MainWindowLayoutTest::navigationUsesOneBlueWithHollowAndFilledStates_data() {
+    QTest::addColumn<QString>("buttonName");
+    QTest::addColumn<QString>("pageName");
+    QTest::newRow("messages") << QStringLiteral("messagesNavButton") << QStringLiteral("messagesPage");
+    QTest::newRow("cloud") << QStringLiteral("cloudNavButton") << QStringLiteral("cloudDrivePage");
+    QTest::newRow("creation") << QStringLiteral("agentNavButton") << QStringLiteral("agentPage");
+    QTest::newRow("contacts") << QStringLiteral("contactsNavButton") << QStringLiteral("contactsPage");
+    QTest::newRow("my") << QStringLiteral("settingsNavButton") << QStringLiteral("profilePage");
+    QTest::newRow("preferences") << QStringLiteral("preferencesNavButton") << QStringLiteral("settingsPage");
+}
+
+void MainWindowLayoutTest::navigationUsesOneBlueWithHollowAndFilledStates() {
+    QFETCH(QString, buttonName);
+    QFETCH(QString, pageName);
+    ScopedNotificationSettings settings;
+    RemoteIMApplication app(QStringLiteral("nav-state-owner"), std::make_unique<FakeRemoteIMClient>());
+    MainWindow window(app);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* stack = window.findChild<QStackedWidget*>(QStringLiteral("contentStack"));
+    auto* button = window.findChild<QPushButton*>(buttonName);
+    auto* page = window.findChild<QWidget*>(pageName);
+    QVERIFY(stack && button && page);
+    // 通过真实页面切换驱动同一导航同步，避免为图标检查创建模型会话。
+    stack->setCurrentWidget(window.findChild<QWidget*>(QStringLiteral("remotePage")));
+    const QImage hollow = button->icon().pixmap(QSize(48, 48)).toImage().convertToFormat(QImage::Format_ARGB32);
+    stack->setCurrentWidget(page);
+    QVERIFY(button->property("selected").toBool());
+    const QImage filled = button->icon().pixmap(QSize(48, 48)).toImage().convertToFormat(QImage::Format_ARGB32);
+    QVERIFY(hollow != filled);
+    for (const QImage& image : {hollow, filled}) {
+        int opaque = 0;
+        for (int y = 0; y < image.height(); ++y) for (int x = 0; x < image.width(); ++x) {
+            const QColor color = image.pixelColor(x, y);
+            // 只比较完全不透明笔画；SVG抗锯齿边缘的预乘/反预乘会产生1级RGB舍入。
+            if (color.alpha() != 255) continue;
+            ++opaque;
+            QCOMPARE(color.rgb(), QColor(QStringLiteral("#0879c9")).rgb());
+        }
+        QVERIFY(opaque > 20);
+    }
+    const QString output = qEnvironmentVariable("MAICHAT_NAV_STATES_CAPTURE");
+    if (!output.isEmpty()) QVERIFY(window.grab().save(QDir(output).filePath(QString::fromLatin1(QTest::currentDataTag()) + QStringLiteral(".png"))));
+}
+
+void MainWindowLayoutTest::cloudNavigationSelectedIconIsFilled() {
+    ScopedNotificationSettings settings;
+    RemoteIMApplication app(QStringLiteral("nav-cloud-owner"), std::make_unique<FakeRemoteIMClient>());
+    MainWindow window(app);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* button = window.findChild<QPushButton*>(QStringLiteral("cloudNavButton"));
+    QVERIFY(button);
+    QTest::mouseClick(button, Qt::LeftButton);
+    QVERIFY(button->property("selected").toBool());
+    const QImage icon = button->icon().pixmap(QSize(48, 48)).toImage();
+    QVERIFY2(icon.pixelColor(icon.width() / 2, icon.height() * 26 / 48).alpha() > 220,
+        "selected cloud must contain solid ink at the interior, not an unchanged outline");
 }
 
 void MainWindowLayoutTest::removesRedundantChromeLabels() {

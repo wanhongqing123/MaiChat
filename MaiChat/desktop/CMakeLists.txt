@@ -10,7 +10,7 @@ if(CMAKE_HOST_APPLE)
   endif()
 endif()
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 2.2.65 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 3.0.1 LANGUAGES C CXX)
 if(MSVC AND MSVC_VERSION LESS 1930)
   message(FATAL_ERROR "The source Qt 6 desktop build requires MSVC 2022 or later")
 endif()
@@ -367,6 +367,17 @@ elseif(WIN32)
   target_compile_definitions(maichat_pdf_preview PRIVATE MAICHAT_PDF_WINDOWS_NATIVE=1)
   target_link_libraries(maichat_pdf_preview PRIVATE
     Qt6::Concurrent windowsapp maichat_image_presentation)
+endif()
+
+add_library(maichat_agent_document_thumbnail STATIC
+  src/agent/AgentDocumentThumbnail.h src/agent/AgentDocumentThumbnail.cpp
+  src/agent/AgentDocumentThumbnailView.h src/agent/AgentDocumentThumbnailView.cpp)
+target_include_directories(maichat_agent_document_thumbnail PUBLIC src)
+target_link_libraries(maichat_agent_document_thumbnail PUBLIC
+  Qt6::Widgets Qt6::Concurrent maichat_markdown maichat_pdf_preview)
+if(APPLE)
+  target_sources(maichat_agent_document_thumbnail PRIVATE src/agent/AgentDocumentThumbnailMac.cpp)
+  target_link_libraries(maichat_agent_document_thumbnail PRIVATE "-framework CoreGraphics")
 endif()
 
 add_subdirectory(../Network "${CMAKE_CURRENT_BINARY_DIR}/maichat_network" EXCLUDE_FROM_ALL)
@@ -964,7 +975,7 @@ target_include_directories(maichat_agent PRIVATE ../Media ../MaiChatTools
 target_compile_definitions(maichat_agent PRIVATE ASIO_STANDALONE _WEBSOCKETPP_CPP11_STRICT_)
 target_link_libraries(maichat_agent PUBLIC
   Qt6::Core Qt6::Widgets Qt6::Concurrent
-  maiagent maichat_markdown maichat_pdf_preview mai_video_circle_client)
+  maiagent maichat_markdown maichat_pdf_preview maichat_agent_document_thumbnail mai_video_circle_client)
 target_link_libraries(maichat_agent PRIVATE ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
 # 历史显示投影是普通共享能力；面板/远端快照直接链接它，不依赖最终 App 的偶然链接顺序。
 target_link_libraries(maichat_agent PRIVATE maichat_image_presentation Qt6::Svg mai_im_history)
@@ -1152,6 +1163,14 @@ endif()
 add_executable(agent_panel_session_test tests/AgentPanelSessionTest.cpp)
 target_include_directories(agent_panel_session_test PRIVATE ../MaiChatTools)
 
+# Starter copy and tool-family availability are pure catalog behavior. Keep
+# this regression independent of the full App and any native desktop input.
+add_executable(starter_catalog_test
+  tests/StarterCatalogTest.cpp src/agent/StarterCatalog.cpp)
+target_include_directories(starter_catalog_test PRIVATE src)
+target_link_libraries(starter_catalog_test PRIVATE Qt6::Core maiagent)
+add_test(NAME starter_catalog_test COMMAND starter_catalog_test)
+
 # The capture lifecycle is independent of chat turns; owned backends exercise
 # blocking native-stop behavior without touching the user's desktop session.
 add_executable(desktop_screen_capture_control_test
@@ -1180,6 +1199,11 @@ target_compile_definitions(agent_panel_session_test PRIVATE
 # UiZoom 在 remote_im_desktop_ui 里，而 AgentChatPanel 用它做缩放，所以要一起链。
 target_link_libraries(agent_panel_session_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
   remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
+
+add_executable(agent_document_thumbnail_test tests/AgentDocumentThumbnailTest.cpp)
+target_link_libraries(agent_document_thumbnail_test PRIVATE maichat_agent_document_thumbnail)
+add_test(NAME agent_document_thumbnail_test COMMAND agent_document_thumbnail_test)
+set_tests_properties(agent_document_thumbnail_test PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(agent_file_delivery_ui_test tests/AgentFileDeliveryUiTest.cpp)
 if(APPLE)

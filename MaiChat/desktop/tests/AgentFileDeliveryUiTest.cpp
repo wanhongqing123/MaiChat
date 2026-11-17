@@ -2,12 +2,15 @@
 #include <QApplication>
 #include <QDialog>
 #include <QDir>
+#include <QEvent>
 #include <QFile>
 #include <QLabel>
 #include <QPainter>
 #include <QPdfWriter>
+#include <QPointer>
 #include <QPushButton>
 #include <QSettings>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -18,9 +21,11 @@
 
 #include "agent/AgentChatPanel.h"
 #include "agent/AgentController.h"
+#include "agent/AgentDocumentThumbnailView.h"
 #include "app/RemoteIMApplication.h"
 #include "im/FakeRemoteIMClient.h"
 #include "ui/MainWindow.h"
+#include "markdown/MarkdownView.h"
 
 #if defined(Q_OS_MACOS)
 bool closeOwnedAgentFilePdfPreview(const QString& title);
@@ -59,6 +64,113 @@ public:
 
 private:
     std::atomic<int> calls_{0};
+};
+
+class ThumbnailDeliveringModel final : public MaiModelClient {
+public:
+    explicit ThumbnailDeliveringModel(bool markdownOnly = false) : markdownOnly_(markdownOnly) {}
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
+        if (calls_++ == 0 && sink.onToolCall) {
+            if (!markdownOnly_)
+                sink.onToolCall({"thumb-pdf", "agent_send_file", R"({"file_path":"report.pdf"})"});
+            sink.onToolCall({"thumb-md", "agent_send_file", R"({"file_path":"report.md"})"});
+            if (!markdownOnly_)
+                sink.onToolCall({"thumb-bad", "agent_send_file", R"({"file_path":"bad.pdf"})"});
+        } else if (sink.onText) {
+            sink.onText("Owned document thumbnails");
+        }
+        return {};
+    }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
+
+private:
+    bool markdownOnly_ = false;
+    std::atomic<int> calls_{0};
+};
+
+// Observe actual card paints, including the first frame before decode completes.
+// Only the owned thumbnail's scheduling timer is paused; layout and native paint
+// events keep running, and releaseDecoding resumes the unchanged real renderer.
+class DocumentCardPaintProbe final : public QObject {
+public:
+    explicit DocumentCardPaintProbe(QWidget* panel) : panel_(panel) {
+        qApp->installEventFilter(this);
+    }
+    ~DocumentCardPaintProbe() override {
+        qApp->removeEventFilter(this);
+    }
+    void setPhase(const QString& phase) {
+        phase_ = phase;
+    }
+    void pauseDecoding() {
+        pauseDecoding_ = true;
+    }
+    void releaseDecoding() {
+        pauseDecoding_ = false;
+        const auto timers = pausedTimers_;
+        pausedTimers_.clear();
+        for (const auto& timer : timers)
+            if (timer) timer->start();
+    }
+    int loadingPaints(const QString& phase) const {
+        return loadingPaints_.value(phase);
+    }
+    const QStringList& failures() const {
+        return failures_;
+    }
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (pauseDecoding_ && event->type() == QEvent::Timer) {
+            auto* timer = qobject_cast<QTimer*>(watched);
+            auto* view = timer ? qobject_cast<QWidget*>(timer->parent()) : nullptr;
+            if (view && panel_ && panel_->isAncestorOf(view) &&
+                view->objectName() == QStringLiteral("agentDocumentThumbnail")) {
+                timer->stop();
+                pausedTimers_.push_back(timer);
+                return true;
+            }
+        }
+        if (event->type() != QEvent::Paint || !panel_) return false;
+        auto* widget = qobject_cast<QWidget*>(watched);
+        if (!widget || !panel_->isAncestorOf(widget)) return false;
+        auto* card = widget;
+        while (card && card != panel_ && card->objectName() != QStringLiteral("agentFileCard"))
+            card = card->parentWidget();
+        if (!card || card == panel_) return false;
+        auto* button = card->findChild<QPushButton*>(QStringLiteral("agentFileOpen"));
+        auto* view = card->findChild<QWidget*>(QStringLiteral("agentDocumentThumbnail"));
+        if (!button || !view || !button->isEnabled()) return false;
+        if (view->isVisible() && view->property("agentThumbnailState").toString() == QStringLiteral("loading"))
+            ++loadingPaints_[phase_];
+        QStringList clipped;
+        for (const auto* label : button->findChildren<QLabel*>()) {
+            if (label->objectName() != QStringLiteral("agentFileName") &&
+                label->objectName() != QStringLiteral("agentFileDetail"))
+                continue;
+            const QRect bounds(label->mapTo(button, QPoint()), label->size());
+            if (!button->rect().contains(bounds) || label->height() < label->fontMetrics().height())
+                clipped << QStringLiteral("%1=%2x%3").arg(label->objectName()).arg(label->width()).arg(label->height());
+        }
+        if (view->isVisible()) {
+            const QRect bounds(view->mapTo(button, QPoint()), view->size());
+            if (!button->rect().contains(bounds) || view->height() < view->heightForWidth(view->width()))
+                clipped << QStringLiteral("thumbnail=%1x%2").arg(view->width()).arg(view->height());
+        }
+        if (!clipped.isEmpty() && failures_.size() < 24)
+            failures_ << QStringLiteral("%1 paint: %2").arg(phase_, clipped.join(QStringLiteral(", ")));
+        return false;
+    }
+
+private:
+    QPointer<QWidget> panel_;
+    QString phase_ = QStringLiteral("initial loading");
+    bool pauseDecoding_ = true;
+    QVector<QPointer<QTimer>> pausedTimers_;
+    QMap<QString, int> loadingPaints_;
+    QStringList failures_;
 };
 
 class AgentFileDeliveryUiTest : public QObject {
@@ -131,6 +243,167 @@ class AgentFileDeliveryUiTest : public QObject {
         QVERIFY(!previewSeen);  // 隐藏 A 或已换根的 A 均不得打开旧文件。
     }
 private slots:
+    void documentCardLoadingPaintAndFailedRecoveryKeepTheirGeometry() {
+        QTemporaryDir workspace;
+        QVERIFY(workspace.isValid());
+        QFile markdown(workspace.filePath(QStringLiteral("report.md")));
+        QVERIFY(markdown.open(QIODevice::WriteOnly));
+        QVERIFY(markdown.write("# Owned loading document\n\nFirst screen remains readable.\n") > 0);
+        markdown.close();
+        QFile corrupt(workspace.filePath(QStringLiteral("corrupt.md")));
+        QVERIFY(corrupt.open(QIODevice::WriteOnly));
+        QCOMPARE(corrupt.write(QByteArray::fromHex("c080eda080")), qint64(5));
+        corrupt.close();
+        RemoteIMApplication app(QStringLiteral("owned-document-loading"), std::make_unique<FakeRemoteIMClient>());
+        MainWindow main(app);
+        AgentController controller(std::make_unique<ThumbnailDeliveringModel>(true), QString());
+        AgentChatPanel panel(controller, &main);
+        main.resize(1100, 760);
+        main.show();
+        panel.setGeometry(100, 60, 760, 650);
+        panel.show();
+        DocumentCardPaintProbe paints(&panel);
+        const QString session = controller.createSession(workspace.path());
+        panel.openSession(session);
+        QVERIFY(controller.sendPrompt(session, QStringLiteral("Deliver the owned loading document")));
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(panel.findChildren<QPushButton*>(QStringLiteral("agentFileOpen")).size(), 1, 5000);
+        auto* button = panel.findChild<QPushButton*>(QStringLiteral("agentFileOpen"));
+        auto* view = dynamic_cast<AgentDocumentThumbnailView*>(
+            button->findChild<QWidget*>(QStringLiteral("agentDocumentThumbnail")));
+        QVERIFY(view);
+        QTRY_VERIFY_WITH_TIMEOUT(button->isEnabled() && view->isVisible(), 5000);
+        QCOMPARE(view->property("agentThumbnailState").toString(), QStringLiteral("loading"));
+        button->repaint();
+        QTRY_VERIFY_WITH_TIMEOUT(paints.loadingPaints(QStringLiteral("initial loading")) > 0, 5000);
+        paints.releaseDecoding();
+        QTRY_VERIFY_WITH_TIMEOUT(!view->thumbnail().isNull(), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(button->rect().contains(QRect(view->mapTo(button, QPoint()), view->size())) &&
+                                     view->height() >= view->heightForWidth(view->width()),
+                                 5000);
+        const int expandedHeight = button->height();
+
+        // A real decoder failure must collapse to the original clickable card.
+        // Rebinding that same production card exercises recovery from hidden HFW.
+        paints.setPhase(QStringLiteral("decode failure"));
+        AgentDocumentThumbnailRequest bad;
+        bad.path = corrupt.fileName();
+        bad.allowedRoot = workspace.path();
+        bad.mimeType = QStringLiteral("text/markdown");
+        view->setDocument(bad);
+        QTRY_COMPARE_WITH_TIMEOUT(view->property("agentThumbnailState").toString(), QStringLiteral("unavailable"), 10000);
+        QVERIFY(view->isHidden() && view->thumbnail().isNull());
+        QVERIFY(button->isEnabled());
+        QTRY_VERIFY_WITH_TIMEOUT(button->height() < expandedHeight, 5000);
+        button->repaint();
+        paints.setPhase(QStringLiteral("retry loading"));
+        paints.pauseDecoding();
+        auto recovered = bad;
+        recovered.path = markdown.fileName();
+        view->setDocument(recovered);
+        button->repaint();
+        QTRY_VERIFY_WITH_TIMEOUT(paints.loadingPaints(QStringLiteral("retry loading")) > 0, 5000);
+        paints.releaseDecoding();
+        QTRY_VERIFY_WITH_TIMEOUT(!view->thumbnail().isNull(), 10000);
+        QCOMPARE(view->sourcePath(), markdown.fileName());
+        QVERIFY(button->isEnabled());
+        QVERIFY(controller.agent().listPendingPermissions().empty());
+        qInfo() << "[owned-document-loading-paints] initial"
+                << paints.loadingPaints(QStringLiteral("initial loading")) << "retry"
+                << paints.loadingPaints(QStringLiteral("retry loading")) << "clipped" << paints.failures();
+        QVERIFY2(paints.failures().isEmpty(), qPrintable(paints.failures().join(QLatin1Char('\n'))));
+    }
+    void documentCardsShowContentAndClickTheFullOriginalDocument() {
+        QTemporaryDir workspace;
+        QVERIFY(workspace.isValid());
+        {
+            QPdfWriter pdf(workspace.filePath(QStringLiteral("report.pdf")));
+            pdf.setResolution(72);
+            QPainter painter(&pdf);
+            painter.fillRect(QRect(30, 30, 400, 200), Qt::red);
+        }
+        const QByteArray original = QByteArray("# Original document\n\nOwned first screen.\n\n") +
+                                    QByteArray("Long body paragraph for the complete file preview.\n\n").repeated(100) +
+                                    "FULL PREVIEW TAIL 926\n";
+        QFile markdown(workspace.filePath(QStringLiteral("report.md")));
+        QVERIFY(markdown.open(QIODevice::WriteOnly));
+        QCOMPARE(markdown.write(original), qint64(original.size()));
+        markdown.close();
+        QFile bad(workspace.filePath(QStringLiteral("bad.pdf")));
+        QVERIFY(bad.open(QIODevice::WriteOnly));
+        QVERIFY(bad.write("%PDF-1.7\nowned malformed fixture") > 0);
+        bad.close();
+        RemoteIMApplication app(QStringLiteral("owned-document-thumbnails"), std::make_unique<FakeRemoteIMClient>());
+        MainWindow main(app);
+        AgentController controller(std::make_unique<ThumbnailDeliveringModel>(), QString());
+        AgentChatPanel panel(controller, &main);
+        main.resize(1100, 900);
+        main.show();
+        panel.setGeometry(100, 60, 760, 800);
+        panel.show();
+        const QString session = controller.createSession(workspace.path());
+        panel.openSession(session);
+        QVERIFY(controller.sendPrompt(session, QStringLiteral("Deliver owned documents")));
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(panel.findChildren<QPushButton*>(QStringLiteral("agentFileOpen")).size(), 3, 5000);
+        QPushButton* markdownOpen = nullptr;
+        AgentDocumentThumbnailView* markdownView = nullptr;
+        for (auto* button : panel.findChildren<QPushButton*>(QStringLiteral("agentFileOpen"))) {
+            QTRY_VERIFY_WITH_TIMEOUT(button->isEnabled(), 5000);
+            auto* view = dynamic_cast<AgentDocumentThumbnailView*>(
+                button->findChild<QWidget*>(QStringLiteral("agentDocumentThumbnail")));
+            QVERIFY(view);
+            if (button->accessibleName().contains(QStringLiteral("bad.pdf"))) {
+                QTRY_COMPARE_WITH_TIMEOUT(view->property("agentThumbnailState").toString(),
+                                          QStringLiteral("unavailable"), 10000);
+                QVERIFY(view->isHidden() && view->thumbnail().isNull());
+                QVERIFY(button->isEnabled());  // Decode failure retains the ordinary file action.
+            } else {
+                QTRY_VERIFY_WITH_TIMEOUT(!view->thumbnail().isNull(), 10000);
+                QVERIFY(button->rect().contains(view->geometry()));
+                if (button->accessibleName().contains(QStringLiteral("report.md"))) {
+                    markdownOpen = button;
+                    markdownView = view;
+                } else {
+                    const QColor sample =
+                        view->thumbnail().pixelColor(view->thumbnail().width() / 3, view->thumbnail().height() / 3);
+                    QVERIFY(sample.red() > 180 && sample.green() < 80 && sample.blue() < 80);
+                }
+            }
+        }
+        QVERIFY(markdownOpen && markdownView);
+        QCOMPARE(markdownView->sourcePath(), markdown.fileName());
+        const QImage first = markdownView->thumbnail();
+        QByteArray revised = original;
+        revised.replace("Original", "Revised!");  // Keep artifact byte metadata valid for the original click contract.
+        QSaveFile replacement(markdown.fileName());
+        QVERIFY(replacement.open(QIODevice::WriteOnly));
+        QCOMPARE(replacement.write(revised), qint64(revised.size()));
+        QVERIFY(replacement.commit());
+        QTRY_VERIFY_WITH_TIMEOUT(markdownView->thumbnail() != first && !markdownView->thumbnail().isNull(), 10000);
+        bool fullPreviewSeen = false;
+        QTimer closePreview;
+        connect(&closePreview, &QTimer::timeout, &panel, [&] {
+            for (auto* top : QApplication::topLevelWidgets()) {
+                auto* dialog = qobject_cast<QDialog*>(top);
+                if (!dialog || dialog->parentWidget() != &main || !dialog->isVisible()) continue;
+                auto* document = dialog->findChild<MarkdownView*>(QStringLiteral("filePreviewMarkdownView"));
+                if (!document) continue;
+                document->selectAll();
+                const QString full = document->selectedText();
+                fullPreviewSeen = full.contains(QStringLiteral("Revised! document")) &&
+                                  full.contains(QStringLiteral("FULL PREVIEW TAIL 926"));
+                dialog->reject();
+            }
+        });
+        closePreview.start(20);
+        QTest::mouseClick(markdownOpen, Qt::LeftButton, Qt::NoModifier,
+                         markdownView->mapTo(markdownOpen, markdownView->rect().center()));
+        QTRY_VERIFY_WITH_TIMEOUT(fullPreviewSeen, 5000);
+        QVERIFY(controller.agent().listPendingPermissions().empty());
+        const QString capture = qEnvironmentVariable("MAICHAT_AGENT_DOCUMENT_CAPTURE_PATH");
+        if (!capture.isEmpty()) QVERIFY(panel.grab().save(capture));
+    }
     void fileCardCompletionSurvivesSessionSwitch() {
         runOwnedCardCompletionRace(false);
     }

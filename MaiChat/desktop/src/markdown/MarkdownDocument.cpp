@@ -1,5 +1,5 @@
 // 文件作用：桌面端Markdown 内容解析与呈现；MarkdownDocument 负责Markdown 文档结构与块级内容组织，本文件给出其实现。
-// 主要入口：parse、plainText。
+// 主要入口：parse、prefixForPreview、plainText。
 // 直接依赖：md4c.h；实现与这些接口协作。
 #include "markdown/MarkdownDocument.h"
 
@@ -583,6 +583,80 @@ MarkdownDocument MarkdownDocument::parse(const QString& markdown) {
 
     document.mBlocks = builder.blocks;
     return document;
+}
+
+MarkdownDocument MarkdownDocument::prefixForPreview(int maxBlocks, int maxCharacters) const {
+    MarkdownDocument prefix;
+    prefix.mSource = mSource;
+    if (maxBlocks <= 0 || maxCharacters <= 0) return prefix;
+
+    int remaining = maxCharacters;
+    int nodes = 512;
+    const auto takeText = [&remaining](const QString& text) {
+        const int count = qMin(remaining, static_cast<int>(text.size()));
+        QString clipped = text.left(count);
+        // 不把 UTF-16 代理对截成半个字形；用完预算后停止，而不是跳过剩余文本。
+        if (!clipped.isEmpty() && clipped.back().isHighSurrogate()) clipped.chop(1);
+        remaining -= qMax(1, static_cast<int>(clipped.size()));
+        if (clipped.size() < text.size()) remaining = 0;
+        return clipped;
+    };
+    const auto takeSpans = [&remaining, &nodes, &takeText](const QVector<MarkdownSpan>& spans) {
+        QVector<MarkdownSpan> clipped;
+        for (const auto& span : spans) {
+            if (remaining <= 0 || nodes <= 0) break;
+            --nodes;
+            MarkdownSpan copy = span;
+            copy.text = takeText(span.text);
+            clipped.push_back(std::move(copy));
+        }
+        return clipped;
+    };
+    for (const auto& original : mBlocks) {
+        if (remaining <= 0 || nodes <= 0 || prefix.mBlocks.size() >= maxBlocks) break;
+        --nodes;
+        MarkdownBlock block = original;
+        switch (original.kind) {
+            case MarkdownBlockKind::Code:
+                block.code = takeText(original.code);
+                break;
+            case MarkdownBlockKind::List:
+                block.items.clear();
+                for (const auto& item : original.items) {
+                    if (remaining <= 0 || nodes <= 0) break;
+                    --nodes;
+                    --remaining;
+                    MarkdownListItem copy = item;
+                    copy.spans = takeSpans(item.spans);
+                    block.items.push_back(std::move(copy));
+                }
+                break;
+            case MarkdownBlockKind::Table:
+                block.rows.clear();
+                for (const auto& row : original.rows) {
+                    if (remaining <= 0 || nodes <= 0) break;
+                    --nodes;
+                    --remaining;
+                    QVector<QVector<MarkdownSpan>> clipped;
+                    for (const auto& cell : row) {
+                        if (remaining <= 0 || nodes <= 0) break;
+                        --nodes;
+                        --remaining;
+                        clipped.push_back(takeSpans(cell));
+                    }
+                    if (!clipped.isEmpty()) block.rows.push_back(std::move(clipped));
+                }
+                break;
+            case MarkdownBlockKind::Divider:
+                --remaining;
+                break;
+            default:
+                block.spans = takeSpans(original.spans);
+                break;
+        }
+        prefix.mBlocks.push_back(std::move(block));
+    }
+    return prefix;
 }
 
 QString markdownCalloutTitle(MarkdownCallout callout) {

@@ -130,6 +130,11 @@ public:
     // 否则同一段文字在 agent 和 IM 里会渲染成两样。
     static MarkdownDocument parse(const QString& markdown);
 
+    // 渲染首屏的纯数据前缀：保留完整解析后的样式、引用和链接，避免截原文重解析改变语义。
+    // 字符预算也计空结构节点，另封顶 512 个树节点；只改返回副本，source() 仍为原文。
+    // 非正预算返回空树。
+    MarkdownDocument prefixForPreview(int maxBlocks, int maxCharacters) const;
+
     const QVector<MarkdownBlock>& blocks() const {
         return mBlocks;
     }

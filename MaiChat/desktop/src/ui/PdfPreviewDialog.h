@@ -4,6 +4,7 @@
 
 #include <QString>
 #ifdef Q_OS_WIN
+#include <QByteArray>
 #include <QImage>
 #endif
 
@@ -21,4 +22,6 @@ struct PdfPreviewPage {
   QString error;
 };
 PdfPreviewPage renderWindowsPdfPage(const QString &path, int pageIndex);
+// Immutable bytes use the same native decoder as full path preview. Call off the GUI thread.
+PdfPreviewPage renderWindowsPdfPageBytes(const QByteArray &bytes, int pageIndex);
 #endif

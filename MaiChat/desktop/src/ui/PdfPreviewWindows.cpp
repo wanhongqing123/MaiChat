@@ -19,16 +19,27 @@
 
 // 作用：用 Windows PDF 接口渲染指定页并返回图像与尺寸。
 PdfPreviewPage renderWindowsPdfPage(const QString &path, int pageIndex) {
+  // Keep the ordinary path API, but bind native decoding to the bounded bytes
+  // just read. The same core also accepts immutable thumbnail snapshots.
+  QFile file(path);
+  constexpr qint64 maxBytes = 100LL * 1024 * 1024;
+  if (!file.open(QIODevice::ReadOnly) || file.size() > maxBytes)
+    return {{}, 0, QStringLiteral("PDF file could not be read")};
+  const QByteArray bytes = file.read(maxBytes + 1);
+  if (file.error() != QFileDevice::NoError || bytes.size() > maxBytes || !file.atEnd())
+    return {{}, 0, QStringLiteral("PDF file could not be read")};
+  return renderWindowsPdfPageBytes(bytes, pageIndex);
+}
+
+PdfPreviewPage renderWindowsPdfPageBytes(const QByteArray &pdfBytes, int pageIndex) {
   PdfPreviewPage result;
   bool apartmentInitialized = false;
   try {
+    if (pdfBytes.size() > 100LL * 1024 * 1024)
+      throw std::runtime_error("PDF file could not be read");
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     apartmentInitialized = true;
     using namespace winrt::Windows;
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly) || file.size() > 100LL * 1024 * 1024)
-      throw std::runtime_error("PDF file could not be read");
-    const QByteArray pdfBytes = file.readAll();
     Storage::Streams::InMemoryRandomAccessStream source;
     {
       Storage::Streams::DataWriter writer(source);

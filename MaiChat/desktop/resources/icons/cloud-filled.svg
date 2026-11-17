@@ -1,0 +1,4 @@
+<!-- Same cloud contour and outer stroke, with a solid selected interior. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 48 48" fill="currentColor" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14 36C7 36 6 29 10 25C10 20 14 16 19 16C22 10 28 9 33 14C35 16 36 18 37 21C43 23 43 31 38 35Q36 36 33 36Z"/>
+</svg>

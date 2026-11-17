@@ -17,4 +17,5 @@ struct StarterEntry {
     QStringList toolNames;
 };
 
+// 只返回实际公开工具的说明卡片；普通聊天不依赖卡片，空工具列表返回空目录。
 QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools);

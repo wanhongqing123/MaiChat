@@ -82,6 +82,7 @@
 #include "MaiIMHistoryFormat.h"
 #include "MaiQuestionTranscript.h"
 #include "agent/AgentController.h"
+#include "agent/AgentDocumentThumbnailView.h"
 #include "agent/AgentToolGroupWidget.h"
 #include "agent/StarterCatalog.h"
 #include "markdown/MarkdownView.h"
@@ -3436,8 +3437,8 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
     }
 }
 
-bool AgentChatPanel::appendAgentFileCard(const QString& messageId, const QString& partId,
-                                        const QString& output, const QString& workspace) {
+bool AgentChatPanel::appendAgentFileCard(const QString& messageId, const QString& partId, const QString& output,
+                                         const QString& workspace) {
     const QString id = partId + QStringLiteral("-agent-file");
     if (runtime_->view->contains(id)) return true;
     const auto artifact = QJsonDocument::fromJson(output.toUtf8()).object();
@@ -3446,41 +3447,70 @@ bool AgentChatPanel::appendAgentFileCard(const QString& messageId, const QString
     const QString mime = artifact.value(QStringLiteral("mime_type")).toString();
     const qint64 bytes = artifact.value(QStringLiteral("bytes")).toInteger(-1);
     if (artifact.value(QStringLiteral("delivery")).toString() != QStringLiteral("current_ai_session") ||
-        artifact.value(QStringLiteral("type")).toString() != QStringLiteral("file") ||
-        relative.isEmpty() || QFileInfo(relative).isAbsolute() || name.isEmpty() || mime.isEmpty() ||
-        bytes <= 0 || bytes > 512LL * 1024 * 1024) return false;
+        artifact.value(QStringLiteral("type")).toString() != QStringLiteral("file") || relative.isEmpty() ||
+        QFileInfo(relative).isAbsolute() || name.isEmpty() || mime.isEmpty() || bytes <= 0 ||
+        bytes > 512LL * 1024 * 1024)
+        return false;
 
+    // 原生按钮不把自有布局计入 sizeHint；显式沿布局测量，兼顾 Cocoa 和窄聊天列。
+    class FileCardButton final : public QPushButton {
+    public:
+        using QPushButton::QPushButton;
+        QSize sizeHint() const override {
+            return {UiZoom::s(340), heightForWidth(UiZoom::s(340))};
+        }
+        QSize minimumSizeHint() const override {
+            return {64, 0};
+        }
+        bool hasHeightForWidth() const override {
+            // QWidgetItem reads our layout directly: a hidden/failed preview has
+            // no HFW layout, so advertise its metadata sizeHint instead of -1.
+            return layout() && layout()->hasHeightForWidth();
+        }
+        int heightForWidth(int width) const override {
+            if (!layout()) return QPushButton::sizeHint().height();
+            const int height = layout()->totalHeightForWidth(width);
+            return height >= 0 ? height : layout()->sizeHint().height();
+        }
+    };
     auto* card = new QWidget;
     card->setObjectName(QStringLiteral("agentFileCard"));
+    card->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
+    card->setMaximumWidth(UiZoom::s(340));
     auto* column = new QVBoxLayout(card);
     column->setContentsMargins(0, 0, 0, 0);
-    auto* open = new QPushButton(card);
+    auto* open = new FileCardButton(card);
     open->setObjectName(QStringLiteral("agentFileOpen"));
     open->setAccessibleName(QStringLiteral("打开文件 %1").arg(name));
     open->setCursor(Qt::PointingHandCursor);
-    open->setFixedWidth(UiZoom::s(340));
-    UiZoom::setStyle(open, QStringLiteral("QPushButton{background:#f3f8ff;border:1px solid #c9ddf7;"
-        "border-radius:12px;text-align:left;color:#175a9e;} QPushButton:hover{background:#e9f3ff;}"));
-    auto* row = new QHBoxLayout(open);
-    row->setContentsMargins(14, 12, 14, 12);
+    open->setMaximumWidth(UiZoom::s(340));
+    UiZoom::setStyle(
+        open,
+        QStringLiteral("QPushButton{background:#f3f8ff;border:1px solid #c9ddf7;"
+                       "border-radius:12px;text-align:left;color:#175a9e;} QPushButton:hover{background:#e9f3ff;}"));
+    auto* buttonColumn = new QVBoxLayout(open);
+    buttonColumn->setContentsMargins(UiZoom::s(14), UiZoom::s(12), UiZoom::s(14), UiZoom::s(12));
+    auto* row = new QHBoxLayout;
+    row->setContentsMargins(0, 0, 0, 0);
+    buttonColumn->addLayout(row);
     auto* symbol = new QLabel(QStringLiteral("▤"), open);
     UiZoom::setStyle(symbol, QStringLiteral("font-size:@heading3;color:#1687d4;background:transparent;"));
     row->addWidget(symbol);
     auto* labels = new QVBoxLayout;
     auto* title = new QLabel(name, open);
+    title->setTextFormat(Qt::PlainText);
+    title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     title->setObjectName(QStringLiteral("agentFileName"));
     UiZoom::setStyle(title, QStringLiteral("font-size:@detail;color:#172033;background:transparent;"));
     title->setToolTip(name);
     title->setText(title->fontMetrics().elidedText(name, Qt::ElideMiddle, UiZoom::s(270)));
     labels->addWidget(title);
     auto* detail = new QLabel(QStringLiteral("正在检查文件…"), open);
+    detail->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     detail->setObjectName(QStringLiteral("agentFileDetail"));
     UiZoom::setStyle(detail, QStringLiteral("font-size:@metadata;color:#667085;background:transparent;"));
     labels->addWidget(detail);
     row->addLayout(labels, 1);
-    // QPushButton 的原生 sizeHint 不包含自有两行布局；让内容决定最小高度，
-    // 否则 Cocoa 会按普通单行按钮裁掉文件名和大小，只留下空白边框。
-    open->setMinimumHeight(row->sizeHint().height());
     column->addWidget(open);
     const QString caption = artifact.value(QStringLiteral("caption")).toString();
     if (!caption.isEmpty()) {
@@ -3496,31 +3526,69 @@ bool AgentChatPanel::appendAgentFileCard(const QString& messageId, const QString
     const auto ownsWorkspace = [panel, ownerSession, workspace] {
         MaiSession current;
         return panel && panel->runtime_->controller->agent().getSession(toUtf8(ownerSession), current) &&
-            current.directory == toUtf8(workspace);
+               current.directory == toUtf8(workspace);
     };
+    AgentDocumentThumbnailView* thumbnail = nullptr;
+    if (agentDocumentThumbnailKind(relative, mime) != AgentDocumentThumbnailKind::Unsupported) {
+        thumbnail = new AgentDocumentThumbnailView(
+            open, ownsWorkspace,
+            [] { return std::make_pair(UiZoom::markdownScale(), UiZoom::fontFamilies().first()); },
+            [cardGuard, openGuard = QPointer<QPushButton>(open)] {
+                if (!cardGuard || !openGuard) return;
+                // MarkdownView observes the outer row, not nested layout requests.
+                // Remeasure loading/fallback transitions before the next paint so
+                // a newly visible preview cannot squeeze metadata into a few pixels.
+                if (openGuard->layout()) openGuard->layout()->invalidate();
+                openGuard->updateGeometry();
+                if (cardGuard->layout()) cardGuard->layout()->invalidate();
+                cardGuard->updateGeometry();
+                QEvent request(QEvent::LayoutRequest);
+                QApplication::sendEvent(cardGuard.data(), &request);
+            });
+        buttonColumn->addWidget(thumbnail);
+    }
     // 首次展示与点击都复用普通 Core 校验，元数据 I/O 不挤占 GUI 或模型事件回调。
-    const auto validate = [panel, cardGuard, open, detail, workspace, relative, name, mime, bytes, ownerSession, ownsWorkspace](bool preview) {
+    const auto validate = [panel, cardGuard, open, detail, thumbnail, workspace, relative, name, mime, bytes,
+                           ownerSession, ownsWorkspace](bool preview) {
         if (!panel || !cardGuard) return;
         open->setEnabled(false);
         // 同一个 session 可换工作区；排队前和回填时都核对所属 session 的原始目录。
         if (!ownsWorkspace()) {
+            if (thumbnail) thumbnail->clear();
+            if (!panel || !cardGuard) return;  // Layout notification may remove the card.
             detail->setText(QStringLiteral("文件已移动或不可用"));
             return;
         }
         auto* watcher = new QFutureWatcher<MaiResult<MaiAgentFile>>(cardGuard);
-        QObject::connect(watcher, &QFutureWatcher<MaiResult<MaiAgentFile>>::finished, cardGuard,
-            [watcher, panel, cardGuard, open, detail, workspace, name, mime, bytes, preview, ownerSession, ownsWorkspace] {
+        QObject::connect(
+            watcher, &QFutureWatcher<MaiResult<MaiAgentFile>>::finished, cardGuard,
+            [watcher, panel, cardGuard, open, detail, thumbnail, workspace, name, mime, bytes, preview, ownerSession,
+             ownsWorkspace] {
                 const auto result = watcher->result();
                 watcher->deleteLater();
                 if (!panel || !cardGuard) return;
                 const bool valid = ownsWorkspace() && result && result.value().name == toUtf8(name) &&
-                    result.value().mimeType == toUtf8(mime) && result.value().bytes == std::uint64_t(bytes);
-                detail->setText(valid ? QStringLiteral("%1 · 预览或另存为").arg(
-                    QLocale().formattedDataSize(bytes)) : QStringLiteral("文件已移动或不可用"));
+                                   result.value().mimeType == toUtf8(mime) &&
+                                   result.value().bytes == std::uint64_t(bytes);
+                detail->setText(valid ? QStringLiteral("%1 · 预览或另存为").arg(QLocale().formattedDataSize(bytes))
+                                      : QStringLiteral("文件已移动或不可用"));
+                QString path;
+                if (valid) {
+                    path = QDir(workspace).filePath(fromUtf8(result.value().relativePath));
+                    if (thumbnail) {
+                        AgentDocumentThumbnailRequest request;
+                        request.path = path;
+                        request.allowedRoot = workspace;
+                        request.mimeType = mime;
+                        thumbnail->setDocument(request);
+                    }
+                } else if (thumbnail) {
+                    thumbnail->clear();
+                }
+                if (!panel || !cardGuard) return;  // Synchronous row remeasurement can delete its owner.
                 open->setEnabled(valid);
                 // A 的存活卡片即使暂时切到 B，也应完成元数据回填；只有预览要求 A 可见。
                 if (!valid || !preview || panel->sessionId() != ownerSession) return;
-                const QString path = QDir(workspace).filePath(fromUtf8(result.value().relativePath));
                 // 与 IM 文件卡片共用现有 PDF/Markdown/HTML 预览和其它类型的另存为。
                 if (auto* main = dynamic_cast<MainWindow*>(panel->window()))
                     main->openFilePreview(RemoteIMFileAttachment{path, name, mime, bytes});

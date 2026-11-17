@@ -29,9 +29,9 @@ QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools)
         {QStringLiteral("图片查看"), QStringLiteral("图"),
          QStringLiteral("让支持图片的当前主模型查看已有图片，说明画面内容。"),
          QStringLiteral("view_image"), QStringLiteral("查看工作目录中的指定图片，说明画面内容。")},
-        {QStringLiteral("桌面截屏"), QStringLiteral("屏"),
-         QStringLiteral("截取当前整屏画面；查看结束后可停止屏幕采集。"),
-         QStringLiteral("screenshot"), QStringLiteral("查看当前屏幕上的报错，说明报错内容。")},
+        {QStringLiteral("电脑操作"), QStringLiteral("控"),
+         QStringLiteral("像人一样查看屏幕，使用鼠标和键盘操作电脑。"),
+         QStringLiteral("desktop_computer screenshot"), QStringLiteral("在电脑上完成我指定的操作。")},
         {QStringLiteral("网页检索"), QStringLiteral("搜"),
          QStringLiteral("使用当前主模型供应商的搜索与网页读取能力查找资料。"),
          QStringLiteral("web_search web_fetch"), QStringLiteral("搜索指定主题的公开资料，并给出来源。")},
@@ -49,10 +49,6 @@ QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools)
         {QStringLiteral("SSH 远程命令"), QStringLiteral("连"),
          QStringLiteral("连接指定 SSH 主机执行命令；密码和主机指纹交给本机确认。"),
          QStringLiteral("ssh_exec"), QStringLiteral("连接我指定的主机查看系统版本，先确认主机、端口和用户名。")},
-        {QStringLiteral("电脑操作"), QStringLiteral("控"),
-         QStringLiteral("按任务需要观察屏幕或窗口，通过点击、键盘和拖动操作桌面应用。"),
-         QStringLiteral("desktop_computer"),
-         QStringLiteral("双击打开桌面上的“软件名称”；找不到就明确告诉我，不要换其他方式反复尝试。")},
         {QStringLiteral("会话定时任务"), QStringLiteral("时"),
          QStringLiteral("安排、查看、修改或取消本会话未来执行的任务。"),
          QStringLiteral("maichat_session_task_list maichat_session_task_create maichat_session_task_update maichat_session_task_cancel"),
@@ -179,9 +175,8 @@ QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools)
     QSet<QString> available;
     for (const auto& tool : tools) available.insert(QString::fromStdString(tool.name));
     QSet<QString> covered;
-    QList<StarterEntry> entries{{QStringLiteral("AI 问答"), QStringLiteral("AI"),
-                                QStringLiteral("解释问题、整理思路与起草文字。"),
-                                QStringLiteral("使用 AI 问答帮我把这段想法整理成行动清单。"), {}}};
+    // 普通聊天仍使用原输入框；欢迎页只列当前声明可用的工具能力，不另设问答卡片。
+    QList<StarterEntry> entries;
     for (const auto& group : groups) {
         QStringList names;
         const QStringList candidates = group.toolNames.split(QLatin1Char(' '), Qt::SkipEmptyParts);
@@ -191,10 +186,20 @@ QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools)
         if (names.isEmpty()) continue;
         // The first currently available member supplies the example's exact ID.
         // A partial host registration must not inherit another member's recipe.
-        const QString goal = names.first() == candidates.first()
-                                 ? group.goal
-                                 : QStringLiteral("先说明这项能力支持的操作和所需参数，缺少目标时先问我。");
-        entries.append({group.name, group.symbol, group.purpose,
+        QString goal = names.first() == candidates.first()
+                           ? group.goal
+                           : QStringLiteral("先说明这项能力支持的操作和所需参数，缺少目标时先问我。");
+        QString purpose = group.purpose;
+        QString symbol = group.symbol;
+        // 截图与电脑输入属于同一张卡；部分注册时只描述真实可用的成员，
+        // 不能因卡片合并就向仅有截图的模型承诺鼠标或键盘操作。
+        if (candidates.contains(QStringLiteral("desktop_computer")) &&
+            !names.contains(QStringLiteral("desktop_computer"))) {
+            purpose = QStringLiteral("查看当前电脑屏幕，说明画面内容。");
+            symbol = QStringLiteral("屏");
+            goal = QStringLiteral("查看当前屏幕上的报错，说明报错内容。");
+        }
+        entries.append({group.name, symbol, purpose,
                         QStringLiteral("使用%1工具（%2）帮我%3").arg(group.name, names.first(), goal), names});
         for (const QString& name : names) covered.insert(name);
     }
