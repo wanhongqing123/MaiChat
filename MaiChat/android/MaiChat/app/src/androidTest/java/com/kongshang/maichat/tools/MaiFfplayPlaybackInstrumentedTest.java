@@ -44,6 +44,79 @@ import org.junit.runner.RunWith;
 
 @RunWith(AndroidJUnit4.class)
 public final class MaiFfplayPlaybackInstrumentedTest {
+    @Test public void manualLandscapeKeepsPausedSessionAndRestoresPortraitOnClose() throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        Activity activity = InstrumentationRegistry.getInstrumentation().startActivitySync(
+            new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        File video = new File(context.getCacheDir(), "owned-rotation-" + java.util.UUID.randomUUID() + ".mp4");
+        UiAutomation ui = InstrumentationRegistry.getInstrumentation().getUiAutomation();
+        try {
+            ui.setRotation(UiAutomation.ROTATION_FREEZE_0);
+            try (InputStream input = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("gallery-sample.mp4");
+                 FileOutputStream output = new FileOutputStream(video)) {
+                byte[] bytes = new byte[8192]; int n;
+                while ((n = input.read(bytes)) >= 0) output.write(bytes, 0, n);
+            }
+            int original = activity.getRequestedOrientation();
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() ->
+                assertTrue(((MainActivity) activity).openAgentVideo(video.getAbsolutePath(), 0)));
+            awaitVideo(video.getAbsolutePath());
+            MaiFfplayVideoView player = MaiFfplayVideoView.activeView();
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> assertTrue(player.command("pause")));
+            long deadline = SystemClock.uptimeMillis() + 5000;
+            while (rotationStatus(player)[3] != 1 && SystemClock.uptimeMillis() < deadline) SystemClock.sleep(30);
+            long handle = rotationHandle(player), position = rotationStatus(player)[0];
+            assertEquals(1, rotationStatus(player)[3]);
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+                View button = findDescription(player, "横屏播放");
+                assertNotNull("player needs a manual landscape control", button);
+                assertTrue(button.performClick());
+            });
+            deadline = SystemClock.uptimeMillis() + 8000;
+            while (activity.getResources().getConfiguration().orientation != Configuration.ORIENTATION_LANDSCAPE
+                    && SystemClock.uptimeMillis() < deadline) SystemClock.sleep(30);
+            assertEquals(Configuration.ORIENTATION_LANDSCAPE, activity.getResources().getConfiguration().orientation);
+            // Configuration先到，Dialog/TextureView随后才完成重排；不能采中间态当横屏结果。
+            deadline = SystemClock.uptimeMillis() + 8000;
+            while ((player.getWidth() <= player.getHeight() || player.isLayoutRequested())
+                    && SystemClock.uptimeMillis() < deadline) SystemClock.sleep(30);
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+            ui.waitForIdle(500, 5000);
+            assertTrue("player surface must fill the stable landscape window", player.getWidth() > player.getHeight());
+            assertSame(player, MaiFfplayVideoView.activeView());
+            assertEquals(handle, rotationHandle(player));
+            assertEquals(1, rotationStatus(player)[3]);
+            assertTrue(Math.abs(position - rotationStatus(player)[0]) < 250000);
+            captureScreen(context, "android-manual-landscape-paused.png");
+            Bitmap stable = ui.takeScreenshot();
+            assertNotNull(stable);
+            assertTrue("screen framebuffer must really be landscape", stable.getWidth() > stable.getHeight());
+            stable.recycle();
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+                View close = findDescription(player.getRootView(), "关闭视频");
+                assertNotNull(close); assertTrue(close.performClick());
+            });
+            deadline = SystemClock.uptimeMillis() + 8000;
+            while ((MaiFfplayVideoView.activeView() != null || activity.getResources().getConfiguration().orientation != Configuration.ORIENTATION_PORTRAIT)
+                    && SystemClock.uptimeMillis() < deadline) SystemClock.sleep(30);
+            assertEquals(null, MaiFfplayVideoView.activeView());
+            assertEquals(original, activity.getRequestedOrientation());
+            assertEquals(Configuration.ORIENTATION_PORTRAIT, activity.getResources().getConfiguration().orientation);
+        } finally {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(activity::finish);
+            video.delete(); ui.setRotation(UiAutomation.ROTATION_UNFREEZE);
+        }
+    }
+
+    private static long rotationHandle(MaiFfplayVideoView view) throws Exception {
+        Field handle = MaiFfplayVideoView.class.getDeclaredField("playbackHandle");
+        handle.setAccessible(true); return handle.getLong(view);
+    }
+    private static long[] rotationStatus(MaiFfplayVideoView view) throws Exception {
+        java.lang.reflect.Method status = MaiFfplayVideoView.class.getDeclaredMethod("nativePlaybackStatus", long.class);
+        status.setAccessible(true); return (long[]) status.invoke(null, rotationHandle(view));
+    }
+
     @Test public void swipingGalleryMovesFromImageToVideoAndBack() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         Activity activity = InstrumentationRegistry.getInstrumentation().startActivitySync(

@@ -9,6 +9,7 @@ import android.graphics.Bitmap;
 import android.graphics.Typeface;
 import android.graphics.drawable.RippleDrawable;
 import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
@@ -28,6 +29,7 @@ public final class MaiFfplayVideoView extends FrameLayout {
     public interface OnVideoSwipeListener {
         void onVideoSwipe(int direction);
     }
+    public interface OnOrientationToggleListener { boolean toggle(); }
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static volatile WeakReference<MaiFfplayVideoView> active = new WeakReference<>(null);
 
@@ -45,6 +47,8 @@ public final class MaiFfplayVideoView extends FrameLayout {
     private final TextView errorLabel;
     private final ImageButton playButton;
     private final Button speedButton;
+    private final ImageButton orientationButton;
+    private OnOrientationToggleListener orientationListener;
     private final LinearLayout speedChoices;
     private final FrameLayout.LayoutParams controlsLayout;
     private final FrameLayout.LayoutParams speedChoicesLayout;
@@ -69,6 +73,7 @@ public final class MaiFfplayVideoView extends FrameLayout {
                 }
             }
             MAIN.postDelayed(this, 500);
+            updateOrientationDescription();
         }
     };
     private String videoPath;
@@ -174,6 +179,18 @@ public final class MaiFfplayVideoView extends FrameLayout {
             MaiChatTheme.rounded(Color.WHITE, 8, context)));
         speedButton.setContentDescription("播放倍速");
         controls.addView(speedButton, new LinearLayout.LayoutParams(dp(56), dp(44)));
+        orientationButton = new ImageButton(context);
+        orientationButton.setImageResource(android.R.drawable.ic_menu_always_landscape_portrait);
+        orientationButton.setImageTintList(ColorStateList.valueOf(Color.WHITE));
+        orientationButton.setBackgroundColor(Color.TRANSPARENT);
+        orientationButton.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        orientationButton.setPadding(dp(11), dp(11), dp(11), dp(11));
+        orientationButton.setContentDescription("横屏播放");
+        orientationButton.setVisibility(GONE);
+        orientationButton.setOnClickListener(view -> {
+            if (orientationListener != null && orientationListener.toggle()) updateOrientationDescription();
+        });
+        controls.addView(orientationButton, new LinearLayout.LayoutParams(dp(44), dp(44)));
         controlsLayout = new LayoutParams(LayoutParams.MATCH_PARENT,
             LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
         controlsLayout.setMargins(dp(16), 0, dp(16), dp(4));
@@ -215,6 +232,22 @@ public final class MaiFfplayVideoView extends FrameLayout {
         controlsLayout.bottomMargin = dp(Math.max(0, bottomDp) + 4);
         speedChoicesLayout.bottomMargin = dp(Math.max(0, bottomDp) + 74);
         requestLayout();
+    }
+
+    public void setOnOrientationToggleListener(OnOrientationToggleListener listener) {
+        orientationListener = listener;
+        orientationButton.setVisibility(listener == null ? GONE : VISIBLE);
+        updateOrientationDescription();
+    }
+
+    @Override protected void onConfigurationChanged(Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        updateOrientationDescription();
+    }
+
+    private void updateOrientationDescription() {
+        orientationButton.setContentDescription(getResources().getConfiguration().orientation
+            == Configuration.ORIENTATION_LANDSCAPE ? "竖屏播放" : "横屏播放");
     }
 
     private static String timestamp(long microseconds) {

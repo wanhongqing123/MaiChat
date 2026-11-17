@@ -3,6 +3,8 @@ package com.kongshang.maichat;
 
 import android.app.Activity;
 import android.app.Dialog;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
 import android.os.Build;
@@ -17,11 +19,44 @@ import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 
 final class MaiVideoPreviewDialog extends Dialog {
+    private final Activity activity;
     private View insetContent;
+    private boolean ownsOrientation;
+    private boolean requestedLandscape;
+    private int originalOrientation;
+    private int lastOrientation;
 
     MaiVideoPreviewDialog(Activity activity) {
         super(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+        this.activity = activity;
         setCanceledOnTouchOutside(false);
+    }
+
+    // 只修改本次播放呈现的方向请求，不移动/重建视频View或原生播放会话。
+    boolean toggleOrientation() {
+        if (!isShowing() || activity.isFinishing() || activity.isDestroyed()) return false;
+        if (!ownsOrientation) {
+            originalOrientation = activity.getRequestedOrientation();
+            requestedLandscape = activity.getResources().getConfiguration().orientation
+                == Configuration.ORIENTATION_LANDSCAPE;
+            ownsOrientation = true;
+        }
+        requestedLandscape = !requestedLandscape;
+        lastOrientation = requestedLandscape ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            : ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT;
+        activity.setRequestedOrientation(lastOrientation);
+        return true;
+    }
+
+    @Override protected void onStop() {
+        // Back、关闭、宿主回收都经过此路径；不覆盖后来由别的页面设置的方向。
+        if (ownsOrientation) {
+            ownsOrientation = false;
+            if (!activity.isFinishing() && !activity.isDestroyed()
+                    && activity.getRequestedOrientation() == lastOrientation)
+                activity.setRequestedOrientation(originalOrientation);
+        }
+        super.onStop();
     }
 
     @Override protected void onStart() {

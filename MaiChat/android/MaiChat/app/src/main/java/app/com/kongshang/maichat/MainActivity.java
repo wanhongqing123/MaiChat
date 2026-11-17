@@ -5732,7 +5732,7 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         List<GalleryItem> playlist = normalizeGallery(path, true, candidates);
         final int[] selected = {galleryIndex(playlist, path, true)};
         final String[] currentPath = {path};
-        Dialog dialog = new MaiVideoPreviewDialog(this);
+        MaiVideoPreviewDialog dialog = new MaiVideoPreviewDialog(this);
         LinearLayout rootView = new LinearLayout(this);
         rootView.setOrientation(LinearLayout.VERTICAL);
         rootView.setBackgroundColor(Color.BLACK);
@@ -5743,6 +5743,7 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         // 44dp 点击区加上下各 8dp；操作行与播放器预留使用同一高度，避免留下空白或遮挡。
         final int actionsHeightDp = 60;
         MaiFfplayVideoView video = new MaiFfplayVideoView(this);
+        video.setOnOrientationToggleListener(dialog::toggleOrientation);
         video.setControlsBottomInset(cloudVod == null ? actionsHeightDp : 0);
         if (cloudVod != null) video.setCloudVodHandle(cloudVod.handle());
         video.setVideoPath(path, startPositionUs);

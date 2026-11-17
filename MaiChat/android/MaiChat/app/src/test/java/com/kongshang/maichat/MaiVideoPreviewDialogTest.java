@@ -29,6 +29,23 @@ import static org.junit.Assert.*;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34, manifest = Config.NONE)
 public class MaiVideoPreviewDialogTest {
+    @Test public void manualRotationRestoresPriorActivityRequestAndKeepsContent() throws Exception {
+        Activity activity = Robolectric.buildActivity(Activity.class).setup().get();
+        activity.setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+        MaiVideoPreviewDialog dialog = new MaiVideoPreviewDialog(activity);
+        FrameLayout player = new FrameLayout(activity);
+        dialog.setContentView(player);
+        dialog.show();
+        java.lang.reflect.Method toggle = MaiVideoPreviewDialog.class.getDeclaredMethod("toggleOrientation");
+        assertEquals(true, toggle.invoke(dialog));
+        assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE, activity.getRequestedOrientation());
+        assertSame(player, ((ViewGroup) dialog.findViewById(android.R.id.content)).getChildAt(0));
+        assertEquals(true, toggle.invoke(dialog));
+        assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT, activity.getRequestedOrientation());
+        dialog.dismiss();
+        assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT, activity.getRequestedOrientation());
+    }
+
     @Test public void independentWindowLeavesTheOriginalPageScrollAndDraftIntact() {
         Activity activity = Robolectric.buildActivity(Activity.class).setup().get();
         FrameLayout page = new FrameLayout(activity);
@@ -64,6 +81,17 @@ public class MaiVideoPreviewDialogTest {
         assertSame(draft, conversation.getChildAt(1));
         assertEquals("Unsent draft", draft.getText().toString());
         assertEquals(originalScroll, scroll.getScrollY());
+    }
+
+    @Test public void closingDoesNotOverwriteANewerOrientationOwner() {
+        Activity activity = Robolectric.buildActivity(Activity.class).setup().get();
+        MaiVideoPreviewDialog dialog = new MaiVideoPreviewDialog(activity);
+        dialog.show();
+        assertTrue(dialog.toggleOrientation());
+        activity.setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT);
+        dialog.dismiss();
+        assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT,
+            activity.getRequestedOrientation());
     }
 
     @Test public void videoCoversTheViewportAndOwnsBackInsteadOfPassingInputToThePage() {
