@@ -84,7 +84,12 @@ Mac's controlled-deployment report identifies Auth PID 173186 and Signer
 100,000,000 / quota 500,000,000,000. Sync PID 173208 retains its old working
 directory and entry hash. Both database online backups passed quick_check and
 the five-column migration rehearsal passed on backup copies; no live restore
-was performed. Existing configuration/drop-in/dependency hashes are unchanged.
+was performed. Unit/drop-in/dependency fingerprints and the environment files
+captured before the task match. The initial systemctl parser kept only the
+last repeated EnvironmentFiles property. The operator's final audit enumerated
+all entries: additional pre-existing files have pre-task mtime/ctime, without
+claiming an unavailable before-SHA comparison. Environment values were not
+output; only the explicit task policy file was added.
 
 The first apply reported a transient health URLError immediately after Sync
 start and retains exit 1. A separate bounded check of the new services then
@@ -100,8 +105,35 @@ their SHA and the JPEG needed no OSS image processing. Ordinary DELETE returned
 disappeared, and the owned session logged out. No new identity was created.
 Second-account isolation and full-size 20GB/100MB network transfer were not run.
 
-iOS metadata now reports 3.0.1(227) and a new installed bundle. The first install
-timed out and that receipt is preserved; OS launch is explicitly Locked, so no
-launch/PID or physical-device cloud E2E claim is made yet. Mac's normal App
-consumer build and Android's normal APK build are in progress. Original
-unrelated workspace changes and the installed Windows App remain preserved.
+iOS metadata reports 3.0.1(227) and a new installed bundle. The initial install
+timeout and Locked launch receipts are preserved. After user unlock, ordinary
+no-argument launch returned 0; independent process lookup confirms PID 71713
+under that same installed bundle, and a second metadata query confirms 227.
+There was no uninstall, data deletion or pairing change. The candidate executable
+SHA is recorded; no device executable hash readback or physical-device cloud
+E2E transfer is claimed.
+
+Mac normal App relink returned 0 in 48.417s using private71 plus the exact shared
+five-file and Qt eight-file deltas; Windows common tests were not repeated.
+Android normal `:app:assembleDebug` completed in 17m14s, with both ARM product
+targets. The cold-cache failures were build-environment issues: the first
+launcher lacked the existing shell tools, and x264's endian probe needed the
+existing NDK `llvm-strings` through its `STRINGS` option. Existing MSYS/NDK tools
+were used; no source, codec feature or library version was changed to obtain
+the successful build. The earlier failed logs are retained.
+
+The new normal Debug APK is 1,689,057,558 bytes, SHA256
+`234d859b3ba799952ebb4a4550c272da3cdbcf176a2b389acb0a2b09bb182cb3`.
+ZIP inspection confirms both arm64-v8a and armeabi-v7a JNI libraries. It is a
+normal 2.2.43(285) Debug build; aapt badging and v2 Android Debug signature
+verification returned 0. Both packaged `libmaichat_agent.so` hashes match the
+new stripped intermediates. It is a working-tree consumer with the existing
+unrelated WIP preserved, not a new clean public release. The available private Android emulator is x86-only;
+the Oppo product installation was not replaced, and no ARM device product-run
+claim is made. Original unrelated workspace changes, installed desktop Apps
+and published release assets remain preserved.
+
+Feature source was committed and pushed as
+`e1222952a62134899d233ca4ed69fea88ef340fa`. Final Apple and Android receipts
+are retained locally with their source/installed-bundle/package identities;
+the public v3.0.1 release tag and its eight assets were not changed.

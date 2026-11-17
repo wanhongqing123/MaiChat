@@ -88,8 +88,9 @@ needed. Preserve unrelated Android WIP.
 ## Task 5: Integration/review/rollout — Root and mac
 
 - [x] mac owns iOS generation, option lifetime, UI and post-225 build/install;
-  shared five-file source supplied and Apple compilation completed. Metadata
-  confirms 227 installation; OS Locked still prevents launch/PID confirmation.
+  shared five-file source supplied and Apple compilation completed. Independent
+  metadata confirms 227 installation; after unlock, ordinary launch and the
+  independent process/bundle query confirm PID 71713.
 - [x] Root reviews service/core/host deltas, runs shared logic once on Windows,
   appropriate UI/Android-specific checks, and records exact source/artifacts.
 - [x] Review quota isolation, thumbnail orphan/cleanup races and rollback notes.
@@ -99,8 +100,13 @@ needed. Preserve unrelated Android WIP.
 - [x] Receive live paired Auth/Signer source/health/effective-cap receipts and
   the existing-identity tiny dual-object complete/read/delete canary. Effective
   limits are 20GB/100MB, quota remains 500GB. No full-size wire-transfer claim.
-- [ ] Receive iOS 227 unlocked launch/platform connection receipt and final
-  Mac App/Android APK consumer build results.
+- [x] Receive final Mac normal App consumer build result, reusing Windows
+  common tests rather than repeating them.
+- [x] Receive iOS 227 unlocked ordinary launch and independent process/bundle
+  receipt. No device executable hash or physical-device cloud E2E claim.
+- [x] Receive final Android normal APK consumer build result: normal assemble
+  passes both ARM targets, artifact SHA/ABI verified. Private AVD is x86-only;
+  no replacement of the Oppo product installation or ARM product-run claim.
 
 Evidence and explicit validation boundaries:
 `docs/diagnostics/2026-11-17-cloud-drive-20gb-integration.md`.
