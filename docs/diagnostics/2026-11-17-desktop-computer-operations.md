@@ -4,7 +4,7 @@
 
 本表列出 MaiChat 当前操作和验收范围。与固定 Sunshine 的逐项行为差异见 `2026-11-17-sunshine-maichat-input-comparison.md`；存在对应原语及通过接收窗口测试，不等于两边逐字段、逐事件严格 1:1。
 
-模型调用的是同一个 `desktop_computer` 工具。`action` 选择要做什么；`input_events` 是其中一个动作，它再用 `type` 指定按下、移动、滚动等细操作。`input_options` 只调整这些操作的方式，不是另一套工具。
+模型调用的是同一个 `desktop_computer` 工具。25 个 `action` 是 MaiChat 面向大模型提效的接口层，包含便利组合、观察、查询、验证和清理；它们不是 Sunshine 原语的对应目录。`input_events` 是其中一个动作，它再用 `type` 指定按下、移动、滚动等细操作。`input_options` 调整这些操作的方式。
 
 当前公开 **25 个 action、8 种 input_events type、10 个 input_options 字段**。普通键鼠、Touch 和 Pen 均使用系统 API，并已通过本机开发构建的实际窗口测试。虚拟手柄、硬件 HID 模拟和控制器反馈已由用户明确暂缓，不是当前能力承诺。
 

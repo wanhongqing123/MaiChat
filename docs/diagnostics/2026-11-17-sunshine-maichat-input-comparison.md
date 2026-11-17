@@ -4,7 +4,11 @@
 
 **先更正结论：此前“排除虚拟设备和手柄，其余已严格 1:1”的说法过满。主要输入种类已有对应实现和开发构建验证，但还存在下文列明的状态、参数、兼容策略及宿主功能差异。通过接收窗口测试，不等于这些差异不存在。**
 
-这份清单区分四层：具体输入能力、配置参数、MaiChat 的模型调用入口、已经排除的设备功能。模型实际调用的是一个 `desktop_computer` 工具；25 个 `action` 是它的操作选择，`input_events` 则是其中一个可装入细操作列表的 action。
+本体对照的是底层输入原语及其必要的参数、状态和清理行为。Sunshine 的远程输入经协议接收后执行这些原语；MaiChat 在共享原语核心上另外提供面向大模型提效的接口。
+
+Sunshine 宿主快捷键、网络调度和测试辅助接口另作标记；它们不是普通输入原语，不能用来判定某个模型 action 是否已对齐。
+
+**25 个 action 是 MaiChat 自己的模型接口层，不纳入 Sunshine 原语逐项对齐的计数。** 其中既有便利组合，也有观察、查询、验证和清理入口。它们单独放在文末附录；`input_events` 是这一层的一个 action，可装入细操作列表。
 
 标记含义：
 
@@ -176,13 +180,13 @@ MaiChat：`type`/`unicode_text` 一次最多 4000 UTF-8 字节，Windows 转 UTF
 
 Sunshine 会继续转交平台；MaiChat 未配置到可用 VK 的映射时明确不支持，不会误发 F11～F14。上游“已转交”不等于证明 Windows 最终能注入这些专用键；常见 Ctrl 组合键是另一种可用表达。
 
-**28. Ctrl+Alt+Shift+F1～F13 宿主选屏——没有相同快捷键**
+**28. Ctrl+Alt+Shift+F1～F13 宿主选屏——宿主控制，没有相同快捷键**
 
 Sunshine：截获该组合，选择显示器 0～12。
 
 MaiChat：有 `list_displays` 和选择显示器的观察/输入能力，没有这组相同的宿主快捷键拦截。
 
-**29. Ctrl+Alt+Shift+N 远程光标显示开关——没有相同入口**
+**29. Ctrl+Alt+Shift+N 远程光标显示开关——宿主控制，没有相同入口**
 
 Sunshine：截获组合，切换捕获/串流中的光标显示。
 
@@ -399,37 +403,7 @@ MaiChat 明确校验 finite、范围、重复身份和几何，返回 InvalidInp
 
 **配置作用域须看清：**键鼠开关对普通和 typed 输入都有门控；扫描码偏好、raw 映射、右 Alt 转换和 raw 自动重复不能笼统解释成每个命名 `key/key_down` 都执行同样配置。
 
-## 七、MaiChat 的 25 个 action，一一对应
-
-Sunshine 提供底层原语，通常没有同名“大模型 action”。以下说“可组合”表示原语能表达，不能误读为 Sunshine 已有相同模型接口。
-
-1. **`list`：列窗口。** MaiChat 扩展；Sunshine 输入接口没有同名窗口目录 action。
-2. **`list_displays`：列显示器。** MaiChat 扩展；Sunshine 有选屏及 viewport 元数据。
-3. **`list_keys`：查命名键和组合语法。** MaiChat 扩展；查询不发按键。
-4. **`observe`：获取目标观察和快照。** MaiChat 的模型观察接口；Sunshine 有视频画面，但没有相同的 snapshot/UIA action。
-5. **`focus`：激活目标窗口。** MaiChat 高层入口；不是 Sunshine 的独立输入包。
-6. **`move`：绝对移动鼠标。** 对应绝对鼠标原语，坐标契约见第 2 项。
-7. **`click`：单击。** MaiChat 包装“移动＋按钮 down/up”。
-8. **`double_click`：双击。** MaiChat 包装两次 down/up。
-9. **`right_click`：右击。** MaiChat 的固定右键包装。
-10. **`drag`：完整拖动。** 包装 down、移动、up；成功返回前配对松开，失败会尝试清理，up 失败保留重试绑定；不验证视觉对齐。Windows 窗口路径当前时长上限 200 ms，显示器路径上限 5000 ms；需要过程中观察时用单独 down/move/up。
-11. **`mouse_down`：按住鼠标。** 对应按钮 down，加位置及 owner 约束。
-12. **`mouse_up`：释放鼠标。** 对应按钮 up，只处理本会话持有。
-13. **`type`：输入文字。** 对应 Unicode 输入，加目标和安全校验。
-14. **`replace_text`：全选并替换。** MaiChat 组合入口，可用键＋文字原语表达；不保证业务保存。
-15. **`key`：命名键或组合键短按。** MaiChat 解析名称，再组合键事件。
-16. **`key_down`：保持一个命名键。** 对应 down，不接受整个 chord；raw repeat 规则另列。
-17. **`key_up`：释放一个命名键。** 对应命名身份 up，不自动清除另一个 raw 身份。
-18. **`scroll`：按行滚动。** 包装位置与双轴 wheel；更细量可用 `wheel`。
-19. **`input_state`：查询本会话持有状态。** MaiChat 扩展；Sunshine 有内部状态，但没有同名模型查询。
-20. **`reset_inputs`：回到中立。** 与 Sunshine reset 目的相关，scope/回执/保留项不同。
-21. **`release_all`：释放并退役会话。** 与 Sunshine 停止/断开清理目的相关，不是同一生命周期接口。
-22. **`verify`：读回焦点文字并比较。** MaiChat 扩展；不表示业务提交或文件保存已成功。
-23. **`clear`：清除目标/观察并清理输入。** MaiChat 扩展；不删除输入框文字。
-24. **`input_events`：执行细操作列表。** 包含 absolute_move、relative_move、mouse_button、wheel、raw_key、unicode_text、touch、pen 八类；不是 Moonlight 网络包队列。
-25. **`input_capabilities`：查询后端能力。** 对应能力发现的目的，返回结构与 Sunshine feature bits 不同。
-
-## 八、按用户要求排除的部分
+## 七、按用户要求排除的部分
 
 **设备模拟/驱动层：排除。** 硬件 HID 身份与报告、Raw Input 可见的虚拟键鼠设备、驱动/许可/broker、ViGEm 设备、虚拟设备重建/重绑定、稳定设备 ID/MAC 策略，都不作为当前功能承诺。普通系统键鼠、触摸和笔输入不等于这些设备模拟功能。
 
@@ -451,7 +425,7 @@ Sunshine 提供底层原语，通常没有同名“大模型 action”。以下�
 
 **对应配置也排除：** controller 开关、DS4 Back 映射触摸板、运动/触摸板按 PlayStation 映射、随机控制器 MAC、driver、default profile、Back 长按转 Home。历史数据类型仍存在，不算执行能力。
 
-## 九、宿主/测试辅助接口，单独说明
+## 八、宿主/测试辅助接口，单独说明
 
 **63. 查询实际鼠标位置**
 
@@ -471,7 +445,7 @@ Sunshine 分配输入后有延迟的 `(+1,+1)` 再 `(-1,-1)` 捕获唤醒副作�
 
 MaiChat 没有复刻该连接副作用；这也不是用户可选择的一种普通输入动作。
 
-## 十、验收与来源
+## 九、验收与来源
 
 现有记录证明：Windows 开发构建中键鼠 71 项、触摸 62 项、笔的普通/工具真实接收链路均通过；另有 9 组回归、窗口发现 3002 项、跨进程编辑器、整屏输入和 ScriptModel Agent 验证。
 
@@ -490,3 +464,33 @@ Touch/Pen 的 319/262 是组件合同检查数，不能写成 319/262 个实际�
 - [固定 Moonlight 客户端发送实现及 relative-as-absolute helper](https://github.com/moonlight-stream/moonlight-common-c/blob/94c65fd364d17b223f00a8763c9a5d94a66cb8dd/src/InputStream.c)
 
 MaiChat 依据：`MaiChat/desktop/src/MaiChatTools/DesktopComputerTools.cpp`、`DesktopComputerInputProtocol.cpp`、`DesktopComputerInputTypes.*`、`DesktopComputerInputSession.cpp`、`DesktopComputerInputOwnership.*`、`DesktopComputerWindows.cpp`、`DesktopComputerWindowsScope.h`、`DesktopComputerWindowsKeyMap.cpp`、`DesktopComputerWindowsTouch.*`、`DesktopComputerWindowsPen.*`。实际产物记录见同目录 `2026-11-17-desktop-input-final-verification.md`。
+
+## 附录 A：MaiChat 面向大模型提效的 25 个 action
+
+本附录只说明 MaiChat 自有接口，不是 Sunshine 功能对应表，也不参与原语对齐验收。普通代码入口与模型入口复用相应核心能力；接口组织服务于模型的操作效率。
+
+1. **`list`：列窗口。** 帮助模型发现和选择目标。
+2. **`list_displays`：列显示器。** 帮助模型选择显示目标。
+3. **`list_keys`：查命名键和组合语法。** 查询不发按键。
+4. **`observe`：获取目标观察和快照。** 给模型提供画面或 UIA 信息，以及后续操作的目标绑定。
+5. **`focus`：激活目标窗口。** 帮助模型建立需要的输入焦点。
+6. **`move`：绝对移动鼠标。** 调用共享绝对移动原语，遵守本次观察的坐标约定。
+7. **`click`：单击。** MaiChat 包装“移动＋按钮 down/up”。
+8. **`double_click`：双击。** MaiChat 包装两次 down/up。
+9. **`right_click`：右击。** MaiChat 的固定右键包装。
+10. **`drag`：完整拖动。** 包装 down、移动、up；成功返回前配对松开，失败会尝试清理，up 失败保留重试绑定；不验证视觉对齐。Windows 窗口路径当前时长上限 200 ms，显示器路径上限 5000 ms；需要过程中观察时用单独 down/move/up。
+11. **`mouse_down`：按住鼠标。** 对应按钮 down，加位置及 owner 约束。
+12. **`mouse_up`：释放鼠标。** 对应按钮 up，只处理本会话持有。
+13. **`type`：输入文字。** 对应 Unicode 输入，加目标和安全校验。
+14. **`replace_text`：全选并替换。** MaiChat 组合入口，可用键＋文字原语表达；不保证业务保存。
+15. **`key`：命名键或组合键短按。** MaiChat 解析名称，再组合键事件。
+16. **`key_down`：保持一个命名键。** 对应 down，不接受整个 chord；raw repeat 规则另列。
+17. **`key_up`：释放一个命名键。** 对应命名身份 up，不自动清除另一个 raw 身份。
+18. **`scroll`：按行滚动。** 包装位置与双轴 wheel；更细量可用 `wheel`。
+19. **`input_state`：查询本会话持有状态。** 帮助模型判断哪些键、按钮或接触点仍按住。
+20. **`reset_inputs`：回到中立。** 释放控制量，保留仍有效的 context/config。
+21. **`release_all`：释放并退役会话。** 供任务结束和清理使用，失败保留重试绑定。
+22. **`verify`：读回焦点文字并比较。** 帮助模型核对结果，不表示业务提交或文件保存已成功。
+23. **`clear`：清除目标/观察并清理输入。** 不删除输入框文字。
+24. **`input_events`：执行细操作列表。** 让模型直接选择 absolute_move、relative_move、mouse_button、wheel、raw_key、unicode_text、touch、pen 八类原语，自主组合。
+25. **`input_capabilities`：查询后端能力。** 帮助模型了解当前实现、可用性和前置条件。
