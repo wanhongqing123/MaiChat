@@ -403,7 +403,7 @@ void testDisabledWanRetainsVideoSchema() {
     CHECK(tooLong.error().message().find("temporarily_disabled") != std::string::npos);
 }
 
-void testBailianKlingUsesWanCredentialsAndRequiresOssForMedia() {
+void testBailianKlingIsPausedBeforeMediaUpload() {
     MaiWanCredentials credentials;
     auto tool = makeMaiBailianKlingVideoTool([&] { return credentials; });
     MaiToolContext context;
@@ -417,8 +417,8 @@ void testBailianKlingUsesWanCredentialsAndRequiresOssForMedia() {
           std::string::npos);
     CHECK(!tool->requiresPerCallApproval(R"({"action":"discover"})"));
     CHECK(!tool->requiresPerCallApproval(R"({"action":"diagnose"})"));
-    CHECK(tool->requiresPerCallApproval(R"({"action":"delegate"})"));
-    CHECK(tool->requiresPaidApproval(R"({"action":"delegate"})"));
+    CHECK(!tool->requiresPerCallApproval(R"({"action":"delegate"})"));
+    CHECK(!tool->requiresPaidApproval(R"({"action":"delegate"})"));
     auto discovered =
         nlohmann::json::parse(tool->execute(R"({"action":"discover"})", context).output());
     CHECK(discovered.at("configured") == false);
@@ -429,7 +429,7 @@ void testBailianKlingUsesWanCredentialsAndRequiresOssForMedia() {
     CHECK(discovered.at("capabilities")[0].contains("model_support"));
     for (const auto& capability : discovered.at("capabilities"))
         CHECK(!capability.at("limitation").get<std::string>().empty());
-    CHECK(discovered.at("capabilities")[1].at("tool_status") == "upload_not_configured");
+    CHECK(discovered.at("capabilities")[1].at("tool_status") == "temporarily_disabled");
     const MaiFilePath source = MaiFileSystem::temporaryDirectory().append(
         MaiFilePath::fromUtf8(MaiIdGenerator::generate("kling_oss_input_") + ".jpg"));
     CHECK(!MaiFileSystem::writeFile(source, "synthetic image fixture"));
@@ -440,7 +440,7 @@ void testBailianKlingUsesWanCredentialsAndRequiresOssForMedia() {
                                     {"resolution", "std"}};
     const MaiToolResult missingUpload = tool->execute(request.dump(), context);
     CHECK(missingUpload.hasError());
-    CHECK(missingUpload.error().message().find("upload_not_configured") != std::string::npos);
+    CHECK(missingUpload.error().message().find("temporarily_disabled") != std::string::npos);
     int uploads = 0;
     const MaiCreativeMediaUploadProvider rejected =
         [&uploads](const std::string&, const MaiToolContext&) -> MaiResult<std::string> {
@@ -450,8 +450,8 @@ void testBailianKlingUsesWanCredentialsAndRequiresOssForMedia() {
     auto withUpload = makeMaiBailianKlingVideoTool([&] { return credentials; }, {}, rejected);
     const MaiToolResult failedUpload = withUpload->execute(request.dump(), context);
     CHECK(failedUpload.hasError());
-    CHECK(failedUpload.error().message().find("upload_failed") != std::string::npos);
-    CHECK(uploads == 1);
+    CHECK(failedUpload.error().message().find("temporarily_disabled") != std::string::npos);
+    CHECK(uploads == 0);
     (void)MaiFileSystem::removeFile(source);
 }
 
@@ -494,14 +494,6 @@ void testVideoTaskManagementNeverDiscardsActiveOrForeignTasks() {
     MaiSession owner;
     owner.id = "video-owner";
     store->putSession(owner);
-    MaiSpecialistTask task;
-    task.id = MaiIdGenerator::generate("spt_");
-    task.ownerSessionId = owner.id;
-    task.specialistName = "wan_video";
-    task.providerTaskId = "provider-task-1";
-    task.intent = "Generate a test video";
-    task.created = MaiTime::getCurrentTime();
-    CHECK(!store->insertSpecialistTask(task));
     const auto credentials = [] { return MaiWanCredentials{"test-key", "ws-test123"}; };
     auto wan = makeMaiWanVideoTool(credentials);
     auto kling = makeMaiBailianKlingVideoTool(credentials);
@@ -511,26 +503,35 @@ void testVideoTaskManagementNeverDiscardsActiveOrForeignTasks() {
         CHECK(schema["properties"]["action"]["enum"].dump().find("delete") != std::string::npos);
         CHECK(tool->requiresPerCallApproval(R"({"action":"cancel"})"));
         CHECK(tool->requiresPerCallApproval(R"({"action":"delete"})"));
+        // 删除只操作本地自有内存记录，证明暂停后仍保留管理边界而不访问供应商。
+        MaiSpecialistTask task;
+        task.id = MaiIdGenerator::generate("spt_");
+        task.ownerSessionId = owner.id;
+        task.specialistName = tool->name();
+        task.providerTaskId = "provider-task-1";
+        task.intent = "Generate a test video";
+        task.created = MaiTime::getCurrentTime();
+        CHECK(!store->insertSpecialistTask(task));
+        MaiToolContext context;
+        context.specialistTasks = store.get();
+        context.sessionId = "foreign-owner";
+        const nlohmann::json remove = {{"action", "delete"}, {"conversation_id", task.id}};
+        CHECK(tool->execute(remove.dump(), context).hasError());
+        context.sessionId = owner.id;
+        CHECK(tool->execute(remove.dump(), context).hasError());
+        CHECK(!store->finishSpecialistTask(task.id, owner.id, MaiSpecialistTaskStatus::Failed,
+                                           "The test task failed", {}, MaiTime::getCurrentTime()));
+        CHECK(tool->execute(remove.dump(), context).hasError());
+        const auto reservation = store->reserveSpecialistNotification(
+            task.id, owner.id, "notification-1", MaiTime::getCurrentTime());
+        CHECK(reservation);
+        CHECK(!store->markSpecialistNotified(task.id, owner.id, reservation.value(),
+                                             MaiTime::getCurrentTime()));
+        const MaiToolResult removed = tool->execute(remove.dump(), context);
+        CHECK(!removed.hasError());
+        CHECK(nlohmann::json::parse(removed.output()).at("provider_deleted") == false);
+        CHECK(!store->getSpecialistTask(task.id, owner.id, task));
     }
-    MaiToolContext context;
-    context.specialistTasks = store.get();
-    context.sessionId = "foreign-owner";
-    const nlohmann::json remove = {{"action", "delete"}, {"conversation_id", task.id}};
-    CHECK(wan->execute(remove.dump(), context).hasError());
-    context.sessionId = owner.id;
-    CHECK(wan->execute(remove.dump(), context).hasError());
-    CHECK(!store->finishSpecialistTask(task.id, owner.id, MaiSpecialistTaskStatus::Failed,
-                                       "The test task failed", {}, MaiTime::getCurrentTime()));
-    CHECK(wan->execute(remove.dump(), context).hasError());
-    const auto reservation = store->reserveSpecialistNotification(
-        task.id, owner.id, "notification-1", MaiTime::getCurrentTime());
-    CHECK(reservation);
-    CHECK(!store->markSpecialistNotified(task.id, owner.id, reservation.value(),
-                                         MaiTime::getCurrentTime()));
-    const MaiToolResult removed = wan->execute(remove.dump(), context);
-    CHECK(!removed.hasError());
-    CHECK(nlohmann::json::parse(removed.output()).at("provider_deleted") == false);
-    CHECK(!store->getSpecialistTask(task.id, owner.id, task));
 }
 
 }  // namespace
@@ -544,7 +545,7 @@ int main() {
     testExistingPaidTasksCanBeRecoveredWithoutResubmission();
     testDisabledWanNeverUploadsLocalMedia();
     testDisabledWanRetainsVideoSchema();
-    testBailianKlingUsesWanCredentialsAndRequiresOssForMedia();
+    testBailianKlingIsPausedBeforeMediaUpload();
     testWanAndKlingImageToolsValidateBeforePaidSubmission();
     testVideoTaskManagementNeverDiscardsActiveOrForeignTasks();
     return failures == 0 ? 0 : 1;

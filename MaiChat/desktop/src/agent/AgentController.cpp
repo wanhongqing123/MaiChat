@@ -74,8 +74,14 @@ namespace {
 // 屏幕截图走原生工具；模型回看像素、同一工作区文件交付和图像能力边界分别说明。
 const char* const kDesktopSystemPrompt =
     R"(You are the AI assistant embedded in MaiChat.
-Video generation rule: before any paid video delegate, use discover to identify configured
-specialists with implemented capabilities for this request. Read descriptions for initial routing,
+Paid image and video generation is temporarily disabled to control costs. This includes every
+image/video specialist, new submissions, reference generation, editing and paid revisions. Do not
+submit, revise, retry, or substitute another paid media model. Existing supported task recovery
+remains available internally. Local image viewing, cropping, format conversion, video playback
+and local editing remain available. The later model selection and retry guidance applies only
+after generation is explicitly re-enabled; it never authorizes a currently paused media call.
+Video generation rule after explicit re-enablement: before any paid video delegate, use discover
+to identify configured specialists with implemented capabilities for this request. Read descriptions for initial routing,
 then call discover on each plausible video specialist before recommending one. Compare actual
 tool_status and input-combination limits; model_support or api_support alone does not prove the
 App can execute a path. Use the JSON schema for exact fields. Do not infer missing capabilities
@@ -95,18 +101,6 @@ that limitation. Do not loop through FFmpeg/OpenCV as a fallback. Return to the 
 For image and video specialist tools, local media paths are upload inputs: the tool sends
 short-lived private OSS HTTPS URLs to the provider. If OSS upload fails, stop before paid
 submission and do not embed local media bytes as Base64.
-For Kling video, use kling_bailian_video with the Beijing Wan API Key and Workspace. Confirm its
-Turbo, Standard, or Omni variant before paid submission.
-Paid image generation is temporarily disabled to control costs. This includes text-to-image,
-image editing, reference generation, and paid revisions through every image specialist. Do not
-submit, revise, retry, or substitute another paid image model. Existing supported task recovery
-remains available internally. Local image viewing, cropping, and format conversion remain available.
-The later provider retry guidance applies only after image generation is explicitly re-enabled;
-it never authorizes a currently paused image call.
-Wan video generation (wan_video) is temporarily disabled to control costs. Do not submit or
-revise Wan video tasks, retry them, or silently choose a replacement model. Existing submitted
-tasks can still be recovered internally. Other listed video models are separate;
-ask the user to choose before using a different video model.
 Do not default to
 flipping or oil-painting a real face to evade review. For other image issues, if an image edit is
 allowed and still serves the user's goal, preserve the original, make a light
@@ -409,12 +403,12 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     const auto glmKey = [provider = credentials.glmApiKeyProvider, key = toUtf8(credentials.glmApiKey)] {
         return provider ? toUtf8(provider()) : key;
     };
-    // 费用暂停只隐藏付费图像生成；保留实例供已接线的旧任务恢复，普通工厂同样受执行闸门约束。
+    // 付费图像与视频生成均暂停；保留内部实例恢复旧任务，普通工厂同样受执行闸门约束。
     tools->addInternal(makeMaiGlmImageTool(glmKey));
     const auto miniMaxKey = [provider = credentials.miniMaxApiKeyProvider, key = toUtf8(credentials.miniMaxApiKey)] {
         return provider ? toUtf8(provider()) : key;
     };
-    tools->add(makeMaiMiniMaxVideoTool(miniMaxKey, {}, miniMaxUploadMedia));
+    tools->addInternal(makeMaiMiniMaxVideoTool(miniMaxKey, {}, miniMaxUploadMedia));
     tools->addInternal(makeMaiMiniMaxImageTool(miniMaxKey, {}, miniMaxUploadMedia));
     const auto wanCredentials = [provider = credentials.wanCredentialsProvider, key = toUtf8(credentials.wanApiKey),
                                  workspace = toUtf8(credentials.wanWorkspaceId)] {
@@ -426,7 +420,7 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     };
     // 因费用暂停万相视频的新任务；后台仍按原名字查询和回收已提交任务。
     tools->addInternal(makeMaiWanVideoTool(wanCredentials, {}, wanUploadMedia));
-    tools->add(makeMaiBailianKlingVideoTool(wanCredentials, {}, klingUploadMedia));
+    tools->addInternal(makeMaiBailianKlingVideoTool(wanCredentials, {}, klingUploadMedia));
     tools->addInternal(makeMaiWanImageTool(wanCredentials, {}, wanUploadMedia));
     tools->addInternal(makeMaiBailianKlingImageTool(wanCredentials, {}, klingUploadMedia));
 #if defined(MAICHAT_EMBEDDED_FFMPEG)

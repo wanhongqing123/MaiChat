@@ -257,27 +257,15 @@ constexpr auto kMarkdownBaseInstructions =
     "the tool sends short-lived private OSS HTTPS URLs to the provider. If OSS "
     "upload fails, stop before paid submission and report the upload stage. Do "
     "not retry by embedding local image or video bytes as Base64. "
-    // 可灵权限已开通，只走百炼入口并复用万相北京地域 Key；仍要确认具体型号。
-    "For Kling video, use kling_bailian_video with the Beijing Wan API Key and "
-    "Workspace. Confirm its Turbo, "
-    "Standard, "
-    "or Omni variant before paid submission. "
-    // 暂停所有供应商付费图像生成，包括带图参考和付费修订；本地免费处理仍可使用。
-    // 后面的供应商重试规则仅在显式恢复生成后适用，不能成为绕过费用暂停的授权。
-    "Paid image generation is temporarily disabled to control costs. "
-    "This includes text-to-image, image editing, reference generation, and paid "
-    "revisions through every image specialist. Do not submit, revise, retry, or "
-    "substitute another paid image model. Existing supported task recovery remains "
-    "available internally. Local image viewing, cropping, and format conversion "
-    "remain available. The later provider retry guidance applies only after image "
-    "generation is explicitly re-enabled; it never authorizes a currently paused image call. "
-    // 万相视频因费用暂停新建与修订；不能误导主模型重试或静默换另一种收费模型。
-    // 已提交任务仍由后台恢复；其余已列出视频模型保持各自入口，图像遵循上方暂停规则。
-    "Wan video generation (wan_video) is temporarily disabled to control costs. "
-    "Do not submit or revise Wan video tasks, retry them, or silently choose a "
-    "replacement model. Existing submitted tasks can still be recovered internally. "
-    "Other listed video models are separate; ask the user to choose "
-    "before using a different video model. "
+    // 所有付费图像和视频新任务均暂停；现有任务仍从内部恢复，本地处理不受影响。
+    // 后续选择型号与重试规则只在显式恢复生成后适用，不能绕过此暂停。
+    "Paid image and video generation is temporarily disabled to control costs. "
+    "This includes every image/video specialist, new submissions, reference generation, "
+    "editing and paid revisions. Do not submit, revise, retry, or substitute another paid "
+    "media model. Existing supported task recovery remains available internally. Local image "
+    "viewing, cropping, format conversion, video playback and local editing remain available. "
+    "The later model selection and retry guidance applies only after generation is explicitly "
+    "re-enabled; it never authorizes a currently paused media call. "
     // 仅在允许的前提下处理图像：轻度处理优先，油画化是兜底；记录损失并补偿描述。
     "Do not default to "
     "flipping or oil-painting a real face to evade review. For other image "

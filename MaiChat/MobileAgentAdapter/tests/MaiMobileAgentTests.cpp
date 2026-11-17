@@ -1467,7 +1467,7 @@ static void sessionIMCabiContract() {
 }
 
 // 消费正常 configure/send 发出的真实模型请求，只连接自有环回 SSE 端点。
-// 万相视频及付费图片生成暂停后不能向模型公开；保留其它视频和本地免费图像处理。
+// 付费视频及图片生成暂停后不能向模型公开；本地免费图像处理和文件交付继续可用。
 static void paidMediaPausedRequestContract() {
     struct Fixture {
         MaiFilePath root = MaiFileSystem::temporaryDirectory().append(
@@ -1490,7 +1490,7 @@ static void paidMediaPausedRequestContract() {
         try {
             const Json body = Json::parse(request.body);
             bool wanVideo = false, wanImage = false, klingVideo = false, klingImage = false;
-            bool miniMaxImage = false, glmImage = false, seedreamImage = false;
+            bool miniMaxVideo = false, miniMaxImage = false, glmImage = false, seedreamImage = false;
             bool viewImage = false, localTransform = false, fileDelivery = false;
             for (const auto& tool : body.at("tools")) {
                 const auto name = tool.at("function").at("name").get<std::string>();
@@ -1498,6 +1498,7 @@ static void paidMediaPausedRequestContract() {
                 wanImage |= name == "wan_image";
                 klingVideo |= name == "kling_bailian_video";
                 klingImage |= name == "kling_bailian_image";
+                miniMaxVideo |= name == "minimax_video";
                 miniMaxImage |= name == "minimax_image";
                 glmImage |= name == "glm_image";
                 seedreamImage |= name == "seedream_image";
@@ -1513,20 +1514,21 @@ static void paidMediaPausedRequestContract() {
             }
             const auto& system = body.at("messages").front();
             const std::string prompt = system.at("content").get<std::string>();
-            std::fprintf(
-                stderr,
-                "OBSERVE owned catalog: wan_video=%d wan_image=%d kling_image=%d minimax_image=%d "
-                "glm_image=%d seedream_image=%d kling_video=%d view_image=%d local_transform=%d agent_file=%d\n",
-                wanVideo, wanImage, klingImage, miniMaxImage, glmImage, seedreamImage, klingVideo, viewImage,
-                localTransform, fileDelivery);
-            valid =
-                system.at("role") == "system" && !wanVideo && !wanImage && klingVideo && !klingImage && !miniMaxImage &&
-                !glmImage && !seedreamImage && viewImage && localTransform && fileDelivery &&
-                prompt.find("Wan video generation (wan_video) is temporarily disabled to control costs.") !=
-                    std::string::npos &&
-                prompt.find("Paid image generation is temporarily disabled to control costs.") != std::string::npos &&
-                prompt.find("Do not submit or revise Wan video tasks") != std::string::npos &&
-                prompt.find("silently choose a replacement model") != std::string::npos;
+            std::fprintf(stderr,
+                         "OBSERVE owned catalog: wan_video=%d wan_image=%d kling_image=%d minimax_image=%d "
+                         "glm_image=%d seedream_image=%d kling_video=%d minimax_video=%d view_image=%d "
+                         "local_transform=%d agent_file=%d\n",
+                         wanVideo, wanImage, klingImage, miniMaxImage, glmImage, seedreamImage, klingVideo,
+                         miniMaxVideo, viewImage, localTransform, fileDelivery);
+            valid = system.at("role") == "system" && !wanVideo && !wanImage && !klingVideo && !miniMaxVideo &&
+                    !klingImage && !miniMaxImage && !glmImage && !seedreamImage && viewImage && localTransform &&
+                    fileDelivery &&
+                    prompt.find("Paid image and video generation is temporarily disabled to control costs.") !=
+                        std::string::npos &&
+                    prompt.find("For Kling video, use") == std::string::npos &&
+                    prompt.find("Other listed video models are separate") == std::string::npos &&
+                    prompt.find("Do not submit, revise, retry, or substitute another paid media model") !=
+                        std::string::npos;
             ++requests;
             response.set_content(frame({{"content", "owned catalog verified"}}, "stop") + "data: [DONE]\n\n",
                                  "text/event-stream");
@@ -1566,7 +1568,7 @@ static void paidMediaPausedRequestContract() {
     }
     CHECK(finished && requests.load() == 1 && valid.load());
     std::puts(
-        "PASS: normal Mobile model request hides Wan video and paid images, retains local image tools and Kling video");
+        "PASS: normal Mobile model request hides paid image/video generation and retains local image tools");
 }
 
 // Exercise the ordinary import and snapshot APIs; private source metadata must

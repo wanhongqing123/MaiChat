@@ -1,6 +1,6 @@
 // 文件作用：验证“MaiCreativeMediaTools”的正确行为和边界条件。
-// 验证入口：testFailedTaskIsStableWithoutProviderRequest、testH3ContentRolesAndRequiredFields、
-// testH3RejectsUnsupportedOutputBeforePaidApproval；检查可观察结果而非实现细节。
+// 验证入口：testPaidVideosArePausedBeforeCredentialsOrUpload、testFailedTaskIsStableWithoutProviderRequest、
+// testH3ValidateRejectsUnsupportedOutputWhileGenerationPaused；检查可观察结果而非实现细节。
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -31,6 +31,104 @@ int failures = 0;
             ++failures;                                                     \
         }                                                                   \
     } while (0)
+
+// 模拟旧工厂指针发起新任务；空凭据保证缺失暂停守卫时也不会访问网络。
+// 图片和视频暂停都必须先于凭据、素材上传及原任务状态变化。
+void testPaidVideosArePausedBeforeCredentialsOrUpload() {
+    using Json = nlohmann::json;
+    int credentialReads = 0;
+    int uploads = 0;
+    const auto key = [&] {
+        ++credentialReads;
+        return std::string{};
+    };
+    const auto credentials = [&] {
+        ++credentialReads;
+        return MaiWanCredentials{};
+    };
+    const MaiCreativeMediaUploadProvider upload =
+        [&](const std::string&, const MaiToolContext&) -> MaiResult<std::string> {
+        ++uploads;
+        return {MaiErrorCode::Network, "Synthetic upload must not be reached"};
+    };
+    std::vector<std::unique_ptr<MaiTool>> videos;
+    videos.push_back(makeMaiMiniMaxVideoTool(key, {}, upload));
+    videos.push_back(makeMaiBailianKlingVideoTool(credentials, {}, upload));
+    auto store = makeMaiMemoryStore();
+    MaiSession owner;
+    owner.id = "owned-paused-video-session";
+    store->putSession(owner);
+    MaiToolContext context;
+    context.root = MaiFileSystem::temporaryDirectory().toUtf8();
+    context.sessionId = owner.id;
+    context.specialistTasks = store.get();
+    for (const auto& video : videos) {
+        CHECK(!video->isAvailableForModel(""));
+        CHECK(!video->isAvailableForModel("glm-5.3"));
+        CHECK(!video->isAvailableForModel("glm-5.3-flash"));
+        MaiSpecialistTask previous;
+        previous.id = MaiIdGenerator::generate("spt_");
+        previous.ownerSessionId = owner.id;
+        previous.specialistName = video->name();
+        previous.providerTaskId = "owned-provider-" + video->name();
+        previous.status = MaiSpecialistTaskStatus::Running;
+        previous.created = 1;
+        CHECK(!store->insertSpecialistTask(previous));
+        const std::size_t activeBefore = store->listActiveSpecialistTasks(10).size();
+        for (const char* action : {"delegate", "revise"}) {
+            const Json arguments = {{"action", action},
+                                    {"message", "Animate the owned reference"},
+                                    {"image_path", "owned-reference.jpg"},
+                                    {"conversation_id", previous.id},
+                                    {"parent_task_id", previous.id},
+                                    {"duration", 5},
+                                    {"resolution", "std"},
+                                    {"ratio", "16:9"}};
+            const std::string raw = arguments.dump();
+            CHECK(!video->requiresApproval(raw));
+            CHECK(!video->requiresPerCallApproval(raw));
+            CHECK(!video->requiresPaidApproval(raw));
+            const MaiToolResult result = video->execute(raw, context);
+            CHECK(result.hasError());
+            const Json error = Json::parse(result.error().message(), nullptr, false);
+            CHECK(error.is_object() && error.value("code", "") == "temporarily_disabled");
+            CHECK(result.execution().has_value());
+            if (result.execution()) {
+                CHECK(result.execution()->status == MaiToolExecutionStatus::NotStarted);
+                CHECK(result.execution()->effectStatus == MaiToolEffectStatus::None);
+                CHECK(result.execution()->started == false);
+            }
+            CHECK(credentialReads == 0);
+            CHECK(uploads == 0);
+            MaiSpecialistTask after;
+            CHECK(store->getSpecialistTask(previous.id, owner.id, after));
+            CHECK(after.providerTaskId == previous.providerTaskId);
+            CHECK(after.status == previous.status);
+            CHECK(store->listActiveSpecialistTasks(10).size() == activeBefore);
+        }
+    }
+    // 即使旧宿主仍用公开 add，注册表也不能把已暂停的新生成入口交给模型。
+    // 普通 find 仍持有实例，后台能继续查询和交付已提交任务。
+    MaiToolRegistry registry;
+    registry.add(makeMaiMiniMaxVideoTool(key, {}, upload));
+    registry.add(makeMaiBailianKlingVideoTool(credentials, {}, upload));
+    for (const std::string model : {"", "glm-5.3", "glm-5.3-flash"}) {
+        CHECK(registry.specs(model).empty());
+        for (const char* name : {"minimax_video", "kling_bailian_video"}) {
+            CHECK(registry.find(name));
+            CHECK(!registry.findForModel(name, model));
+        }
+    }
+    CHECK(credentialReads == 0);
+    CHECK(uploads == 0);
+    for (const auto& video : videos) {
+        const MaiToolResult result = video->execute(R"({"action":"discover"})", context);
+        CHECK(!result.hasError());
+        const Json discovered = Json::parse(result.output());
+        CHECK(!discovered.value("generation_enabled", true));
+        CHECK(discovered["capabilities"][0]["tool_status"] == "temporarily_disabled");
+    }
+}
 
 // 直接保留工厂实例来模拟旧调用，暂停必须先于凭据、上传和任务变更。
 // 空凭据也保证旧实现的 RED 不会触达供应商；已存在任务仅放在自有内存存储。
@@ -153,11 +251,6 @@ void testPaidImagesArePausedBeforeCredentialsOrUpload() {
         CHECK(unchanged.status == baseline.status);
         CHECK(unchanged.notifiedAt == baseline.notifiedAt);
     }
-    // 图像暂停不能把共享 MiniMax 分支或百炼可灵视频的付费确认一并关掉。
-    auto miniMaxVideo = makeMaiMiniMaxVideoTool(key);
-    auto klingVideo = makeMaiBailianKlingVideoTool(wanCredentials);
-    CHECK(miniMaxVideo->requiresPaidApproval(R"({"action":"delegate"})"));
-    CHECK(klingVideo->requiresPaidApproval(R"({"action":"delegate"})"));
     CHECK(credentialReads == 0);
     CHECK(uploads == 0);
     for (const auto& image : images) {
@@ -192,17 +285,15 @@ void checkTool(MaiTool& tool, const std::string& expectedName, const std::string
     CHECK(nlohmann::json::parse(tool.parametersSchema()).is_object());
     CHECK(!tool.requiresPerCallApproval(R"({"action":"discover"})"));
     CHECK(!tool.requiresPerCallApproval(R"({"action":"continue"})"));
-    CHECK(tool.requiresPerCallApproval(R"({"action":"delegate"})") ==
-          (video && expectedName != "minimax_video"));
-    CHECK(tool.requiresPaidApproval(R"({"action":"delegate"})") == video);
+    CHECK(!tool.requiresPerCallApproval(R"({"action":"delegate"})"));
+    CHECK(!tool.requiresPaidApproval(R"({"action":"delegate"})"));
     CHECK(!tool.requiresPaidApproval(R"({"action":"continue"})"));
     CHECK(tool.requiresPerCallApproval("broken json"));
     const auto discovered =
         nlohmann::json::parse(tool.execute(R"({"action":"discover"})", context).output());
     CHECK(discovered.at("bound_model") == expectedModel);
     CHECK(discovered.at("configured") == false);
-    CHECK(discovered.at("capabilities")[0].at("tool_status") ==
-          (video ? "not_configured" : "temporarily_disabled"));
+    CHECK(discovered.at("capabilities")[0].at("tool_status") == "temporarily_disabled");
     CHECK(discovered.dump().find("secret") == std::string::npos);
     if (expectedName == "minimax_video") {
         CHECK(discovered.dump().find("Hailuo-2.3") == std::string::npos);
@@ -271,7 +362,7 @@ void testH3ContentRolesAndRequiredFields() {
     auto video = makeMaiMiniMaxVideoTool([] { return std::string("test-key"); });
     MaiToolContext context;
     context.root = MaiFileSystem::temporaryDirectory().toUtf8();
-    Json base = {{"action", "delegate"},
+    Json base = {{"action", "validate"},
                  {"model", "MiniMax-H3"},
                  {"duration", 10},
                  {"resolution", "768P"},
@@ -331,12 +422,12 @@ void testH3ContentRolesAndRequiredFields() {
           "Missing top-level resolution for paid video generation");
 }
 
-void testH3RejectsUnsupportedOutputBeforePaidApproval() {
+void testH3ValidateRejectsUnsupportedOutputWhileGenerationPaused() {
     auto video = makeMaiMiniMaxVideoTool([] { return std::string("test-key"); });
     MaiToolContext context;
     context.root = MaiFileSystem::temporaryDirectory().toUtf8();
     for (const std::string& resolution : {"1080P", "720P"}) {
-        const nlohmann::json args = {{"action", "delegate"},
+        const nlohmann::json args = {{"action", "validate"},
                                      {"model", "MiniMax-H3"},
                                      {"message", "A running cat"},
                                      {"duration", 10},
@@ -346,11 +437,18 @@ void testH3RejectsUnsupportedOutputBeforePaidApproval() {
               std::string::npos);
     }
     for (const std::string& resolution : {"768P", "2K"}) {
-        const nlohmann::json args = {{"action", "delegate"},
-                                     {"model", "MiniMax-H3"},
-                                     {"duration", 10},
-                                     {"resolution", resolution}};
-        CHECK(video->requiresPerCallApproval(args.dump()));
+        const nlohmann::json args = {
+            {"action", "validate"}, {"model", "MiniMax-H3"}, {"message", "A running cat"},
+            {"ratio", "16:9"},      {"duration", 10},        {"resolution", resolution}};
+        CHECK(!video->requiresPerCallApproval(args.dump()));
+        const MaiToolResult result = video->execute(args.dump(), context);
+        CHECK(!result.hasError());
+        if (!result.hasError()) {
+            const auto output = nlohmann::json::parse(result.output());
+            CHECK(output.at("status") == "validated");
+            CHECK(output.at("submitted") == false);
+            CHECK(output.at("uploaded") == false);
+        }
     }
 }
 
@@ -416,13 +514,14 @@ void testH3LocalValidationChecksAllReferencePathsWithoutBilling() {
 
 // 使用假服务验证付费生成前的本地检查、任务状态转换和结果交付，不创建真实云任务。
 int main() {
+    testPaidVideosArePausedBeforeCredentialsOrUpload();
     testPaidImagesArePausedBeforeCredentialsOrUpload();
     CHECK(maiCreativeHttpsUrl("https://example.com/object.jpg?signature=abc"));
     CHECK(!maiCreativeHttpsUrl("http://example.com/object.jpg"));
     CHECK(!maiCreativeHttpsUrl("https://name@example.com/object.jpg"));
     testFailedTaskIsStableWithoutProviderRequest();
     testH3ContentRolesAndRequiredFields();
-    testH3RejectsUnsupportedOutputBeforePaidApproval();
+    testH3ValidateRejectsUnsupportedOutputWhileGenerationPaused();
     testH3LocalValidationChecksAllReferencePathsWithoutBilling();
     std::string key;
     auto miniMaxVideo = makeMaiMiniMaxVideoTool([&] { return key; });
@@ -473,8 +572,7 @@ int main() {
         const auto discovered =
             nlohmann::json::parse(tool->execute(R"({"action":"discover"})", context).output());
         CHECK(discovered.at("configured") == true);
-        CHECK(discovered.at("capabilities")[0].at("tool_status") ==
-              (tool == miniMaxVideo.get() ? "implemented_unverified" : "temporarily_disabled"));
+        CHECK(discovered.at("capabilities")[0].at("tool_status") == "temporarily_disabled");
         CHECK(discovered.dump().find(key) == std::string::npos);
         CHECK(tool->execute(R"({"action":"delegate","message":"A cat","video_path":"old.mp4"})",
                             context)

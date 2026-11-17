@@ -870,16 +870,22 @@ void AgentPanelSessionTest::welcomeToolRowsHideInternalGenerationAndCoverPublicR
             QVERIFY2(row->accessibleDescription().contains(name), qPrintable(name));
         }
     }
-    QVERIFY(!listed.contains(QStringLiteral("wan_video")));
-    QVERIFY(!listed.contains(QStringLiteral("seedance_video")));
-    for (const QString& name : {QStringLiteral("wan_image"), QStringLiteral("seedream_image"),
-                                QStringLiteral("glm_image"), QStringLiteral("minimax_image"),
-                                QStringLiteral("kling_bailian_image")}) {
+    for (const QString& name :
+         {QStringLiteral("wan_video"), QStringLiteral("seedance_video"), QStringLiteral("minimax_video"),
+          QStringLiteral("kling_bailian_video"), QStringLiteral("wan_image"), QStringLiteral("seedream_image"),
+          QStringLiteral("glm_image"), QStringLiteral("minimax_image"), QStringLiteral("kling_bailian_image")}) {
         QVERIFY(!listed.contains(name));
         QVERIFY(!allText.contains(name));
     }
     QSet<QString> expected;
     QVERIFY(tools);
+    // 暂停必须作用于模型真实可调用的注册表，不能只从欢迎页隐藏；
+    // 内部实例继续供已提交任务恢复使用，不允许新建付费任务。
+    for (const char* name : {"minimax_video", "kling_bailian_video"}) {
+        QVERIFY(tools->find(name));
+        QVERIFY(!tools->findForModel(name, configuration.model.toStdString()));
+        QVERIFY(!tools->findForModel(name));
+    }
     for (const MaiToolSpec& tool : tools->specs(configuration.model.toStdString()))
         expected.insert(QString::fromStdString(tool.name));
     QCOMPARE(listed, expected);
@@ -893,8 +899,6 @@ void AgentPanelSessionTest::welcomeToolRowsHideInternalGenerationAndCoverPublicR
     QVERIFY(listed.contains(QStringLiteral("maichat_play_local_music")));
     QVERIFY(listed.contains(QStringLiteral("maichat_cloud_drive_upload_media")));
     QVERIFY(listed.contains(QStringLiteral("maichat_cloud_drive_download_media")));
-    QVERIFY(listed.contains(QStringLiteral("minimax_video")));
-    QVERIFY(listed.contains(QStringLiteral("kling_bailian_video")));
     QVERIFY(controller.agent().listMessages(panel.sessionId().toStdString()).empty());
 
     // This fixture registers the real cloud/media families. Exercise their long
@@ -3934,12 +3938,14 @@ void AgentPanelSessionTest::desktopAgentSuppliesMarkdownSystemPrompt() {
     QVERIFY(!hasTool("wan_video"));
     for (const char* image : {"wan_image", "kling_bailian_image", "minimax_image", "glm_image", "seedream_image"})
         QVERIFY2(!hasTool(image), image);
-    QVERIFY(hasTool("kling_bailian_video"));
-    QVERIFY(hasTool("minimax_video"));
+    QVERIFY(!hasTool("kling_bailian_video"));
+    QVERIFY(!hasTool("minimax_video"));
     QVERIFY(hasTool("file_read"));
     const QString prompt = QString::fromStdString(request.baseInstructions);
-    QVERIFY(prompt.contains(QStringLiteral("Wan video generation (wan_video) is temporarily disabled")));
-    QVERIFY(prompt.contains(QStringLiteral("Paid image generation is temporarily disabled to control costs.")));
+    QVERIFY(
+        prompt.contains(QStringLiteral("Paid image and video generation is temporarily disabled to control costs.")));
+    QVERIFY(!prompt.contains(QStringLiteral("Other listed video models are separate")));
+    QVERIFY(!prompt.contains(QStringLiteral("For Kling video, use")));
     QVERIFY(!prompt.contains(QStringLiteral("wan_video mode=")));
     QVERIFY(!prompt.contains(QStringLiteral("For Kling images use")));
     QVERIFY(!prompt.contains(QStringLiteral("For MiniMax images use")));

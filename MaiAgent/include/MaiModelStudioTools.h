@@ -29,8 +29,9 @@ std::unique_ptr<MaiTool> makeMaiWanVideoTool(MaiWanCredentialsProvider credentia
                                              MaiCreativeMediaUploadProvider uploadMedia = {});
 
 // 百炼可灵视频与万相共用北京地域 Key/Workspace，但需单独开通可灵模型权限。
-// 本地 JPEG/PNG 和 MP4/MOV 经宿主私有 OSS 直传，再提交异步任务；无上传通道时
-// 文生视频仍可用，媒体输入会在付费提交前被拒绝。App 只注册此百炼可灵入口。
+// 实现保留本地 JPEG/PNG 与 MP4/MOV 经私有 OSS 直传和异步任务恢复。
+// 当前 delegate/revise 因费用暂停，在凭据、旧任务读取、上传和 HTTP 前拒绝，返回无副作用。
+// 对所有模型均不可见，宿主仅内部注册；已有任务 continue/cancel/delete 保留原行为。
 std::unique_ptr<MaiTool> makeMaiBailianKlingVideoTool(
     MaiWanCredentialsProvider credentials, std::string caBundlePath = {},
     MaiCreativeMediaUploadProvider uploadMedia = {});

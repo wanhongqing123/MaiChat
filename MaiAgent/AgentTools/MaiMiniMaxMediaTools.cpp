@@ -463,46 +463,21 @@ public:
     std::string name() const override {
         return mVideo ? "minimax_video" : "minimax_image";
     }
+    bool isAvailableForModel(const std::string& model) const override {
+        // 所有宿主共享此暂停边界，旧宿主的公开注册也不能把视频交给主模型。
+        // 内部 find 仍能恢复既有任务；普通工厂 execute 另有新任务守卫。
+        return !mVideo && MaiTool::isAvailableForModel(model);
+    }
     std::string description() const override {
-        // 共享类只暂停图像，原 H3 视频描述、付费确认与任务管理继续保留。
-        if (!mVideo)
-            return "Paid image generation is temporarily disabled to control costs. "
-                   "This includes text-to-image and character-reference generation. "
-                   "Do not retry or switch models silently. MiniMax image implementation is "
-                   "retained.";
-        // 视频分支英文描述的对应含义：MiniMax H3 为付费视频工具，接文本、首尾帧，
-        // 也接图片/视频/音频的多模态参考。content[] 的图片角色用 reference_image；
-        // 工具兼容 reference 或省略角色的旧写法，文本条目的 role 会忽略。
-        // duration/resolution 位于顶层；H3 支持 4–15 秒、768P/2K；H3 Max 支持
-        // 5–15 秒、480P/768P。两者都无原生 1080P，若用户必须要该规格，先说明
-        // “2K 生成后本地降采样”再付费确认。H3 Max 可用 model 显式选择。
-        // 严格首尾帧不可与多模态参考混用；纯文生视频必须给具体画幅。
-        // 参考视频只用来引导生成，当前没有承诺逐像素保留原视频的专用编辑模式。
-        // validate 只做本地校验不上传不扣费，delegate 确认后生成，continue 查任务；
-        // delete 仅移除已交付的本地任务记录，没有已核实的云端取消接口。
-        // 终态结果会自动回灌主模型。图片分支 image-01 支持文生图及角色参考图，
-        // discover 查能力，delegate 需付费确认且在本次调用内完成生成。
-        return mVideo ? "MiniMax H3 video specialist. Call discover before model selection; "
-                        "validate checks a plan locally without upload or charge. H3 creates "
-                        "4-15 seconds at native 768P/2K; H3 Max creates 5-15 seconds at "
-                        "480P/768P. Neither natively outputs 1080P. Text-only, one first "
-                        "frame or first+last frames, and multimodal reference generation are "
-                        "wired. Multimodal limits: up to nine images, three videos, three "
-                        "audio clips; strict first/last frames cannot mix with references. "
-                        "content[] media roles are reference_image/reference_video/"
-                        "reference_audio; local image and video paths go through private OSS. "
-                        "A reference video is not a guaranteed source-video edit. Text-only "
-                        "requires a concrete ratio. Confirm model, duration, resolution and "
-                        "ratio before paid delegate. Continue checks the existing task; delete "
-                        "removes only a delivered local record. No verified cloud cancel API "
-                        "is wired. For exact 1080P, explain 2K generation then local downscale."
-                      : "MiniMax image-01 / image-01-live paid image specialist. Text-to-image "
-                        "and character-reference image-to-image are wired. A reference image "
-                        "preserves a character in a newly generated scene; this is not generic "
-                        "pixel-preserving editing. Use one local JPG/PNG uploaded to private OSS "
-                        "or one public HTTPS image URL. Prompt limit is 1500 characters. "
-                        "Choose an official ratio or supported custom dimensions before the "
-                        "paid delegate call; one result is downloaded immediately.";
+        // 暂停只禁止新生成；已提交视频仍按原任务标识查询并交付。
+        return mVideo
+                   ? "MiniMax H3 video generation is temporarily disabled to control costs. "
+                     "Delegate and revise are unavailable; do not retry or switch models silently. "
+                     "Existing submitted tasks can still be recovered internally."
+                   : "Paid image generation is temporarily disabled to control costs. "
+                     "This includes text-to-image and character-reference generation. "
+                     "Do not retry or switch models silently. MiniMax image implementation is "
+                     "retained.";
     }
     std::string parametersSchema() const override {
         // content[] 是 V2 多模态输入；image_path 等扁平字段保留单图便利写法。
@@ -536,14 +511,8 @@ public:
     }
     std::optional<MaiSpecialistInfo> specialistInfo() const override {
         const bool configured = mKey && !mKey().empty();
-        const auto ready = !mVideo      ? MaiSpecialistCapabilityStatus::TemporarilyDisabled
-                           : configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                        : MaiSpecialistCapabilityStatus::NotConfigured;
-        const auto mediaReady = !mVideo       ? MaiSpecialistCapabilityStatus::TemporarilyDisabled
-                                : !configured ? MaiSpecialistCapabilityStatus::NotConfigured
-                                : mUploadMedia
-                                    ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                    : MaiSpecialistCapabilityStatus::UploadNotConfigured;
+        const auto ready = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
+        const auto mediaReady = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
         MaiSpecialistInfo info;
         info.toolName = name();
         info.modelId = mVideo ? "MiniMax-H3" : "image-01";
@@ -621,17 +590,11 @@ public:
     bool requiresPerCallApproval(const std::string& argumentsJson) const override {
         const Json args = Json::parse(argumentsJson, nullptr, false);
         const std::string action = value(args, "action");
-        if (!mVideo && (action == "delegate" || action == "revise")) return false;
-        if (mVideo && action == "delegate" && args.is_object()) {
-            const std::string model =
-                value(args, "model").empty() ? "MiniMax-H3" : value(args, "model");
-            if (validateH3OutputSpec(args, model)) return false;
-        }
+        if (action == "delegate" || action == "revise") return false;
         return action != "discover" && action != "validate" && action != "continue";
     }
-    bool requiresPaidApproval(const std::string& raw) const override {
-        const Json args = Json::parse(raw, nullptr, false);
-        return mVideo && args.is_object() && value(args, "action") == "delegate";
+    bool requiresPaidApproval(const std::string&) const override {
+        return false;
     }
     // 根据 action 分派 MiniMax 参数校验、图片生成、视频委托与状态查询。
     // 本地校验不触发付费请求；异步查询沿用受理时返回的云任务标识。
@@ -643,8 +606,18 @@ public:
         if (!args.is_object()) return maiCreativeInvalid("arguments must be a JSON object");
         const std::string action = value(args, "action");
         // 在任何凭据、旧任务查询、素材上传和网络之前返回，旧工厂实例也不能绕过。
-        if (!mVideo && (action == "delegate" || action == "revise"))
-            return maiCreativeImageGenerationPaused();
+        if (action == "delegate" || action == "revise") {
+            if (!mVideo) return maiCreativeImageGenerationPaused();
+            MaiToolExecution execution;
+            execution.status = MaiToolExecutionStatus::NotStarted;
+            execution.effectStatus = MaiToolEffectStatus::None;
+            execution.started = false;
+            return maiCreativeFailure(
+                       MaiErrorCode::NotSupported, "temporarily_disabled",
+                       "MiniMax video generation is temporarily disabled to control costs. "
+                       "No task was submitted. Do not retry or switch models silently.")
+                .withExecution(std::move(execution));
+        }
         // 模型即使带旧字段直调 execute，也要拒绝而非遗漏图片后付费提交。
         const Json schema = Json::parse(parametersSchema(), nullptr, false);
         for (auto field = args.begin(); field != args.end(); ++field) {
@@ -687,11 +660,10 @@ public:
                            {"local_validation", mVideo},
                            {"capabilities", std::move(capabilities)},
                            {"reply", "MiniMax capabilities listed"}};
-            if (!mVideo) {
-                output["generation_enabled"] = false;
-                output["reply"] =
-                    "MiniMax image generation is temporarily disabled to control costs.";
-            }
+            output["generation_enabled"] = false;
+            output["reply"] =
+                mVideo ? "MiniMax video generation is temporarily disabled to control costs."
+                       : "MiniMax image generation is temporarily disabled to control costs.";
             return MaiToolResult::success(output.dump());
         }
         if (action == "validate")

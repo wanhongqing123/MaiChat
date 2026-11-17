@@ -1191,23 +1191,27 @@ public:
     std::string name() const override {
         return "kling_bailian_video";
     }
+    bool isAvailableForModel(const std::string&) const override {
+        // 不能依赖各宿主同步隐藏卡片，暂停工具不得再进入模型声明或真实分派。
+        // 工厂和内部 find 保留，后台仍按原任务标识查询、下载和清理。
+        return false;
+    }
     bool requiresApproval(const std::string& raw) const override {
-        return isPaidGenerationAction(raw);
+        return requiresPerCallApproval(raw);
     }
     bool requiresPerCallApproval(const std::string& raw) const override {
-        return isPaidGenerationAction(raw);
+        return !isBillableSubmissionAction(raw) && isPaidGenerationAction(raw);
     }
-    bool requiresPaidApproval(const std::string& raw) const override {
-        return isBillableSubmissionAction(raw);
+    bool requiresPaidApproval(const std::string&) const override {
+        return false;
     }
     std::optional<MaiSpecialistInfo> specialistInfo() const override {
         const MaiWanCredentials credentials = mCredentials ? mCredentials() : MaiWanCredentials{};
         const bool configured = hasCredentials(credentials);
-        const auto ready = configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                      : MaiSpecialistCapabilityStatus::NotConfigured;
-        const auto media = !configured    ? MaiSpecialistCapabilityStatus::NotConfigured
-                           : mUploadMedia ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                          : MaiSpecialistCapabilityStatus::UploadNotConfigured;
+        const auto accountStatus = configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
+                                              : MaiSpecialistCapabilityStatus::NotConfigured;
+        const auto ready = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
+        const auto media = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
         return MaiSpecialistInfo{
             name(),
             kBailianKlingTurboModel,
@@ -1240,7 +1244,7 @@ public:
               "Provider multi-shot, element_list, and keep_original_sound controls are not "
               "exposed by this tool"},
              // 云端取消沿用百炼通用接口，只能处理 PENDING，RUNNING 无法取消。
-             {"cloud_task_cancel", false, true, ready,
+             {"cloud_task_cancel", false, true, accountStatus,
               "cancel works only for PENDING tasks; RUNNING jobs cannot be canceled"},
              // 供应商没有本适配器可用的云端删除；删除只清理本地已交付索引。
              {"cloud_task_delete", false, false, MaiSpecialistCapabilityStatus::NotImplemented,
@@ -1250,26 +1254,11 @@ public:
               "delete removes only a delivered local record; cloud output and saved MP4 remain"}}};
     }
     std::string description() const override {
-        // 可灵统一走阿里云百炼的北京地域接口，沿用万相凭据。
-        // Turbo 只接文字/首帧且不支持 4k；标准版加首尾帧和 4k；Omni 加多图、
-        // 单视频特征参考与源视频编辑。普通输出 3–15 秒；带特征视频时 3–10 秒。
-        // 无视频时参考图最多七张，有视频时最多四张；尚未接主体元素、多镜头、
-        // 原声保留控制。所有本地素材先直传私有 OSS，模型只接收短期 HTTPS 链接。
-        // 付费前确认型号、时长、分辨率和音频；continue 查询旧任务，cancel 仅排队，
-        // delete 只清理本地已交付记录，不重复付费提交。
-        return "Kling V3 video via Beijing Model Studio, using Wan regional credentials after "
-               "Kling access is activated. Call discover before selecting Turbo, Standard, or "
-               "Omni; diagnose is a read-only access check. Turbo supports text or one first "
-               "frame at std(720P)/pro(1080P); Standard adds first+last frames and 4k; Omni "
-               "adds reference images, one feature video, and base-video editing. Pure "
-               "generation lasts 3-15 seconds; feature-video reference is 3-10 seconds; edit "
-               "follows source duration. Omni takes up to seven reference images without "
-               "video, or four with one video. Local JPEG/PNG and MP4/MOV are uploaded to "
-               "private OSS. The tool does not expose subject elements, multi-shot control, "
-               "or keep_original_sound. Turbo always produces audio even if audio=false. "
-               "Confirm model, duration, resolution, ratio, and audio before paid delegate. "
-               "Continue checks an existing job; cancel works only while PENDING; delete "
-               "removes only a delivered local record and keeps cloud output and saved MP4.";
+        // 不能把历史实现能力当作当前可提交的能力；已有任务仅由内部恢复。
+        return "Kling video generation is temporarily disabled to control costs. "
+               "Delegate and revise are unavailable; do not retry or switch models silently. "
+               "Existing submitted tasks can still be recovered internally. "
+               "Continue, cancel and delete retain their existing task-management behavior.";
     }
     std::string parametersSchema() const override {
         // task_mode 区分生成、特征参考与源视频编辑；model 是百炼模型 ID，不是直连 ID。
@@ -1297,10 +1286,21 @@ public:
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
         const Json args = Json::parse(raw, nullptr, false);
         if (!args.is_object()) return invalid("arguments must be an object");
+        const std::string action = value(args, "action");
+        if (action == "delegate" || action == "revise") {
+            // 旧工厂指针与历史重试也必须在凭据、旧任务读取、素材上传和 HTTP 前拒绝。
+            MaiToolExecution execution;
+            execution.status = MaiToolExecutionStatus::NotStarted;
+            execution.effectStatus = MaiToolEffectStatus::None;
+            execution.started = false;
+            return failure(MaiErrorCode::NotSupported, "temporarily_disabled",
+                           "Kling video generation is temporarily disabled to control costs. "
+                           "No task was submitted. Do not retry or switch models silently.")
+                .withExecution(std::move(execution));
+        }
         if (auto error = rejectUnknownFields(args, parametersSchema())) return *error;
         if (args.contains("poll_once") && !args["poll_once"].is_boolean())
             return invalid("poll_once must be boolean");
-        const std::string action = value(args, "action");
         const MaiWanCredentials credentials = mCredentials ? mCredentials() : MaiWanCredentials{};
         if (action == "discover") {
             const MaiSpecialistInfo info = *specialistInfo();
@@ -1312,12 +1312,14 @@ public:
                          {"api_support", capability.apiSupported},
                          {"tool_status", maiSpecialistCapabilityStatusToString(capability.status)},
                          {"limitation", capability.limitation}});
-            return MaiToolResult::success(Json{{"tool_kind", "model_backed"},
-                                               {"bound_model", info.modelId},
-                                               {"configured", info.configured},
-                                               {"capabilities", capabilities},
-                                               {"reply", "Kling via Beijing Model Studio."}}
-                                              .dump());
+            return MaiToolResult::success(
+                Json{{"tool_kind", "model_backed"},
+                     {"bound_model", info.modelId},
+                     {"configured", info.configured},
+                     {"generation_enabled", false},
+                     {"capabilities", capabilities},
+                     {"reply", "Kling video generation is temporarily disabled to control costs."}}
+                    .dump());
         }
         if (action == "delete")
             return manageVideoTask(args, name().c_str(), credentials, mCaBundle, context);

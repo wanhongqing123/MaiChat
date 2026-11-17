@@ -15,12 +15,13 @@ using MaiMiniMaxApiKeyProvider = std::function<std::string()>;
 // 视频使用 H3/H3 Max V2 异步接口。图片使用 image-01 或 image-01-live 的同步接口；
 // 无参考图是文生图，一张人物参考图走 character 主体图生图，不提供任意局部重绘。
 // 本地图只作为私有 OSS 上传源，供应商收到 HTTPS URL；输出 URL 立刻下载到工作区。
-// 两类生成都可能扣费，必须通过工具逐次授权并响应取消；空 Key 只允许 discover。
+// 当前视频新生成与重做因费用暂停，在凭据、素材上传和 HTTP 前拒绝，返回未开始且无副作用。
+// 视频对所有模型均不可见；宿主仅内部注册供旧任务 continue/delete 使用。
+// 本地 validate 和 discover 不创建任务；已有任务查询、下载及本地记录清理保持原行为。
 std::unique_ptr<MaiTool> makeMaiMiniMaxVideoTool(MaiMiniMaxApiKeyProvider apiKey,
                                                  std::string caBundlePath = {},
                                                  MaiCreativeMediaUploadProvider uploadMedia = {});
-// 仅图像分支当前因费用暂停；文生图和参考图生成在凭据、上传及 HTTP 之前拒绝。
-// 上方视频工厂的付费确认、执行和旧任务管理不受图像暂停影响。
+// 图像生成同样因费用暂停；文生图和参考图生成在凭据、上传及 HTTP 之前拒绝。
 std::unique_ptr<MaiTool> makeMaiMiniMaxImageTool(MaiMiniMaxApiKeyProvider apiKey,
                                                  std::string caBundlePath = {},
                                                  MaiCreativeMediaUploadProvider uploadMedia = {});
