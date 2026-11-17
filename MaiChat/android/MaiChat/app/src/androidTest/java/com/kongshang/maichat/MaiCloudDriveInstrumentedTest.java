@@ -346,10 +346,13 @@ public final class MaiCloudDriveInstrumentedTest {
         String url = link.json().getString("read_url");
         assertTrue(url.startsWith("https://localhost:18446/"));
         File downloaded = new File(context.getCacheDir(), "cloud-drive-playback-test.mp4");
+        // Read the same native policy as product callers; do not duplicate the cloud limit.
+        MaiCloudDrive.MediaInfo playbackPolicy = MaiCloudDrive.mediaInfo(downloaded.getName());
+        assertNotNull("Native playback policy is unavailable", playbackPolicy);
         CountDownLatch downloadedDone = new CountDownLatch(1);
         AtomicReference<MaiChatAttachmentDownload.Result> downloadedResult = new AtomicReference<>();
         new MaiChatAttachmentDownload.NativeTransport(MaiCloudDriveInstrumentedTest::cert)
-            .download(url, downloaded, MaiCloudDrive.MAX_VIDEO_BYTES,
+            .download(url, downloaded, playbackPolicy.maxBytes,
                 new MaiChatAttachmentDownload.Scope(), result -> {
                     downloadedResult.set(result); downloadedDone.countDown();
                 });

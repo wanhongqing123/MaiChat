@@ -247,10 +247,13 @@ public final class MaiCloudDriveProductionCanaryTest {
 
     private static MaiChatAttachmentDownload.Result download(String url, File destination)
         throws Exception {
+        // The canary must follow the active native cloud-video policy, not a stale Java constant.
+        MaiCloudDrive.MediaInfo playbackPolicy = MaiCloudDrive.mediaInfo("cloud-playback.mp4");
+        assertNotNull("Native playback policy is unavailable", playbackPolicy);
         CountDownLatch done = new CountDownLatch(1);
         AtomicReference<MaiChatAttachmentDownload.Result> result = new AtomicReference<>();
         new MaiChatAttachmentDownload.NativeTransport().download(url, destination,
-            MaiCloudDrive.MAX_VIDEO_BYTES, new MaiChatAttachmentDownload.Scope(),
+            playbackPolicy.maxBytes, new MaiChatAttachmentDownload.Scope(),
             value -> { result.set(value); done.countDown(); });
         assertTrue("Private OSS download timed out", done.await(90, TimeUnit.SECONDS));
         assertNotNull(result.get());
