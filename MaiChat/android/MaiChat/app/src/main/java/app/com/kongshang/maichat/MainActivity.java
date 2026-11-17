@@ -6614,20 +6614,9 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         }
         if (mime.contains("markdown") || name.endsWith(".md") || name.endsWith(".markdown")
                 || mime.startsWith("text/")) {
-            ScrollView scroll = new ScrollView(this);
-            TextView text = MaiChatTheme.text(this, "", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.TEXT);
-            text.setText("正在打开…");
-            text.setTextIsSelectable(true);
-            text.setPadding(dp(16), dp(14), dp(16), dp(18));
-            scroll.addView(text, matchWrap());
-            Dialog dialog = previewDialog(attachment.fileName());
-            addPreviewContent(dialog, scroll);
-            mediaExecutor.execute(() -> {
-                String source = readTextFile(attachment.localPath());
-                MarkdownRenderer.prepare(Collections.singletonList(source), () -> !destroyed, () -> {
-                    if (dialog.isShowing()) MarkdownRenderer.bind(text, source);
-                });
-            });
+            // Both IM and creation artifacts use the same bounded, cancelable Markdown preview.
+            allowKeyboardLocation = false;
+            MarkdownPreviewDialog.show(this, new File(attachment.localPath()), null, attachment.fileName());
             return;
         }
         try {

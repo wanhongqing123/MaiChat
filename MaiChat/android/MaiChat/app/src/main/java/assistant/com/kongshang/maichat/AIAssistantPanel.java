@@ -84,6 +84,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private final TextView quoteText;
     private final TextView attachmentCount;
     private final MessageAdapter adapter = new MessageAdapter();
+    private final AIAssistantArtifactThumbnail artifactThumbnails = new AIAssistantArtifactThumbnail();
+    private int artifactPreviewGeneration;
     private AIAssistantController.State state;
     private String selected = "", pendingSignature = "";
     private String renderedMessagesSession = "", pendingLatestSession = "";
@@ -591,6 +593,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     }
     @Override
     protected void onDetachedFromWindow() {
+        ++artifactPreviewGeneration;
         setForeground(false);
         if (browser != null) browser.detach(browserHost);
         videoCircle.cancel();
@@ -629,6 +632,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 || actionAccountGeneration != MaiChatAuthClient.shared(activity).accountSessionGeneration()))
             dismissActionMenu();
         if (changedSession) {
+            // An away/back transition also invalidates delayed file-thumbnail work.
+            ++artifactPreviewGeneration;
             // 切走后即使又切回同一会话，也不能接收旧录音的迟到 final。
             invalidateVoiceTranscription();
             requestedRemoteImages.clear();
@@ -3086,6 +3091,10 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                                 }
                                 if (artifact.optString("mime_type").equals("application/pdf")) {
                                     PdfPreviewDialog.show(activity, file, controller.workspaceDirectoryForPreview());
+                                } else if (MarkdownPreviewDialog.isMarkdown(artifact.optString("mime_type"),
+                                               artifact.optString("name"))) {
+                                    MarkdownPreviewDialog.show(activity, file, controller.workspaceDirectoryForPreview(),
+                                        artifact.optString("name"), artifact.optString("mime_type"));
                                 } else {
                                     // 与普通附件一样显式选择打开/保存；交付卡片本身不执行或上传文件。
                                     try {
@@ -3265,16 +3274,29 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             JSONObject artifact = fileFromToolOutput(part);
                             fileCard.setVisibility(artifact == null ? GONE : VISIBLE);
                             if (artifact != null) {
-                                boolean available = validatedAgentFile(artifact) != null;
                                 String name = artifact.optString("name");
-                                String caption = artifact.optString("caption");
-                                fileCard.setText(name + "\n" + android.text.format.Formatter.formatFileSize(
-                                    activity, artifact.optLong("bytes")) +
-                                    (available ? " · 查看或保存" : " · 文件已移动或不可用") +
-                                    (caption.isEmpty() ? "" : "\n" + caption));
+                                setFileCardLabel(fileCard, artifact, true);
                                 fileCard.setContentDescription("文件 " + name);
                                 fileCard.setTag(artifact);
-                                fileCard.setEnabled(available);
+                                fileCard.setEnabled(true);
+                                int generation = artifactPreviewGeneration;
+                                long accountGeneration = MaiChatAuthClient.shared(activity).accountSessionGeneration();
+                                String owner = messageOwner(state);
+                                String thumbnailOwner = new JSONArray().put(accountGeneration).put(owner)
+                                    .put(displayMessageId(message)).put(id).put(artifact.optString("path")).toString();
+                                // Resolver/file access is deferred; a recycled row, changed account or
+                                // away/back session transition cannot receive the previous document.
+                                artifactThumbnails.bind(fileCard, thumbnailOwner, name,
+                                    artifact.optString("mime_type"), artifact.optLong("bytes"),
+                                    controller.workspaceDirectoryForPreview(), () -> validatedAgentFile(artifact),
+                                    () -> generation == artifactPreviewGeneration && owner.equals(messageOwner(state))
+                                        && accountGeneration == MaiChatAuthClient.shared(activity).accountSessionGeneration(),
+                                    available -> {
+                                        setFileCardLabel(fileCard, artifact, available);
+                                        fileCard.setEnabled(available);
+                                    });
+                            } else {
+                                artifactThumbnails.clear(fileCard);
                             }
                         }
                         LinearLayout mediaCard = mediaCards.get(id);
@@ -3596,6 +3618,14 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 file.length() != artifact.optLong("bytes")) return null;
             return file;
         } catch (Exception failure) { return null; }
+    }
+    private void setFileCardLabel(Button card, JSONObject artifact, boolean available) {
+        String caption = artifact.optString("caption");
+        String action = MarkdownPreviewDialog.isMarkdown(artifact.optString("mime_type"), artifact.optString("name"))
+            ? " · 查看或分享" : " · 查看或保存";
+        card.setText(artifact.optString("name") + "\n" + android.text.format.Formatter.formatFileSize(
+            activity, artifact.optLong("bytes")) + (available ? action : " · 文件已移动或不可用")
+            + (caption.isEmpty() ? "" : "\n" + caption));
     }
     private List<MainActivity.GalleryItem> mediaPlaylist() {
         List<MainActivity.GalleryItem> result = new ArrayList<>();

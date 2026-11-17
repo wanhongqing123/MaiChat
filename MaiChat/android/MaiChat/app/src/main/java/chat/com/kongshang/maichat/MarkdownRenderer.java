@@ -24,6 +24,7 @@ import io.noties.markwon.movement.MovementMethodPlugin;
 /** CommonMark/GFM parsing is serialized off the UI thread; only applying spans touches views. */
 public final class MarkdownRenderer {
     private static final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private static final Object parseLock = new Object();
     private static final Handler main = new Handler(Looper.getMainLooper());
     private static volatile Markwon markwon;
     private static volatile Typeface codeFace;
@@ -132,7 +133,9 @@ public final class MarkdownRenderer {
         String key = cacheKey(value, timestamp);
         Spanned ready = cache.get(key);
         if (ready == null) {
-            try { ready = markwon.toMarkdown(source(value)); }
+            // Thumbnail workers share the parser, but must never hold initialize's
+            // class monitor while parsing: initialize is also called from UI binds.
+            try { synchronized (parseLock) { ready = markwon.toMarkdown(source(value)); } }
             catch (RuntimeException | StackOverflowError error) {
                 android.util.Log.w("MaiChat.markdown", "Could not render message; showing plain text", error);
                 ready = new android.text.SpannedString(source(value));
@@ -173,6 +176,39 @@ public final class MarkdownRenderer {
         java.util.List<Presentation> items = new java.util.ArrayList<>();
         for (String text : sources) items.add(new Presentation(text, null));
         preparePresentations(items, current, completion);
+    }
+    /** Rasterize the first viewport with the same parsed spans as the full document.
+     * The caller supplies a complete, bounded document; parsing a cut prefix could change
+     * fenced blocks or references whose definitions occur later in the file. */
+    static android.graphics.Bitmap thumbnail(Context context, String source, int width, int height,
+                                             BooleanSupplier current) {
+        if (!current.getAsBoolean()) return null;
+        android.graphics.Bitmap bitmap = null;
+        try {
+            Spanned parsed = prepare(source, null);
+            if (!current.getAsBoolean()) return null;
+            android.text.TextPaint paint = new android.text.TextPaint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+            paint.setTypeface(MaiChatTypography.normal());
+            paint.setTextSize(MaiChatTypography.pixels(context, MaiChatTypographyTokens.Role.DETAIL));
+            paint.setColor(MaiChatTheme.TEXT);
+            int inset = MaiChatTheme.dp(context, 12);
+            android.text.StaticLayout layout = android.text.StaticLayout.Builder
+                .obtain(parsed, 0, parsed.length(), paint, Math.max(1, width - inset * 2))
+                .setIncludePad(false).setMaxLines(120).build();
+            bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888);
+            bitmap.eraseColor(MaiChatTheme.PANEL);
+            android.graphics.Canvas canvas = new android.graphics.Canvas(bitmap);
+            canvas.translate(inset, inset);
+            layout.draw(canvas);
+            if (!current.getAsBoolean()) return null;
+            android.graphics.Bitmap result = bitmap;
+            bitmap = null;
+            return result;
+        } catch (RuntimeException | OutOfMemoryError failure) {
+            return null;
+        } finally {
+            if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
+        }
     }
     static void preparePresentations(List<Presentation> sources, BooleanSupplier current, Runnable completion) {
         worker.execute(() -> {

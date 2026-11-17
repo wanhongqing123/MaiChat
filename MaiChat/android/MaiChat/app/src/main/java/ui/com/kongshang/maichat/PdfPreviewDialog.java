@@ -126,6 +126,39 @@ final class PdfPreviewDialog {
         return canonical;
     }
 
+    /** Render only page zero's first viewport; descriptors/pages never escape the worker. */
+    static Bitmap thumbnail(File file, File workspace, int width, int height, File cacheDirectory) throws IOException {
+        try (DocumentThumbnailSnapshot snapshot = DocumentThumbnailSnapshot.pdf(file, workspace, cacheDirectory, () -> true)) {
+            return renderSnapshot(snapshot, width, height);
+        }
+    }
+
+    /** Consumes the descriptor of a verified, already-unlinked immutable snapshot. */
+    static Bitmap renderSnapshot(DocumentThumbnailSnapshot snapshot, int width, int height) throws IOException {
+        try (ParcelFileDescriptor owned = snapshot.takeDescriptor(); PdfRenderer renderer = new PdfRenderer(owned)) {
+            if (renderer.getPageCount() <= 0) throw new IOException("PDF has no pages");
+            try (PdfRenderer.Page page = renderer.openPage(0)) {
+                return raster(page, width, height, true);
+            }
+        }
+    }
+
+    private static Bitmap raster(PdfRenderer.Page page, int width, int height, boolean firstViewport) {
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        try {
+            bitmap.eraseColor(Color.WHITE);
+            Matrix scale = new Matrix();
+            float x = (float) width / page.getWidth();
+            // A thumbnail crops a real top viewport; it must not stretch a whole page into it.
+            scale.setScale(x, firstViewport ? x : (float) height / page.getHeight());
+            page.render(bitmap, null, scale, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+            return bitmap;
+        } catch (RuntimeException | Error failure) {
+            bitmap.recycle();
+            throw failure;
+        }
+    }
+
     private void requestPage(int index) {
         if (closed.get() || index < 0 || index >= pageCount || index == currentPage) return;
         activity.runOnUiThread(() -> {
@@ -147,11 +180,7 @@ final class PdfPreviewDialog {
                 Math.max(720, activity.getResources().getDisplayMetrics().widthPixels * 2));
             int height = Math.max(1, Math.min(3000,
                 Math.round((float) page.getHeight() * width / page.getWidth())));
-            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
-            bitmap.eraseColor(Color.WHITE);
-            Matrix scale = new Matrix();
-            scale.setScale((float) width / page.getWidth(), (float) height / page.getHeight());
-            page.render(bitmap, null, scale, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+            bitmap = raster(page, width, height, false);
             Bitmap result = bitmap;
             bitmap = null;
             activity.runOnUiThread(() -> {
