@@ -1,6 +1,6 @@
 # desktop_computer 当前操作清单
 
-日期：2026-11-17。原始 Windows 输入实现为 `94f785d7`，窗口发现修订为 `b7001a6d`；后续参数/状态收敛及新产物记录见 `2026-11-17-desktop-input-semantics.md`。尚未替换已安装的 Windows App。
+日期：2026-11-17。原始 Windows 输入实现为 `94f785d7`，窗口发现修订为 `b7001a6d`，参数/状态收敛实现为 `efd27a7e`；新产物记录见 `2026-11-17-desktop-input-semantics.md`。尚未替换已安装的 Windows App。
 
 本表列出 MaiChat 当前操作和验收范围。与固定 Sunshine 的逐项行为差异见 `2026-11-17-sunshine-maichat-input-comparison.md`；存在对应原语及通过接收窗口测试，不等于两边逐字段、逐事件严格 1:1。
 
