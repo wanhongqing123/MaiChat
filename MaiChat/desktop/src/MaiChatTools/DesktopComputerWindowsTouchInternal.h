@@ -26,7 +26,7 @@ struct DesktopWindowsTouchPoint {
     std::int32_t right = 0;
     std::int32_t bottom = 0;
     std::uint32_t pressure = 0;
-    std::uint32_t orientation = 0;
+    std::uint32_t orientation = 0;  // Native +X origin, clockwise; valid only when hasOrientation.
     bool hasPressure = false;
     bool hasOrientation = false;
     bool hasArea = false;

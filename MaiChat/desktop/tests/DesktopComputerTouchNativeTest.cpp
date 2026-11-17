@@ -651,7 +651,9 @@ private:
                 return e && e->roundtrip &&
                        (e->touch.touchMask & (TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE)) ==
                            (TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE) &&
-                       e->touch.pressure == pressure && e->touch.orientation == 0 &&
+                       // Shared screen direction: source90deg points toward-X,
+                       // which is native Win32 orientation180deg.
+                       e->touch.pressure == pressure && e->touch.orientation == 180 &&
                        e->touch.rcContact.left <= e->touch.pointerInfo.ptPixelLocation.x &&
                        e->touch.rcContact.right > e->touch.pointerInfo.ptPixelLocation.x &&
                        e->touch.rcContact.top <= e->touch.pointerInfo.ptPixelLocation.y &&

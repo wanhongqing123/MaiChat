@@ -10,6 +10,10 @@ Mac native acceptance. The reference is Sunshine
 virtual keyboard/mouse devices, gamepads and controller feedback were explicitly
 excluded by the user.
 
+This is the original `94f785d7` artifact record. Subsequent canonical-key,
+modifier-plan and pointer-parameter convergence, with fresh source/runtime
+verification, is recorded in `2026-11-17-desktop-input-semantics.md`.
+
 The ordinary Controller and model tool use one owned native session. Keyboard,
 mouse, touch and pen use their corresponding Windows APIs. No input SDK, extra
 Git dependency, broker or driver was introduced. New third-party dependencies

@@ -780,12 +780,229 @@ void aliasesAndMixedEntry() {
         additionalControl = additionalControl || fake.events[index].ki.wScan == 0x1d;
     check(!additionalControl && fake.session->state().rawKeys.size() == 1, "temporary chord never represses or releases persistent control");
     check(!fake.send(raw(0x8011, true)), "typed control final up");
-    check(!fake.send(raw(0x8041)) && !fake.send(raw(0x0041)), "full16 source identities both acquire aliases");
-    check(fake.session->state().rawKeys.size() == 2, "source high prefix is not stripped from identity");
+    check(!fake.send(raw(0x8041)) && !fake.send(raw(0x0041)), "canonical prefixed and bare down are accepted");
+    check(fake.session->state().rawKeys.size() == 1, "legacy high prefix shares one canonical source lease");
     const auto count = fake.events.size();
-    check(!fake.send(raw(0x0041, true)) && fake.events.size() == count, "first alias up has no native up");
-    check(!fake.send(raw(0x8041, true)) && fake.session->state().empty(), "second alias final up");
+    check(!fake.send(raw(0x0041, true)) && fake.events.size() == count + 1 && fake.session->state().empty(),
+          "bare canonical up ends prefixed hold with the original native up");
+    check(!fake.send(raw(0x8041, true)) && fake.events.size() == count + 1,
+          "late prefixed canonical up does not emit a second native up");
 }
+
+void canonicalRawSourceAliases() {
+    Fake fake;
+    DesktopInputOptions options;
+    options.keyBindings = {{0x100, 'A'}};
+    check(!fake.send(raw(0x7a, false, 1), options), "editing scancode resolves its canonical user binding");
+    const auto count = fake.events.size();
+    options.keyBindings = {{0x100, 'B'}};
+    check(!fake.send(raw(0x100, false, 1), options) && fake.events.size() == count &&
+              fake.session->state().rawKeys.size() == 1,
+          "canonical editing duplicate keeps one original lease");
+    check(!fake.send(raw(0x100, true, 1), options) && fake.events.size() == count + 1 &&
+              fake.events.back().ki.wScan == 0x1e && (fake.events.back().ki.dwFlags & KEYEVENTF_KEYUP),
+          "canonical editing up retains first-down A despite changed remap");
+    check(!fake.send(raw(0x7a, true, 1), options) && fake.events.size() == count + 1,
+          "late editing alias up has no native effect");
+    Fake flags;
+    check(!flags.send(raw('A')) && !flags.send(raw(0x8041, false, 1)),
+          "flags-distinct source aliases share physical A");
+    check(flags.events.size() == 1 && flags.session->state().rawKeys.size() == 2,
+          "canonical code retains protocol flags in logical source identity");
+    check(!flags.send(raw('A', true)) && flags.events.size() == 1,
+          "one flags-distinct up preserves the other physical alias");
+    check(!flags.send(raw('A', true, 1)) && flags.events.size() == 2 && flags.session->state().empty(),
+          "final flags-distinct alias emits exactly one native up");
+}
+
+void rawSourceModifierSemantics() {
+    // Packet modifier bits describe source-side holds before user remapping.
+    // Record the Win32 boundary so these regressions cannot affect real input.
+    for (const auto source :
+         {VK_MENU, VK_LMENU, VK_RMENU, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_SHIFT, VK_LSHIFT, VK_RSHIFT}) {
+        Fake fake;
+        const auto mask = std::uint8_t(source == VK_MENU || source == VK_LMENU || source == VK_RMENU            ? 4
+                                       : source == VK_CONTROL || source == VK_LCONTROL || source == VK_RCONTROL ? 2
+                                                                                                                : 1);
+        DesktopInputOptions options;
+        options.keyBindings = {{std::uint16_t(source), 'A'}};
+        check(!fake.send(raw(std::uint16_t(0x8000 | source)), options), "source modifier can map to ordinary A");
+        const auto before = fake.events.size();
+        check(!fake.send(raw('B', false, 0, mask), options) && fake.events.size() == before + 1 &&
+                  fake.events.back().ki.wScan == 0x30 && !(fake.events.back().ki.dwFlags & KEYEVENTF_KEYUP),
+              "held generic or sided source modifier suppresses an unrelated native modifier");
+        auto repeat = raw('B');
+        repeat.key.repeat = true;
+        const auto repeated = fake.events.size();
+        check(!fake.send(repeat, options) && fake.events.size() == repeated + 1 && fake.events.back().ki.wScan == 0x30,
+              "repeat consults the same source modifier ownership");
+        check(!fake.send(raw(std::uint16_t(source), true), options), "bare canonical modifier up ends its mapped hold");
+        const auto missing = fake.events.size();
+        check(!fake.send(repeat, options) && fake.events.size() == missing + 1 && fake.events.back().ki.wScan == 0x30,
+              "repeat freezes the initially empty synthetic set after source modifier up");
+    }
+    Fake toModifier;
+    DesktopInputOptions options;
+    options.keyBindings = {{'A', VK_CONTROL}};
+    check(!toModifier.send(raw('A', false, 0, 1), options) && toModifier.events.size() == 3 &&
+              toModifier.events[0].ki.wScan == 0x2a && toModifier.events[1].ki.wScan == 0x1d &&
+              toModifier.events[2].ki.wScan == 0x2a && (toModifier.events[2].ki.dwFlags & KEYEVENTF_KEYUP),
+          "ordinary source mapped to modifier still gets its requested temporary Shift");
+    Fake fromModifier;
+    options.keyBindings = {{VK_CONTROL, 'A'}};
+    check(!fromModifier.send(raw(VK_CONTROL, false, 0, 4), options) && fromModifier.events.size() == 1 &&
+              fromModifier.events[0].ki.wScan == 0x1e,
+          "modifier source mapped to ordinary key never synthesizes packet modifiers around itself");
+    Fake rightAlt;
+    options = {};
+    options.rightAltToMeta = true;
+    check(!rightAlt.send(raw(0x80a5), options), "right Alt maps to held Meta before side-family checks");
+    options.rightAltToMeta = false;
+    auto count = rightAlt.events.size();
+    check(!rightAlt.send(raw('B', false, 0, 4), options) && rightAlt.events.size() == count + 1,
+          "cached right Alt to Meta suppresses synthetic Alt after options change");
+    check(!rightAlt.send(raw(VK_LMENU), options) && !rightAlt.send(raw(VK_RMENU, true), options),
+          "left Alt remains owned after right Alt to Meta source is released");
+    count = rightAlt.events.size();
+    check(!rightAlt.send(raw('C', false, 0, 4), options) && rightAlt.events.size() == count + 1,
+          "remaining left Alt preserves source family without another temporary Alt");
+    Fake meta;
+    check(!meta.send(raw('B', false, 0, 8)) && meta.events.size() == 3 && meta.events.front().ki.wVk == VK_LWIN &&
+              meta.events.back().ki.wVk == VK_LWIN && (meta.events.back().ki.dwFlags & KEYEVENTF_KEYUP),
+          "automatic Meta extension remains supported");
+}
+
+void temporaryRawModifierOwnership() {
+    DesktopInputOptions options;
+    options.keyBindings = {{VK_CONTROL, 'A'}};
+    Fake remapped;
+    check(!remapped.send(raw('B', false, 0, 2), options) && remapped.events.size() == 3 &&
+              remapped.events[0].ki.wScan == 0x1e && remapped.events[1].ki.wScan == 0x30 &&
+              remapped.events[2].ki.wScan == 0x1e && (remapped.events[2].ki.dwFlags & KEYEVENTF_KEYUP),
+          "missing source Ctrl uses its user-mapped A binding for temporary down and up");
+    auto repeat = raw('B');
+    repeat.key.repeat = true;
+    options.keyBindings = {{VK_CONTROL, 'C'}};
+    const auto repeated = remapped.events.size();
+    check(!remapped.send(repeat, options) && remapped.events.size() == repeated + 3 &&
+              remapped.events[repeated].ki.wScan == 0x1e && remapped.events[repeated + 1].ki.wScan == 0x30 &&
+              remapped.events[repeated + 2].ki.wScan == 0x1e &&
+              (remapped.events[repeated + 2].ki.dwFlags & KEYEVENTF_KEYUP),
+          "repeat freezes the original temporary A binding despite a Ctrl remap change");
+    options.keyBindings = {{VK_CONTROL, 'A'}};
+    Fake named;
+    check(!named.named(DesktopNativeInputKind::KeyDown, "Ctrl"), "ordinary named Ctrl hold setup");
+    const auto namedCount = named.events.size();
+    check(!named.send(raw('B', false, 0, 2)) && named.events.size() == namedCount + 1 &&
+              named.session->state().keysDown.size() == 2,
+          "raw modifier intent borrows an existing named native Ctrl");
+    check(!named.send(raw('B', true)) && !named.named(DesktopNativeInputKind::KeyUp, "Ctrl") &&
+              named.session->state().empty(),
+          "borrowed named Ctrl survives temporary retirement until its own up");
+    Fake namedMapped;
+    check(!namedMapped.named(DesktopNativeInputKind::KeyDown, "A"), "ordinary named mapped A hold setup");
+    const auto mappedCount = namedMapped.events.size();
+    check(!namedMapped.send(raw('B', false, 0, 2), options) && namedMapped.events.size() == mappedCount + 1 &&
+              namedMapped.session->state().keysDown.size() == 2,
+          "temporary mapped modifier borrows an existing named A binding");
+    check(!namedMapped.named(DesktopNativeInputKind::KeyUp, "A") && namedMapped.events.back().ki.wScan == 0x1e,
+          "mapped modifier borrowing leaves the ordinary named up intact");
+    Fake rawMapped;
+    check(!rawMapped.send(raw('A')), "independent raw mapped A hold setup");
+    const auto rawCount = rawMapped.events.size();
+    check(!rawMapped.send(raw('B', false, 0, 2), options) && rawMapped.events.size() == rawCount + 1 &&
+              rawMapped.session->state().rawKeys.size() == 2,
+          "temporary mapped modifier preserves an existing raw A lease");
+    Fake physical;
+    physical.foreignKeys = {VK_CONTROL, VK_LCONTROL};
+    check(!physical.send(raw('B', false, 0, 2)) && physical.events.size() == 1 && !physical.send(raw('B', true)) &&
+              physical.events.size() == 2 && physical.session->state().empty(),
+          "raw shortcut borrows external physical Ctrl without injecting its down or up");
+    Fake physicalMapped;
+    physicalMapped.foreignKeys = {'A'};
+    check(!physicalMapped.send(raw('B', false, 0, 2), options) && physicalMapped.events.size() == 1 &&
+              !physicalMapped.send(raw('B', true), options) && physicalMapped.events.size() == 2,
+          "temporary remapped modifier never presses or releases an external physical A");
+    Fake unknown;
+    unknown.foreignKeys = {VK_CONTROL, VK_LCONTROL};
+    check(!unknown.send(raw(VK_CONTROL, true), options) && unknown.events.empty(),
+          "unknown source up cannot release a physical user modifier through remapping");
+}
+void remappedTemporaryModifiersPreflightSecureIntent() {
+    Fake literal;
+    literal.secure = true;
+    DesktopNativeInput desktop;
+    desktop.desktopScope = true;
+    DesktopInputOptions options;
+    options.keyBindings = {{VK_LWIN, 'A'}};
+    check(literal.send(raw('R', false, 0, 8), options, desktop).code() == MaiErrorCode::NotSupported &&
+              literal.events.empty() && literal.session->state().empty(),
+          "Meta remapped to ordinary A cannot use Win+R secure-input exemption or emit any prefix");
+    Fake prefix;
+    prefix.secure = true;
+    options.keyBindings = {{VK_SHIFT, 'R'}};
+    check(prefix.send(raw(VK_TAB, false, 0, 9), options, desktop).code() == MaiErrorCode::NotSupported &&
+              prefix.events.empty() && prefix.session->state().empty(),
+          "mapped R before a later temporary Meta cannot borrow the future Win+R secure-input exemption");
+    Fake secureAttention;
+    options.keyBindings = {{VK_SHIFT, VK_CONTROL}, {VK_LWIN, VK_MENU}};
+    check(secureAttention.send(raw(VK_DELETE, false, 0, 9), options).code() == MaiErrorCode::NotSupported &&
+              secureAttention.events.empty() && secureAttention.session->state().empty(),
+          "preflight rejects Ctrl+Alt+Delete formed by two remapped temporary modifiers before any down");
+}
+
+void remappedPrefixRechecksCurrentSecureFocus() {
+    // A permitted navigation prefix can move focus to a password control in
+    // the same window. Earlier whole-plan checks cannot authorize later text.
+    const auto entersPasswordAfterTab = [](Fake& fake) {
+        fake.onEmit = [&fake](const INPUT& input) {
+            if (input.type == INPUT_KEYBOARD && input.ki.wScan == 0x0f && !(input.ki.dwFlags & KEYEVENTF_KEYUP))
+                fake.secure = true;
+        };
+    };
+    const auto noCharacterDown = [](const Fake& fake, std::size_t start) {
+        return std::none_of(fake.events.begin() + std::ptrdiff_t(start), fake.events.end(), [](const INPUT& input) {
+            return input.type == INPUT_KEYBOARD && !(input.ki.dwFlags & KEYEVENTF_KEYUP) &&
+                   (input.ki.wScan == 0x1e || input.ki.wScan == 0x30);
+        });
+    };
+    const auto pairedTabOnly = [](const Fake& fake) {
+        return fake.events.size() == 2 && fake.events[0].ki.wScan == 0x0f &&
+               !(fake.events[0].ki.dwFlags & KEYEVENTF_KEYUP) && fake.events[1].ki.wScan == 0x0f &&
+               (fake.events[1].ki.dwFlags & KEYEVENTF_KEYUP) && fake.session->state().empty();
+    };
+    DesktopInputOptions options;
+    options.keyBindings = {{VK_CONTROL, VK_TAB}};
+    Fake first;
+    first.foreignKeys = {VK_CONTROL, VK_LCONTROL};
+    entersPasswordAfterTab(first);
+    check(first.send(raw('B', false, 0, 2), options).code() == MaiErrorCode::NotSupported,
+          "first down rejects terminal character after mapped Tab enters password control");
+    check(noCharacterDown(first, 0), "first down emits no character after prefix changes secure focus");
+    check(pairedTabOnly(first), "first-down rejection pairs only its temporary Tab and preserves physical user Ctrl");
+    Fake repeat;
+    check(!repeat.send(raw('B', false, 0, 2), options), "password-focus repeat original B setup");
+    entersPasswordAfterTab(repeat);
+    const auto before = repeat.events.size();
+    auto repeated = raw('B');
+    repeated.key.repeat = true;
+    check(repeat.send(repeated, options).code() == MaiErrorCode::NotSupported,
+          "repeat rejects terminal character after frozen Tab prefix enters password control");
+    check(noCharacterDown(repeat, before), "repeat emits no new character after prefix changes secure focus");
+    check(repeat.events.size() == before + 3 && repeat.events[before].ki.wScan == 0x0f &&
+              !(repeat.events[before].ki.dwFlags & KEYEVENTF_KEYUP) && repeat.events[before + 1].ki.wScan == 0x0f &&
+              (repeat.events[before + 1].ki.dwFlags & KEYEVENTF_KEYUP) && repeat.events.back().ki.wScan == 0x30 &&
+              (repeat.events.back().ki.dwFlags & KEYEVENTF_KEYUP) && repeat.session->state().empty(),
+          "repeat rejection pairs temporary Tab and cleans only the original owned B binding");
+    Fake prefixes;
+    options.keyBindings = {{VK_SHIFT, VK_TAB}, {VK_CONTROL, 'A'}};
+    entersPasswordAfterTab(prefixes);
+    check(prefixes.send(raw('B', false, 0, 3), options).code() == MaiErrorCode::NotSupported,
+          "later mapped ordinary prefix rejects changed secure focus before terminal input");
+    check(noCharacterDown(prefixes, 0), "multiple-prefix sequence emits neither mapped A nor terminal B after Tab");
+    check(pairedTabOnly(prefixes), "multiple-prefix rejection pairs its already held Tab and leaves no owned input");
+}
+
 void mouseWheelAndUnicode() {
     Fake fake;
     DesktopInputEvent button;
@@ -888,8 +1105,8 @@ void modifiersAndRetainedFailure() {
     repeated = raw(0x8043);
     repeated.key.repeat = true;
     const auto leftStart = fake.events.size();
-    check(!fake.send(repeated) && fake.events.size() == leftStart + 3 && fake.events[leftStart].ki.wScan == 0x38,
-          "left-alt modifier intent is not suppressed by right-alt policy");
+    check(!fake.send(repeated) && fake.events.size() == leftStart + 1 && fake.events[leftStart].ki.wScan == 0x2e,
+          "repeat does not revive a source Alt released after the initial C down");
     fake.session->releaseAll();
     check(!fake.send(raw(0x8041)), "retain-failure setup");
     fake.failUps = true;
@@ -1365,6 +1582,11 @@ void revocationDuringPendingCleanup() {
 int main() {
     rawIdentityAndBinding();
     aliasesAndMixedEntry();
+    canonicalRawSourceAliases();
+    rawSourceModifierSemantics();
+    temporaryRawModifierOwnership();
+    remappedTemporaryModifiersPreflightSecureIntent();
+    remappedPrefixRechecksCurrentSecureFocus();
     mouseWheelAndUnicode();
     failureSnapshotAndCancellation();
     modifiersAndRetainedFailure();

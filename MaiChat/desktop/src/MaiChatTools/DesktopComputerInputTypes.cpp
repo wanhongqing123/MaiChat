@@ -8,6 +8,16 @@ namespace {
 using Kind = DesktopInputEventKind;
 using Phase = DesktopInputPhase;
 
+std::uint16_t canonicalInputKeyCode(const DesktopInputRawKey& source) {
+    const bool legacyNormalized = (source.code & 0x8000) != 0;
+    auto code = std::uint16_t(legacyNormalized ? source.code & 0xff : source.code);
+    // Use the same pre-binding code for logical holds and native remapping.
+    // The legacy prefix keeps F11-F14 out of editing-scancode interpretation.
+    if (!legacyNormalized && (source.flags & 1U) && code >= 0x7a && code <= 0x7d)
+        code = std::uint16_t(0x100 + (code - 0x7a));
+    return code;
+}
+
 MaiError invalid(const std::string& message) {
     return {MaiErrorCode::InvalidInput, message};
 }
@@ -272,18 +282,13 @@ bool maiDesktopInputEventsOnlyRelease(const std::vector<DesktopInputEvent>& even
 }
 
 std::uint32_t maiDesktopInputKeyIdentity(const DesktopInputRawKey& key) {
-    return (std::uint32_t(key.code) << 8) | key.flags;
+    return (std::uint32_t(canonicalInputKeyCode(key)) << 8) | key.flags;
 }
 
 DesktopInputRawKey maiDesktopRemapInputKey(const DesktopInputRawKey& source, const DesktopInputOptions& options) {
     auto result = source;
     const bool legacyNormalized = (source.code & 0x8000) != 0;
-    auto code = std::uint16_t(legacyNormalized ? source.code & 0xff : source.code);
-    // Non-normalized client editing scancodes are canonicalized before user
-    // bindings. The legacy prefix and ordinary normalized codes still mean
-    // F11-F14; unsupported dedicated keys must never become those function keys.
-    if (!legacyNormalized && (source.flags & 1U) && code >= 0x7a && code <= 0x7d)
-        code = std::uint16_t(0x100 + (code - 0x7a));
+    auto code = canonicalInputKeyCode(source);
     bool mapped = false;
     for (const auto& binding : options.keyBindings) {
         if (binding[0] != code) continue;

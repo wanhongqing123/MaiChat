@@ -654,7 +654,7 @@ void anglesAndPixelBounds() {
     CHECK(!touch->dispatch({sample}, bounds));
     const auto projected = transport->snapshot().back().points.front();
     CHECK(projected.screenX == 60 && projected.screenY == 120);
-    CHECK(projected.hasOrientation && projected.orientation == 0 && projected.hasArea);
+    CHECK(projected.hasOrientation && projected.orientation == 180 && projected.hasArea);
     CHECK(projected.right - projected.left >= 20 && projected.bottom - projected.top >= 20);
     sample.phase = Phase::CancelAll;
     CHECK(!touch->dispatch({sample}, {}));
@@ -677,6 +677,99 @@ void anglesAndPixelBounds() {
     sample = contact(1);
     sample.pressureOrDistance = std::numeric_limits<float>::quiet_NaN();
     CHECK(touch->dispatch({sample}, bounds).code() == MaiErrorCode::InvalidInput);
+}
+
+void physicalAnglesAndEllipseBounds() {
+    // The client plane has +X right and +Y down. The same directed pose as
+    // pen tilt starts at +Y and rotates toward -X; Win32 starts at +X and
+    // increases clockwise. A full direction must survive even though an
+    // ellipse's contact box repeats every half turn.
+    struct Expected {
+        std::uint16_t rotation;
+        std::uint32_t orientation;
+        std::int32_t halfWidth, halfHeight;
+    };
+    const Expected cases[] = {{0, 90, 64, 128},  {90, 180, 128, 64},  {180, 270, 64, 128},
+                              {270, 0, 128, 64}, {45, 135, 102, 102}, {360, 90, 64, 128}};
+    for (const auto& expected : cases) {
+        auto transport = std::make_shared<Transport>();
+        auto touch = backend(transport);
+        auto bounds = port();
+        bounds.x = bounds.y = -1024;
+        bounds.width = bounds.height = 1024;
+        bounds.environmentX = bounds.environmentY = -2048;
+        bounds.environmentWidth = bounds.environmentHeight = 4096;
+        auto sample = contact(1);
+        sample.rotation = expected.rotation;
+        sample.contactAreaMajor = .25F;
+        sample.contactAreaMinor = .125F;
+        CHECK(!touch->dispatch({sample}, bounds));
+        const auto frames = transport->snapshot();
+        CHECK(!frames.empty() && frames.back().points.size() == 1);
+        if (frames.empty() || frames.back().points.empty()) continue;
+        const auto& point = frames.back().points.front();
+        // Projection rounds the absolute screen coordinate; -512.5 rounds
+        // away from zero to -513 before virtual-origin rebasing.
+        CHECK(point.screenX == -513 && point.screenY == -513);
+        CHECK(point.x == 1535 && point.y == 1535);
+        CHECK(point.hasOrientation && point.orientation == expected.orientation);
+        CHECK(point.hasArea);
+        CHECK(point.left == 1535 - expected.halfWidth && point.right == 1535 + expected.halfWidth);
+        CHECK(point.top == 1535 - expected.halfHeight && point.bottom == 1535 + expected.halfHeight);
+        CHECK(!touch->releaseAll());
+    }
+}
+
+void nonuniformViewportAndOptionalEllipseAxes() {
+    // Area diameters live in the normalized client plane. Apply viewport
+    // width to every horizontal component and height to every vertical one.
+    // At 45 degrees this is an ellipse bound, not a rotated rectangle bound.
+    struct Expected {
+        std::uint16_t rotation;
+        float major, minor;
+        std::int32_t halfWidth, halfHeight;
+        bool area, orientation;
+    };
+    const Expected cases[] = {{0, .25F, .125F, 64, 256, true, true},   {90, .25F, .125F, 128, 128, true, true},
+                              {180, .25F, .125F, 64, 256, true, true}, {270, .25F, .125F, 128, 128, true, true},
+                              {45, .25F, .125F, 102, 203, true, true}, {65535, .25F, .125F, 102, 203, true, false},
+                              {0, .25F, 0, 128, 256, true, true},      {45, .25F, 0, 128, 256, true, true},
+                              {0, 0, .125F, 64, 128, true, true},      {0, 0, 0, 0, 0, false, true},
+                              {65535, 0, 0, 0, 0, false, false}};
+    for (const auto& expected : cases) {
+        auto transport = std::make_shared<Transport>();
+        auto touch = backend(transport);
+        auto bounds = port();
+        bounds.x = -2048;
+        bounds.y = -1024;
+        bounds.width = 1024;
+        bounds.height = 2048;
+        bounds.environmentX = -4096;
+        bounds.environmentY = -2048;
+        bounds.environmentWidth = 8192;
+        bounds.environmentHeight = 4096;
+        auto sample = contact(1);
+        sample.rotation = expected.rotation;
+        sample.contactAreaMajor = expected.major;
+        sample.contactAreaMinor = expected.minor;
+        CHECK(!touch->dispatch({sample}, bounds));
+        const auto frames = transport->snapshot();
+        CHECK(!frames.empty() && frames.back().points.size() == 1);
+        if (frames.empty() || frames.back().points.empty()) continue;
+        const auto& point = frames.back().points.front();
+        // Both absolute centers are negative half pixels, so llround keeps
+        // the same away-from-zero convention as the ordinary pen projection.
+        CHECK(point.screenX == -1537 && point.screenY == -1);
+        CHECK(point.x == 2559 && point.y == 2047);
+        CHECK(point.hasArea == expected.area && point.hasOrientation == expected.orientation);
+        // Direction is independent metadata. Stretching or omitting the
+        // contact ellipse must not rotate the caller's requested direction.
+        if (expected.orientation) CHECK(point.orientation == (expected.rotation + 90U) % 360U);
+        CHECK(point.left == 2559 - expected.halfWidth && point.right == 2559 + expected.halfWidth);
+        CHECK(point.top == 2047 - expected.halfHeight && point.bottom == 2047 + expected.halfHeight);
+        if (!expected.orientation) CHECK(point.orientation == 0);
+        CHECK(!touch->releaseAll());
+    }
 }
 
 void layoutChangeRetiresPhysicalBinding() {
@@ -754,6 +847,12 @@ void stopDoesNotWaitForPeriodicIo() {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--parameter-semantics") {
+        physicalAnglesAndEllipseBounds();
+        nonuniformViewportAndOptionalEllipseAxes();
+        std::printf("touch parameter semantics: %d checks, %d failures\n", checks, failures);
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--periodic-release-reentry") {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         periodicReleaseReentry();
@@ -780,6 +879,8 @@ int main(int argc, char** argv) {
     stationaryAndLifetime();
     retryExhaustionAndDestroy();
     anglesAndPixelBounds();
+    physicalAnglesAndEllipseBounds();
+    nonuniformViewportAndOptionalEllipseAxes();
     stopDoesNotWaitForPeriodicIo();
     layoutChangeRetiresPhysicalBinding();
     opaqueIdsKeepNativeOrder();

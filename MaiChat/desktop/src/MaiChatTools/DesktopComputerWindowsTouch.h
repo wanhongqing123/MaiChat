@@ -15,6 +15,9 @@
 // Immutable state/fault/physical positions remain readable during native calls;
 // positions never reinterpret cached points through a later viewport.
 // Opaque caller IDs never become Windows pointer IDs or device handles.
+// Direction starts at screen +Y and increases toward -X, as for pen tilt.
+// It is independent of the contact ellipse: normalized ellipse diameters are
+// projected per viewport axis while center ratios use size-1 pixel endpoints.
 class DesktopComputerWindowsTouch {
 public:
     virtual ~DesktopComputerWindowsTouch() = default;

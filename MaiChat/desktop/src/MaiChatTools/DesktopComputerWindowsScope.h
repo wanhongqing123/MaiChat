@@ -217,14 +217,15 @@ public:
         return {};
     }
     MaiError hold(INPUT down, INPUT up, std::string tag = {}, std::string label = {},
-                  std::optional<DesktopInputRawKey> raw = {}, WORD vk = 0, WORD scan = 0, std::uint8_t modifiers = 0) {
+                  std::optional<DesktopInputRawKey> raw = {}, WORD vk = 0, WORD scan = 0,
+                  std::vector<DesktopWindowsRawBinding> synthetic = {}) {
         if (!tag.empty() && ownsTag(tag)) return {};
         if (const auto ready = validate()) return ready;
         if (down.type == INPUT_MOUSE)
             if (const auto target = validatePointerTarget()) return target;
         if (!vk) vk = nativeVk(up);
         if (!scan && up.type == INPUT_KEYBOARD) scan = up.ki.wScan;
-        Alias alias{++sequence_, std::move(tag), std::move(label), std::move(raw), modifiers};
+        Alias alias{++sequence_, std::move(tag), std::move(label), std::move(raw), std::move(synthetic)};
         for (auto& entry : held_) if (sameBinding(entry, up, vk, scan)) {
             entry.aliases.push_back(std::move(alias));
             publish();
@@ -299,11 +300,11 @@ public:
                 auto down = entry.up;
                 down.ki.dwFlags &= ~KEYEVENTF_KEYUP;
                 const auto vk = entry.vk;
-                const auto modifiers = alias.modifiers;
-                if (const auto secure = guardKey(vk, modifiers)) return secure;
+                const auto synthetic = alias.synthetic;
+                if (const auto secure = guardRawPlan(vk, synthetic)) return secure;
                 std::vector<std::uint64_t> temporary;
-                auto result = introduceModifiers(vk, modifiers, temporary);
-                if (!result) result = validate();
+                auto result = introduceModifiers(synthetic, temporary);
+                if (!result) result = guardKey(vk);
                 if (!result) result = emitInput(down);
                 return retireModifiers(temporary, result);
             }
@@ -315,25 +316,28 @@ public:
         if (!binding) return binding.error();
         if ((keyState(binding.value().virtualKey) & 0x8000) && !ownsNative(binding.value()))
             return {MaiErrorCode::Busy, "Keyboard key is already held outside this input owner"};
-        // Modifier bits describe this key-down. Independently held modifiers
-        // stay in this ledger; only newly introduced temporary leases retire.
-        std::vector<std::uint64_t> temporary;
-        auto modifiers = std::uint8_t(source.modifiers & 15);
-        if (heldRightAltAsMeta()) modifiers &= ~std::uint8_t(4);
+        // Resolve the missing source-side modifiers before any input escapes.
+        // Their native bindings, like the terminal key, freeze at first down.
+        const auto prepared = prepareModifiers(source, options);
+        if (!prepared) return prepared.error();
         auto original = source;
         original.release = original.repeat = false;
         // Acquiring an alias is metadata only. A modifier tap with no new key
         // down would itself be an unrelated observable input.
         if (ownsNative(binding.value()))
             return hold(binding.value().down, binding.value().up, tag,
-                "raw:" + std::to_string(source.code) + ":" + std::to_string(source.flags), original,
-                binding.value().virtualKey, binding.value().physicalScan, modifiers);
-        if (const auto secure = guardKey(binding.value().virtualKey, modifiers)) return secure;
-        MaiError first = introduceModifiers(binding.value().virtualKey, modifiers, temporary);
+                        "raw:" + std::to_string(source.code) + ":" + std::to_string(source.flags), original,
+                        binding.value().virtualKey, binding.value().physicalScan, prepared.value());
+        if (const auto secure = guardRawPlan(binding.value().virtualKey, prepared.value())) return secure;
+        std::vector<std::uint64_t> temporary;
+        MaiError first = introduceModifiers(prepared.value(), temporary);
+        // A permitted prefix such as Tab may change the focused control. Check
+        // this actual down again with current native modifiers and secure focus.
+        if (!first) first = guardKey(binding.value().virtualKey);
         if (!first) {
             first = hold(binding.value().down, binding.value().up, tag,
-                "raw:" + std::to_string(source.code) + ":" + std::to_string(source.flags), original,
-                binding.value().virtualKey, binding.value().physicalScan, modifiers);
+                         "raw:" + std::to_string(source.code) + ":" + std::to_string(source.flags), original,
+                         binding.value().virtualKey, binding.value().physicalScan, prepared.value());
         }
         return retireModifiers(temporary, first);
     }
@@ -370,45 +374,100 @@ public:
     }
 
 private:
-    struct Alias { std::uint64_t id; std::string tag, label; std::optional<DesktopInputRawKey> raw; std::uint8_t modifiers; };
+    struct Alias {
+        std::uint64_t id;
+        std::string tag, label;
+        std::optional<DesktopInputRawKey> raw;
+        // Binding metadata for repeat, not another ownership ledger. Every
+        // actual temporary down still acquires a lease in held_.aliases.
+        std::vector<DesktopWindowsRawBinding> synthetic;
+    };
     struct Held { INPUT up; WORD vk, scan; std::vector<Alias> aliases; };
     static bool isModifierKey(WORD key) {
         return key == VK_SHIFT || key == VK_LSHIFT || key == VK_RSHIFT || key == VK_CONTROL || key == VK_LCONTROL ||
                key == VK_RCONTROL || key == VK_MENU || key == VK_LMENU || key == VK_RMENU || key == VK_LWIN || key == VK_RWIN;
     }
-    bool heldRightAltAsMeta() const {
-        for (const auto& entry : held_) if (entry.vk == VK_LWIN || entry.vk == VK_RWIN)
-            for (const auto& alias : entry.aliases) if (alias.raw) {
-                const auto code = alias.raw->code & 0x8000 ? alias.raw->code & 255 : alias.raw->code;
-                if (code == VK_RMENU) return true;
-            }
-        return false;
+    static std::uint8_t modifierMask(WORD key) {
+        if (key == VK_SHIFT || key == VK_LSHIFT || key == VK_RSHIFT) return 1;
+        if (key == VK_CONTROL || key == VK_LCONTROL || key == VK_RCONTROL) return 2;
+        if (key == VK_MENU || key == VK_LMENU || key == VK_RMENU) return 4;
+        if (key == VK_LWIN || key == VK_RWIN) return 8;
+        return 0;
+    }
+    std::uint8_t sourceModifiers() const {
+        std::uint8_t result = 0;
+        // Packet bits refer to canonical source families, even when a source
+        // Alt currently owns A or right Alt owns a cached native Meta binding.
+        for (const auto& entry : held_)
+            for (const auto& alias : entry.aliases)
+                if (alias.raw) result |= modifierMask(WORD(maiDesktopInputKeyIdentity(*alias.raw) >> 8));
+        return result;
     }
     std::uint8_t actualModifiers() const {
         std::uint8_t result = 0;
-        const auto add = [&](WORD key) {
-            if (key == VK_SHIFT || key == VK_LSHIFT || key == VK_RSHIFT) result |= 1;
-            if (key == VK_CONTROL || key == VK_LCONTROL || key == VK_RCONTROL) result |= 2;
-            if (key == VK_MENU || key == VK_LMENU || key == VK_RMENU) result |= 4;
-            if (key == VK_LWIN || key == VK_RWIN) result |= 8;
-        };
-        for (const auto& entry : held_) if (entry.up.type == INPUT_KEYBOARD) add(entry.vk);
+        for (const auto& entry : held_)
+            if (entry.up.type == INPUT_KEYBOARD) result |= modifierMask(entry.vk);
         for (const WORD key : {VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
                                VK_MENU, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN})
-            if (keyState(key) & 0x8000) add(key);
+            if (keyState(key) & 0x8000) result |= modifierMask(key);
         return result;
     }
-    MaiError introduceModifiers(WORD target, std::uint8_t mask, std::vector<std::uint64_t>& temporary) {
-        if (isModifierKey(target)) return {};
+    MaiResult<std::vector<DesktopWindowsRawBinding>> prepareModifiers(const DesktopInputRawKey& source,
+                                                                      const DesktopInputOptions& options) const {
+        std::vector<DesktopWindowsRawBinding> prepared;
+        if (isModifierKey(WORD(maiDesktopInputKeyIdentity(source) >> 8))) return prepared;
+        const auto mask = std::uint8_t(source.modifiers & 15 & ~sourceModifiers());
         const WORD modifiers[]{VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN};
         for (unsigned index = 0; index < 4; ++index) {
             if (!(mask & (1u << index))) continue;
-            const auto native = virtualKeyBinding(modifiers[index], layout());
-            const auto down = keyEvent(native), up = keyEvent(native, true);
-            bool owned = false;
-            for (const auto& entry : held_) owned = owned || sameBinding(entry, up, native.virtualKey, native.scanCode);
-            if (owned || (keyState(modifiers[index]) & 0x8000)) continue;
-            const auto result = hold(down, up);
+            DesktopInputRawKey modifier;
+            modifier.code = modifiers[index];
+            const auto effective = maiDesktopRemapInputKey(modifier, options);
+            const auto binding = maiDesktopWindowsResolveRawKey(effective, options, std::uintptr_t(layout()));
+            if (!binding) return binding.error();
+            prepared.push_back(binding.value());
+        }
+        return prepared;
+    }
+    bool borrowsBinding(const DesktopWindowsRawBinding& binding) const {
+        if (ownsNative(binding) || (keyState(binding.virtualKey) & 0x8000)) return true;
+        // A generic temporary modifier can borrow either native side. Sided
+        // remappings retain their exact binding and never release another side.
+        if (binding.virtualKey == VK_SHIFT || binding.virtualKey == VK_CONTROL || binding.virtualKey == VK_MENU)
+            return (actualModifiers() & modifierMask(binding.virtualKey)) != 0;
+        return false;
+    }
+    MaiError guardRawPlan(WORD target, const std::vector<DesktopWindowsRawBinding>& synthetic) const {
+        if (const auto ready = validate()) return ready;
+        auto finalModifiers = std::uint8_t(actualModifiers() | modifierMask(target));
+        bool hasDelete = target == VK_DELETE;
+        for (const auto& binding : synthetic) {
+            finalModifiers |= modifierMask(binding.virtualKey);
+            hasDelete = hasDelete || binding.virtualKey == VK_DELETE;
+        }
+        // Check the complete mapped chord before any prefix can escape. Source
+        // modifier bits cannot predict the host's secure-attention combination.
+        if (hasDelete && (finalModifiers & 6) == 6)
+            return {MaiErrorCode::NotSupported,
+                    "Ctrl+Alt+Delete is a system secure-attention sequence, not injectable keyboard input"};
+        auto effects = actualModifiers();
+        for (const auto& binding : synthetic) {
+            if (borrowsBinding(binding)) continue;
+            if (const auto secure = guardKey(binding.virtualKey, effects)) return secure;
+            effects |= modifierMask(binding.virtualKey);
+        }
+        // Use only modifiers that really precede this event. A mapped ordinary
+        // key cannot borrow a future Win press to bypass secure text handling.
+        return guardKey(target, effects);
+    }
+    MaiError introduceModifiers(const std::vector<DesktopWindowsRawBinding>& synthetic,
+                                std::vector<std::uint64_t>& temporary) {
+        for (const auto& binding : synthetic) {
+            if (borrowsBinding(binding)) continue;
+            // Earlier prefixes can navigate inside the selected window. The
+            // prepared plan cannot authorize this down after focus has changed.
+            if (const auto secure = guardKey(binding.virtualKey)) return secure;
+            const auto result = hold(binding.down, binding.up, {}, {}, {}, binding.virtualKey, binding.physicalScan);
             if (result) return result;
             temporary.push_back(sequence_);
         }

@@ -183,6 +183,78 @@ void editingKeysCanonicalizeBeforeBindings() {
     }
 }
 
+void logicalKeyIdentityUsesCanonicalSourceCode() {
+    for (const std::uint8_t flags : {std::uint8_t{0}, std::uint8_t{1}}) {
+        DesktopInputRawKey source;
+        source.code = 'A';
+        source.flags = flags;
+        const auto identity = maiDesktopInputKeyIdentity(source);
+        CHECK(identity == ((std::uint32_t('A') << 8) | flags));
+        for (const std::uint16_t legacy : {std::uint16_t{0x8041}, std::uint16_t{0xff41}}) {
+            auto alias = source;
+            alias.code = legacy;
+            CHECK(maiDesktopInputKeyIdentity(alias) == identity);
+            CHECK(alias.code == legacy);
+        }
+
+        // Modifiers, the extended bit, release and repeat describe this event,
+        // not a second held key. Flags remain part of the logical identity.
+        for (std::uint8_t modifiers = 0; modifiers <= 0x1f; ++modifiers) {
+            auto changed = source;
+            changed.modifiers = modifiers;
+            changed.release = true;
+            changed.repeat = true;
+            CHECK(maiDesktopInputKeyIdentity(changed) == identity);
+        }
+        auto otherFlags = source;
+        otherFlags.flags ^= 1;
+        CHECK(maiDesktopInputKeyIdentity(otherFlags) != identity);
+    }
+
+    for (std::uint16_t offset = 0; offset < 4; ++offset) {
+        DesktopInputRawKey editing;
+        editing.code = std::uint16_t(0x7a + offset);
+        editing.flags = 1;
+        auto dedicated = editing;
+        dedicated.code = std::uint16_t(0x100 + offset);
+        CHECK(maiDesktopInputKeyIdentity(editing) == maiDesktopInputKeyIdentity(dedicated));
+        CHECK(maiDesktopInputKeyIdentity(editing) == ((std::uint32_t(dedicated.code) << 8) | 1));
+
+        // Legacy normalization happens before editing-key interpretation, so a
+        // prefixed F11-F14 remains a function key even with flags bit 0 set.
+        auto legacyFunction = editing;
+        legacyFunction.code |= 0x8000;
+        CHECK(maiDesktopInputKeyIdentity(legacyFunction) == ((std::uint32_t(editing.code) << 8) | 1));
+        CHECK(maiDesktopInputKeyIdentity(legacyFunction) != maiDesktopInputKeyIdentity(editing));
+        auto normalizedFunction = editing;
+        normalizedFunction.flags = 0;
+        CHECK(maiDesktopInputKeyIdentity(normalizedFunction) == (std::uint32_t(editing.code) << 8));
+    }
+}
+
+void logicalKeyIdentityPrecedesUserBindings() {
+    DesktopInputRawKey first;
+    first.code = 'A';
+    DesktopInputRawKey second = first;
+    second.code = 'B';
+    DesktopInputOptions options;
+    options.keyBindings = {{{'A', 'C'}}, {{'B', 'C'}}};
+    CHECK(maiDesktopRemapInputKey(first, options).code == maiDesktopRemapInputKey(second, options).code);
+    CHECK(maiDesktopInputKeyIdentity(first) != maiDesktopInputKeyIdentity(second));
+
+    auto alias = first;
+    alias.code |= 0x8000;
+    CHECK((maiDesktopRemapInputKey(alias, options).code & 0xff) == 'C');
+    CHECK(maiDesktopInputKeyIdentity(alias) == maiDesktopInputKeyIdentity(first));
+
+    // Default generic-modifier aliases are native mappings too. Their source
+    // identities stay distinct so releasing one source cannot release another.
+    first.code = 0x10;
+    second.code = 0xa0;
+    CHECK(maiDesktopRemapInputKey(first, {}).code == maiDesktopRemapInputKey(second, {}).code);
+    CHECK(maiDesktopInputKeyIdentity(first) != maiDesktopInputKeyIdentity(second));
+}
+
 void touchAndPen() {
     auto value = event(Kind::Touch);
     for (auto phase : {Phase::Hover, Phase::Down, Phase::Up, Phase::Move, Phase::Cancel,
@@ -608,6 +680,8 @@ int main() {
     basicPrimitives();
     rawKeysAndText();
     editingKeysCanonicalizeBeforeBindings();
+    logicalKeyIdentityUsesCanonicalSourceCode();
+    logicalKeyIdentityPrecedesUserBindings();
     touchAndPen();
     controllers();
     optionsAndNames();

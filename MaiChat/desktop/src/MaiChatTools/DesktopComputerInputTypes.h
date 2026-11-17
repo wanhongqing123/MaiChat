@@ -71,17 +71,23 @@ struct DesktopInputTouch {
     float x = 0;
     float y = 0;
     float pressureOrDistance = 0;
+    // Ellipse diameters in the normalized client plane. Area projection and
+    // direction are independent; a missing axis uses the other known axis.
     float contactAreaMajor = 0;
     float contactAreaMinor = 0;
+    // Screen direction from +Y toward -X, shared with pen azimuth. Unknown is
+    // 65535; known 0 is meaningful, and 360 has the same direction as 0.
     std::uint16_t rotation = 0xffff;
 };
 
 struct DesktopInputPen {
+    // UP ends contact while retaining hover; HOVER_LEAVE exits range.
+    // BUTTON_ONLY retains the accepted contact/pose and changes buttons/tool.
     DesktopInputPhase phase = DesktopInputPhase::Move;
     std::uint8_t toolType = 1;
     std::uint8_t buttons = 0;
     std::uint8_t tilt = 0xff;
-    std::uint16_t rotation = 0xffff;
+    std::uint16_t rotation = 0xffff;  // Same screen-direction basis as touch, not shaft twist.
     float x = 0;
     float y = 0;
     float pressureOrDistance = 0;
@@ -230,8 +236,9 @@ MaiError maiDesktopValidateInputEvents(const std::vector<DesktopInputEvent>& eve
 MaiError maiDesktopValidateInputOptions(const DesktopInputOptions& options);
 bool maiDesktopInputEventsOnlyRelease(const std::vector<DesktopInputEvent>& events);
 // Pure source identity/remapping shared by platform implementations. Identity
-// retains the complete 16-bit source code and flags. Modifier snapshots do not
-// change the identity or reinterpret an already held native binding.
+// uses the canonical pre-binding code and flags: legacy codes use the low byte,
+// while non-legacy editing scancodes become their dedicated codes. Modifier
+// snapshots do not change identity or reinterpret a held native binding.
 std::uint32_t maiDesktopInputKeyIdentity(const DesktopInputRawKey& key);
 DesktopInputRawKey maiDesktopRemapInputKey(const DesktopInputRawKey& key, const DesktopInputOptions& options);
 std::string maiDesktopInputProfileName(DesktopInputProfile profile);

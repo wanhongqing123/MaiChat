@@ -320,10 +320,20 @@ public:
         dispatchFor(40);
         check("barrel_zero_releases_with_cached_position", hasBarrel(noButtonsBegin, false));
         plannedUp_ = GetTickCount64();
+        const auto upBegin = receiver_.raw.size();
         if (!batch(pen(Phase::Up), false, true, "ordinary_up_without_token")) return;
         dispatchFor(60);
+        check("up_retains_owned_hover_state", controller_->inputState(context_.sessionId).penActive);
+        check("up_has_native_in_range_without_contact",
+              std::any_of(receiver_.raw.begin() + upBegin, receiver_.raw.end(), [](const auto& event) {
+                  return event.infoOk && (event.pen.pointerInfo.pointerFlags & POINTER_FLAG_INRANGE) &&
+                         !(event.pen.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT);
+              }));
+        const auto leaveBegin = receiver_.raw.size();
         if (!batch(pen(Phase::HoverLeave), true, true, "tool_leave_without_token")) return;
         dispatchFor(80);
+        check("leave_has_native_exit_and_no_hover_state",
+              count(WM_POINTERLEAVE, leaveBegin) > 0 && !controller_->inputState(context_.sessionId).penActive);
         primaryEnd_ = receiver_.raw.size();
         checkPrimary();
         const auto ctrlUps = receiver_.controlUps;

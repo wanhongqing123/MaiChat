@@ -97,10 +97,11 @@ MaiResult<HeldContact> project(const DesktopInputTouch& input, const DesktopInpu
     result.pressure = !result.touching ? 0 : input.pressureOrDistance > 0 ?
         static_cast<std::uint32_t>(std::lround(input.pressureOrDistance * 1024.0)) : 512;
     result.hasOrientation = input.rotation != 0xffff;
-    // The protocol measures clockwise from vertical; Win32 measures from +X.
-    // Ellipse axes are symmetric, but retaining the full native angle avoids
-    // turning an unknown orientation into a reported zero-degree measurement.
-    result.orientation = result.hasOrientation ? (input.rotation % 360 + 270) % 360 : 0;
+    // Client direction starts at +Y and increases toward -X, matching pen
+    // tilt. Win32 starts at +X and increases clockwise. Keep this directed
+    // metadata independent of the separately projected contact ellipse, and
+    // never turn an unknown direction into a reported zero-degree value.
+    result.orientation = result.hasOrientation ? (input.rotation % 360 + 90) % 360 : 0;
     result.left = result.right = x;
     result.top = result.bottom = y;
     const double major = input.contactAreaMajor > 0 ? input.contactAreaMajor : input.contactAreaMinor;

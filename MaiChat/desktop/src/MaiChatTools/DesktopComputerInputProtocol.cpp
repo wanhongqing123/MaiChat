@@ -250,23 +250,34 @@ Json integerSchema(std::int64_t minimum, std::uint64_t maximum) {
 }
 
 Json contactSchema() {
-    return {{"type", "object"},
-            {"properties",
-             {{"phase",
-               {{"type", "string"}, {"enum", {"hover", "down", "up", "move", "cancel", "hover_leave", "cancel_all"}}}},
-              {"pointer_id", integerSchema(0, 0xffffffff)},
-              {"x_ratio", {{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
-              {"y_ratio", {{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
-              {"pressure_or_distance", {{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
-              {"contact_area_major", {{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
-              {"contact_area_minor", {{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
-              {"rotation",
-               {{"type", {"integer", "null"}},
-                {"minimum", 0},
-                {"maximum", 65535},
-                {"description", "Degrees 0..360; null or 65535 means unknown."}}}}},
-            {"required", {"phase"}},
-            {"additionalProperties", false}};
+    return {
+        {"type", "object"},
+        {"properties",
+         {{"phase",
+           {{"type", "string"}, {"enum", {"hover", "down", "up", "move", "cancel", "hover_leave", "cancel_all"}}}},
+          {"pointer_id", integerSchema(0, 0xffffffff)},
+          {"x_ratio", {{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
+          {"y_ratio", {{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
+          {"pressure_or_distance", {{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
+          {"contact_area_major",
+           {{"type", "number"},
+            {"minimum", 0},
+            {"maximum", 1},
+            {"description", "Normalized client-plane ellipse diameter; both axes 0 means unknown."}}},
+          {"contact_area_minor",
+           {{"type", "number"},
+            {"minimum", 0},
+            {"maximum", 1},
+            {"description", "Normalized client-plane ellipse diameter; a missing axis uses the other known axis."}}},
+          {"rotation",
+           {{"type", {"integer", "null"}},
+            {"minimum", 0},
+            {"maximum", 65535},
+            {"description",
+             "Screen direction in degrees 0..360, from +Y toward -X; null or 65535 means unknown. "
+             "Direction is independent of ellipse area and viewport aspect ratio; not shaft twist."}}}}},
+        {"required", {"phase"}},
+        {"additionalProperties", false}};
 }
 
 Json eventSchema(const char* type, Json properties, Json required = Json::array()) {
@@ -348,10 +359,12 @@ std::string maiDesktopComputerInputSchema(const std::string& legacySchema) {
                                    {"code", "release"}));
     // 保留协议的编码空间和每一位含义，避免模型把 raw code 当成 Unicode 字符或扫描码。
     variants.back()["properties"]["code"]["description"] =
-        "Sunshine 16-bit physical key code, including its legacy 0x8000 prefix; not a Unicode scalar.";
+        "Sunshine 16-bit physical key code, including its legacy 0x8000 prefix; equivalent encodings share one "
+        "canonical source identity before user remapping. Not a Unicode scalar.";
     variants.back()["properties"]["flags"]["description"] = "Bit 0 means non-normalized key code.";
     variants.back()["properties"]["modifiers"]["description"] =
-        "Modifier-state bits: Shift=1, Control=2, Alt=4, Meta=8, extended key=16.";
+        "Source modifier-state bits: Shift=1, Control=2, Alt=4, Meta=8, extended key=16. Missing modifiers use "
+        "the same key remapping; target and synthetic native bindings freeze at first down for repeat/up.";
     variants.push_back(
         eventSchema("unicode_text",
                     {{"text",
@@ -380,6 +393,7 @@ std::string maiDesktopComputerInputSchema(const std::string& legacySchema) {
     variants.back()["description"] =
         "System pen input. Check input_capabilities before use. Logical side buttons share one native barrel bit; "
         "tilt/azimuth map to native tilt, not shaft twist. Hover distance and contact ellipse have no Windows mapping. "
+        "UP ends contact and retains hover; hover_leave exits range. button_only retains accepted pose/contact. "
         "Dispatch is not acknowledgement from the target application.";
     properties["events"] = {{"type", "array"},
                             {"minItems", 1},

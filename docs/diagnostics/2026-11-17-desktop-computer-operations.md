@@ -1,6 +1,6 @@
 # desktop_computer 当前操作清单
 
-日期：2026-11-17。本轮 Windows 输入实现已提交为 `94f785d7`；窗口发现修订为 `b7001a6d`。尚未替换已安装的 Windows App，统一验证记录见 `2026-11-17-desktop-input-final-verification.md`。
+日期：2026-11-17。原始 Windows 输入实现为 `94f785d7`，窗口发现修订为 `b7001a6d`；后续参数/状态收敛及新产物记录见 `2026-11-17-desktop-input-semantics.md`。尚未替换已安装的 Windows App。
 
 本表列出 MaiChat 当前操作和验收范围。与固定 Sunshine 的逐项行为差异见 `2026-11-17-sunshine-maichat-input-comparison.md`；存在对应原语及通过接收窗口测试，不等于两边逐字段、逐事件严格 1:1。
 
@@ -48,7 +48,7 @@
 2. `relative_move`：相对移动。字段 `delta_x`、`delta_y` 为有符号 32 位整数；Windows 使用原生相对输入，不先把鼠标移到 `(0,0)`。原生鼠标加速可能影响实际位移，不应把相对量当成绝对屏幕定位结果。
 3. `mouse_button`：原地按下或抬起。`button` 为 `left`、`middle`、`right`、`back`、`forward`，`release` 为布尔值；事件本身不移动鼠标。窗口模式在派发前检查当前鼠标下目标。
 4. `wheel`：原地细滚动。`axis` 为 `vertical` / `horizontal`；`delta_120` 为有符号 32 位整数，120 表示一格，正数表示向上或向右，0 是无效果事件。启用高精度时保留细量；关闭时按轴累计不足一格的余数。窗口模式每个原生发送块均需检查当前鼠标下目标。
-5. `raw_key`：物理键的按下或抬起。`code` 为 1～65535 的协议键码，包含历史 `0x8000` 前缀，不是 Unicode 字符；`flags` 只允许 bit 0，表示非归一化键码；`modifiers` 只允许 0～31，其中 Shift=1、Control=2、Alt=4、Meta=8、extended=16；`release` 为布尔值。首次 down 缓存原生绑定，后续重复和 up 不因布局或映射变化而重新解析。模型不能传内部 `repeat` 标志。
+5. `raw_key`：物理键的按下或抬起。`code` 为 1～65535 的协议键码，包含历史 `0x8000` 前缀，不是 Unicode 字符；`flags` 只允许 bit 0，表示非归一化键码；`modifiers` 只允许 0～31，其中 Shift=1、Control=2、Alt=4、Meta=8、extended=16；`release` 为布尔值。逻辑身份先规范化再重映射，同 flags 的等价编码共享一个持有。首次 down 缓存目标及缺失临时修饰键的原生绑定，后续重复和 up 不因布局或映射变化重译，也不因来源修饰键后来释放而重新补齐。模型不能传内部 `repeat` 标志。
 6. `unicode_text`：发送字面 UTF-8 文字，最多 4000 字节；空字符串是无效果事件。中文及补充平面字符使用同一 Unicode 路径；此项不表示所有应用一定接受这些字符。
 
 来源：`DesktopComputerInputProtocol.cpp:325` 的 6 个 schema 分支；原生执行在 `DesktopComputerWindows.cpp` 的 `InputScope::dispatchTyped`，与命名动作共享一个输入作用域和持有表。
@@ -61,6 +61,8 @@
 8. `pen`：笔输入。阶段包含上述 7 项及 `button_only`；`tool_type` 为 0=未知、1=笔、2=橡皮，`buttons` 为 0～7；`tilt` 为 0～90 度，`null` / 255 表示未知。Windows 使用项目自有 User32 适配器，`implemented=true`；`available` 检查所需的三个系统 API。定位、接触压力、倾斜/方位角、橡皮端、悬停和释放已在同一普通/工具会话的真实窗口中测试。三位逻辑侧键按 OR 映射到 Windows 的一个 barrel 位，不是三个独立硬件键；悬停距离、接触椭圆和笔杆自转没有此后端的原生映射。`button_only` 使用已接受的原生位置，按下前重新检查该位置所属窗口；释放不依赖新的位置。
 
 释放和取消阶段只消费其身份/阶段所需的数据；陈旧但有限的几何值不应阻止清理。DTO 的存在不等于平台实现或可用性。
+
+方向统一从屏幕 +Y 朝 -X 起算：0°向下、90°向左，Windows Touch orientation 为 `(rotation+90)%360`。方向与接触范围独立；接触椭圆按 NDC 直径投影。笔的 `up` 只结束接触并保留 hover，`hover_leave` 才离开范围，`button_only` 保留接受的姿态。详细状态合同及负坐标取整说明见本次 semantics 记录。
 
 来源：`DesktopComputerInputProtocol.cpp:363`、`DesktopComputerInputTypes.cpp:93`，以及 `DesktopComputerWindows.cpp` 中 Touch/Pen 分支和 `WindowsInputSession::capabilities()`。
 

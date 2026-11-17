@@ -334,7 +334,7 @@ void nativeOwnsAliasesAndFrozenBindings() {
     CHECK(!session->inputEvents({raw(0x42, true)}, {}, {}, options));
     CHECK(native->transitions().size() == 2 && native->transitions().back().code == 0x43 &&
           native->transitions().back().release);
-    CHECK(maiDesktopInputKeyIdentity(raw(0x41).key) != maiDesktopInputKeyIdentity(raw(0x8041).key));
+    CHECK(maiDesktopInputKeyIdentity(raw(0x41).key) == maiDesktopInputKeyIdentity(raw(0x8041).key));
     auto first = raw(0x41);
     first.key.modifiers = 0x10;
     CHECK(!session->inputEvents({first}, {}, {}, noRepeat()));
@@ -359,6 +359,49 @@ void repeatUsesOnlyNativeSourceProjection() {
     const auto count = native->transitions().size();
     std::this_thread::sleep_for(std::chrono::milliseconds(35));
     CHECK(native->transitions().size() == count && session->state().empty());
+}
+void canonicalAliasesKeepOneFrozenRepeatBinding() {
+    auto native = std::make_shared<Native>();
+    auto session = wrap(native);
+    DesktopInputOptions first;
+    first.repeatDelayMs = 25;
+    first.repeatPeriodMs = 15;
+    first.keyBindings = {{{0x41, 0x42}}};
+    const auto send = [&](const DesktopInputEvent& event, const DesktopInputOptions& options) {
+        const auto end = Clock::now() + std::chrono::milliseconds(500);
+        MaiError result;
+        do {
+            result = session->inputEvents({event}, {}, {}, options);
+            if (result.code() != MaiErrorCode::Busy ||
+                result.message() != "another ordinary input operation or cleanup is in flight")
+                return result;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (Clock::now() < end);
+        return result;
+    };
+    CHECK(!send(raw(0x8041), first));
+    auto changed = first;
+    changed.keyBindings = {{{0x41, 0x43}}};
+    auto alias = raw(0x41);
+    alias.key.modifiers = 0x10;  // A duplicate cannot rewrite the first extended/native binding.
+    CHECK(!send(alias, changed));
+    CHECK(session->state().rawKeys.size() == 1 && session->state().rawKeys[0].code == 0x8041);
+    CHECK(waitUntil([&] {
+        const auto events = native->events();
+        return std::any_of(events.begin(), events.end(), [](const auto& event) { return event.key.repeat; });
+    }));
+    const auto transitions = native->transitions();
+    CHECK(std::count_if(transitions.begin(), transitions.end(),
+                        [](const auto& key) { return !key.repeat && !key.release; }) == 1);
+    CHECK(std::all_of(transitions.begin(), transitions.end(),
+                      [](const auto& key) { return key.code == 0x8042 && key.modifiers == 0; }));
+    CHECK(!send(raw(0x41, true), changed));
+    CHECK(session->state().empty());
+    const auto released = native->transitions();
+    CHECK(!released.empty() && released.back().release && released.back().code == 0x8042);
+    const auto stopped = native->events().size();
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    CHECK(native->events().size() == stopped);
 }
 void firstRepeatDelayStartsBeforeSlowNativeDispatch() {
     auto native = std::make_shared<Native>();
@@ -964,6 +1007,7 @@ int main() {
     preflightAndCleanupFailures();
     nativeOwnsAliasesAndFrozenBindings();
     repeatUsesOnlyNativeSourceProjection();
+    canonicalAliasesKeepOneFrozenRepeatBinding();
     firstRepeatDelayStartsBeforeSlowNativeDispatch();
     disablingRepeatStopsSchedulingWithoutInventingAnUp();
     policyLeavesSecureIntentToTheNative();

@@ -372,6 +372,8 @@ public:
     void run() {
         mouse();
         keyboard();
+        canonicalRawAliases();
+        mappedModifierRepeat();
         heldScreenshot();
         clearing();
     }
@@ -797,6 +799,74 @@ private:
             wheelSeen = wheelSeen || (event.message == WM_MOUSEWHEEL && event.wheel == 120 && event.control);
         }
         check("control_cross_entry_native_evidence", keySeen && wheelSeen);
+    }
+    void canonicalRawAliases() {
+        if (receiver_.canceled) return;
+        const auto begin = receiver_.events.size();
+        const auto originalF7 = receiver_.count(WM_KEYDOWN, VK_F7);
+        const auto originalF6 = receiver_.count(WM_KEYDOWN, VK_F6);
+        const auto originalUp = receiver_.count(WM_KEYUP, VK_F7);
+        options_.keyboardRepeat = true;
+        options_.repeatDelayMs = 100;
+        options_.repeatPeriodMs = 20;
+        options_.keyBindings = {{{VK_F8, VK_F7}}};
+        if (!typed("canonical_prefix_down_maps_to_f7", {key(std::uint16_t(0x8000 | VK_F8))})) return;
+        options_.keyBindings = {{{VK_F8, VK_F6}}};
+        auto alias = key(VK_F8, false, 0x10);
+        alias.key.code = VK_F8;
+        if (!typed("canonical_plain_duplicate_keeps_first_binding", {alias})) return;
+        check("canonical_alias_owns_one_source", session_->state().rawKeys.size() == 1);
+        check("canonical_repeat_received_on_first_f7",
+              pumpUntil([&] { return receiver_.count(WM_KEYDOWN, VK_F7) >= originalF7 + 3; }));
+        bool unchanged = true;
+        for (std::size_t i = begin; i < receiver_.events.size(); ++i) {
+            const auto& event = receiver_.events[i];
+            if (event.message == WM_KEYDOWN && event.key == VK_F7) unchanged = unchanged && !event.extended;
+        }
+        check("canonical_remap_and_extended_remain_frozen",
+              unchanged && receiver_.count(WM_KEYDOWN, VK_F6) == originalF6);
+        alias.key.release = true;
+        if (!typed("canonical_plain_up_releases_prefix_hold", {alias})) return;
+        check("canonical_one_actual_up_and_empty",
+              receiver_.count(WM_KEYUP, VK_F7) == originalUp + 1 && session_->state().empty());
+        const auto stopped = receiver_.count(WM_KEYDOWN, VK_F7);
+        pumpFor(80);
+        check("canonical_up_stops_native_repeat", receiver_.count(WM_KEYDOWN, VK_F7) == stopped);
+        options_.keyboardRepeat = false;
+        options_.keyBindings.clear();
+    }
+    void mappedModifierRepeat() {
+        if (receiver_.canceled) return;
+        options_.keyboardRepeat = false;
+        options_.keyBindings = {{{VK_CONTROL, VK_F7}}};
+        const auto begin = receiver_.events.size();
+        if (!typed("mapped_source_control_down_is_f7", {key(VK_CONTROL)})) return;
+        options_.keyboardRepeat = true;
+        options_.repeatDelayMs = 80;
+        options_.repeatPeriodMs = 20;
+        if (!typed("source_control_suppresses_unwanted_native_control", {key(VK_F8, false, 2)})) return;
+        options_.keyBindings = {{{VK_CONTROL, VK_F6}}};
+        auto alias = key(VK_F8, false, 2);
+        alias.key.code = VK_F8;
+        if (!typed("duplicate_updates_options_without_rewriting_modifier_plan", {alias})) return;
+        if (!typed("mapped_source_control_up_uses_held_f7", {key(VK_CONTROL, true)})) return;
+        const auto afterModifierUp = receiver_.count(WM_KEYDOWN, VK_F8);
+        check("repeat_survives_source_modifier_release",
+              pumpUntil([&] { return receiver_.count(WM_KEYDOWN, VK_F8) >= afterModifierUp + 2; }));
+        bool noControl = true;
+        for (std::size_t i = begin; i < receiver_.events.size(); ++i) {
+            const auto& event = receiver_.events[i];
+            if (event.message == WM_KEYDOWN && event.key == VK_F8) noControl = noControl && !event.control;
+            if (event.message == WM_KEYDOWN || event.message == WM_KEYUP)
+                noControl =
+                    noControl && event.key != VK_CONTROL && event.key != VK_LCONTROL && event.key != VK_RCONTROL;
+        }
+        check("source_modifier_repeat_never_revives_native_control", noControl);
+        alias.key.release = true;
+        if (!typed("mapped_modifier_plain_up_ends_repeat", {alias})) return;
+        check("mapped_modifier_case_owned_state_empty", session_->state().empty());
+        options_.keyboardRepeat = false;
+        options_.keyBindings.clear();
     }
     void heldScreenshot() {
         if (receiver_.canceled || !move("held_absolute_setup", .25, .4)) return;
