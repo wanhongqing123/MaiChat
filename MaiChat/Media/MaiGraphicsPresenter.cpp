@@ -681,6 +681,12 @@ private:
         const uint32_t width = view->width;
         const uint32_t height = view->height;
         gs_load_swapchain(view->swapchain);
+#if defined(_WIN32)
+        // OBS 的 sRGB 纹理采样先转为线性；D3D11 最终写出须配对启用 sRGB RTV，
+        // 否则 128 中灰会直接按线性值写成约 55。恢复状态，避免影响中间转换任务。
+        const bool previousFramebufferSrgb = gs_framebuffer_srgb_enabled();
+        gs_enable_framebuffer_srgb(true);
+#endif
 #if defined(__ANDROID__)
         // OBS 的纹理采样输出为线性；GLES 线性窗口不自动写回 sRGB，需在最终一步编码。
         // 根据实际附件编码选择，不能用“支持 sRGB 纹理”推断窗口也是 sRGB。
@@ -756,6 +762,9 @@ private:
         else
             presented = false;
         gs_load_swapchain(nullptr);
+#if defined(_WIN32)
+        gs_enable_framebuffer_srgb(previousFramebufferSrgb);
+#endif
         return presented;
     }
 
