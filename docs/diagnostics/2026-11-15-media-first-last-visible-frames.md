@@ -1,0 +1,19 @@
+# Media first and last visible frames, 2026-11-15
+
+The user directly ran the R5 private candidate at PID64730, source facf plus exact R5 overlay, signed executable828ef878494ae8dccc4039231693fb29f58b67f10476654eaff9fecc99a8290f. Three supplied camera movies show image expansion handoff flicker, a restored small video window during fullscreen closing, and an initially small video window later resized. The first video-opening issue also occurs on Windows. The running user App and actual films were not operated or replaced.
+
+Decisive original normal Cocoa RED: the first visible video geometry was QRect(0,0 480x270), settled QRect(515,321 480x320); at actual native WillExit alpha was1. Image animation initially had no visible real preview window because the parent snapshot was later exchanged for a separate native Dialog. Both video assertions and the image assertion failed against the original implementation.
+
+The shared ordinary prepareAndShow API now starts the same playback worker hidden and prepares the actual source geometry before one first show. Main local/cloud and generic tool fallback use the same API. Original QWidget.show behavior remains available. Source generation checks reject stale size/title/position/fullscreen/completion callbacks; failed/canceled preparation has a terminal state and cannot reopen later. Native HDR uses actual AVPlayer presentationSize metadata without waiting for a first visible-layer frame.
+
+Closing fullscreen uses the original serialized DidEnter/DidExit/delete lifecycle. Opacity is suppressed only immediately before truly starting exit, before the restoration snapshot. Suppressing it during an unfinished entry caused an early-close failure and was corrected; the raw failed case is retained. Original opacity is restored only once hidden, preserving ordinary component close/show reuse.
+
+Image expansion and shrink now move the same application-modal Dialog, with one native handle and stable pixels throughout. There is no parent snapshot-to-native handoff or 50/100ms handoff timer. The original thumbnail remains in place; backing conversation brightness and alpha canvas policies remain unchanged. Image layout updates before per-frame scaling.
+
+Final normal same-library video cases pass11/0/0: Sdr/native HDR first geometry, error/cancel including queued fullscreen, component close/show reuse, pre-exit alpha, generic tool source time, Creation close/reopen, independent tool window and R5 native Space ownership. Image cases pass8/0/0: real one-window expand/shrink with actual movement/pixels, duplicate-preview guard, normal/max conversation background, native pixmap and transparent/opaque canvas.
+
+The final image fixture explicitly selects its owned peer and waits for actual source visibleRegion exposure. Earlier variants clicked a logically visible source while its parent bubble still had width0, causing the intentional no-visible-source fallback rather than exercising an animation. Original logs remain; the dedicated final case requires multiple closing frames, motion, unchanged native handle and rendered color. This is not a claim that cached native window objects all disappear.
+
+Only the three owned MainWindow functions change, alongside Dialog cpp/h, ImagePreviewDialog cpp/h, generic DesktopMediaTools opening call and original tests. Root eventFilter/title changes are separate; function preimage hashes are supplied for merging. R5 MacLayer production remains exactly367cca595db7f45c6454e0565c2dd95bddb0addb. No Renderer/Media/Core behavior is part of this R6 piece.
+
+Own QWidget bitmap frames were viewed and native opacity/Space and hit behavior checked. No Screen Recording/TCC request, paid supplier, real SDK send, user DB/Clipboard or continuous native compositor recording was used. Formal successor source/build/package/runtime receipts must be recorded separately; private tests are not represented as an installed update.

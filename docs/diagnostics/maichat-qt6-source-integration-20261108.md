@@ -132,3 +132,53 @@ The final stage passes 33-Mach-O/signature/four-model gates and normal/debug
 sandboxed Cocoa smoke, exit 0 in 3.025/0.676 seconds. Code is coordinated at
 `f01c592d675a8eedb7438df6d15cf73d11009ce0`; exact delivery evidence is in the
 [delivery receipt](maichat-qt-ui-delivery-20261109.json).
+
+## Mac common-3 integration receipt
+
+The coordinator's common-3 CMake/script delta was subsequently imported and
+verified against temporary tree `dbfe93348d52c1d61470efea66f4b3f70be1ef11`.
+Its normal registered `app_log_lifecycle_test` target compiled successfully and
+passed 4 / 0 / 0 (105 ms). Explicit CMake regeneration was needed to add the new
+target to the existing Makefile build. All 1,816 pre-existing Mac compile
+commands were identical; only the new test's three compilation entries were
+added. The normal App SHA256 remained unchanged, so the signed private App's
+native debug-plugin exit evidence below also covers this source freeze. The
+executed registered-suite ledger now contains 92 unique passing suites after
+the one camera-test path correction; the original bulk-run failure is retained.
+
+## Final product commit and common-4 follow-up
+
+The Mac workspace fast-forwarded to
+`f01c592d675a8eedb7438df6d15cf73d11009ce0` after preserving the complete
+overlay and original index in a 3,016,499-byte archive (SHA256
+`be25601626a09f60f32127160c5ed3f797beb381e9a5c323bf4a831b406453cc`).
+No reset, restore, stash, independent product commit or push was used. Product
+working files match MaiChat tree `fa8724995009ce88242af4b55b9468fa763f11d2`;
+Core remains `69e18eb1e4b587b30ad8b467dd3172bea0443b8e`. Local diagnostic
+additions and the independent disk-cleanup document remain preserved.
+
+Common-4 removes only the retired Windows `QT_MEDIA_BACKEND` setting and comment.
+Main blob is `60e81f88717bd585b48e4b5e5194544e5d8b295a`. The producer's raw
+manifest uses CRLF while this Mac checkout uses LF; exact SHA comparison after
+newline conversion confirms that distinction.
+
+After the fast-forward, normal configure/build, private app-only packaging and
+both Cocoa sandbox smokes succeeded. Ordinary smoke PID 53141 exited 0 in
+3.025 seconds; debug-plugin smoke PID 53335 exited 0 in 0.676 seconds. DYLD logs
+confirm that both loaded Qt and Cocoa from the private stage. The 33-image
+closure, 4/4 model and signature gates passed. No unchanged regression suite was
+rerun, and installed PID 96951 remains untouched.
+
+The final source App SHA256 is
+`c78d121c0b327fe9f0dd58f35abeafed16a09e05cf3fe55617935ce5d06adba5`;
+the final signed App executable SHA256 is
+`933f1181c1a1de2ad7b8c872000a6289d693123f91d6faae6b567e062ecd3742`.
+These supersede the checkpoint hashes above. Normal reconfiguration regenerated
+OpenCV's build information from `b95e1ff0-dirty` to `f01c592d-dirty`, rebuilding
+its `core/src/system.cpp` object. The dirty marker reflects the retained
+documentation changes, not a product-source difference.
+
+Final App: `/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app`.
+Raw final proof is under that common-4 directory; the 214,598-byte evidence ZIP
+has SHA256 `d0d47a0ceafb01edb20162615643b561bcdc07d7da646bd11d0906aee1d0a7fc`.
+The macOS 27.2-only and tiny direct-Qt WebP boundaries above remain unchanged.

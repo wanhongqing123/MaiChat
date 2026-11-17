@@ -132,3 +132,7 @@ scene fix. Bounded live evidence then established a separate service size-budget
 gap. See [the message-budget investigation](2026-11-15-session-sync-message-budget.md)
 for actual artifacts, byte counts, server repair, frame-safe pagination and the
 remaining deployment/physical-acceptance boundary.
+
+## Mac 侧补充记录
+
+更细的本机复现、失败历史和验收边界另存于 [2026-11-15-remote-session-stale-initial-read-mac-evidence.md](2026-11-15-remote-session-stale-initial-read-mac-evidence.md)，本文件保留共同结论和 Windows 证据。

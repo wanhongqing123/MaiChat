@@ -40,3 +40,7 @@ exit 0（61.485秒），设备 metadata 为2.2.4/213，正常启动 PID66929；�
 `b6b59e75e99589db8f8a450e89fac74decedaacc22581c35840e9b443b008bf6`。
 协作者报告正常 build/签名 exit0、保数据覆盖 exit0（12.768秒）、设备2.2.4/214、
 正常启动 PID66971；本机只核源码，不将跨机回执冒称本机实机验收。
+
+## Mac 侧补充记录
+
+更细的本机复现、失败历史和验收边界另存于 [2026-11-16-image-preview-zoom-pan-mac-evidence.md](2026-11-16-image-preview-zoom-pan-mac-evidence.md)，本文件保留共同结论和 Windows 证据。
