@@ -24,6 +24,11 @@ MaiChat/**/dist-*/
 MaiAgent/third_party/onnxruntime/onnxruntime/test/
 MaiAgent/third_party/onnxruntime/winml/test/
 
+# Local upstream code references, kept only for source review.
+/reference/codex/
+/reference/openclaw/
+/reference/source-manifest.json
+
 # Generated icons (produced by scripts/build-icons.mjs)
 build/icon.png
 build/icon-256.png
