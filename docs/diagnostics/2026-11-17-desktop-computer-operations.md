@@ -2,6 +2,8 @@
 
 日期：2026-11-17。本轮 Windows 输入实现已提交为 `94f785d7`；窗口发现修订为 `b7001a6d`。尚未替换已安装的 Windows App，统一验证记录见 `2026-11-17-desktop-input-final-verification.md`。
 
+本表列出 MaiChat 当前操作和验收范围。与固定 Sunshine 的逐项行为差异见 `2026-11-17-sunshine-maichat-input-comparison.md`；存在对应原语及通过接收窗口测试，不等于两边逐字段、逐事件严格 1:1。
+
 模型调用的是同一个 `desktop_computer` 工具。`action` 选择要做什么；`input_events` 是其中一个动作，它再用 `type` 指定按下、移动、滚动等细操作。`input_options` 只调整这些操作的方式，不是另一套工具。
 
 当前公开 **25 个 action、8 种 input_events type、10 个 input_options 字段**。普通键鼠、Touch 和 Pen 均使用系统 API，并已通过本机开发构建的实际窗口测试。虚拟手柄、硬件 HID 模拟和控制器反馈已由用户明确暂缓，不是当前能力承诺。
@@ -111,7 +113,7 @@
 
 - 当前活跃源码、CMake 模块/目标及仓库配置中，未发现 libvirtualhid、Hid adapter、Input Router、ViGEm provider、ViGEmClient 的 include、链接、构建目标或 Git 子模块引用。检索包括当前未提交的新源；没有将 docs/cache 的历史字符串当成活跃依赖。
 - `.gitmodules` 当前只有原有 `qtbase`、`qtsvg`；输入 SDK 的源码 Gitlink 已不存在。Git 本地子模块配置未发现 LVH/ViGEm 条目。原有 Qt 配置不属于本次输入 SDK。
-- 活跃输入构建使用项目自有 `maichat_desktop_input_types`、Windows 键码映射和 User32 触摸候选源。系统输入调用 SendInput/User32，没有安装驱动、联系 broker 或激活许可的产品路径。
+- 活跃输入构建使用项目自有 `maichat_desktop_input_types`、Windows 键码映射和 User32 触摸/笔适配器。系统输入调用 SendInput/User32，没有安装驱动、联系 broker 或激活许可的产品路径。
 - Controller 的普通动作与 typed 动作均先准备同一个 owned native session；Windows 共同进入 `WindowsInputSession::perform`，使用同一个 `InputScope::held_` 及原生绑定。没有旧/new ledger 的 borrowed 状态桥。
 - 旧的一次性自由函数入口仍作为普通 API 包装存在，但复用同一个 `InputScope` / `dispatchNativeInput` 实现，且不支持跨调用的独立 down/up；Controller 没有回退到另一套 `backend.input()` 执行器。没有发现仍活跃的 SDK/系统 API 双执行核。
 - 以上是源码/构建依赖结论，不等于本轮执行了系统驱动卸载；本次审计没有探测、安装或卸载系统驱动。

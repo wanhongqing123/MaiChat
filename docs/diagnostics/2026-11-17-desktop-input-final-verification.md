@@ -1,8 +1,10 @@
 # Windows desktop input final verification
 
 Date: 2026-11-17. Input implementation commit: `94f785d7`, based on
-`b7001a6d`. This closes the required Windows system-API implementation and its
-development-build verification. It does not replace the installed App or claim
+`b7001a6d`. This records the implemented Windows system-API operations and their
+development-build verification. It does not establish exact Sunshine semantic
+parity; the subsequent `2026-11-17-sunshine-maichat-input-comparison.md` lists
+known differences. It does not replace the installed App or claim
 Mac native acceptance. The reference is Sunshine
 `bb6930bd782ed3edd2eea9a71d46b42183be9358`; virtual hardware/HID devices,
 virtual keyboard/mouse devices, gamepads and controller feedback were explicitly
@@ -20,7 +22,9 @@ require explicit user confirmation under the tracked repository rules.
   held-key bindings. Unsupported dedicated hardware mappings fail explicitly.
 - Mouse absolute/relative movement, five buttons, both fine-wheel axes, taps,
   complete drags and separate down/move/up retain ownership across observation
-  and capture. Ordinary and typed entries can release each other's holds.
+  and capture. Ordinary and typed mouse entries can release each other's
+  button holds. Named-key and raw-key identities remain separate leases;
+  one does not automatically release the other's held key identity.
 - Touch supports up to ten contacts, stable opaque caller identities, pressure,
   contact area, orientation, full peer frames, sustained holds, independent
   updates/cancel and full-capacity same-batch UP/new-DOWN slot reuse.
