@@ -65,9 +65,8 @@ final class AIAssistantSessionModels {
     static JSONObject selection(String session, String model, String effort) throws Exception {
         if (!AIAssistantModelSettings.supportedCloud(model) && !LOCAL.equals(model))
             throw new IllegalArgumentException("请选择受支持的主模型");
-        if (effort != null && !effort.isEmpty() && !effort.equals("low")
-                && !effort.equals("high") && !effort.equals("max"))
-            throw new IllegalArgumentException("思考强度只支持 low、high、max");
+        if (effort != null && !AIAssistantModelSettings.supportedEffortForModel(model, effort))
+            throw new IllegalArgumentException("所选模型不支持此思考强度");
         JSONObject result = new JSONObject().put("op", session.isEmpty() ? "create" : "set_model")
             .put("session", session).put("model", model);
         if (effort != null) result.put("reasoningEffort", effort);
@@ -156,10 +155,11 @@ final class AIAssistantSessionModels {
                 Object effort = result.opt("reasoningEffort");
                 if (ticket.effort != null && !ticket.effort.isEmpty() && !ticket.effort.equals(effort))
                     throw new IllegalStateException("所属设备思考强度回执与原选择不匹配");
+                // Product cloud choices use Responses; only the bundled local model uses local.
                 if ((!AIAssistantModelSettings.supportedCloud(model) && !LOCAL.equals(model))
-                    || !(effort instanceof String) || (!effort.equals("") && !effort.equals("low")
-                        && !effort.equals("high") && !effort.equals("max"))
-                    || !(wire.equals("chat_completions") || wire.equals("responses") || wire.equals("local")))
+                    || !(effort instanceof String)
+                    || !AIAssistantModelSettings.supportedEffortForModel(model, (String)effort)
+                    || !wire.equals(LOCAL.equals(model) ? "local" : "responses"))
                     throw new IllegalStateException("所属设备未返回完整主模型配置");
                 committed.put(ticket.key, new JSONObject().put("model", model)
                     .put("reasoningEffort", effort).put("wire", wire));

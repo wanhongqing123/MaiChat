@@ -380,6 +380,10 @@ private slots:
     void staleTurnCompletionDoesNotFinishReplacement_data();
     void staleTurnCompletionDoesNotFinishReplacement();
     void sessionEffortAndModelPersistTogetherAcrossRestart();
+    void fableEffortModelChangesAreAtomic_data();
+    void fableEffortModelChangesAreAtomic();
+    void fableConfiguredDefaultsKeepTheirModelSpecificEffort_data();
+    void fableConfiguredDefaultsKeepTheirModelSpecificEffort();
     void sessionConfigurationUsesFixedLegacyDefaultsAndAtomicValidation();
     void sessionConfigurationRejectsMissingProviderWithoutMutation();
     void sessionConfigurationReflectsOnlySelectedProviderCredentials();
@@ -389,6 +393,8 @@ private slots:
     void accountModelClientUsesProviderProtocolAndProfile_data();
     void accountModelClientUsesProviderProtocolAndProfile();
     void accountModelClientRoutesBySelectedModelAndFreshKey();
+    void productGlmWebToolsStayIndependentOfPrimaryModel_data();
+    void productGlmWebToolsStayIndependentOfPrimaryModel();
 #ifdef Q_OS_MACOS
     void accountModelClientUsesResolvedProxy();
 #endif
@@ -696,11 +702,16 @@ void AgentControllerTest::sessionEffortAndModelPersistTogetherAcrossRestart() {
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
     const QString database = QDir(directory.path()).filePath(QStringLiteral("session-effort.sqlite"));
-    const QStringList models{QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
-                             QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro"),
+    const QStringList models{QStringLiteral("glm-5.3"),
+                             QStringLiteral("glm-5.3-flash"),
+                             QStringLiteral("deepseek-flash"),
+                             QStringLiteral("deepseek-v4-pro"),
+                             QStringLiteral("anthropic/claude-fable-5.2"),
+                             QStringLiteral("anthropic/claude-fable-5.2"),
                              QStringLiteral("anthropic/claude-fable-5.2")};
-    const QStringList efforts{QStringLiteral("low"), QStringLiteral("high"), QStringLiteral("max"),
-                              QStringLiteral("low"), QStringLiteral("max")};
+    const QStringList efforts{QStringLiteral("low"),  QStringLiteral("high"), QStringLiteral("max"),
+                              QStringLiteral("low"),  QStringLiteral("max"),  QStringLiteral("medium"),
+                              QStringLiteral("xhigh")};
     QStringList sessions;
     {
         AgentController original(std::make_unique<SessionSelectionModel>(), database);
@@ -729,6 +740,76 @@ void AgentControllerTest::sessionEffortAndModelPersistTogetherAcrossRestart() {
     }
     QCOMPARE(recorded->requestedModels(), models);
     QCOMPARE(recorded->requestedEfforts(), efforts);
+}
+
+void AgentControllerTest::fableEffortModelChangesAreAtomic_data() {
+    QTest::addColumn<QString>("effort");
+    QTest::addColumn<QString>("target");
+    for (const auto& effort : {QStringLiteral("medium"), QStringLiteral("xhigh")})
+        for (const auto& target : {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
+                                   QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")}) {
+            const auto name = (effort + QLatin1Char('-') + target).toUtf8();
+            QTest::newRow(name.constData()) << effort << target;
+        }
+}
+
+void AgentControllerTest::fableEffortModelChangesAreAtomic() {
+    QFETCH(QString, effort);
+    QFETCH(QString, target);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto model = std::make_unique<SessionSelectionModel>();
+    auto* observed = model.get();
+    AgentController controller(std::move(model), QString());
+    const auto session = controller.createSession(directory.path(), QStringLiteral("model effort pair"));
+    const auto fable = QStringLiteral("anthropic/claude-fable-5.2");
+    QVERIFY(controller.setSessionModelConfiguration(session, fable, effort));
+    QVERIFY(!controller.setSessionModelConfiguration(session, target, effort));
+    AgentController::SessionModelConfiguration selected;
+    QVERIFY(controller.sessionModelConfiguration(session, selected));
+    QCOMPARE(selected.model, fable);
+    QCOMPARE(selected.reasoningEffort, effort);
+    QVERIFY(controller.setSessionModelConfiguration(session, target));
+    QVERIFY(controller.sessionModelConfiguration(session, selected));
+    QCOMPARE(selected.model, target);
+    QCOMPARE(selected.reasoningEffort, QStringLiteral("high"));
+    MaiSession stored;
+    QVERIFY(controller.agent().getSession(session.toStdString(), stored));
+    QCOMPARE(QString::fromStdString(stored.model), target);
+    QCOMPARE(QString::fromStdString(stored.reasoningEffort), QStringLiteral("high"));
+    QSignalSpy finished(&controller, &AgentController::turnFinished);
+    QVERIFY(controller.sendPrompt(session, QStringLiteral("verify target model effort")));
+    QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 10'000);
+    QCOMPARE(observed->requestedModels(), QStringList{target});
+    QCOMPARE(observed->requestedEfforts(), QStringList{QStringLiteral("high")});
+    QVERIFY(controller.setSessionModelConfiguration(session, fable, effort));
+    QVERIFY(controller.setSessionModelConfiguration(session, fable, QString()));
+    QVERIFY(controller.agent().getSession(session.toStdString(), stored));
+    QVERIFY(stored.reasoningEffort.empty());
+}
+
+void AgentControllerTest::fableConfiguredDefaultsKeepTheirModelSpecificEffort_data() {
+    QTest::addColumn<QString>("effort");
+    QTest::newRow("medium") << QStringLiteral("medium");
+    QTest::newRow("xhigh") << QStringLiteral("xhigh");
+}
+
+void AgentControllerTest::fableConfiguredDefaultsKeepTheirModelSpecificEffort() {
+    QFETCH(QString, effort);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    AgentController::ModelConfig model;
+    model.modelName = QStringLiteral("anthropic/claude-fable-5.2");
+    model.reasoningEffort = effort;
+    model.openrouterBaseUrl = QStringLiteral("http://127.0.0.1:1/synthetic-openrouter");
+    model.accountModelKeyProvider = [](const QString&) { return QStringLiteral("synthetic-fixture-key"); };
+    AgentController controller(model, QString());
+    const auto session = controller.createSession(directory.path(), QStringLiteral("Fable default effort"));
+    QVERIFY(!session.isEmpty());
+    AgentController::SessionModelConfiguration selected;
+    QVERIFY(controller.sessionModelConfiguration(session, selected));
+    QCOMPARE(selected.model, model.modelName);
+    QCOMPARE(selected.reasoningEffort, effort);
 }
 
 void AgentControllerTest::sessionConfigurationUsesFixedLegacyDefaultsAndAtomicValidation() {
@@ -1010,7 +1091,11 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile_data(
     for (const QString& model :
          {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
           QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2")}) {
-        for (const QString& effort : {QStringLiteral("low"), QStringLiteral("high"), QStringLiteral("max")}) {
+        for (const QString& effort : {QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high"),
+                                      QStringLiteral("xhigh"), QStringLiteral("max")}) {
+            if (model != QStringLiteral("anthropic/claude-fable-5.2") &&
+                (effort == QStringLiteral("medium") || effort == QStringLiteral("xhigh")))
+                continue;
             const QByteArray name = (model + QLatin1Char('-') + effort).toUtf8();
             QTest::newRow(name.constData())
                 << model
@@ -1072,6 +1157,70 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile() {
     QCOMPARE(
         received.front().body.value(QStringLiteral("reasoning")).toObject().value(QStringLiteral("effort")).toString(),
         effort);
+}
+
+void AgentControllerTest::productGlmWebToolsStayIndependentOfPrimaryModel_data() {
+    QTest::addColumn<QString>("model");
+    for (const auto* model :
+         {"anthropic/claude-fable-5.2", "deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash"})
+        QTest::newRow(model) << QString::fromLatin1(model);
+}
+
+void AgentControllerTest::productGlmWebToolsStayIndependentOfPrimaryModel() {
+    QFETCH(QString, model);
+    std::atomic<unsigned> glmKeyReads{0};
+    std::atomic<unsigned> deepseekKeyReads{0};
+    AgentController::ModelConfig config;
+    config.modelName = model;
+    config.accountModelKeyProvider = [&](const QString& provider) {
+        if (provider == QStringLiteral("glm")) ++glmKeyReads;
+        if (provider == QStringLiteral("deepseek")) ++deepseekKeyReads;
+        return QString();  // Missing synthetic credentials stop before any HTTP request.
+    };
+    MaiTool* search = nullptr;
+    MaiTool* fetch = nullptr;
+    AgentController controller(config, QString(), [&](MaiToolRegistry& tools) {
+        // Observe the actual product-owned registrations, without substituting either tool.
+        search = tools.find("web_search");
+        fetch = tools.find("web_fetch");
+    });
+    QVERIFY(search && fetch);
+    const auto specs = controller.availableToolSpecs(model);
+    const MaiToolSpec* searchSpec = nullptr;
+    const MaiToolSpec* fetchSpec = nullptr;
+    for (const auto& spec : specs) {
+        if (spec.name == "web_search") searchSpec = &spec;
+        if (spec.name == "web_fetch") fetchSpec = &spec;
+    }
+    QVERIFY2(searchSpec && fetchSpec, "Every product cloud model must own the explicit GLM web backend.");
+    QVERIFY(QString::fromStdString(searchSpec->description).contains(QStringLiteral("GLM")));
+    QVERIFY(QString::fromStdString(fetchSpec->description).contains(QStringLiteral("GLM")));
+    const auto schema = QJsonDocument::fromJson(QByteArray::fromStdString(searchSpec->parametersJson)).object();
+    const auto properties = schema.value(QStringLiteral("properties")).toObject();
+    QCOMPARE(properties.value(QStringLiteral("query")).toObject().value(QStringLiteral("maxLength")).toInt(), 70);
+    QVERIFY(properties.contains(QStringLiteral("search_engine")));
+    QVERIFY(!properties.contains(QStringLiteral("need_content")));
+    QCOMPARE(glmKeyReads.load(), 0U);
+    QCOMPARE(deepseekKeyReads.load(), 0U);
+
+    MaiToolContext context;
+    context.model = model.toStdString();
+    context.sessionId = "ses_product_glm_web";
+    const auto tooLong = QJsonDocument(QJsonObject{{QStringLiteral("query"), QString(71, QLatin1Char('q'))}})
+                             .toJson(QJsonDocument::Compact)
+                             .toStdString();
+    const auto invalid = search->execute(tooLong, context);
+    QCOMPARE(invalid.error().code(), MaiErrorCode::InvalidInput);
+    const auto failure = QJsonDocument::fromJson(QByteArray::fromStdString(invalid.error().message())).object();
+    QVERIFY(failure.value(QStringLiteral("reason")).toString().contains(QStringLiteral("GLM")));
+    QCOMPARE(glmKeyReads.load(), 0U);
+    QCOMPARE(deepseekKeyReads.load(), 0U);
+    const auto searchResult = search->execute(R"({"query":"synthetic product search"})", context);
+    const auto fetchResult = fetch->execute(R"({"url":"https://example.invalid/article"})", context);
+    QCOMPARE(searchResult.error().code(), MaiErrorCode::NotConfigured);
+    QCOMPARE(fetchResult.error().code(), MaiErrorCode::NotConfigured);
+    QCOMPARE(glmKeyReads.load(), 2U);
+    QCOMPARE(deepseekKeyReads.load(), 0U);
 }
 
 void AgentControllerTest::accountModelClientRoutesBySelectedModelAndFreshKey() {

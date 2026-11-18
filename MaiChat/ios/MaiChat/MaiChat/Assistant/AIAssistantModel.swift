@@ -52,6 +52,62 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     static let fableModel = "anthropic/claude-fable-5.2"
     static let cloudModels = ["deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash", fableModel]
     static let deepSeekUrl = "https://api.deepseek.com"
+    static let ordinaryReasoningEfforts = ["low", "high", "max"]
+    static let fableReasoningEfforts = ["low", "medium", "high", "xhigh", "max"]
+
+    static func reasoningEfforts(for model: String, advertised: [String]? = nil) -> [String] {
+        let known = model == fableModel ? fableReasoningEfforts : ordinaryReasoningEfforts
+        guard let advertised else { return known }
+        // Choice metadata may narrow capability, but cannot grant another model Fable-only values.
+        return !advertised.isEmpty && Set(advertised).count == advertised.count &&
+            advertised.allSatisfy(known.contains) ? advertised : known
+    }
+
+    static func validReasoningMetadata(_ advertised: [String]?, for model: String) -> Bool {
+        guard let advertised else { return true } // old owner/CAPI: exact-model fallback
+        let known = reasoningEfforts(for: model)
+        return !advertised.isEmpty && Set(advertised).count == advertised.count && advertised.allSatisfy(known.contains)
+    }
+
+    static func isValidReasoningEffort(_ value: String, for model: String, advertised: [String]? = nil) -> Bool {
+        value.isEmpty || (reasoningEfforts(for: model).contains(value) &&
+            reasoningEfforts(for: model, advertised: advertised).contains(value))
+    }
+
+    static func normalizedDefaultReasoningEffort(_ value: String?, for model: String,
+                                                 advertised: [String]? = nil) -> String {
+        let supported = reasoningEfforts(for: model, advertised: advertised)
+        guard let value, !value.isEmpty else {
+            return supported.contains("high") ? "high" : (supported.first ?? "high")
+        }
+        if supported.contains(value) { return value }
+        // Only a known Fable-only global default crosses to a three-level model
+        // as high. Unknown strings (or inconsistent capability metadata) remain
+        // invalid so callers reject them instead of reporting a made-up default.
+        if fableReasoningEfforts.contains(value) && !reasoningEfforts(for: model).contains(value) {
+            return "high"
+        }
+        return value
+    }
+
+    static func reasoningEffortTitle(_ value: String, for model: String) -> String {
+        if model == fableModel {
+            switch value {
+            case "low": return "低"
+            case "medium": return "中"
+            case "high": return "高"
+            case "xhigh": return "超高"
+            case "max": return "最高"
+            default: return "不可用"
+            }
+        }
+        switch value {
+        case "low": return "低"
+        case "high": return "高"
+        case "max": return "最高"
+        default: return "不可用"
+        }
+    }
 
     // Exact catalog membership prevents unknown/remote IDs from taking a GLM key.
     static func cloudProvider(for model: String) -> String? {
@@ -98,19 +154,32 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     mutating func selectModelSource(local: Bool) {
         if local {
             if !isLocalModel { cloudModel = effectiveCloudModel }
+            selectModel("local:" + AILocalModelStore.bundledPrimaryID)
             modelProvider = "llama"
             localModelID = AILocalModelStore.bundledPrimaryID
             localProjectorID = nil
-            model = "local:" + AILocalModelStore.bundledPrimaryID
         } else {
             selectModel(effectiveCloudModel)
         }
     }
-    // Optional so settings written before this field existed still decode.
+    // Empty/nil is inheritance, not an explicit high override. Invalid explicit
+    // values remain visible to validation instead of silently changing user intent.
     var reasoningEffort: String? = nil
+    var inheritedReasoningEffort = "high"
+    var advertisedReasoningEfforts: [String]? = nil
+    var availableReasoningEfforts: [String] {
+        Self.reasoningEfforts(for: model, advertised: advertisedReasoningEfforts)
+    }
     var effectiveReasoningEffort: String {
-        let value = reasoningEffort ?? "high"
-        return ["low", "high", "max"].contains(value) ? value : "high"
+        if let value = reasoningEffort, !value.isEmpty { return value }
+        return Self.normalizedDefaultReasoningEffort(inheritedReasoningEffort, for: model,
+                                                     advertised: advertisedReasoningEfforts)
+    }
+    // Owner capability/default projection is runtime state, never persisted as a
+    // preference or reused as another account/session's authoritative choice.
+    enum CodingKeys: String, CodingKey {
+        case baseUrl, model, modelProvider, cloudModel, localModelID, localProjectorID
+        case localContextSize, localMaximumTokens, localThreads, reasoningEffort, policy
     }
     var policy = "on-request"
     var effectiveWire: String {
@@ -118,6 +187,17 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     }
 
     mutating func selectModel(_ selected: String) {
+        if selected != model {
+            // Only a valid previous model-only selection may normalize across a
+            // capability boundary. Malformed explicit state is left for rejection.
+            if let stored = reasoningEffort, !stored.isEmpty,
+               Self.isValidReasoningEffort(stored, for: model),
+               !Self.isValidReasoningEffort(stored, for: selected) {
+                reasoningEffort = Self.normalizedDefaultReasoningEffort(nil, for: selected)
+            }
+            advertisedReasoningEfforts = nil
+            inheritedReasoningEffort = Self.normalizedDefaultReasoningEffort(inheritedReasoningEffort, for: selected)
+        }
         model = selected
         if ["deepseek-flash", "deepseek-v4-pro"].contains(selected) {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.deepSeekUrl
@@ -370,6 +450,7 @@ struct AISession: Codable, Identifiable, Sendable, Equatable {
     var turnId: String? = nil
     var model: String? = nil
     var reasoningEffort: String? = nil
+    var supportedReasoningEfforts: [String]? = nil
     var wire: String? = nil
     var displayTitle: String { title == "New session" ? "新对话" : title }
 }
@@ -387,6 +468,8 @@ struct AIRemoteSession: Decodable, Identifiable, Sendable, Equatable {
     var turnId: String? = nil
     var model: String? = nil
     var reasoningEffort: String? = nil
+    var supportedReasoningEfforts: [String]? = nil
+    var defaultReasoningEffort: String? = nil
     var wire: String? = nil
 
     var id: String { "\(deviceSlot):\(deviceID):\(sessionID)" }
@@ -1549,6 +1632,7 @@ struct AIResponse: Codable, Sendable {
     var model: String?
     var reasoningEffort: String?
     var defaultReasoningEffort: String?
+    var supportedReasoningEfforts: [String]?
     var session: String?
     var selectedModel: String?
     var selectedReasoningEffort: String?
@@ -1560,7 +1644,7 @@ struct AIResponse: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case ok, id, path, error, errorCode, changed, sessions, messages, messageUpdates, hasMessageUpdates, questionMessages, rootSessionId, permissions, questions
-        case busy, turnId, configured, model, reasoningEffort, defaultReasoningEffort, session, selectedModel, selectedReasoningEffort, selectedWire, wire, localGpuSelected, localGpuModelBytes, localGpuBackend
+        case busy, turnId, configured, model, reasoningEffort, defaultReasoningEffort, supportedReasoningEfforts, session, selectedModel, selectedReasoningEffort, selectedWire, wire, localGpuSelected, localGpuModelBytes, localGpuBackend
         case userMessageID = "user_message_id"
         case questionID = "question_id"
     }
@@ -1857,6 +1941,10 @@ actor AIAssistantBackend {
         try checkLifecycle()
         // Swift 只负责应用目录、云端密钥和线协议选择；工具调用规则在共享 C++ 层。
         guard let root else { throw AIBackendError(message: "创作中心尚未准备好") }
+        guard AIModelSettings.isValidReasoningEffort(config.effectiveReasoningEffort, for: config.model,
+            advertised: config.advertisedReasoningEfforts) else {
+            throw AIBackendError(message: "该模型不支持所选思考强度", code: "invalid_input")
+        }
         let caBundle = Bundle.main.url(forResource: "cacert", withExtension: "pem",
                                       subdirectory: "MaiAgentCertificates")
         guard config.isLocalModel || caBundle != nil else {
@@ -2642,6 +2730,11 @@ final class AIAssistantModel: ObservableObject {
         await remoteConfigurationConnectionChanged(connected: true)
     }
 
+    func deliverSessionModelUITestHistory(_ data: Data, owner: AIRemoteSession, older: Bool) {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") else { return }
+        applyRemoteHistory(data, source: owner, older: older)
+    }
+
     /// Feeds an owned fake peer's receipt through the exact production tuple/ACK decoder.
     func deliverSessionModelUITestReceipt(owner: AIRemoteSession, id: String, result: [String: Any]) async {
         guard ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") ||
@@ -3029,7 +3122,8 @@ final class AIAssistantModel: ObservableObject {
             "questionMessages": payload["questionMessages"] ?? [], "busy": payload["busy"] ?? false,
             "turnId": payload["turnId"] ?? "", "session": payload["session"] ?? "",
             "model": payload["model"] ?? "", "reasoningEffort": payload["reasoningEffort"] ?? "",
-            "wire": payload["wire"] ?? "", "defaultReasoningEffort": payload["defaultReasoningEffort"] ?? ""]
+            "wire": payload["wire"] ?? "", "defaultReasoningEffort": payload["defaultReasoningEffort"] ?? "",
+            "supportedReasoningEfforts": payload["supportedReasoningEfforts"] ?? []]
         let bytes = try JSONSerialization.data(withJSONObject: state, options: .sortedKeys)
         return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
@@ -3111,6 +3205,8 @@ final class AIAssistantModel: ObservableObject {
             if let known = previous.first(where: { $0.id == discovered.id && $0.loginSessionID == discovered.loginSessionID }) {
                 current.model = known.model
                 current.reasoningEffort = known.reasoningEffort
+                current.supportedReasoningEfforts = known.supportedReasoningEfforts
+                current.defaultReasoningEffort = known.defaultReasoningEffort
                 current.wire = known.wire
             }
             return current
@@ -3163,10 +3259,12 @@ final class AIAssistantModel: ObservableObject {
         for index in remoteSessions.indices {
             remoteSessions[index].model = nil
             remoteSessions[index].reasoningEffort = nil
+            remoteSessions[index].supportedReasoningEfforts = nil
+            remoteSessions[index].defaultReasoningEffort = nil
             remoteSessions[index].wire = nil
         }
         if var remote = selectedRemote {
-            remote.model = nil; remote.reasoningEffort = nil; remote.wire = nil
+            remote.model = nil; remote.reasoningEffort = nil; remote.supportedReasoningEfforts = nil; remote.defaultReasoningEffort = nil; remote.wire = nil
             selectedRemote = remote
             if connected { await requestRemoteConfiguration(remote) }
         }
@@ -3477,7 +3575,13 @@ final class AIAssistantModel: ObservableObject {
                       let model = result["model"] as? String,
                       let effort = result["reasoningEffort"] as? String,
                       let wire = result["wire"] as? String,
-                      validRemoteModelConfiguration(model: model, effort: effort, wire: wire),
+                      (result["supportedReasoningEfforts"] == nil || result["supportedReasoningEfforts"] is NSNull ||
+                       result["supportedReasoningEfforts"] is [String]),
+                      (result["defaultReasoningEffort"] == nil || result["defaultReasoningEffort"] is NSNull ||
+                       result["defaultReasoningEffort"] is String),
+                      validRemoteModelConfiguration(model: model, effort: effort, wire: wire,
+                          supported: result["supportedReasoningEfforts"] as? [String],
+                          inherited: result["defaultReasoningEffort"] as? String),
                       pending.model == nil || pending.model == model,
                       pending.reasoningEffort == nil || effort == pending.reasoningEffort else { return }
             }
@@ -3500,15 +3604,18 @@ final class AIAssistantModel: ObservableObject {
             let wire = result["wire"] as? String ?? ""
             var current = owner
             current.model = model; current.reasoningEffort = effort; current.wire = wire
+            current.supportedReasoningEfforts = result["supportedReasoningEfforts"] as? [String]
+            current.defaultReasoningEffort = AIModelSettings.normalizedDefaultReasoningEffort(
+                result["defaultReasoningEffort"] as? String, for: model,
+                advertised: current.supportedReasoningEfforts)
             if let index = remoteSessions.firstIndex(where: { $0.id == owner.id && $0.loginSessionID == owner.loginSessionID }) {
                 remoteSessions[index] = current
             }
             if selectedRemote?.id == owner.id && selectedRemote?.loginSessionID == owner.loginSessionID {
                 selectedRemote = current
-                if let fallback = result["defaultReasoningEffort"] as? String, ["low", "high", "max"].contains(fallback) {
-                    sessionDefaultReasoningEffort = fallback
-                }
-                projectSessionConfiguration(model: model, effort: effort, wire: wire)
+                projectSessionConfiguration(model: model, effort: effort, wire: wire,
+                    supported: current.supportedReasoningEfforts,
+                    inherited: current.defaultReasoningEffort)
             }
             return
         }
@@ -3571,8 +3678,13 @@ final class AIAssistantModel: ObservableObject {
         applyRemotePage(page, source: source, older: false)
     }
 
-    private func validRemoteModelConfiguration(model: String, effort: String, wire: String) -> Bool {
-        guard ["", "low", "high", "max"].contains(effort) else { return false }
+    private func validRemoteModelConfiguration(model: String, effort: String, wire: String,
+                                               supported: [String]? = nil, inherited: String? = nil) -> Bool {
+        guard AIModelSettings.validReasoningMetadata(supported, for: model),
+              AIModelSettings.isValidReasoningEffort(effort, for: model, advertised: supported),
+              AIModelSettings.isValidReasoningEffort(AIModelSettings.normalizedDefaultReasoningEffort(
+                  inherited, for: model, advertised: supported), for: model, advertised: supported)
+        else { return false }
         if model.hasPrefix("local:"), model.count > "local:".count { return wire == "local" }
         guard AIModelSettings.cloudModels.contains(model) else { return false }
         return wire == "responses"
@@ -3597,21 +3709,25 @@ final class AIAssistantModel: ObservableObject {
         if let current = remoteSessions.first(where: { $0.id == source.id && $0.loginSessionID == source.loginSessionID }) {
             source.model = current.model
             source.reasoningEffort = current.reasoningEffort
+            source.supportedReasoningEfforts = current.supportedReasoningEfforts
+            source.defaultReasoningEffort = current.defaultReasoningEffort
             source.wire = current.wire
         }
         if let busy = page.busy { source.busy = busy }
         if let turnId = page.turnId { source.turnId = turnId }
         if !older, page.session == source.sessionID,
            let model = page.model, let effort = page.reasoningEffort, let wire = page.wire,
-           validRemoteModelConfiguration(model: model, effort: effort, wire: wire),
+           validRemoteModelConfiguration(model: model, effort: effort, wire: wire,
+               supported: page.supportedReasoningEfforts, inherited: page.defaultReasoningEffort),
            !pendingModelOwners.values.contains(where: {
                $0.owner.id == source.id && $0.owner.loginSessionID == source.loginSessionID
            }) {
             source.model = model; source.reasoningEffort = effort; source.wire = wire
-            if selectedRemote?.id == source.id || pendingRemoteSelection?.id == source.id,
-               let fallback = page.defaultReasoningEffort, ["low", "high", "max"].contains(fallback) {
-                sessionDefaultReasoningEffort = fallback
-            }
+            source.supportedReasoningEfforts = page.supportedReasoningEfforts
+            // Adopt default/capabilities only with this same validated choice.
+            // An older/pending page must not replace an ACK's inherited default.
+            source.defaultReasoningEffort = AIModelSettings.normalizedDefaultReasoningEffort(
+                page.defaultReasoningEffort, for: model, advertised: page.supportedReasoningEfforts)
         }
         if let index = remoteSessions.firstIndex(where: {
             $0.id == source.id && $0.loginSessionID == source.loginSessionID
@@ -3619,7 +3735,8 @@ final class AIAssistantModel: ObservableObject {
         if selectedRemote?.id == source.id || pendingRemoteSelection?.id == source.id {
             if selectedRemote?.id == source.id { selectedRemote = source }
             if let model = source.model {
-                projectSessionConfiguration(model: model, effort: source.reasoningEffort, wire: source.wire)
+                projectSessionConfiguration(model: model, effort: source.reasoningEffort, wire: source.wire,
+                    supported: source.supportedReasoningEfforts, inherited: source.defaultReasoningEffort)
             }
         }
         guard let received = page.messages else { return }
@@ -3982,9 +4099,14 @@ final class AIAssistantModel: ObservableObject {
         }
         let safePage = page.map(remoteHistoryMessage)
         let encoded = try JSONEncoder().encode(safePage)
-        return ["ok": true, "session": state.session ?? "", "model": state.model ?? "",
-                "reasoningEffort": state.reasoningEffort ?? "", "wire": state.wire ?? "",
-                "defaultReasoningEffort": state.defaultReasoningEffort ?? "high",
+        let actualModel = state.selectedModel ?? state.model ?? ""
+        let actualEffort = state.selectedReasoningEffort ?? state.reasoningEffort ?? ""
+        let actualWire = state.selectedWire ?? state.wire ?? ""
+        var payload: [String: Any] = ["ok": true, "session": state.session ?? "", "model": actualModel,
+                "reasoningEffort": actualEffort, "wire": actualWire,
+                "defaultReasoningEffort": AIModelSettings.normalizedDefaultReasoningEffort(
+                    state.defaultReasoningEffort, for: actualModel,
+                    advertised: state.supportedReasoningEfforts),
                 "busy": state.busy ?? false, "turnId": state.turnId ?? "",
                 "messages": try JSONSerialization.jsonObject(with: encoded),
                 "questionMessages": try JSONSerialization.jsonObject(
@@ -3993,6 +4115,11 @@ final class AIAssistantModel: ObservableObject {
                     with: JSONEncoder().encode(state.permissions ?? [])),
                 "questions": try JSONSerialization.jsonObject(
                     with: JSONEncoder().encode(state.questions ?? []))]
+        // Missing metadata remains missing when relaying an older native owner;
+        // the receiver may use its exact-model display fallback without us
+        // claiming that an older CAPI already implements the new levels.
+        if let supported = state.supportedReasoningEfforts { payload["supportedReasoningEfforts"] = supported }
+        return payload
     }
 
     private func forgetRemoteSteeringImports(session: String) {
@@ -4280,13 +4407,21 @@ final class AIAssistantModel: ObservableObject {
                         throw AIBackendError(message: "缺少主模型编号", code: "invalid_input")
                     }
                     values["model"] = model
-                    if let effort = envelope.payload.reasoningEffort { values["reasoningEffort"] = effort }
+                    if let effort = envelope.payload.reasoningEffort {
+                        guard AIModelSettings.isValidReasoningEffort(effort, for: model) else {
+                            throw AIBackendError(message: "该模型不支持所选思考强度", code: "invalid_input")
+                        }
+                        values["reasoningEffort"] = effort
+                    }
                 }
                 let choice = try await backend.request(envelope.payload.action ?? "", values: values)
                 result = ["ok": true, "session": choice.session ?? envelope.sessionID,
                           "model": choice.model ?? "", "reasoningEffort": choice.reasoningEffort ?? "",
-                          "defaultReasoningEffort": choice.defaultReasoningEffort ?? "high",
+                          "defaultReasoningEffort": AIModelSettings.normalizedDefaultReasoningEffort(
+                              choice.defaultReasoningEffort, for: choice.model ?? "",
+                              advertised: choice.supportedReasoningEfforts),
                           "wire": choice.wire ?? ""]
+                if let supported = choice.supportedReasoningEfforts { result["supportedReasoningEfforts"] = supported }
                 localSessionChanged(envelope.sessionID)
             case "stop":
                 let closeCamera = AIMobileLocalMediaRequests.shared.cameraSessionID == envelope.sessionID
@@ -4526,10 +4661,21 @@ final class AIAssistantModel: ObservableObject {
             // 轮询只同步最近几条；旧消息由用户上滑时单独分页读取，避免又把首屏扩成 30 条。
             var result = try await displaySessionSnapshot(target, force: force)
             guard isCurrentPage() else { return }
-            if let effort = result.defaultReasoningEffort { sessionDefaultReasoningEffort = effort }
+            let choiceModel = result.selectedModel ?? result.model ?? settings.model
+            let choiceSupported = result.supportedReasoningEfforts ??
+                result.sessions?.first(where: { $0.id == target })?.supportedReasoningEfforts
+            if let effort = result.defaultReasoningEffort {
+                let resolved = AIModelSettings.normalizedDefaultReasoningEffort(
+                    effort, for: choiceModel, advertised: choiceSupported)
+                guard AIModelSettings.isValidReasoningEffort(resolved, for: choiceModel,
+                    advertised: choiceSupported) else {
+                    throw AIBackendError(message: "模型默认思考强度无效", code: "invalid_input")
+                }
+                sessionDefaultReasoningEffort = resolved
+            }
             if result.selectedWire == "local" {
                 projectSessionConfiguration(model: result.selectedModel ?? "", effort: result.selectedReasoningEffort,
-                                            wire: result.selectedWire)
+                    wire: result.selectedWire, supported: choiceSupported, inherited: result.defaultReasoningEffort)
                 configured = false
                 try await preparePrimaryModelForDisplay()
                 guard isCurrentPage() else { return }
@@ -4540,7 +4686,7 @@ final class AIAssistantModel: ObservableObject {
             if let wire = result.selectedWire ?? result.wire { actualWire = wire }
             if let model = result.selectedModel {
                 projectSessionConfiguration(model: model, effort: result.selectedReasoningEffort,
-                                            wire: result.selectedWire)
+                    wire: result.selectedWire, supported: choiceSupported, inherited: result.defaultReasoningEffort)
             }
             if let selected = result.localGpuSelected { actualGPUSelected = selected }
             if let bytes = result.localGpuModelBytes { actualGPUModelBytes = bytes }
@@ -5671,7 +5817,16 @@ final class AIAssistantModel: ObservableObject {
         try await MaiCloudDriveClient.shared.cleanupSessionRoom(room)
     }
     /// 显示层投影 owner 的会话配置；不写设置文件，不配置/重建 Native Agent。
-    private func projectSessionConfiguration(model: String, effort: String?, wire: String?) {
+    var availableReasoningEfforts: [String] { settings.availableReasoningEfforts }
+
+    private func projectSessionConfiguration(model: String, effort: String?, wire: String?,
+                                             supported: [String]? = nil, inherited: String? = nil) {
+        let resolvedDefault = AIModelSettings.normalizedDefaultReasoningEffort(
+            inherited ?? sessionDefaultReasoningEffort, for: model, advertised: supported)
+        guard AIModelSettings.validReasoningMetadata(supported, for: model),
+              AIModelSettings.isValidReasoningEffort(effort ?? "", for: model, advertised: supported),
+              AIModelSettings.isValidReasoningEffort(resolvedDefault, for: model, advertised: supported)
+        else { return }
         if model.hasPrefix("local:") {
             settings.modelProvider = "llama"
             settings.model = model
@@ -5682,7 +5837,10 @@ final class AIAssistantModel: ObservableObject {
             if model == "test-model" { settings.modelProvider = "remote"; settings.model = model }
             #endif
         }
-        settings.reasoningEffort = effort?.isEmpty == false ? effort : sessionDefaultReasoningEffort
+        settings.advertisedReasoningEfforts = supported
+        sessionDefaultReasoningEffort = resolvedDefault
+        settings.inheritedReasoningEffort = sessionDefaultReasoningEffort
+        settings.reasoningEffort = effort // retain the raw empty inheritance sentinel
         actualModelID = model
         if let wire { actualWire = wire }
     }
@@ -5701,13 +5859,27 @@ final class AIAssistantModel: ObservableObject {
     func selectPrimaryModel(_ model: String, reasoningEffort: String? = nil) async {
         guard canChangeSessionModel else { return }
         guard AIModelSettings.cloudModels.contains(model) || model == "local:" + AILocalModelStore.bundledPrimaryID else { return }
-        if let reasoningEffort, !["", "low", "high", "max"].contains(reasoningEffort) { return }
+        let advertised = model == settings.model ? settings.advertisedReasoningEfforts : nil
+        let requestedEffort: String
+        if let reasoningEffort {
+            guard AIModelSettings.isValidReasoningEffort(reasoningEffort, for: model, advertised: advertised) else {
+                showTransientError("该模型不支持所选思考强度", duration: .seconds(8)); return
+            }
+            requestedEffort = reasoningEffort
+        } else {
+            let stored = settings.reasoningEffort ?? ""
+            guard AIModelSettings.isValidReasoningEffort(stored, for: settings.model,
+                advertised: settings.advertisedReasoningEfforts) else {
+                showTransientError("当前思考强度无效，请重新选择", duration: .seconds(8)); return
+            }
+            requestedEffort = AIModelSettings.isValidReasoningEffort(stored, for: model, advertised: advertised)
+                ? stored : AIModelSettings.normalizedDefaultReasoningEffort(nil, for: model, advertised: advertised)
+        }
         let target = selected
         let remote = selectedRemote
         let generation = submissionGeneration
         let draftToken = emptyDraftToken
         let selection = selectionGeneration
-        let requestedEffort = reasoningEffort ?? settings.effectiveReasoningEffort
         let account = screenFrameCurrentAccountID
         changingModelSource = true
         defer { changingModelSource = false }
@@ -5715,7 +5887,7 @@ final class AIAssistantModel: ObservableObject {
             if let remote {
                 guard AIModelSettings.cloudModels.contains(model) else { return }
                 var payload: [String: Any] = ["action": "set_model", "model": model]
-                if let reasoningEffort { payload["reasoningEffort"] = reasoningEffort }
+                payload["reasoningEffort"] = requestedEffort
                 _ = try await enqueueRemoteCommand(to: remote, payload: payload)
                 return // 只有 owner ACK/history 可以提交显示选择，传输成功不冒充保存成功。
             }
@@ -5736,7 +5908,7 @@ final class AIAssistantModel: ObservableObject {
                 await selectConversation(id)
             } else {
                 var values = ["session": target, "model": model]
-                if let reasoningEffort { values["reasoningEffort"] = reasoningEffort }
+                values["reasoningEffort"] = requestedEffort
                 _ = try await backend.request("set_model", values: values)
                 guard generation == submissionGeneration else { return }
                 await refresh(force: true)

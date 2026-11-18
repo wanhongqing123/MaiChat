@@ -34,7 +34,9 @@ final class AIAssistantModelSettings {
         String policy = saved.optString("policy", "on-request");
         if (!supportedPolicy(policy)) policy = "on-request";
         String effort = saved.optString("reasoningEffort", "high");
-        if (!supportedEffort(effort)) effort = "high";
+        String selectedModel = local ? "local:" + LOCAL_MODEL_ID : cloud;
+        effort = normalizeEffortForModel(selectedModel, effort);
+        if (!supportedEffortForModel(selectedModel, effort)) effort = "high";
         // Old local IDs migrate to the same pinned bundled model as iOS. File paths are never
         // restored from settings: the asset installer resolves the verified immutable file.
         return new AIAssistantModelSettings(local, cloud, policy, effort);
@@ -56,13 +58,15 @@ final class AIAssistantModelSettings {
     }
 
     AIAssistantModelSettings selectSource(boolean local) {
-        return this.local == local ? this : new AIAssistantModelSettings(local, cloudModel, policy, effort);
+        return this.local == local ? this : new AIAssistantModelSettings(local, cloudModel, policy,
+            normalizeEffortForModel(local ? "local:" + LOCAL_MODEL_ID : cloudModel, effort));
     }
     AIAssistantModelSettings withOptions(String model, String policy, String effort) throws Exception {
         if (!supportedPolicy(policy)) throw new IllegalArgumentException("请选择受支持的操作权限");
-        if (!supportedEffort(effort)) throw new IllegalArgumentException("思考强度只支持 low、high、max");
         String cloud = local ? cloudModel : model.trim();
         if (!supportedCloud(cloud)) throw new IllegalArgumentException("请选择受支持的主模型");
+        if (!supportedEffortForModel(local ? model() : cloud, effort))
+            throw new IllegalArgumentException("所选模型不支持此思考强度");
         return new AIAssistantModelSettings(local, cloud, policy, effort);
     }
     JSONObject toJson() throws Exception {
@@ -92,7 +96,14 @@ final class AIAssistantModelSettings {
     private static boolean supportedPolicy(String policy) {
         return "on-request".equals(policy) || "unless-trusted".equals(policy) || "never".equals(policy);
     }
-    private static boolean supportedEffort(String effort) {
-        return "low".equals(effort) || "high".equals(effort) || "max".equals(effort);
+    // Mirrors the shared catalog's exact model capability. Empty retains inheritance;
+    // unsupported explicit input is rejected before any compatibility normalization.
+    static boolean supportedEffortForModel(String model, String effort) {
+        return "".equals(effort) || "low".equals(effort) || "high".equals(effort) || "max".equals(effort)
+            || (OPENROUTER_MODEL.equals(model) && ("medium".equals(effort) || "xhigh".equals(effort)));
+    }
+    static String normalizeEffortForModel(String model, String effort) {
+        return !OPENROUTER_MODEL.equals(model) && ("medium".equals(effort) || "xhigh".equals(effort))
+            ? "high" : effort;
     }
 }

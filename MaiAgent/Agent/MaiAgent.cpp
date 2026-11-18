@@ -1230,7 +1230,9 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
             using T = std::decay_t<decltype(operation)>;
 
             if constexpr (std::is_same_v<T, MaiCreateSession>) {
-                if (!maiIsValidReasoningEffort(operation.reasoningEffort))
+                const auto& selectedModel =
+                    operation.model.empty() ? mRuntime->options.defaultModel : operation.model;
+                if (!maiIsValidReasoningEffortForModel(selectedModel, operation.reasoningEffort))
                     return {MaiErrorCode::InvalidInput, "Unsupported reasoning effort."};
                 if (!operation.model.empty() && mRuntime->model &&
                     !mRuntime->model->wireApiForModel(operation.model))
@@ -1254,15 +1256,12 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                     const auto valid = maiValidateSessionTitle(operation.title);
                     if (valid) return valid;
                 }
-                // 所有策略先校验再进入同一次 mutation，非法 effort 不能顺带改掉标题或模型。
-                if (operation.reasoningEffort &&
-                    !maiIsValidReasoningEffort(*operation.reasoningEffort))
-                    return {MaiErrorCode::InvalidInput, "Unsupported reasoning effort."};
                 if (!operation.model.empty() && mRuntime->model &&
                     !mRuntime->model->wireApiForModel(operation.model))
                     return {MaiErrorCode::InvalidInput, "The selected model is not configured."};
                 std::string title;
                 bool changed = false;
+                MaiError effortError;
                 std::string updateField = "title";
                 std::unique_lock<std::mutex> runtimeLock(mRuntime->mutex);
                 if ((!operation.model.empty() || operation.reasoningEffort.has_value()) &&
@@ -1272,6 +1271,24 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                             "Stop the target session before changing its model or effort."};
                 const bool found =
                     mRuntime->store->mutateSession(operation.sessionId, [&](MaiSession& session) {
+                        const auto& selectedModel =
+                            operation.model.empty() ? session.model : operation.model;
+                        const auto& effectiveModel =
+                            selectedModel.empty() ? mRuntime->options.defaultModel : selectedModel;
+                        // 显式 effort 严格校验；仅重选型号时才兼容继承来的扩展档位。
+                        // 在修改任何字段前确定最终组合，非法输入不能顺带改标题。
+                        const std::string effort =
+                            operation.reasoningEffort ? *operation.reasoningEffort
+                            : !operation.model.empty()
+                                ? maiNormalizeReasoningEffortForModel(effectiveModel,
+                                                                      session.reasoningEffort)
+                                : session.reasoningEffort;
+                        if ((operation.reasoningEffort || !operation.model.empty()) &&
+                            !maiIsValidReasoningEffortForModel(effectiveModel, effort)) {
+                            effortError = {MaiErrorCode::InvalidInput,
+                                           "Unsupported reasoning effort."};
+                            return;
+                        }
                         // 标题与显式命名标记在同一次存储 mutation 中写入；Titler 的锁内复查
                         // 因此不会在当前轮收尾时把有效的占位同名标题覆盖掉。
                         if (!operation.title.empty() &&
@@ -1285,9 +1302,8 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                             changed = true;
                             updateField.clear();
                         }
-                        if (operation.reasoningEffort &&
-                            session.reasoningEffort != *operation.reasoningEffort) {
-                            session.reasoningEffort = *operation.reasoningEffort;
+                        if (session.reasoningEffort != effort) {
+                            session.reasoningEffort = effort;
                             changed = true;
                             updateField.clear();
                         }
@@ -1307,6 +1323,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                         title = session.title;
                     });
                 if (!found) return {MaiErrorCode::NotFound, "session not found"};
+                if (effortError) return effortError;
                 const auto persisted = mRuntime->store->lastWriteError();
                 if (persisted) return persisted;
                 if (!changed) return operation.sessionId;

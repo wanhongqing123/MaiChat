@@ -37,3 +37,30 @@ then verify fixed requests, atomic switching, persistence, menus and ACKs.
 Primary source: https://openrouter.ai/anthropic/claude-fable-5.2 and its public
 model record (`reasoning.mandatory=true`, five `supported_efforts`). The original
 three-level integration is retained as the baseline, not described as five-level.
+
+## Subsequent user steering: retrieval and 402 diagnosis
+
+The user also needs ordinary keyword search and URL正文 retrieval while Fable is
+the primary model. In the two MaiChat product registration points, use the
+existing `registerMaiGlmWebTools` ordinary implementation directly. The tool
+schema/descriptions/results explicitly identify GLM, and its search limit stays
+70 Unicode characters. Its independent default endpoint remains
+`https://open.bigmodel.cn/api/paas/v4`, not the primary-model `/api/v1` endpoint.
+Do not select DeepSeek as fallback. The lower-level native-provider wrapper keeps
+its existing strict contract; the product no longer uses that wrapper.
+
+The reported OpenRouter 402 cannot be reconstructed from historical metadata:
+the previous adapter kept only the supplier message. A free key-info check with
+remaining key capacity does not prove wallet or in-flight capacity. The current
+App does not explicitly send 128000; its output limit is omitted, and 128000 only
+appears in the local context reserve. Do not silently change a product output
+limit based on that incorrect assumption.
+
+For future failures retain the original message plus allowlisted OpenRouter
+reason/source classification and bounded numeric Retry-After seconds. Known
+in-flight exhaustion is RateLimited; a single request exceeding the budget is
+distinguished from transient occupancy. Missing/mismatched metadata remains
+unclassified, and other suppliers do not inherit OpenRouter semantics. Do not
+copy arbitrary metadata/headers, add retries, change keys/credits, or call a paid
+model to diagnose this. Reference:
+https://openrouter.ai/docs/api_reference/limits#in-flight-spending-budget .

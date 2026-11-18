@@ -266,6 +266,7 @@ private slots:
     void remoteHostRejectsInvalidAndBusyModelChangesWithoutMutation();
     void coordinatorModelCommandKeepsOwnerTupleAndRejectsOldLogin();
     void remoteModelDisplayWaitsForOwnerAckAndSurvivesCatalogRefresh();
+    void remoteFableEffortsAndNormalizedModelPairWaitForOwnerAck();
     void remoteModelReceiptsCannotCrossSessionOrLogin();
     void remoteLocalConfigurationKeepsCloudChoicesButDisablesEffort();
     void remoteModelFailureSurvivesNormalHistory_data();
@@ -3344,6 +3345,79 @@ void DesktopSessionSyncHostTest::remoteModelDisplayWaitsForOwnerAckAndSurvivesCa
     QCOMPARE(composer->toPlainText(), QStringLiteral("Keep this draft during model selection"));
 }
 
+void DesktopSessionSyncHostTest::remoteFableEffortsAndNormalizedModelPairWaitForOwnerAck() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("five-effort-outbox.json")));
+    panel.resize(900, 680);
+    const auto owner = modelOwner(QStringLiteral("ses_fable_effort_ack"));
+    QList<QJsonObject> commands;
+    panel.setHistoryHandler(
+        [&](const QJsonObject& remote, const QString&, int, RemoteAgentPanel::Completion completion) {
+            panel.receivePayload(remote, QStringLiteral("history_page"),
+                                 {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{}}});
+            completion({});
+        });
+    panel.setCommandHandler(
+        [&](const QJsonObject&, const QJsonObject& command, RemoteAgentPanel::Completion completion) {
+            commands.append(command);
+            completion({});
+        });
+    panel.show();
+    panel.openSession(owner);
+    QTRY_VERIFY_WITH_TIMEOUT(!commands.isEmpty(), 3000);
+    auto fable = modelReceipt(owner, QStringLiteral("anthropic/claude-fable-5.2"));
+    fable.insert(QStringLiteral("reasoningEffort"), QStringLiteral("medium"));
+    auto* value = panel.findChild<QLabel*>(QStringLiteral("remoteAgentModelValue"));
+    auto* effortValue = panel.findChild<QLabel*>(QStringLiteral("remoteAgentEffortValue"));
+    QVERIFY(value && effortValue);
+    const auto unconfirmedModel = value->text();
+    const auto unconfirmedEffort = effortValue->text();
+    for (const auto& wire : {QStringLiteral("chat_completions"), QStringLiteral("local")}) {
+        auto wrongWire = fable;
+        wrongWire.insert(QStringLiteral("wire"), wire);
+        deliverModelReceipt(panel, owner, commands.first(), wrongWire);
+        QCOMPARE(value->text(), unconfirmedModel);
+        QCOMPARE(effortValue->text(), unconfirmedEffort);
+    }
+    deliverModelReceipt(panel, owner, commands.first(), fable);
+    QCOMPARE(value->text(), QStringLiteral("anthropic/claude-fable-5.2"));
+    QCOMPARE(effortValue->text(), QStringLiteral("中"));
+    auto* more = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentMoreActions"));
+    auto* section = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentEffortSection"));
+    QVERIFY(more && section);
+    QTest::mouseClick(more, Qt::LeftButton);
+    QTest::mouseClick(section, Qt::LeftButton);
+    for (const auto& effort : {QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high"),
+                               QStringLiteral("xhigh"), QStringLiteral("max")}) {
+        auto* option = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentEffortOption-") + effort);
+        QVERIFY2(option && option->isVisible(), qPrintable(effort));
+        QCOMPARE(option->isChecked(), effort == QStringLiteral("medium"));
+    }
+    auto* target = remoteModelOption(panel, QStringLiteral("deepseek-flash"));
+    QVERIFY(target && target->isVisible() && target->isEnabled());
+    QTest::mouseClick(target, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(commands.size(), 2, 3000);
+    const auto selection = commands.last();
+    QVERIFY(!selection.contains(QStringLiteral("reasoningEffort")));
+    QCOMPARE(value->text(), QStringLiteral("anthropic/claude-fable-5.2"));
+    QCOMPARE(effortValue->text(), QStringLiteral("中"));
+    auto invalid = modelReceipt(owner, QStringLiteral("deepseek-flash"));
+    invalid.insert(QStringLiteral("reasoningEffort"), QStringLiteral("medium"));
+    deliverModelReceipt(panel, owner, selection, invalid);
+    QCOMPARE(value->text(), QStringLiteral("anthropic/claude-fable-5.2"));
+    QCOMPARE(effortValue->text(), QStringLiteral("中"));
+    deliverModelReceipt(panel, owner, selection, modelReceipt(owner, QStringLiteral("deepseek-flash")));
+    QCOMPARE(value->text(), QStringLiteral("deepseek-flash"));
+    QCOMPARE(effortValue->text(), QStringLiteral("高"));
+    QTest::mouseClick(more, Qt::LeftButton);
+    QTest::mouseClick(section, Qt::LeftButton);
+    for (const auto& effort : {QStringLiteral("medium"), QStringLiteral("xhigh")}) {
+        auto* option = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentEffortOption-") + effort);
+        QVERIFY(!option || !option->isVisible());
+    }
+}
+
 void DesktopSessionSyncHostTest::remoteModelReceiptsCannotCrossSessionOrLogin() {
     QTemporaryDir spool;
     QVERIFY(spool.isValid());
@@ -3437,12 +3511,19 @@ void DesktopSessionSyncHostTest::remoteLocalConfigurationKeepsCloudChoicesButDis
     QCOMPARE(commands.first().value(QStringLiteral("action")).toString(), QStringLiteral("get_session"));
     auto local = modelReceipt(owner, QStringLiteral("local:fixture"));
     local.insert(QStringLiteral("wire"), QStringLiteral("local"));
-    deliverModelReceipt(panel, owner, commands.first(), local);
     auto* value = panel.findChild<QLabel*>(QStringLiteral("remoteAgentModelValue"));
     auto* composer = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
     auto* modelSection = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentModelSection"));
     auto* effortSection = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentEffortSection"));
     QVERIFY(value && composer && modelSection && effortSection);
+    const auto unconfirmedModel = value->text();
+    for (const auto& wire : {QStringLiteral("responses"), QStringLiteral("chat_completions")}) {
+        auto wrongWire = local;
+        wrongWire.insert(QStringLiteral("wire"), wire);
+        deliverModelReceipt(panel, owner, commands.first(), wrongWire);
+        QCOMPARE(value->text(), unconfirmedModel);
+    }
+    deliverModelReceipt(panel, owner, commands.first(), local);
     QCOMPARE(value->text(), QStringLiteral("local:fixture"));
     QVERIFY(modelSection->isEnabled());
     // Local remains readable and can switch to a supported cloud model, but its

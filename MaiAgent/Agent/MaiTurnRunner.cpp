@@ -251,7 +251,9 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
             ? (mDependencies.reasoningEffortProvider ? mDependencies.reasoningEffortProvider()
                                                      : mDependencies.reasoningEffort)
             : session.reasoningEffort;
-    if (!maiIsValidReasoningEffort(mReasoningEffort)) {
+    // 宿主/旧会话可带入另一型号的已知档位；只归一请求快照，不改写继承偏好。
+    mReasoningEffort = maiNormalizeReasoningEffortForModel(mModelName, mReasoningEffort);
+    if (!maiIsValidReasoningEffortForModel(mModelName, mReasoningEffort)) {
         mError = {MaiErrorCode::InvalidInput, "Unsupported reasoning effort."};
         return;
     }

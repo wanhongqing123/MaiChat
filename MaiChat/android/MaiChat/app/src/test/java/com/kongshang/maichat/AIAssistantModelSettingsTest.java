@@ -23,7 +23,7 @@ public final class AIAssistantModelSettingsTest {
     }
 
     @Test public void openRouterConfigurationKeepsRemoteSourceAndExactSessionChoice() throws Exception {
-        for (String effort : new String[]{"low", "high", "max"}) {
+        for (String effort : new String[]{"low", "medium", "high", "xhigh", "max"}) {
             AIAssistantModelSettings settings = AIAssistantModelSettings.defaults()
                 .withOptions("anthropic/claude-fable-5.2", "on-request", effort);
             JSONObject config = settings.configuration(null, "synthetic-openrouter-key");
@@ -37,6 +37,28 @@ public final class AIAssistantModelSettingsTest {
                 AIAssistantModelSettings.fromJson(settings.toJson()).model());
         }
         assertEquals("deepseek-flash", AIAssistantModelSettings.defaults().model());
+    }
+
+    @Test public void fableExtraEffortsSurviveRestoreAndOtherModelsNormalizeOnlyTheirProjection() throws Exception {
+        for (String effort : new String[]{"medium", "xhigh"}) {
+            JSONObject fable = new JSONObject().put("model", "anthropic/claude-fable-5.2")
+                .put("reasoningEffort", effort);
+            assertEquals(effort, AIAssistantModelSettings.fromJson(fable).effort);
+            for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"}) {
+                JSONObject saved = new JSONObject().put("model", model).put("reasoningEffort", effort);
+                assertEquals("high", AIAssistantModelSettings.fromJson(saved).effort);
+                assertEquals("Reading settings must not rewrite persisted source", effort,
+                    saved.getString("reasoningEffort"));
+                try {
+                    AIAssistantModelSettings.defaults().withOptions(model, "on-request", effort);
+                    fail("An explicit unsupported effort must be rejected for its target model");
+                } catch (IllegalArgumentException expected) { }
+            }
+        }
+        for (String effort : new String[]{"low", "high", "max"})
+            for (String model : new String[]{"glm-5.3", "deepseek-flash", "anthropic/claude-fable-5.2"})
+                assertEquals(effort, AIAssistantModelSettings.fromJson(new JSONObject()
+                    .put("model", model).put("reasoningEffort", effort)).effort);
     }
 
     @Test public void localSettingsRestoreTheirSourceInsteadOfBeingForcedToTheCloud() throws Exception {

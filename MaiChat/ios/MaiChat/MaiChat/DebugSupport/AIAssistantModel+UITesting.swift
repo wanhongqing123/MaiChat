@@ -389,8 +389,9 @@ extension AIAssistantModel {
         await selectPrimaryModel("glm-5.3-flash")
         guard let localSwitch = commands.last else { return }
         require(localSwitch.2["action"] as? String == "set_model" && localSwitch.2["model"] as? String == "glm-5.3-flash", "remote local could not select a cloud model")
-        await deliverSessionModelUITestReceipt(owner: local, id: localSwitch.1, result: result(local, model: "glm-5.3-flash", effort: "high"))
-        require(settings.model == "glm-5.3-flash", "cloud switch from local was not committed")
+        await deliverSessionModelUITestReceipt(owner: local, id: localSwitch.1, result: result(local, model: "glm-5.3-flash", effort: ""))
+        require(localSwitch.2["reasoningEffort"] as? String == "" && settings.reasoningEffort == "" &&
+                settings.model == "glm-5.3-flash", "cloud switch from local was not committed")
         states[local.sessionID] = ["model": "deepseek-v4-pro", "reasoningEffort": "max", "wire": "responses"]
         let beforeReconnect = readCount
         let writes = commands.filter { $0.2["action"] as? String == "set_model" }.count
@@ -434,6 +435,124 @@ extension AIAssistantModel {
             require(settings.model == AIModelSettings.fableModel && settings.displayName == "Claude Fable 5.2" &&
                 selectedRemote?.wire == "responses", "Fable owner ACK was not projected")
         } else { require(false, "Fable owner command missing") }
+        // This exercises host command/ACK semantics with an owned peer, not a
+        // claim that the pre-upgrade local CAPI accepts medium/xhigh.
+        func capableResult(model: String, effort: String, fallback: String = "high") -> [String: Any] {
+            var value = result(a, model: model, effort: effort)
+            value["supportedReasoningEfforts"] = AIModelSettings.reasoningEfforts(for: model)
+            value["defaultReasoningEffort"] = fallback
+            return value
+        }
+        require(availableReasoningEfforts == AIModelSettings.fableReasoningEfforts,
+                "legacy owner missing capabilities did not use exact Fable fallback")
+        for wanted in ["medium", "xhigh"] {
+            let previous = settings.effectiveReasoningEffort
+            await selectReasoningEffort(wanted)
+            guard let firstAttempt = commands.last else { return }
+            require(firstAttempt.2["model"] as? String == AIModelSettings.fableModel &&
+                    firstAttempt.2["reasoningEffort"] as? String == wanted,
+                    "Fable level was silently remapped before owner dispatch")
+            require(settings.effectiveReasoningEffort == previous, "selection committed before owner ACK")
+            // An older owner can reject a new value; no optimistic success may leak through.
+            await deliverSessionModelUITestReceipt(owner: a, id: firstAttempt.1,
+                result: ["ok": false, "error": "owned old owner rejects the new effort"])
+            require(settings.effectiveReasoningEffort == previous, "old owner rejection changed displayed effort")
+            await selectReasoningEffort(wanted)
+            guard let acceptedAttempt = commands.last else { return }
+            await deliverSessionModelUITestReceipt(owner: a, id: acceptedAttempt.1,
+                result: capableResult(model: AIModelSettings.fableModel, effort: wanted))
+            require(settings.reasoningEffort == wanted && settings.effectiveReasoningEffort == wanted,
+                    "valid Fable effort ACK was rejected or normalized")
+            await selectPrimaryModel("deepseek-flash")
+            guard let switched = commands.last else { return }
+            require(switched.2["model"] as? String == "deepseek-flash" &&
+                    switched.2["reasoningEffort"] as? String == "high",
+                    "model-only switch did not dispatch an atomic normalized pair")
+            await deliverSessionModelUITestReceipt(owner: a, id: switched.1,
+                result: capableResult(model: "deepseek-flash", effort: wanted))
+            require(settings.model == AIModelSettings.fableModel && settings.reasoningEffort == wanted,
+                    "invalid DeepSeek effort ACK consumed the pending switch")
+            var malformed = capableResult(model: "deepseek-flash", effort: "high")
+            malformed["supportedReasoningEfforts"] = AIModelSettings.fableReasoningEfforts
+            await deliverSessionModelUITestReceipt(owner: a, id: switched.1, result: malformed)
+            require(settings.model == AIModelSettings.fableModel, "foreign capability list granted DeepSeek Fable levels")
+            var badDefault = capableResult(model: "deepseek-flash", effort: "high")
+            badDefault["defaultReasoningEffort"] = "not-a-mode"
+            await deliverSessionModelUITestReceipt(owner: a, id: switched.1, result: badDefault)
+            require(settings.model == AIModelSettings.fableModel, "unknown default metadata was silently accepted as high")
+            await deliverSessionModelUITestReceipt(owner: a, id: switched.1,
+                result: capableResult(model: "deepseek-flash", effort: "high"))
+            require(settings.model == "deepseek-flash" && settings.effectiveReasoningEffort == "high",
+                    "valid normalized switch ACK was lost after malformed receipts")
+            let beforeInvalid = commands.count
+            await selectPrimaryModel("deepseek-flash", reasoningEffort: wanted)
+            require(commands.count == beforeInvalid && settings.effectiveReasoningEffort == "high",
+                    "explicit invalid DeepSeek effort was coerced or dispatched")
+            await selectPrimaryModel(AIModelSettings.fableModel)
+            guard let back = commands.last else { return }
+            await deliverSessionModelUITestReceipt(owner: a, id: back.1,
+                result: capableResult(model: AIModelSettings.fableModel, effort: "high"))
+        }
+        await selectReasoningEffort("")
+        if let inherited = commands.last {
+            await deliverSessionModelUITestReceipt(owner: a, id: inherited.1,
+                result: capableResult(model: AIModelSettings.fableModel, effort: "", fallback: "medium"))
+            require(settings.reasoningEffort == "" && settings.effectiveReasoningEffort == "medium",
+                    "empty inheritance was stored as an explicit high override")
+            // A historical DS page was captured before the Fable/empty ACK. Its
+            // normalized high default must not replace this accepted medium default.
+            let delayed: [String: Any] = ["ok": true, "session": a.sessionID,
+                "model": "deepseek-flash", "reasoningEffort": "", "wire": "responses",
+                "defaultReasoningEffort": "high", "supportedReasoningEfforts": ["low", "high", "max"],
+                "messages": [["id": "owned-delayed-old-page", "role": "assistant", "created": 0,
+                    "completed": 1, "active": false, "parts": [["id": "owned-delayed-text", "kind": "text", "text": "Owned older page"]]]]]
+            if let data = try? JSONSerialization.data(withJSONObject: delayed) {
+                deliverSessionModelUITestHistory(data, owner: a, older: true)
+                require(settings.model == AIModelSettings.fableModel && settings.reasoningEffort == "" &&
+                        settings.effectiveReasoningEffort == "medium",
+                        "delayed older DS page replaced accepted Fable inherited default")
+            } else { require(false, "cannot encode owned older history fixture") }
+            await selectPrimaryModel("deepseek-flash")
+            if let normalized = commands.last {
+                require(normalized.2["reasoningEffort"] as? String == "", "model switch erased empty inheritance")
+                await deliverSessionModelUITestReceipt(owner: a, id: normalized.1,
+                    result: capableResult(model: "deepseek-flash", effort: "", fallback: "medium"))
+                require(settings.reasoningEffort == "" && settings.effectiveReasoningEffort == "high",
+                        "inherited default was not normalized for the actual model")
+            }
+        }
+        require(AIModelSettings.normalizedDefaultReasoningEffort("not-a-mode", for: "deepseek-flash") == "not-a-mode",
+                "unknown default was normalized to high")
+        var malformedSettings = AIModelSettings()
+        malformedSettings.reasoningEffort = "not-a-mode"
+        malformedSettings.selectModel(AIModelSettings.fableModel)
+        require(malformedSettings.effectiveReasoningEffort == "not-a-mode" &&
+                !AIModelSettings.isValidReasoningEffort(malformedSettings.effectiveReasoningEffort,
+                    for: malformedSettings.model), "settings getter silently converted an invalid explicit mode to high")
+        // Missing/null old-owner defaults must not inherit another room's
+        // already-accepted Fable medium default through shared display state.
+        let savedOwnerHandler = uiTestSupport.sessionModelCommandHandler
+        for usesNull in [false, true] {
+            uiTestSupport.sessionModelCommandHandler = { [weak self] peer, id, payload in
+                guard let self else { throw CancellationError() }
+                if payload["action"] as? String == "get_session", peer.id == a.id || peer.id == b.id {
+                    var value = result(peer, model: AIModelSettings.fableModel, effort: "")
+                    value["supportedReasoningEfforts"] = AIModelSettings.fableReasoningEfforts
+                    if peer.id == a.id { value["defaultReasoningEffort"] = "medium" }
+                    else if usesNull { value["defaultReasoningEffort"] = NSNull() }
+                    else { value.removeValue(forKey: "defaultReasoningEffort") }
+                    await self.deliverSessionModelUITestReceipt(owner: peer, id: id, result: value)
+                } else if let savedOwnerHandler { try await savedOwnerHandler(peer, id, payload) }
+            }
+            await selectRemoteConversation(a)
+            require(settings.model == AIModelSettings.fableModel && settings.reasoningEffort == "" &&
+                    settings.effectiveReasoningEffort == "medium", "owner A inherited medium setup failed")
+            await selectRemoteConversation(b)
+            require(selectedRemote?.id == b.id && settings.reasoningEffort == "" &&
+                    settings.effectiveReasoningEffort == "high",
+                    "missing/null owner B default inherited owner A medium")
+        }
+        uiTestSupport.sessionModelCommandHandler = savedOwnerHandler
         let offline = owner("offline", online: false)
         applyUITestMutation(.remoteSessions([a, b, local, offline]))
         let beforeOffline = commands.count

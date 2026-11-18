@@ -1,4 +1,4 @@
-// 文件作用：真实 C ABI + loopback 验证会话模型/推理等级、双供应商、原子失败和重启。
+// 文件作用：真实 C ABI + loopback 验证原会话回归和独立五档推理 selector。
 // 合成账号/模型响应与独立临时库，不读取用户数据库、真实凭据或付费供应商。
 #include "MaiMobileAgent.h"
 
@@ -53,6 +53,8 @@ const char* keyHandler(void* context, const char* name, const char*) {
         result = {{"ok", true}, {"output", Json{{"key", keys.glmAvailable ? "synthetic-glm-key" : ""}}.dump()}};
     else if (std::strcmp(name, "deepseek_api_key") == 0)
         result = {{"ok", true}, {"output", Json{{"key", "synthetic-deepseek-key"}}.dump()}};
+    else if (std::strcmp(name, "openrouter_api_key") == 0)
+        result = {{"ok", true}, {"output", Json{{"key", "synthetic-openrouter-key"}}.dump()}};
     else
         result = {{"ok", false}, {"error", "Synthetic optional host capability is unavailable."}};
     const auto encoded = result.dump();
@@ -126,6 +128,295 @@ struct Provider {
         if (worker.joinable()) worker.join();
     }
 };
+
+// The effort selector uses only Responses and leaves the older GLM Chat fixture
+// unchanged. Its terminal message is authoritative, not an empty output after a delta.
+struct EffortProvider {
+    httplib::Server server;
+    std::thread worker;
+    std::mutex mutex;
+    std::vector<Json> requests;
+    std::string url;
+    explicit EffortProvider(const std::string& provider) {
+        server.new_task_queue = [] { return new httplib::ThreadPool(2); };
+        server.Post("/responses", [this, provider](const auto& request, auto& response) {
+            const auto body = Json::parse(request.body, nullptr, false);
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                requests.push_back(body);
+            }
+            if (request.get_header_value("Authorization") != "Bearer synthetic-" + provider + "-key" ||
+                !body.is_object() || !body.contains("input") || body.contains("messages")) {
+                response.status = 400;
+                response.set_content("{}", "application/json");
+                return;
+            }
+            const Json message = {
+                {"id", "msg_owned_effort"},
+                {"type", "message"},
+                {"role", "assistant"},
+                {"status", "completed"},
+                {"content", Json::array({{{"type", "output_text"}, {"text", "Owned effort reply"}}})}};
+            const Json completed = {
+                {"type", "response.completed"},
+                {"response",
+                 {{"id", "resp_owned_effort"}, {"status", "completed"}, {"output", Json::array({message})}}}};
+            response.set_content("data: " + completed.dump() + "\n\n", "text/event-stream");
+        });
+        const int port = server.bind_to_any_port("127.0.0.1");
+        check(port > 0, "Could not bind owned effort provider");
+        url = "http://127.0.0.1:" + std::to_string(port);
+        worker = std::thread([this] {
+            MaiThread::setCurrentName("mai-effort-provider");
+            server.listen_after_bind();
+        });
+        for (int index = 0; index < 200 && !server.is_running(); ++index)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        check(server.is_running(), "Owned effort provider did not start");
+    }
+    ~EffortProvider() {
+        server.stop();
+        if (worker.joinable()) worker.join();
+    }
+    std::size_t requestCount() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return requests.size();
+    }
+};
+
+struct ModelEffortChecks {
+    int checks = 0;
+    int failures = 0;
+    void expect(bool value, const std::string& name) {
+        ++checks;
+        if (!value) {
+            ++failures;
+            std::printf("FAIL model-efforts %s\n", name.c_str());
+        }
+    }
+    bool accepted(const Json& result, const std::string& name) {
+        const bool ok = result.is_object() && result.value("ok", false);
+        expect(ok, name + " expected ok (errorCode=" + result.value("errorCode", std::string("none")) + ")");
+        return ok;
+    }
+};
+
+MaiFilePath effortWorkspace() {
+    const auto root = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8(MaiIdGenerator::generate("mobile-model-efforts-")));
+    check(!MaiFileSystem::createDirectories(root), "Cannot create owned effort workspace");
+    return root;
+}
+
+Json effortConfiguration(const MaiFilePath& root, const EffortProvider& openrouter, const EffortProvider& deepseek,
+                         const std::string& model, const std::string& effort) {
+    const bool fable = model == "anthropic/claude-fable-5.2";
+    return {{"op", "configure"},
+            {"database", root.append(MaiFilePath::fromUtf8("sessions.sqlite")).toUtf8()},
+            {"workspace", root.toUtf8()},
+            {"appRoot", root.toUtf8()},
+            {"baseUrl", fable ? openrouter.url : deepseek.url},
+            {"openrouterBaseUrl", openrouter.url},
+            {"glmBaseUrl", deepseek.url},
+            {"deepseekBaseUrl", deepseek.url},
+            {"apiKey", fable ? "synthetic-openrouter-key" : "synthetic-deepseek-key"},
+            {"wire", "responses"},
+            {"model", model},
+            {"reasoningEffort", effort},
+            {"policy", "never"}};
+}
+
+void bindEffortKeys(Handle& handle, Keys& keys) {
+    check(handle.value != nullptr, "Cannot create native effort Agent");
+    check(maiMobileAgentSetHostToolHandler(handle.value, &keys, keyHandler, freeResponse, releaseKeys) == 1,
+          "Cannot bind owned effort keys");
+}
+
+std::string storedEffort(const MaiFilePath& root, const std::string& id) {
+    sqlite3* database = nullptr;
+    const auto path = root.append(MaiFilePath::fromUtf8("sessions.sqlite")).toUtf8();
+    check(sqlite3_open_v2(path.c_str(), &database, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK,
+          "Cannot read owned effort database");
+    sqlite3_stmt* query = nullptr;
+    check(sqlite3_prepare_v2(database, "SELECT reasoning_effort FROM sessions WHERE id=?1", -1, &query, nullptr) ==
+              SQLITE_OK,
+          "Cannot query owned stored effort");
+    sqlite3_bind_text(query, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(query) == SQLITE_ROW, "Owned effort session disappeared");
+    const auto text = sqlite3_column_text(query, 0);
+    const std::string result = text ? reinterpret_cast<const char*>(text) : "";
+    sqlite3_finalize(query);
+    sqlite3_close(database);
+    return result;
+}
+
+// Simulate a persisted valid Fable value arriving from another supported owner.
+// The Agent is destroyed before changing this newly-created test database.
+void seedOwnedEffort(const MaiFilePath& root, const std::string& id, const std::string& effort) {
+    sqlite3* database = nullptr;
+    const auto path = root.append(MaiFilePath::fromUtf8("sessions.sqlite")).toUtf8();
+    check(sqlite3_open_v2(path.c_str(), &database, SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK,
+          "Cannot open owned effort database");
+    sqlite3_stmt* update = nullptr;
+    check(sqlite3_prepare_v2(database, "UPDATE sessions SET reasoning_effort=?1 WHERE id=?2", -1, &update, nullptr) ==
+              SQLITE_OK,
+          "Cannot prepare owned effort seed");
+    sqlite3_bind_text(update, 1, effort.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(update, 2, id.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(update) == SQLITE_DONE && sqlite3_changes(database) == 1, "Cannot seed owned stored effort");
+    sqlite3_finalize(update);
+    sqlite3_close(database);
+}
+
+const Json kFableEfforts = Json::array({"low", "medium", "high", "xhigh", "max"});
+const Json kOtherCloudEfforts = Json::array({"low", "high", "max"});
+
+void expectEffortChoices(ModelEffortChecks& checks, void* handle, const std::string& id, const std::string& model,
+                         const std::string& stored, const std::string& normalizedDefault, const Json& supported,
+                         const std::string& entry) {
+    const auto choice = call(handle, {{"op", "get_session"}, {"session", id}});
+    checks.expect(choice.value("ok", false) && choice.value("model", "") == model &&
+                      choice.value("reasoningEffort", "<missing>") == stored &&
+                      choice.value("defaultReasoningEffort", "") == normalizedDefault,
+                  entry + " get_session preserves choice/inheritance and normalized default");
+    checks.expect(choice.contains("supportedReasoningEfforts") && choice["supportedReasoningEfforts"] == supported,
+                  entry + " get_session supportedReasoningEfforts");
+    const auto snapshot = call(handle, {{"op", "snapshot"}, {"session", id}, {"messageLimit", 0}, {"force", true}});
+    checks.expect(snapshot.value("ok", false) && snapshot.value("selectedModel", "") == model &&
+                      snapshot.value("selectedReasoningEffort", "<missing>") == stored &&
+                      snapshot.value("defaultReasoningEffort", "") == normalizedDefault,
+                  entry + " snapshot selected choice/normalized default");
+    checks.expect(snapshot.contains("supportedReasoningEfforts") && snapshot["supportedReasoningEfforts"] == supported,
+                  entry + " snapshot top supportedReasoningEfforts");
+    bool found = false;
+    if (snapshot.contains("sessions") && snapshot["sessions"].is_array()) {
+        for (const auto& session : snapshot["sessions"]) {
+            if (session.value("id", "") != id) continue;
+            found = session.value("model", "") == model && session.value("reasoningEffort", "<missing>") == stored &&
+                    session.contains("supportedReasoningEfforts") && session["supportedReasoningEfforts"] == supported;
+        }
+    }
+    checks.expect(found, entry + " snapshot sessions entry uses its own model profile");
+    const auto remote = call(handle, {{"op", "remote_snapshot"}, {"session", id}, {"limit", 1}});
+    checks.expect(remote.value("ok", false) && remote.value("model", "") == model &&
+                      remote.value("reasoningEffort", "<missing>") == stored &&
+                      remote.value("defaultReasoningEffort", "") == normalizedDefault,
+                  entry + " remote_snapshot selected choice/normalized default");
+    checks.expect(remote.contains("supportedReasoningEfforts") && remote["supportedReasoningEfforts"] == supported,
+                  entry + " remote_snapshot supportedReasoningEfforts");
+}
+
+int runModelEfforts() {
+    EffortProvider openrouter("openrouter"), deepseek("deepseek");
+    const std::string fable = "anthropic/claude-fable-5.2";
+    const std::string ds = "deepseek-flash";
+    ModelEffortChecks checks;
+    Keys keys;
+    // Keep the old-production RED controls independent; a failed new configure
+    // must not become a cascade of failed create/get calls against no Agent.
+    for (const char* effort : {"medium", "xhigh"}) {
+        const auto root = effortWorkspace();
+        Handle handle;
+        bindEffortKeys(handle, keys);
+        check(call(handle.value, effortConfiguration(root, openrouter, deepseek, fable, "high")).value("ok", false),
+              "Fable high baseline control failed before the new effort assertions");
+        const auto configured = call(handle.value, effortConfiguration(root, openrouter, deepseek, fable, effort));
+        if (!checks.accepted(configured, std::string("configure Fable ") + effort)) continue;
+        const auto created = call(handle.value, {{"op", "create"}});
+        if (!checks.accepted(created, std::string("create with Fable configured default ") + effort)) continue;
+        const auto id = created.at("id").get<std::string>();
+        expectEffortChoices(checks, handle.value, id, fable, effort, effort, kFableEfforts,
+                            std::string("configured Fable ") + effort);
+        // An inherited DS choice must not expose the incompatible host's Fable
+        // default. Its stored empty marker still means inherit, not an override.
+        const auto inherited = call(handle.value, {{"op", "create"}, {"model", ds}, {"reasoningEffort", ""}});
+        if (checks.accepted(inherited, "create inherited DS under Fable default")) {
+            const auto dsId = inherited.at("id").get<std::string>();
+            expectEffortChoices(checks, handle.value, dsId, ds, "", "high", kOtherCloudEfforts,
+                                std::string("DS under Fable default ") + effort);
+            checks.expect(storedEffort(root, dsId).empty(), "Inherited DS value remains empty in storage");
+        }
+    }
+    {
+        const auto root = effortWorkspace();
+        Handle handle;
+        bindEffortKeys(handle, keys);
+        check(call(handle.value, effortConfiguration(root, openrouter, deepseek, fable, "high")).value("ok", false),
+              "Cannot initialize explicit effort fixture");
+        for (const char* effort : {"medium", "xhigh"}) {
+            const auto created = call(handle.value, {{"op", "create"}, {"model", fable}, {"reasoningEffort", effort}});
+            if (checks.accepted(created, std::string("create explicit Fable ") + effort))
+                expectEffortChoices(checks, handle.value, created.at("id").get<std::string>(), fable, effort, "high",
+                                    kFableEfforts, std::string("created Fable ") + effort);
+        }
+        const auto created = call(handle.value, {{"op", "create"}, {"model", fable}, {"reasoningEffort", "high"}});
+        check(created.value("ok", false), "Cannot create old-supported Fable high control");
+        const auto id = created.at("id").get<std::string>();
+        expectEffortChoices(checks, handle.value, id, fable, "high", "high", kFableEfforts, "Fable high control");
+        for (const char* effort : {"medium", "xhigh"}) {
+            const auto selected = call(
+                handle.value, {{"op", "set_model"}, {"session", id}, {"model", fable}, {"reasoningEffort", effort}});
+            if (checks.accepted(selected, std::string("set_model Fable ") + effort)) {
+                checks.expect(selected.contains("supportedReasoningEfforts") &&
+                                  selected["supportedReasoningEfforts"] == kFableEfforts,
+                              "set_model choice returns Fable effort profile");
+                expectEffortChoices(checks, handle.value, id, fable, effort, "high", kFableEfforts,
+                                    std::string("selected Fable ") + effort);
+            }
+        }
+    }
+    // Reopen a private persisted Fable medium value to test getters and a
+    // model-only switch even against old production that rejects setting it.
+    {
+        const auto root = effortWorkspace();
+        std::string id;
+        {
+            Handle handle;
+            bindEffortKeys(handle, keys);
+            check(call(handle.value, effortConfiguration(root, openrouter, deepseek, fable, "high")).value("ok", false),
+                  "Cannot initialize persisted effort fixture");
+            const auto created = call(handle.value, {{"op", "create"}, {"model", fable}, {"reasoningEffort", "high"}});
+            check(created.value("ok", false), "Cannot create persisted effort control");
+            id = created.at("id").get<std::string>();
+        }
+        seedOwnedEffort(root, id, "medium");
+        Handle handle;
+        bindEffortKeys(handle, keys);
+        check(call(handle.value, effortConfiguration(root, openrouter, deepseek, fable, "high")).value("ok", false),
+              "Cannot reopen persisted effort fixture");
+        expectEffortChoices(checks, handle.value, id, fable, "medium", "high", kFableEfforts, "reopened Fable medium");
+        const auto switched = call(handle.value, {{"op", "set_model"}, {"session", id}, {"model", ds}});
+        if (checks.accepted(switched, "model-only Fable medium to DS")) {
+            const auto actual = call(handle.value, {{"op", "get_session"}, {"session", id}});
+            const auto stored = actual.value("reasoningEffort", "<missing>");
+            const auto effective = stored.empty() ? actual.value("defaultReasoningEffort", "") : stored;
+            checks.expect(effective == "high" && actual.value("defaultReasoningEffort", "") == "high",
+                          "model-only DS normalizes incompatible Fable medium to effective high");
+            expectEffortChoices(checks, handle.value, id, ds, stored, "high", kOtherCloudEfforts, "model-only DS");
+        }
+        const auto before = openrouter.requestCount() + deepseek.requestCount();
+        for (const auto& rejected :
+             {call(handle.value, {{"op", "set_model"}, {"session", id}, {"model", ds}, {"reasoningEffort", "medium"}}),
+              call(handle.value, {{"op", "create"}, {"model", ds}, {"reasoningEffort", "medium"}}),
+              call(handle.value, effortConfiguration(root, openrouter, deepseek, ds, "medium"))})
+            checks.expect(!rejected.value("ok", false) && rejected.value("errorCode", "") == "invalid_input",
+                          "explicit DS medium rejected before state/HTTP effects");
+        checks.expect(openrouter.requestCount() + deepseek.requestCount() == before,
+                      "explicit DS medium refusal performs zero HTTP");
+        const auto inherited = call(handle.value, {{"op", "create"}, {"model", ds}, {"reasoningEffort", ""}});
+        if (checks.accepted(inherited, "create explicit empty stored DS effort")) {
+            const auto inheritedId = inherited.at("id").get<std::string>();
+            expectEffortChoices(checks, handle.value, inheritedId, ds, "", "high", kOtherCloudEfforts,
+                                "empty stored DS");
+            checks.expect(storedEffort(root, inheritedId).empty(), "Empty stored DS marker survives choice reads");
+        }
+    }
+    checks.expect(openrouter.requestCount() == 0 && deepseek.requestCount() == 0,
+                  "Configuration and choice APIs perform zero provider HTTP");
+    std::printf("Model efforts: failures=%d checks=%d providerHTTP=%zu\n", checks.failures, checks.checks,
+                openrouter.requestCount() + deepseek.requestCount());
+    return checks.failures ? 1 : 0;
+}
 
 void waitIdle(void* handle, const std::string& id) {
     for (int index = 0; index < 500; ++index) {
@@ -314,6 +605,7 @@ int main(int argc, char** argv) {
     setenv("no_proxy", "*", 1);
 #endif
     try {
+        if (argc == 2 && std::string(argv[1]) == "--model-efforts") return runModelEfforts();
         run(argc == 2 && std::string(argv[1]) == "--legacy-overwrite");
         return 0;
     } catch (const std::exception& error) {

@@ -720,6 +720,7 @@ private slots:
     void videoImportFinishesInItsOriginalSession();
     void actionPanelMatchesMobileModelAndPolicyFlow();
     void mainModelChoicesStaySeparateFromReasoningEffort();
+    void mainModelEffortOptionsFollowTheSelectedModel();
     void mainModelValueFollowsTheSelectedSession();
     void firstModelSelectionPreservesTheBlankPageDraft();
     void newAgentOutputDoesNotInterruptReadingHistory();
@@ -1727,7 +1728,7 @@ void AgentPanelSessionTest::actionPanelMatchesMobileModelAndPolicyFlow() {
     QVERIFY(modelSection);
     QLabel* selectedValue = nullptr;
     for (QLabel* label : modelSection->findChildren<QLabel*>()) {
-        if (label->text() == QStringLiteral("标准")) selectedValue = label;
+        if (label->text() == QStringLiteral("高")) selectedValue = label;
     }
     QVERIFY(selectedValue);
     const QPoint valueCenter = selectedValue->mapTo(actions, selectedValue->rect().center());
@@ -1809,6 +1810,44 @@ void AgentPanelSessionTest::mainModelChoicesStaySeparateFromReasoningEffort() {
     auto* value = actions->findChild<QLabel*>(QStringLiteral("agentModelValue"));
     QVERIFY(value);
     QCOMPARE(value->text(), QStringLiteral("anthropic/claude-fable-5.2"));
+}
+
+void AgentPanelSessionTest::mainModelEffortOptionsFollowTheSelectedModel() {
+    Harness harness;
+    const auto fable = QStringLiteral("anthropic/claude-fable-5.2");
+    QVERIFY(harness.controller->setSessionModelConfiguration(harness.mine, fable, QStringLiteral("medium")));
+    harness.panel->openSession(harness.mine);
+    QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
+    auto* more = harness.panel->findChild<QPushButton*>(QStringLiteral("agentMoreActions"));
+    QVERIFY(more);
+    QTest::mouseClick(more, Qt::LeftButton);
+    auto* actions = harness.panel->findChild<QWidget*>(QStringLiteral("agentActionPanel"));
+    auto* section = harness.panel->findChild<QPushButton*>(QStringLiteral("agentEffortSection"));
+    QVERIFY(actions && actions->isVisible() && section);
+    QTest::mouseClick(section, Qt::LeftButton);
+    const QList<QPair<QString, QString>> efforts{{QStringLiteral("low"), QStringLiteral("低")},
+                                                 {QStringLiteral("medium"), QStringLiteral("中")},
+                                                 {QStringLiteral("high"), QStringLiteral("高")},
+                                                 {QStringLiteral("xhigh"), QStringLiteral("超高")},
+                                                 {QStringLiteral("max"), QStringLiteral("最高")}};
+    for (const auto& effort : efforts) {
+        auto* option = actions->findChild<QPushButton*>(QStringLiteral("agentEffortOption-") + effort.first);
+        QVERIFY2(option && option->isVisible(), qPrintable(effort.first));
+        QCOMPARE(option->text(), effort.second);
+        QCOMPARE(option->isChecked(), effort.first == QStringLiteral("medium"));
+    }
+    QCOMPARE(section->accessibleName(), QStringLiteral("思考强度：中"));
+    QVERIFY(harness.controller->setSessionModelConfiguration(harness.mine, fable, QStringLiteral("xhigh")));
+    harness.panel->refreshModelConfiguration();
+    QCOMPARE(section->accessibleName(), QStringLiteral("思考强度：超高"));
+    QVERIFY(harness.panel->applySelectedModel(QStringLiteral("deepseek-flash")));
+    auto* high = actions->findChild<QPushButton*>(QStringLiteral("agentEffortOption-high"));
+    QVERIFY(high && high->isVisible() && high->isChecked());
+    QCOMPARE(section->accessibleName(), QStringLiteral("思考强度：高"));
+    for (const auto& effort : {QStringLiteral("medium"), QStringLiteral("xhigh")}) {
+        auto* option = actions->findChild<QPushButton*>(QStringLiteral("agentEffortOption-") + effort);
+        QVERIFY(!option || !option->isVisible());
+    }
 }
 
 void AgentPanelSessionTest::mainModelValueFollowsTheSelectedSession() {

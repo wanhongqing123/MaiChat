@@ -7,6 +7,87 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public final class AIAssistantSessionModelTest {
+    @Test public void cloudReceiptsRejectForeignWireBeforeCommittingTheRequestedPair() throws Exception {
+        for (String wire : new String[]{"chat_completions", "local"}) {
+            AIAssistantSessionModels.Remote cache = new AIAssistantSessionModels.Remote();
+            JSONObject owner = owner("mac", "login-wire-guard", "wire-session");
+            assertTrue(cache.accept(cache.begin(owner, null), receipt("wire-session", "deepseek-flash", "high")));
+            try {
+                cache.accept(cache.begin(owner, "anthropic/claude-fable-5.2", "medium"),
+                    receipt("wire-session", "anthropic/claude-fable-5.2", "medium").put("wire", wire));
+                fail("A correlated Fable medium ACK must still use the catalog's Responses wire");
+            } catch (IllegalStateException expected) { }
+            assertEquals("deepseek-flash", cache.project(owner).getString("model"));
+            assertEquals("high", cache.project(owner).getString("reasoningEffort"));
+            assertEquals("responses", cache.project(owner).getString("wire"));
+            assertTrue(cache.accept(cache.begin(owner, "anthropic/claude-fable-5.2", "medium"),
+                receipt("wire-session", "anthropic/claude-fable-5.2", "medium")));
+            assertEquals("medium", cache.project(owner).getString("reasoningEffort"));
+        }
+    }
+
+    @Test public void localReceiptsRejectCloudWireAndKeepThePreviousOwnerConfiguration() throws Exception {
+        for (String wire : new String[]{"responses", "chat_completions"}) {
+            AIAssistantSessionModels.Remote cache = new AIAssistantSessionModels.Remote();
+            JSONObject owner = owner("mac", "login-local-wire", "local-session");
+            assertTrue(cache.accept(cache.begin(owner, null),
+                receipt("local-session", "anthropic/claude-fable-5.2", "medium")));
+            try {
+                cache.accept(cache.begin(owner, null),
+                    receipt("local-session", AIAssistantSessionModels.LOCAL, "high").put("wire", wire));
+                fail("A local model ACK must use its local wire");
+            } catch (IllegalStateException expected) { }
+            assertEquals("anthropic/claude-fable-5.2", cache.project(owner).getString("model"));
+            assertEquals("medium", cache.project(owner).getString("reasoningEffort"));
+            assertEquals("responses", cache.project(owner).getString("wire"));
+            assertTrue(cache.accept(cache.begin(owner, null),
+                receipt("local-session", AIAssistantSessionModels.LOCAL, "high").put("wire", "local")));
+            assertEquals(AIAssistantSessionModels.LOCAL, cache.project(owner).getString("model"));
+            assertEquals("local", cache.project(owner).getString("wire"));
+        }
+    }
+
+    @Test public void effortValidationIsBoundToTheRequestedModelAndPreservesInheritance() throws Exception {
+        for (String effort : new String[]{"low", "medium", "high", "xhigh", "max"}) {
+            JSONObject choice = AIAssistantSessionModels.selection("fable", "anthropic/claude-fable-5.2", effort);
+            assertEquals(effort, choice.getString("reasoningEffort"));
+        }
+        for (String model : new String[]{"glm-5.3", "deepseek-flash"})
+            for (String effort : new String[]{"medium", "xhigh"}) {
+                try {
+                    AIAssistantSessionModels.selection("other", model, effort);
+                    fail("Explicit Fable-only effort must be rejected for another model");
+                } catch (IllegalArgumentException expected) { }
+            }
+        assertFalse(AIAssistantSessionModels.selection("fable", "deepseek-flash", null).has("reasoningEffort"));
+        assertEquals("", AIAssistantSessionModels.selection("fable", "anthropic/claude-fable-5.2", "")
+            .getString("reasoningEffort"));
+    }
+
+    @Test public void remoteModelAndNormalizedEffortCommitTogetherOnlyAfterOwnerAck() throws Exception {
+        for (String effort : new String[]{"medium", "xhigh"}) {
+            AIAssistantSessionModels.Remote cache = new AIAssistantSessionModels.Remote();
+            JSONObject owner = owner("mac", "login-five-efforts", "fable");
+            assertTrue(cache.accept(cache.begin(owner, null), receipt("fable", "anthropic/claude-fable-5.2", effort)));
+            JSONObject choice = AIAssistantSessionModels.Remote.request("deepseek-flash", null);
+            assertFalse(choice.has("reasoningEffort"));
+            AIAssistantSessionModels.Remote.Ticket pending = cache.begin(owner, "deepseek-flash", null);
+            assertEquals("anthropic/claude-fable-5.2", cache.project(owner).getString("model"));
+            assertEquals(effort, cache.project(owner).getString("reasoningEffort"));
+            assertTrue(cache.accept(pending, receipt("fable", "deepseek-flash", "high")));
+            assertEquals("deepseek-flash", cache.project(owner).getString("model"));
+            assertEquals("high", cache.project(owner).getString("reasoningEffort"));
+            try {
+                cache.accept(cache.begin(owner, null), receipt("fable", "deepseek-flash", effort));
+                fail("An invalid model/effort pair cannot replace the acknowledged configuration");
+            } catch (IllegalStateException expected) { }
+            assertEquals("deepseek-flash", cache.project(owner).getString("model"));
+            assertEquals("high", cache.project(owner).getString("reasoningEffort"));
+            assertTrue(cache.accept(cache.begin(owner, "anthropic/claude-fable-5.2", effort),
+                receipt("fable", "anthropic/claude-fable-5.2", effort)));
+        }
+    }
+
     @Test public void openRouterSessionUsesItsOwnEndpointAndExactSelection() throws Exception {
         JSONObject snapshot = new JSONObject().put("sessions", new JSONArray()
             .put(new JSONObject().put("id", "fable").put("model", "anthropic/claude-fable-5.2")

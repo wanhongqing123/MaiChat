@@ -21,7 +21,7 @@
 #include "MaiSessionSchedule.h"
 #include "MaiCalendarTools.h"
 #include "MaiCloudModelCatalog.h"
-#include "MaiProviderWebTools.h"
+#include "MaiGlmWebTools.h"
 #include "MaiTime.h"
 #if defined(MAICHAT_CV_VIDEO_ANALYSIS)
 #include "MaiCvImageTools.h"
@@ -272,8 +272,9 @@ QString initialModel(const QString& model) {
     return model.isEmpty() ? fromUtf8(MaiAgent::Options{}.defaultModel) : model;
 }
 
-QString initialReasoningEffort(const QString& effort) {
-    return maiIsValidReasoningEffort(toUtf8(effort)) ? effort : QStringLiteral("high");
+QString initialReasoningEffort(const QString& model, const QString& effort) {
+    const auto normalized = maiNormalizeReasoningEffortForModel(toUtf8(model), toUtf8(effort));
+    return maiIsValidReasoningEffortForModel(toUtf8(model), normalized) ? fromUtf8(normalized) : QStringLiteral("high");
 }
 
 // 存储打不开时退化成内存存储，而不是让整个界面起不来。
@@ -312,24 +313,20 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     // 要不要把工具声明给模型看是 MaiContextBuilder 的事，不是这里的。
     auto tools = std::make_unique<MaiToolRegistry>();
     registerMaiBuiltinTools(*tools);
-    // 搜索/抓取只填宿主凭据与证书；普通工具由 Core 按该轮固定型号选择供应商。
-    MaiProviderWebOptions webOptions;
+    // 产品搜索/抓取固定使用明确的 GLM 原生合同，与主聊天供应商解耦。
+    // 保留原生 /api/paas/v4 默认地址，不借用聊天 Responses 地址或 DeepSeek 凭据。
+    MaiGlmWebOptions webOptions;
     QFile webCertificates(QStringLiteral(":/maichat/auth/cacert.pem"));
     if (webCertificates.open(QIODevice::ReadOnly)) {
         const std::string caPem = toUtf8(QString::fromUtf8(webCertificates.readAll()));
-        webOptions.deepseek.caPem = caPem;
-        webOptions.glm.caPem = caPem;
+        webOptions.caPem = caPem;
     }
-    webOptions.deepseek.apiKey = [provider = credentials.accountModelKeyProvider,
-                                  key = toUtf8(credentials.deepseekApiKey)] {
-        return provider ? toUtf8(provider(QStringLiteral("deepseek"))) : key;
-    };
-    webOptions.glm.apiKey = [provider = credentials.accountModelKeyProvider,
-                            glmProvider = credentials.glmApiKeyProvider, key = toUtf8(credentials.glmApiKey)] {
+    webOptions.apiKey = [provider = credentials.accountModelKeyProvider, glmProvider = credentials.glmApiKeyProvider,
+                         key = toUtf8(credentials.glmApiKey)] {
         if (provider) return toUtf8(provider(QStringLiteral("glm")));
         return glmProvider ? toUtf8(glmProvider()) : key;
     };
-    registerMaiProviderWebTools(*tools, std::move(webOptions));
+    registerMaiGlmWebTools(*tools, std::move(webOptions));
     registerMaiQrCodeTools(*tools);
 #if defined(Q_OS_MAC)
     registerMaiSessionScheduleTools(*tools, scheduleStore, "Mac");
@@ -471,7 +468,8 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     MaiAgent::Options options;
     if (!defaultModel.isEmpty()) options.defaultModel = toUtf8(defaultModel);
     // 会话空值继承这个构造期常量，不再逐请求读取可变的 UI 全局设置。
-    options.reasoningEffort = toUtf8(initialReasoningEffort(credentials.reasoningEffort));
+    options.reasoningEffort =
+        toUtf8(initialReasoningEffort(fromUtf8(options.defaultModel), credentials.reasoningEffort));
     // 0 = 无限等。桌面端有人盯着，超时自动拒绝等于替用户做决定。
     options.permissionTimeoutMs = 0;
     options.approvalPolicy = approvalPolicy;
@@ -491,8 +489,8 @@ AgentController::AgentController(std::unique_ptr<MaiModelClient> model, const QS
 AgentController::AgentController(std::unique_ptr<MaiModelClient> model, const QString& databasePath,
                                  ToolRegistrar hostTools, QObject* parent)
     : QObject(parent),
-      runtime_(std::make_unique<Runtime>(initialModel(QString()),
-                                        initialReasoningEffort(ModelConfig{}.reasoningEffort))) {
+      runtime_(std::make_unique<Runtime>(
+          initialModel(QString()), initialReasoningEffort(initialModel(QString()), ModelConfig{}.reasoningEffort))) {
     // 排队投递要求这个类型是注册过的。放在构造里而不是全局静态，是因为注册本身是幂等且线程安全的，
     // 而全局静态的初始化顺序不好讲。
     qRegisterMetaType<MaiEvent>("MaiEvent");
@@ -528,7 +526,9 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
 AgentController::AgentController(const ModelConfig& model, const QString& databasePath, ToolRegistrar hostTools,
                                  QObject* parent)
     : QObject(parent),
-      runtime_(std::make_unique<Runtime>(initialModel(model.modelName), initialReasoningEffort(model.reasoningEffort))) {
+      runtime_(
+          std::make_unique<Runtime>(initialModel(model.modelName),
+                                    initialReasoningEffort(initialModel(model.modelName), model.reasoningEffort))) {
     qRegisterMetaType<MaiEvent>("MaiEvent");
     runtime_->scheduleStore = openScheduleStore(databasePath);
 
@@ -809,6 +809,8 @@ bool AgentController::sessionModelConfiguration(const QString& sessionId, Sessio
     resolved.model = session.model.empty() ? runtime_->initialDefaultModel : fromUtf8(session.model);
     resolved.reasoningEffort =
         session.reasoningEffort.empty() ? runtime_->initialDefaultReasoningEffort : fromUtf8(session.reasoningEffort);
+    resolved.reasoningEffort =
+        fromUtf8(maiNormalizeReasoningEffortForModel(toUtf8(resolved.model), toUtf8(resolved.reasoningEffort)));
     if (runtime_->modelClient) {
         const auto wire = runtime_->modelClient->wireApiForModel(toUtf8(resolved.model));
         if (!wire || *wire == MaiWireApi::Mixed) return false;
@@ -837,8 +839,8 @@ bool AgentController::setSessionModelConfiguration(const QString& sessionId, con
         runtime_->setError(QStringLiteral("当前客户端不支持此模型。"));
         return false;
     }
-    if (reasoningEffort && !maiIsValidReasoningEffort(toUtf8(*reasoningEffort))) {
-        runtime_->setError(QStringLiteral("思考强度仅支持 low、high、max 或继承默认。"));
+    if (reasoningEffort && !maiIsValidReasoningEffortForModel(toUtf8(selected), toUtf8(*reasoningEffort))) {
+        runtime_->setError(QStringLiteral("所选模型不支持此思考强度。"));
         return false;
     }
     MaiSession session;
@@ -847,11 +849,14 @@ bool AgentController::setSessionModelConfiguration(const QString& sessionId, con
         return false;
     }
     const QString currentModel = session.model.empty() ? runtime_->initialDefaultModel : fromUtf8(session.model);
-    const QString currentEffort =
+    const QString inheritedEffort =
         session.reasoningEffort.empty() ? runtime_->initialDefaultReasoningEffort : fromUtf8(session.reasoningEffort);
+    const QString currentEffort =
+        fromUtf8(maiNormalizeReasoningEffortForModel(toUtf8(currentModel), toUtf8(inheritedEffort)));
     QString requestedEffort = currentEffort;
     if (reasoningEffort)
         requestedEffort = reasoningEffort->isEmpty() ? runtime_->initialDefaultReasoningEffort : *reasoningEffort;
+    requestedEffort = fromUtf8(maiNormalizeReasoningEffortForModel(toUtf8(selected), toUtf8(requestedEffort)));
     if (runtime_->agent->isBusy(toUtf8(sessionId))) {
         if (selected != currentModel || requestedEffort != currentEffort) {
             runtime_->setError(QStringLiteral("任务进行中，请结束后再切换模型或思考强度。"));

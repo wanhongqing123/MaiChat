@@ -33,7 +33,8 @@ struct MaiCreateSession {
     std::string directory;
     std::string title;
     std::string model;
-    // 空串继承宿主默认；显式值须为 low/high/max。追加末尾保留原三字段聚合初始化。
+    // 空串继承宿主默认；显式值按所选型号校验，Fable 五档，其余保留 low/high/max。
+    // 追加末尾保留原三字段聚合初始化。
     std::string reasoningEffort;
 };
 
@@ -47,7 +48,8 @@ struct MaiUpdateSession {
     // 移动端更新后，应用沙箱的绝对路径可能改变。调用方传入当前工作目录时，
     // 必须同步修正持久化会话，否则历史图片仍会从旧容器路径读取。
     std::string directory;
-    // nullopt 不修改；有值但空串恢复继承；非空仅 low/high/max。
+    // nullopt 不显式设置；有值但空串恢复继承；非空按目标型号校验。
+    // 仅切换型号时，原 medium/xhigh 在不支持它们的型号下原子归一到 high。
     // 与 model/title 等同一次校验和写入；非法值不产生部分更新。
     // 修改 model/effort 时目标活动轮次返回 Busy，改名/修正目录保持原语义。
     // 追加末尾保留原五字段聚合初始化。
@@ -224,7 +226,7 @@ public:
     struct Options {
         // 会话没指定模型时用这个。会话上配了就用会话的（MaiUpdateSession）。
         std::string defaultModel = "glm-5.3";
-        // 会话 effort 为空时的宿主默认。空串保留供应商默认；显式值仅 low/high/max。
+        // 会话 effort 为空时的宿主默认。空串保留供应商默认；显式值按当前轮次型号校验。
         std::string reasoningEffort;
         // 可选宿主默认提供器，仅在轮次开始且会话没有显式值时调用一次。
         // 本轮（包括工具跟进/压缩）固定该快照，不随其他会话或 UI 选择变化。

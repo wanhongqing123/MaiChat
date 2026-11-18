@@ -14,20 +14,34 @@ Platform hosts adapt menus and remote tuple validation, without new structs.
 - [x] Inspect official model record and current hard-coded validators/menus.
 - [x] Freeze helper signatures, inheritance, explicit rejection and switch rules.
 - [x] Protocol tests first: `MaiModelClientTests --reasoning-efforts` RED.
-- [ ] Catalog: modify `MaiCloudModelCatalog.h/.cpp`; retain original single-value
+- [x] Catalog: modify `MaiCloudModelCatalog.h/.cpp`; retain original single-value
   API and add model-specific list/validation/known-level normalization.
-- [ ] Core: `MaiAgent.cpp`, `MaiTurnRunner.cpp`, `MaiAgent.h`; existing Core/Runner
+- [x] Core: `MaiAgent.cpp`, `MaiTurnRunner.cpp`, `MaiAgent.h`; existing Core/Runner
   tests cover Fable choices, explicit invalid pairs, model-only atomic high,
   busy isolation and persisted values after reopen.
-- [ ] Wire: `MaiResponsesClient.cpp` and `MaiModelClientTests.cpp`; strict rejection
+- [x] Wire: `MaiResponsesClient.cpp` and `MaiModelClientTests.cpp`; strict rejection
   before HTTP and unchanged Fable medium/xhigh payloads. Run the same RED selector.
-- [ ] CAPI: `MaiMobileAgent.cpp` and `MaiMobileSessionModelTests.cpp`; verify normal
+- [x] CAPI: `MaiMobileAgent.cpp` and `MaiMobileSessionModelTests.cpp`; verify normal
   configure/create/get/set/snapshot and supported list through the existing C ABI.
-- [ ] Qt/Android: model-specific controls, effective labels and ACK validation;
+- [x] Qt/Android: model-specific controls, effective labels and ACK validation;
   use existing controller/panel/session fixtures and Java tests before fixes.
-- [ ] Apple: consume exact shared delta; native medium/xhigh host fixtures and
+- [x] Apple: consume exact shared delta; native medium/xhigh host fixtures and
   normal consumers, without repeating common protocol or paid provider requests.
-- [ ] Root: run targeted GREEN and related common regression; normal Windows
+- [x] Root: run targeted GREEN and related common regression; normal Windows
   runtime deployment gate and Android ABI build; review and aggregate exact source.
-- [ ] Record tested source/build/device boundaries, commit and push main; a new
+- [x] Record tested source/build/device boundaries, commit and push main; a new
   device installation follows the existing authorized Apple delivery workflow.
+
+Additional authorized checks:
+
+- [x] Product retrieval: existing GLM Search/Reader registration in
+  `AgentController.cpp` and `MaiMobileAgent.cpp`; all primary models use its
+  declared GLM schema, ordinary implementation and GLM-only key callback.
+  `productGlmWebToolsStayIndependentOfPrimaryModel` must fail on the prior product
+  and pass without real credentials/network after the registration change.
+- [x] Future 402 diagnostics: `MaiResponsesClient.cpp` and
+  `MaiModelClientTests --openrouter-402`; synthetic RED then GREEN for safe
+  metadata, bounded numeric Retry-After, supplier isolation and zero automatic
+  retries. Preserve output-budget behavior and unknown-error truthfulness.
+
+- [ ] Independently verify the normal iOS 230 Release install and running process.

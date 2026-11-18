@@ -2071,6 +2071,75 @@ void test_unfenced_image_groups_follow_execute_tools_and_continue() {
     }
 }
 
+void test_runner_efforts_follow_the_actual_model_and_preserve_invalid_errors() {
+    const auto runCase = [](const std::string& selectedModel, const std::string& savedEffort,
+                            const std::string& defaultModel, const std::string& inheritedEffort,
+                            bool useProvider, bool valid, const std::string& expectedEffort) {
+        auto store = makeMaiMemoryStore();
+        MaiSession session;
+        session.id = MaiIdGenerator::newSessionId();
+        session.model = selectedModel;
+        session.reasoningEffort = savedEffort;
+        store->putSession(session);
+        MaiMessage user;
+        user.id = MaiIdGenerator::newMessageId();
+        user.role = MaiRole::User;
+        user.parts.push_back({MaiIdGenerator::newPartId(), MaiTextPart{"Synthetic effort."}, 1});
+        store->putMessage(session.id, user);
+        MaiMessage assistant;
+        assistant.id = MaiIdGenerator::newMessageId();
+        assistant.role = MaiRole::Assistant;
+        store->putMessage(session.id, assistant);
+        MaiFakeModelClient model;
+        model.setRepeatingTurn(defaultTurn());
+        MaiEventBus bus;
+        MaiEventEmitter emitter(bus);
+        MaiContextBuilder context;
+        MaiToolRegistry tools;
+        MaiTurnRunner::Dependencies dependencies;
+        dependencies.store = store.get();
+        dependencies.model = &model;
+        dependencies.tools = &tools;
+        dependencies.emitter = &emitter;
+        dependencies.context = &context;
+        dependencies.defaultModel = defaultModel;
+        dependencies.reasoningEffort = inheritedEffort;
+        if (useProvider)
+            dependencies.reasoningEffortProvider = [inheritedEffort] { return inheritedEffort; };
+        std::atomic<bool> cancel{false};
+        MaiTurnRunner runner(dependencies, session.id, assistant);
+        runner.run(cancel);
+        CHECK(runner.succeeded() == valid);
+        CHECK(model.requestCount() == (valid ? 1U : 0U));
+        if (valid && model.requestCount() == 1) {
+            const auto request = model.lastRequest();
+            CHECK(request.model == (selectedModel.empty() ? defaultModel : selectedModel));
+            CHECK(request.reasoningEffort == expectedEffort);
+        }
+    };
+    const std::string fable = "anthropic/claude-fable-5.2";
+    for (const auto& effort : {"low", "medium", "high", "xhigh", "max"}) {
+        runCase(fable, effort, "deepseek-flash", "unknown-default", false, true, effort);
+        runCase("", "", fable, effort, false, true, effort);
+        runCase(fable, "", "deepseek-flash", effort, true, true, effort);
+    }
+    for (const auto& model : {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"}) {
+        for (const auto& effort : {"low", "high", "max"})
+            runCase(model, effort, fable, "xhigh", false, true, effort);
+        for (const auto& effort : {"medium", "xhigh"}) {
+            // 兼容已保存值及宿主继承值；只按当前请求实际型号归一，不回写全局偏好。
+            runCase(model, effort, fable, "low", false, true, "high");
+            runCase(model, "", fable, effort, false, true, "high");
+            runCase("", "", model, effort, true, true, "high");
+        }
+    }
+    for (const auto& invalid : {"unknown-effort", "none", "MEDIUM"}) {
+        runCase(fable, invalid, fable, "low", false, false, "");
+        runCase("deepseek-flash", "", fable, invalid, true, false, "");
+    }
+    runCase(fable, "", fable, "", false, true, "");
+}
+
 // 两会话共用客户端时仍把选择写入各自会话；活动轮次/工具上下文使用固定配置。
 void test_session_model_effort_are_atomic_and_turn_scoped() {
     struct Probe final : MaiModelClient {
@@ -2549,6 +2618,11 @@ void test_untrusted_tool_output_cannot_claim_accepted_task_identity() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--model-efforts") {
+        test_runner_efforts_follow_the_actual_model_and_preserve_invalid_errors();
+        std::printf("model effort runner checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--continuation-cancel") {
         test_response_continuation_cancel_contracts();
         std::printf("response continuation cancellation checks: %d failure(s)\n", failures);
@@ -2594,6 +2668,7 @@ int main(int argc, char** argv) {
         std::printf("unfenced executeTools checks: %d failure(s)\n", failures);
         return failures == 0 ? 0 : 1;
     }
+    test_runner_efforts_follow_the_actual_model_and_preserve_invalid_errors();
     test_session_model_effort_are_atomic_and_turn_scoped();
     test_unfenced_image_groups_follow_execute_tools_and_continue();
     if (argc == 2 && std::string(argv[1]) == "--active-turn-bytes") {

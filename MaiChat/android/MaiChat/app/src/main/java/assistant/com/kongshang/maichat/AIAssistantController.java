@@ -89,8 +89,9 @@ public final class AIAssistantController {
                 remoteSession == null ? model : "");
             String modelBaseUrl = AIAssistantModelSettings.baseUrlForModel(this.model);
             this.baseUrl = modelBaseUrl.isEmpty() ? baseUrl : modelBaseUrl;
-            this.reasoningEffort = AIAssistantSessionModels.effort(data, remoteSession, selected,
-                remoteSession == null ? data.optString("defaultReasoningEffort", "high") : "");
+            this.reasoningEffort = AIAssistantModelSettings.normalizeEffortForModel(this.model,
+                AIAssistantSessionModels.effort(data, remoteSession, selected,
+                    remoteSession == null ? data.optString("defaultReasoningEffort", "high") : ""));
             this.policy = policy;
             this.error = error;
             this.syncStatus = syncStatus;
@@ -3505,8 +3506,9 @@ public final class AIAssistantController {
             boolean success = false;
             publishState();
             try {
-                // A model-only choice preserves the stored effort, including its empty inherit
-                // value. Sending the displayed fallback here would silently make it explicit.
+                // Core keeps compatible effort/inheritance, and atomically saves high when a
+                // model-only change leaves Fable's medium/xhigh for a model with three efforts.
+                // Sending a displayed fallback here would make an inherited value explicit.
                 applySessionModel(clicked, name, null);
                 success = true;
             } catch (Exception failure) { reportModelSettingsFailure(clicked, failure); }

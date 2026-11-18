@@ -72,8 +72,25 @@ private final class SessionModelHTTPFixture: @unchecked Sendable {
         let key = "synthetic-session-" + provider.rawValue + "-key"
         let authorized = header.contains("POST /responses ") &&
             header.lowercased().contains("authorization: bearer " + key)
-        let reply = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"" +
-            provider.reply + "\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+        // Normal replies end with the full authoritative assistant message. A
+        // nonempty delta followed by output=[] describes a compatibility/negative
+        // boundary, not the provider's ordinary modern continuation contract.
+        let messageID = "msg_owned_" + UUID().uuidString.lowercased()
+        let requestedEffort = (object["reasoning"] as? [String: Any])?["effort"] as? String ?? "inherited"
+        let replyText = provider == .openrouter ? provider.reply + " (" + requestedEffort + ")" : provider.reply
+        let content: [String: Any] = ["type": "output_text", "text": replyText, "annotations": []]
+        let message: [String: Any] = ["id": messageID, "type": "message", "role": "assistant",
+                                      "status": "completed", "content": [content]]
+        let delta: [String: Any] = ["type": "response.output_text.delta", "sequence_number": 0,
+            "item_id": messageID, "output_index": 0, "content_index": 0, "delta": replyText]
+        let terminal: [String: Any] = ["type": "response.completed", "sequence_number": 1,
+            "response": ["id": "resp_owned_" + UUID().uuidString.lowercased(), "object": "response",
+                "status": "completed", "model": object["model"] as? String ?? "owned-fixture",
+                "output": [message]]]
+        let reply = [delta, terminal].map { event in
+            "data: " + String(decoding: try! JSONSerialization.data(withJSONObject: event,
+                options: .sortedKeys), as: UTF8.self) + "\n\n"
+        }.joined()
         let bytes = Data((authorized ? reply : "{}").utf8)
         let encoded = Data("HTTP/1.1 \(authorized ? "200 OK" : "401 Unauthorized")\r\nContent-Type: text/event-stream\r\nContent-Length: \(bytes.count)\r\nConnection: close\r\n\r\n".utf8) + bytes
         connection.send(content: encoded, completion: .contentProcessed { _ in connection.cancel() })
@@ -102,6 +119,51 @@ final class SessionModelsUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "value BEGINSWITH %@", "PASS"), object: result)], timeout: 15), .completed,
                        "Actual protocol checks: \(result.value ?? "missing")")
         let capture = XCTAttachment(screenshot: app.screenshot()); capture.name = "remote-owner-configuration"; capture.lifetime = .keepAlways; add(capture)
+    }
+
+    /// A normal model selection must expose the model's actual effort menu.
+    /// This first checks availability only; no unsupported old-Core selection is faked.
+    @MainActor
+    func testFableOffersFiveReasoningLevelsAndOtherModelsKeepThree() throws {
+        continueAfterFailure = false
+        let glm = try SessionModelHTTPFixture(provider: .glm)
+        let deepseek = try SessionModelHTTPFixture(provider: .deepseek)
+        let openrouter = try SessionModelHTTPFixture(provider: .openrouter)
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test", "--ai-session-model-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_GLM_PORT"] = String(glm.port)
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_DEEPSEEK_PORT"] = String(deepseek.port)
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_OPENROUTER_PORT"] = String(openrouter.port)
+        app.launch(); defer { app.terminate() }
+        XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 30))
+        app.buttons["更多"].tap(); app.buttons["ai-primary-model-settings"].tap()
+        let choice = app.buttons["ai-primary-model-anthropic/claude-fable-5.2"]
+        XCTAssertTrue(choice.waitForExistence(timeout: 5)); choice.tap()
+        let config = app.staticTexts["primary-ui-session-configuration"]
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate:
+            NSPredicate(format: "value CONTAINS %@", "model:anthropic/claude-fable-5.2;"), object: config)],
+            timeout: 12), .completed)
+        app.buttons["思考强度"].tap()
+        let menu = app.descendants(matching: .any)["ai-effort-menu"]
+        XCTAssertTrue(menu.waitForExistence(timeout: 5))
+        let image = XCTAttachment(screenshot: app.screenshot())
+        image.name = "fable-five-effort-menu"; image.lifetime = .keepAlways; add(image)
+        XCTAssertEqual(menu.buttons.count, 5, "The Fable model requires five distinct reasoning levels")
+        for label in ["低", "中", "高", "超高", "最高"] {
+            XCTAssertTrue(menu.buttons[label].exists, "Missing Fable level: " + label)
+        }
+        // The same ordinary panel must still offer the original three choices for DeepSeek.
+        app.buttons["ai-primary-model-settings"].tap()
+        app.buttons["ai-primary-model-deepseek-flash"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate:
+            NSPredicate(format: "value CONTAINS %@", "model:deepseek-flash;"), object: config)],
+            timeout: 12), .completed)
+        app.buttons["思考强度"].tap()
+        XCTAssertEqual(menu.buttons.count, 3)
+        for label in ["低", "高", "最高"] { XCTAssertTrue(menu.buttons[label].exists) }
+        XCTAssertFalse(menu.buttons["中"].exists); XCTAssertFalse(menu.buttons["超高"].exists)
     }
 
     @MainActor
@@ -200,7 +262,11 @@ final class SessionModelsUITests: XCTestCase {
             XCTAssertTrue(item.waitForExistence(timeout: 5)); XCTAssertTrue(item.isHittable); item.tap()
         }
         func chooseEffort(_ label: String) {
-            openPanel(); app.buttons["思考强度"].tap()
+            openPanel()
+            let control = app.buttons["思考强度"]
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "enabled == true"), object: control)], timeout: 10), .completed)
+            control.tap()
             let button = app.buttons[label]
             XCTAssertTrue(button.waitForExistence(timeout: 5)); button.tap()
         }
@@ -233,30 +299,42 @@ final class SessionModelsUITests: XCTestCase {
         require("deepseek-flash", "high")
         composer.tap(); composer.typeText("draft-A")
         let a = try sessionID()
-        chooseModel("glm-5.3"); chooseEffort("简单"); require("glm-5.3", "low")
+        chooseModel("glm-5.3"); chooseEffort("低"); require("glm-5.3", "low")
         closePanel(); XCTAssertEqual(composer.value as? String, "draft-A")
         let selected = XCTAttachment(screenshot: app.screenshot()); selected.name = "session-A-glm-low-with-draft"; selected.lifetime = .keepAlways; add(selected)
         let b = try createSession()
         require("deepseek-flash", "high")
-        chooseModel("deepseek-v4-pro"); chooseEffort("深度"); require("deepseek-v4-pro", "max")
+        chooseModel("deepseek-v4-pro"); chooseEffort("最高"); require("deepseek-v4-pro", "max")
         closePanel(); composer.tap(); composer.typeText("Reply in session B\n")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "value CONTAINS %@", "Fixture DeepSeek reply"), object: app.staticTexts["primary-ui-model-output"])], timeout: 15), .completed)
         selectSession(a); require("glm-5.3", "low")
         XCTAssertEqual(composer.value as? String, "draft-A")
         composer.tap(); composer.typeText("\n")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "value CONTAINS %@", "Fixture GLM reply"), object: app.staticTexts["primary-ui-model-output"])], timeout: 15), .completed)
-        chooseModel("glm-5.3-flash"); chooseEffort("标准"); require("glm-5.3-flash", "high")
+        chooseModel("glm-5.3-flash"); chooseEffort("高"); require("glm-5.3-flash", "high")
         closePanel(); selectSession(b); require("deepseek-v4-pro", "max")
         let separate = XCTAttachment(screenshot: app.screenshot()); separate.name = "session-B-pro-max-isolated"; separate.lifetime = .keepAlways; add(separate)
         // A third ordinary session exercises OpenRouter without changing either existing session or the default.
         let c = try createSession()
         require("deepseek-flash", "high")
         let fable = "anthropic/claude-fable-5.2"
-        chooseModel(fable); chooseEffort("深度"); require(fable, "max")
-        closePanel(); composer.tap(); composer.typeText("Reply in session C\n")
-        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "value CONTAINS %@", "Fixture OpenRouter reply"),
-            object: app.staticTexts["primary-ui-model-output"])], timeout: 15), .completed)
+        chooseModel(fable)
+        for (value, label) in [("low", "低"), ("medium", "中"), ("high", "高"), ("xhigh", "超高"), ("max", "最高")] {
+            chooseEffort(label); require(fable, value)
+            closePanel(); composer.tap(); composer.typeText("Reply at " + value + "\n")
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "value CONTAINS %@", "Fixture OpenRouter reply (" + value + ")"),
+                object: app.staticTexts["primary-ui-model-output"])], timeout: 15), .completed)
+        }
+        for (value, label) in [("medium", "中"), ("xhigh", "超高")] {
+            chooseEffort(label); require(fable, value)
+            chooseModel("deepseek-flash"); require("deepseek-flash", "high")
+            XCTAssertTrue((config.value as? String ?? "").contains("stored-effort:high;"),
+                          "Model-only switch must atomically persist high after a Fable-only level")
+            chooseModel(fable)
+        }
+        chooseEffort("最高"); require(fable, "max")
+        closePanel()
         let routed = XCTAttachment(screenshot: app.screenshot())
         routed.name = "session-C-fable-responses"; routed.lifetime = .keepAlways; add(routed)
         selectSession(a); require("glm-5.3-flash", "high")
@@ -271,8 +349,14 @@ final class SessionModelsUITests: XCTestCase {
         restored.name = "session-C-fable-native-wire-after-relaunch"; restored.lifetime = .keepAlways; add(restored)
         XCTAssertTrue(glm.requests().contains { $0["model"] as? String == "glm-5.3" && ($0["reasoning"] as? [String: Any])?["effort"] as? String == "low" })
         XCTAssertTrue(deepseek.requests().contains { $0["model"] as? String == "deepseek-v4-pro" && ($0["reasoning"] as? [String: Any])?["effort"] as? String == "max" })
-        XCTAssertTrue(openrouter.requests().contains { $0["model"] as? String == fable &&
-            ($0["reasoning"] as? [String: Any])?["effort"] as? String == "max" &&
-            $0["input"] is [Any] && $0["messages"] == nil && $0["thinking"] == nil })
+        for value in ["low", "medium", "high", "xhigh", "max"] {
+            XCTAssertTrue(openrouter.requests().contains { $0["model"] as? String == fable &&
+                ($0["reasoning"] as? [String: Any])?["effort"] as? String == value &&
+                $0["input"] is [Any] && $0["messages"] == nil && $0["thinking"] == nil },
+                "Native Responses request did not preserve exact Fable effort: " + value)
+        }
+        XCTAssertFalse(deepseek.requests().contains {
+            ["medium", "xhigh"].contains(($0["reasoning"] as? [String: Any])?["effort"] as? String ?? "")
+        })
     }
 }

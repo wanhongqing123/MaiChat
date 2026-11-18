@@ -362,6 +362,8 @@ private slots:
     void agentReasoningEffortBeforeFirstSessionKeepsDeepSeek();
     void agentAccountKeysUpdateModelWithoutSavingSecrets();
     void agentDeepSeekKeyAloneConfiguresMainModel();
+    void fableEffortMenuUpdatesTheRealSession_data();
+    void fableEffortMenuUpdatesTheRealSession();
     void agentModelFailureRefreshesWithoutDialog();
     void delayedModelCredentialsApplyOnlyToTheRequestedSession();
     void leftNavigationRailIsResizableAndWider();
@@ -3854,6 +3856,78 @@ void MainWindowLayoutTest::agentDeepSeekKeyAloneConfiguresMainModel() {
     settings.clear();
     QCoreApplication::setOrganizationName(originalOrganization);
     QCoreApplication::setApplicationName(originalApplication);
+}
+
+void MainWindowLayoutTest::fableEffortMenuUpdatesTheRealSession_data() {
+    QTest::addColumn<QString>("effort");
+    QTest::newRow("medium") << QStringLiteral("medium");
+    QTest::newRow("xhigh") << QStringLiteral("xhigh");
+}
+
+void MainWindowLayoutTest::fableEffortMenuUpdatesTheRealSession() {
+    QFETCH(QString, effort);
+    const auto previousOrganization = QCoreApplication::organizationName();
+    const auto previousApplication = QCoreApplication::applicationName();
+    const bool previousTestMode = QStandardPaths::isTestModeEnabled();
+    QCoreApplication::setOrganizationName(QStringLiteral("MaiChatFableEffortTests"));
+    QCoreApplication::setApplicationName(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QStandardPaths::setTestModeEnabled(true);
+    const auto restore = qScopeGuard([previousOrganization, previousApplication, previousTestMode] {
+        QSettings ownSettings;
+        ownSettings.clear();
+        QCoreApplication::setOrganizationName(previousOrganization);
+        QCoreApplication::setApplicationName(previousApplication);
+        QStandardPaths::setTestModeEnabled(previousTestMode);
+    });
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
+    MainWindow window(app);
+    window.setAccountModelKeys({{QStringLiteral("deepseek"), QString(40, QLatin1Char('D'))},
+                                {QStringLiteral("openrouter"), QString(40, QLatin1Char('O'))}});
+    auto* panel = window.findChild<AgentChatPanel*>();
+    auto* controller = window.findChild<AgentController*>();
+    QVERIFY(panel && controller);
+    panel->openSession();
+    QVERIFY(!panel->sessionId().isEmpty());
+    QVERIFY(controller->setSessionModelConfiguration(panel->sessionId(), QStringLiteral("anthropic/claude-fable-5.2")));
+    panel->refreshModelConfiguration();
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* agentNavigation = window.findChild<QPushButton*>(QStringLiteral("agentNavButton"));
+    QVERIFY(agentNavigation);
+    QTest::mouseClick(agentNavigation, Qt::LeftButton);
+    QTRY_VERIFY(panel->isVisible());
+    auto* more = panel->findChild<QPushButton*>(QStringLiteral("agentMoreActions"));
+    auto* section = panel->findChild<QPushButton*>(QStringLiteral("agentEffortSection"));
+    QVERIFY(more && section);
+    QTest::mouseClick(more, Qt::LeftButton);
+    QTest::mouseClick(section, Qt::LeftButton);
+    auto* option = panel->findChild<QPushButton*>(QStringLiteral("agentEffortOption-") + effort);
+    QVERIFY(option && option->isVisible());
+    const auto capturePrefix = qEnvironmentVariable("MAICHAT_FABLE_EFFORT_CAPTURE");
+    if (!capturePrefix.isEmpty()) {
+        auto* actions = panel->findChild<QWidget*>(QStringLiteral("agentActionPanel"));
+        QVERIFY(actions && actions->isVisible());
+        for (const auto& value : {QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high"),
+                                  QStringLiteral("xhigh"), QStringLiteral("max")}) {
+            auto* visible = panel->findChild<QPushButton*>(QStringLiteral("agentEffortOption-") + value);
+            QVERIFY(visible && visible->isVisible());
+        }
+        QCoreApplication::processEvents();
+        const auto capture = capturePrefix + QLatin1Char('-') + effort;
+        QVERIFY(QDir().mkpath(QFileInfo(capture).absolutePath()));
+        QVERIFY(window.grab().save(capture + QStringLiteral("-window.png")));
+        QVERIFY(actions->grab().save(capture + QStringLiteral("-menu.png")));
+    }
+    QTest::mouseClick(option, Qt::LeftButton);
+    MaiSession configured;
+    QVERIFY(controller->agent().getSession(panel->sessionId().toStdString(), configured));
+    QCOMPARE(QString::fromStdString(configured.model), QStringLiteral("anthropic/claude-fable-5.2"));
+    QCOMPARE(QString::fromStdString(configured.reasoningEffort), effort);
+    QCOMPARE(window.findChild<AgentChatPanel*>(), panel);
+    QCOMPARE(window.findChild<AgentController*>(), controller);
+    QSettings ownSettings;
+    QVERIFY(!ownSettings.contains(QStringLiteral("agent/reasoningEffort")));
 }
 
 void MainWindowLayoutTest::delayedModelCredentialsApplyOnlyToTheRequestedSession() {

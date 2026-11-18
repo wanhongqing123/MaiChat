@@ -44,7 +44,7 @@ final class AIAssistantActionMenu extends LinearLayout {
     private final List<ImageView> modelChecks = new ArrayList<>();
     private final List<View> effortChoices = new ArrayList<>(), policyChoices = new ArrayList<>();
     private final List<ImageView> effortChecks = new ArrayList<>(), policyChecks = new ArrayList<>();
-    private static final String[] EFFORTS = {"low", "high", "max"};
+    private static final String[] EFFORTS = {"low", "medium", "high", "xhigh", "max"};
     private static final String[] POLICIES = {"on-request", "unless-trusted", "never"};
     private static final String[] MODELS = {"glm-5.3", "glm-5.3-flash", "deepseek-flash",
         "deepseek-v4-pro", AIAssistantModelSettings.OPENROUTER_MODEL, AIAssistantSessionModels.LOCAL};
@@ -86,7 +86,7 @@ final class AIAssistantActionMenu extends LinearLayout {
         effortHeading = heading("思考强度", R.drawable.ic_ai_menu_sparkles, effortValue, effortChevron,
             ignored -> toggle(EFFORT_SECTION));
         addView(effortHeading, match(dp(52)));
-        effortGroup = options(new String[]{"简单", "标准", "深度"}, EFFORTS,
+        effortGroup = options(new String[]{"低", "中", "高", "超高", "最高"}, EFFORTS,
             effortChoices, effortChecks, EFFORT_SECTION);
         addView(effortGroup, match(LayoutParams.WRAP_CONTENT));
         effortDivider = addDivider();
@@ -116,7 +116,7 @@ final class AIAssistantActionMenu extends LinearLayout {
                 boolean changeAllowed, boolean changeModelAllowed, boolean clearAllowed) {
         this.model = model;
         this.changingModelSource = changingModelSource;
-        this.effort = effort;
+        this.effort = AIAssistantModelSettings.normalizeEffortForModel(model, effort);
         this.policy = policy;
         this.changeAllowed = changeAllowed;
         this.changeModelAllowed = changeModelAllowed;
@@ -144,7 +144,8 @@ final class AIAssistantActionMenu extends LinearLayout {
             : model.isEmpty() ? "未读取模型"
             : model.startsWith("local:") ? "本地模型" : model);
         effortValue.setText(remote && model.isEmpty() ? "未读取" : effort.isEmpty() ? "跟随默认"
-            : effort.equals("low") ? "简单" : effort.equals("max") ? "深度" : "标准");
+            : effort.equals("low") ? "低" : effort.equals("medium") ? "中"
+            : effort.equals("xhigh") ? "超高" : effort.equals("max") ? "最高" : "高");
         policyValue.setText(policy.equals("never") ? "完全访问"
             : policy.equals("unless-trusted") ? "帮我批准" : "请求批准");
         modelHeading.setEnabled(changeModelAllowed);
@@ -166,6 +167,10 @@ final class AIAssistantActionMenu extends LinearLayout {
         refreshChoices(modelChoices, modelChecks, models, model,
             changeModelAllowed);
         refreshChoices(effortChoices, effortChecks, EFFORTS, effort, changeAllowed);
+        // Keep the same popup and rows alive while a correlated owner ACK changes models.
+        for (int index = 0; index < EFFORTS.length; index++)
+            effortChoices.get(index).setVisibility(
+                AIAssistantModelSettings.supportedEffortForModel(model, EFFORTS[index]) ? VISIBLE : GONE);
         refreshChoices(policyChoices, policyChecks, POLICIES, policy, changeAllowed);
         clear.setEnabled(clearAllowed);
         clear.setAlpha(clearAllowed ? 1f : .5f);
@@ -208,6 +213,7 @@ final class AIAssistantActionMenu extends LinearLayout {
                 }
                 if (!changeAllowed) return;
                 if (section == EFFORT_SECTION) {
+                    if (!AIAssistantModelSettings.supportedEffortForModel(model, value)) return;
                     if (!value.equals(effort)) listener.selectEffort(value);
                 } else if (!value.equals(policy)) listener.selectPolicy(value);
             });

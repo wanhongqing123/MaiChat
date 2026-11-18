@@ -44,7 +44,7 @@ struct AIPrimaryModelUITestStatus: View {
             Text("会话模型配置")
                 .font(.caption2)
                 .accessibilityIdentifier("primary-ui-session-configuration")
-                .accessibilityValue("session:\(model.selected);model:\(model.settings.model);effort:\(model.settings.effectiveReasoningEffort);wire:\(model.actualWire);remote:\(model.selectedRemote != nil)")
+                .accessibilityValue("session:\(model.selected);model:\(model.settings.model);effort:\(model.settings.effectiveReasoningEffort);wire:\(model.actualWire);remote:\(model.selectedRemote != nil);stored-effort:\(model.settings.reasoningEffort ?? "");supported:\(model.availableReasoningEfforts.joined(separator: ","))")
             if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") {
                 AISessionModelRemoteUITestStatus()
             }

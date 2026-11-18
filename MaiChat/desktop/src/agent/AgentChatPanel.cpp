@@ -1905,13 +1905,16 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     auto* effortOptionsLayout = new QVBoxLayout(effortOptions);
     effortOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
     effortOptionsLayout->setSpacing(0);
-    const QList<QPair<QString, QString>> efforts = {{QStringLiteral("简单"), QStringLiteral("low")},
-                                                    {QStringLiteral("标准"), QStringLiteral("high")},
-                                                    {QStringLiteral("深度"), QStringLiteral("max")}};
+    const QList<QPair<QString, QString>> efforts = {{QStringLiteral("低"), QStringLiteral("low")},
+                                                    {QStringLiteral("中"), QStringLiteral("medium")},
+                                                    {QStringLiteral("高"), QStringLiteral("high")},
+                                                    {QStringLiteral("超高"), QStringLiteral("xhigh")},
+                                                    {QStringLiteral("最高"), QStringLiteral("max")}};
     for (const auto& effort : efforts) {
         auto* option = new QPushButton(effort.first, effortOptions);
         option->setObjectName(QStringLiteral("agentEffortOption-") + effort.second);
         option->setProperty("reasoningEffort", effort.second);
+        option->setVisible(maiIsValidReasoningEffort(toUtf8(effort.second)));
         option->setCheckable(true);
         option->setAutoExclusive(true);
         option->setFixedHeight(UiZoom::s(38));
@@ -2381,16 +2384,22 @@ void AgentChatPanel::setModelLabel(const QString& label, bool configured) {
 }
 
 void AgentChatPanel::setReasoningEffortLabel(const QString& effort) {
-    const QString normalized =
-        effort == QStringLiteral("low") || effort == QStringLiteral("max") ? effort : QStringLiteral("high");
-    const QString title = normalized == QStringLiteral("low")   ? QStringLiteral("简单")
-                          : normalized == QStringLiteral("max") ? QStringLiteral("深度")
-                                                                : QStringLiteral("标准");
+    QString model = runtime_->modelChip->text();
+    AgentController::SessionModelConfiguration configuration;
+    if (runtime_->controller->sessionModelConfiguration(runtime_->sessionId, configuration))
+        model = configuration.model;
+    const QString normalized = fromUtf8(maiNormalizeReasoningEffortForModel(toUtf8(model), toUtf8(effort)));
+    const QString title = normalized == QStringLiteral("low")      ? QStringLiteral("低")
+                          : normalized == QStringLiteral("medium") ? QStringLiteral("中")
+                          : normalized == QStringLiteral("xhigh")  ? QStringLiteral("超高")
+                          : normalized == QStringLiteral("max")    ? QStringLiteral("最高")
+                          : normalized.isEmpty()                   ? QStringLiteral("跟随默认")
+                                                                   : QStringLiteral("高");
     if (runtime_->effortSectionValue) runtime_->effortSectionValue->setText(title);
-    if (runtime_->effortSection)
-        runtime_->effortSection->setAccessibleName(QStringLiteral("思考强度：%1").arg(title));
+    if (runtime_->effortSection) runtime_->effortSection->setAccessibleName(QStringLiteral("思考强度：%1").arg(title));
     for (QPushButton* option : runtime_->effortOptionButtons) {
         const QString value = option->property("reasoningEffort").toString();
+        option->setVisible(maiIsValidReasoningEffortForModel(toUtf8(model), toUtf8(value)));
         option->setChecked(value == normalized);
     }
 }
@@ -2398,9 +2407,8 @@ void AgentChatPanel::setReasoningEffortLabel(const QString& effort) {
 bool AgentChatPanel::applySelectedModel(const QString& model) {
     const QString selected = model.trimmed();
     if (runtime_->sessionId.isEmpty()) openSession();
-    const bool applied =
-        !runtime_->sessionId.isEmpty() &&
-        runtime_->controller->setSessionModelConfiguration(runtime_->sessionId, selected);
+    const bool applied = !runtime_->sessionId.isEmpty() &&
+                         runtime_->controller->setSessionModelConfiguration(runtime_->sessionId, selected);
     if (!applied) {
         appendNotice(runtime_->controller->lastError(), true);
         return false;

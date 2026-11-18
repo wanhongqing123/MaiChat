@@ -9,8 +9,10 @@
 // 把多个事件塞进同一个 TCP 包、再掺几个心跳注释行和畸形行。
 //
 // 这正是真实服务端会干的事，也是这一层唯一真正难写的地方。
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -54,6 +56,7 @@ struct FakeServer {
     std::vector<std::string> scripts;
     std::size_t chunk = 1;
     int status = 200;
+    std::string retryAfter;
     int transientFailures = 0;
     bool stallWithoutBytes = false;
     bool sendOnlyHeartbeats = false;
@@ -90,6 +93,7 @@ struct FakeServer {
             }
             if (status != 200) {
                 response.status = status;
+                if (!retryAfter.empty()) response.set_header("Retry-After", retryAfter);
                 response.set_content(script, "application/json");
                 return;
             }
@@ -460,6 +464,250 @@ void test_http_error_preserves_provider_message() {
     CHECK(result.error.find("HTTP 429") != std::string::npos);
     CHECK(result.error.find("quota exhausted") != std::string::npos);
     CHECK(result.error.find("usage_limit") != std::string::npos);
+}
+
+// 合成限额 metadata 用于诊断，不代表用户余额；只有已知来源/原因组合改变错误分类。
+void test_openrouter_402_classifies_in_flight_budget_without_retry() {
+    FakeServer fake;
+    fake.status = 402;
+    fake.retryAfter = "7";
+    const std::string providerMessage = "Synthetic provider reservation rejection.";
+    fake.script = json{{"error",
+                        {{"code", 402},
+                         {"message", providerMessage},
+                         {"metadata",
+                          {{"reason", "in_flight_budget_exhausted"},
+                           {"limit_source", "openrouter_in_flight_budget"},
+                           {"remedy_hint", "synthetic-metadata-secret\nInjected"},
+                           {"debug", "synthetic-debug-secret"}}}}}}
+                      .dump();
+    fake.start();
+    MaiModelRequest request;
+    request.model = "anthropic/claude-fable-5.2";
+    const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+    CHECK(answer.code == MaiErrorCode::RateLimited);
+    CHECK(answer.error.find("HTTP 402") != std::string::npos);
+    CHECK(answer.error.find(providerMessage) != std::string::npos);
+    CHECK(answer.error.find("limit_source=openrouter_in_flight_budget") != std::string::npos);
+    CHECK(answer.error.find("reason=in_flight_budget_exhausted") != std::string::npos);
+    CHECK(answer.error.find("retry_after_seconds=7") != std::string::npos);
+    CHECK(answer.error.find("synthetic-metadata-secret") == std::string::npos);
+    CHECK(answer.error.find("synthetic-debug-secret") == std::string::npos);
+    CHECK(answer.error.find('\n') == std::string::npos);
+    CHECK(answer.calls.empty() && answer.continuations.empty());
+    CHECK(fake.requestCount.load() == 1);
+}
+
+void test_openrouter_402_limits_do_not_infer_missing_or_foreign_metadata() {
+    struct LimitCase {
+        const char* model;
+        json metadata;
+        bool singleRequest;
+    };
+    const LimitCase cases[] = {
+        {"anthropic/claude-fable-5.2",
+         {{"reason", "weight_exceeds_budget"},
+          {"limit_source", "openrouter_credits"},
+          {"debug", "synthetic-metadata-secret"}},
+         true},
+        {"anthropic/claude-fable-5.2", nullptr, false},
+        {"anthropic/claude-fable-5.2",
+         {{"reason", "synthetic-unknown-reason\nInjected"},
+          {"limit_source", "synthetic-source-secret"}},
+         false},
+        {"anthropic/claude-fable-5.2",
+         {{"reason", "in_flight_budget_exhausted"}, {"limit_source", "openrouter_credits"}},
+         false},
+        {"glm-5.3",
+         {{"reason", "in_flight_budget_exhausted"},
+          {"limit_source", "openrouter_in_flight_budget"}},
+         false},
+        {"deepseek-flash",
+         {{"reason", "weight_exceeds_budget"}, {"limit_source", "openrouter_credits"}},
+         false},
+    };
+    const std::string providerMessage = "Synthetic provider reservation rejection.";
+    for (const auto& item : cases) {
+        FakeServer fake;
+        fake.status = 402;
+        fake.retryAfter = "7";
+        json error{{"code", 402}, {"message", providerMessage}};
+        if (!item.metadata.is_null()) error["metadata"] = item.metadata;
+        fake.script = json{{"error", error}}.dump();
+        fake.start();
+        MaiModelRequest request;
+        request.model = item.model;
+        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        CHECK(answer.code == MaiErrorCode::Protocol);
+        CHECK(answer.error.find(providerMessage) != std::string::npos);
+        if (item.singleRequest) {
+            CHECK(answer.error.find("category=single_request_budget_exceeded") !=
+                  std::string::npos);
+            CHECK(answer.error.find("reason=weight_exceeds_budget") != std::string::npos);
+            CHECK(answer.error.find("limit_source=openrouter_credits") != std::string::npos);
+        } else {
+            CHECK(answer.error == "HTTP 402: " + providerMessage);
+        }
+        CHECK(answer.error.find("retry_after_seconds=") == std::string::npos);
+        CHECK(answer.error.find("synthetic-metadata-secret") == std::string::npos);
+        CHECK(answer.error.find("synthetic-source-secret") == std::string::npos);
+        CHECK(answer.error.find("synthetic-unknown-reason") == std::string::npos);
+        CHECK(answer.error.find('\n') == std::string::npos);
+        CHECK(fake.requestCount.load() == 1);
+    }
+}
+
+// 只接受有界非负整数秒；HTTP-date 本轮不解析，任意原头值不得进入错误字符串。
+void test_openrouter_402_retry_after_only_accepts_bounded_numeric_seconds() {
+    struct RetryCase {
+        const char* header;
+        const char* expected;
+    };
+    const RetryCase cases[] = {
+        {"0", "retry_after_seconds=0"},
+        {" 0007 ", "retry_after_seconds=7"},
+        {"86400", "retry_after_seconds=86400"},
+        {"86401", nullptr},
+        {"999999999999999999999999999999", nullptr},
+        {"-1", nullptr},
+        {"+7", nullptr},
+        {"7.5", nullptr},
+        {"7e1", nullptr},
+        {"synthetic-header-secret", nullptr},
+        {"Wed, 21 Oct 2015 07:28:00 GMT", nullptr},
+        {"", nullptr},
+    };
+    for (const auto& item : cases) {
+        FakeServer fake;
+        fake.status = 402;
+        fake.retryAfter = item.header;
+        fake.script = json{{"error",
+                            {{"code", 402},
+                             {"message", "Synthetic provider reservation rejection."},
+                             {"metadata",
+                              {{"reason", "in_flight_budget_exhausted"},
+                               {"limit_source", "openrouter_in_flight_budget"}}}}}}
+                          .dump();
+        fake.start();
+        MaiModelRequest request;
+        request.model = "anthropic/claude-fable-5.2";
+        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        CHECK(answer.code == MaiErrorCode::RateLimited);
+        if (item.expected)
+            CHECK(answer.error.find(item.expected) != std::string::npos);
+        else
+            CHECK(answer.error.find("retry_after_seconds=") == std::string::npos);
+        CHECK(answer.error.find("synthetic-header-secret") == std::string::npos);
+        CHECK(answer.error.find("Wed, 21 Oct") == std::string::npos);
+        CHECK(fake.requestCount.load() == 1);
+    }
+}
+
+// 完整 402 头之后的 RST 仍是已被拒绝的请求，不能把接收失败当作未收到 HTTP 的网络重试。
+void test_openrouter_402_truncated_reset_response_is_not_retried() {
+    class ResetServer final : public httplib::Server {
+    public:
+        std::atomic<int> requests{0};
+        std::atomic<int> resets{0};
+        std::atomic<int> socketFailures{0};
+        std::thread listener;
+        int port = 0;
+
+        void start() {
+            port = bind_to_any_port("127.0.0.1");
+            listener = std::thread([this] { listen_after_bind(); });
+            for (int attempt = 0; attempt < 200 && !is_running(); ++attempt)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        ~ResetServer() {
+            stop();
+            if (listener.joinable()) listener.join();
+        }
+
+    private:
+        bool process_and_close_socket(socket_t socket) override {
+            // 先读完小 POST，避免客户端仍在上传时被重置而误测为 SEND_ERROR。
+            std::string request;
+            bool requestComplete = false;
+            while (request.size() < 16384) {
+                if (httplib::detail::select_read(socket, 2, 0) <= 0) break;
+                char buffer[2048];
+                const auto received =
+                    httplib::detail::read_socket(socket, buffer, sizeof(buffer), 0);
+                if (received <= 0) break;
+                request.append(buffer, static_cast<std::size_t>(received));
+                const auto headerEnd = request.find("\r\n\r\n");
+                if (headerEnd == std::string::npos) continue;
+                std::string headers = request.substr(0, headerEnd);
+                std::transform(
+                    headers.begin(), headers.end(), headers.begin(),
+                    [](unsigned char character) { return char(std::tolower(character)); });
+                const auto field = headers.find("\r\ncontent-length:");
+                if (field == std::string::npos) break;
+                const char* value = headers.c_str() + field + 17;
+                char* end = nullptr;
+                const auto contentLength = std::strtoull(value, &end, 10);
+                if (end == value || contentLength > 16384) break;
+                if (request.size() >= headerEnd + 4 + contentLength) {
+                    requestComplete = true;
+                    break;
+                }
+            }
+            if (!requestComplete) {
+                ++socketFailures;
+                httplib::detail::close_socket(socket);
+                return false;
+            }
+            ++requests;
+            const std::string response =
+                "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\n"
+                "Content-Length: 4096\r\nConnection: close\r\nRetry-After: 7\r\n\r\n"
+                "{\"error\":{\"code\":402,\"message\":\"Synthetic truncated error";
+            std::size_t sent = 0;
+            while (sent < response.size()) {
+                const auto written = httplib::detail::send_socket(socket, response.data() + sent,
+                                                                  response.size() - sent, 0);
+                if (written <= 0) break;
+                sent += static_cast<std::size_t>(written);
+            }
+            // 给 curl 一次接收完整状态行/响应头的机会，再强制 RST，不能用普通 FIN 假冒接收错误。
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            struct linger reset = {1, 0};
+            if (sent == response.size() &&
+                setsockopt(socket, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&reset),
+                           static_cast<int>(sizeof(reset))) == 0)
+                ++resets;
+            else
+                ++socketFailures;
+            httplib::detail::close_socket(socket);
+            return false;
+        }
+    } server;
+    server.start();
+    CHECK(server.port > 0);
+    if (server.port <= 0) return;
+    MaiModelConfig config;
+    config.baseUrl = "http://127.0.0.1:" + std::to_string(server.port);
+    config.wire = MaiWireApi::Responses;
+    config.apiKey = "synthetic-reset-key";
+    config.totalTimeoutSeconds = 5;
+    config.maxRetries = 2;
+    config.retryInitialDelayMs = 1;
+    config.proxyResolver = [](const std::string&, MaiModelProxy& proxy) {
+        proxy.url.clear();
+        return true;
+    };
+    MaiModelRequest request;
+    request.model = "anthropic/claude-fable-5.2";
+    const std::atomic<bool> cancel{false};
+    const MaiError error = makeMaiModelClient(config)->stream(request, {}, cancel);
+    CHECK(error.code() == MaiErrorCode::Network);
+    // 固定两份已入库 curl 的 CURLE_RECV_ERROR 文案，排除 FIN 导致 PARTIAL_FILE 的假绿。
+    CHECK(error.message() == "curl: Failure when receiving data from the peer");
+    CHECK(server.socketFailures.load() == 0);
+    CHECK(server.resets.load() >= 1);
+    CHECK(server.requests.load() == 1);
 }
 
 void test_finish_reason_length_is_not_reported_as_success() {
@@ -2069,6 +2317,59 @@ void test_glm_responses_completes_without_done_and_keeps_metadata_only_state() {
     }
 }
 
+// Fable 五档是模型能力，不能用旧全局三档列表把 medium/xhigh 静默省略或映射成其它值。
+void test_fable_responses_preserves_all_five_reasoning_efforts() {
+    FakeServer fake;
+    fake.script = sse(json{{"type", "response.completed"},
+                           {"response", {{"status", "completed"}, {"output", json::array()}}}});
+    fake.start();
+    MaiModelRequest request;
+    request.model = "anthropic/claude-fable-5.2";
+    for (const char* effort : {"low", "medium", "high", "xhigh", "max"}) {
+        request.reasoningEffort = effort;
+        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        const json body = json::parse(fake.lastBody);
+        CHECK(wireValue(body, "/reasoning/effort") == effort);
+    }
+    request.reasoningEffort.clear();
+    CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+    std::lock_guard<std::mutex> lock(fake.mutex);
+    CHECK(!json::parse(fake.lastBody).contains("reasoning"));
+}
+
+// 显式不支持的档位必须在任何 HTTP 和流式回调之前拒绝；不能静默省略后使用供应商默认。
+void test_responses_rejects_unsupported_model_efforts_before_http() {
+    FakeServer fake;
+    fake.script = sse(json{{"type", "response.completed"},
+                           {"response", {{"status", "completed"}, {"output", json::array()}}}});
+    fake.start();
+    for (const char* model : {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+                              "local:synthetic", "unknown-fixture"}) {
+        for (const char* effort : {"medium", "xhigh"}) {
+            MaiModelRequest request;
+            request.model = model;
+            request.reasoningEffort = effort;
+            const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+            CHECK(!answer.done);
+            CHECK(answer.code == MaiErrorCode::InvalidInput);
+            CHECK(answer.text.empty() && answer.reasoning.empty());
+            CHECK(answer.calls.empty() && answer.continuations.empty());
+            CHECK(fake.requestCount.load() == 0);
+        }
+    }
+    for (const char* effort : {"minimal", "none", "ultra"}) {
+        MaiModelRequest request;
+        request.model = "anthropic/claude-fable-5.2";
+        request.reasoningEffort = effort;
+        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        CHECK(!answer.done);
+        CHECK(answer.code == MaiErrorCode::InvalidInput);
+        CHECK(answer.calls.empty() && answer.continuations.empty());
+        CHECK(fake.requestCount.load() == 0);
+    }
+}
+
 // 官方型号矩阵：产品云端统一 Responses；generic Chat 仅保留 GLM 的旧兼容扩展。
 void test_cloud_effort_levels_reach_the_selected_wire() {
     for (const MaiWireApi wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
@@ -2772,6 +3073,19 @@ void test_context_limits_output_budget_and_actual_usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--openrouter-402") {
+        test_openrouter_402_classifies_in_flight_budget_without_retry();
+        test_openrouter_402_limits_do_not_infer_missing_or_foreign_metadata();
+        test_openrouter_402_retry_after_only_accepts_bounded_numeric_seconds();
+        test_openrouter_402_truncated_reset_response_is_not_retried();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--reasoning-efforts") {
+        test_fable_responses_preserves_all_five_reasoning_efforts();
+        test_responses_rejects_unsupported_model_efforts_before_http();
+        test_cloud_effort_levels_reach_the_selected_wire();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--continuation-completeness") {
         test_responses_explicit_empty_terminal_does_not_recover_old_tool();
         test_responses_item_snapshot_fallback_rejects_unfinished_visible_item();
@@ -2791,6 +3105,8 @@ int main(int argc, char** argv) {
         test_responses_continuation_checks_source_and_rejects_corruption();
         test_responses_foreign_continuation_uses_only_ordinary_history();
         test_glm_responses_completes_without_done_and_keeps_metadata_only_state();
+        test_fable_responses_preserves_all_five_reasoning_efforts();
+        test_responses_rejects_unsupported_model_efforts_before_http();
         test_cloud_effort_levels_reach_the_selected_wire();
         test_routed_models_keep_wire_key_and_failure_isolation();
         return failures == 0 ? 0 : 1;
@@ -2844,6 +3160,10 @@ int main(int argc, char** argv) {
     test_server_error_inside_stream();
     test_reasoning_delta();
     test_http_error_preserves_provider_message();
+    test_openrouter_402_classifies_in_flight_budget_without_retry();
+    test_openrouter_402_limits_do_not_infer_missing_or_foreign_metadata();
+    test_openrouter_402_retry_after_only_accepts_bounded_numeric_seconds();
+    test_openrouter_402_truncated_reset_response_is_not_retried();
     test_finish_reason_length_is_not_reported_as_success();
     test_final_unterminated_sse_line_is_processed();
     test_transient_http_failure_retries_before_streaming();
@@ -2880,6 +3200,8 @@ int main(int argc, char** argv) {
     test_responses_continuation_checks_source_and_rejects_corruption();
     test_responses_foreign_continuation_uses_only_ordinary_history();
     test_glm_responses_completes_without_done_and_keeps_metadata_only_state();
+    test_fable_responses_preserves_all_five_reasoning_efforts();
+    test_responses_rejects_unsupported_model_efforts_before_http();
     test_cloud_effort_levels_reach_the_selected_wire();
     test_routed_models_keep_wire_key_and_failure_isolation();
     test_responses_needs_terminal_event_and_reports_incomplete();

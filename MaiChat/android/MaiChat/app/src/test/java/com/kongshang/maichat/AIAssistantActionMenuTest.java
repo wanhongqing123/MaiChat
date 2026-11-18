@@ -19,6 +19,29 @@ import org.robolectric.shadows.ShadowAlertDialog;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34, manifest = Config.NONE)
 public final class AIAssistantActionMenuTest {
+    @Test public void fableMenusOfferFiveEffortsAndSwitchBackToThreeForOtherModels() {
+        for (boolean remote : new boolean[]{false, true}) {
+            AIAssistantActionMenu menu = menu(remote);
+            menu.update("anthropic/claude-fable-5.2", false, "medium", "on-request", true, true, true);
+            click(menu, "思考强度");
+            for (String title : new String[]{"低", "中", "高", "超高", "最高"})
+                assertNotNull("Missing Fable effort: " + title, option(menu, title));
+            assertTrue(option(menu, "中").isSelected());
+            option(menu, "超高").performClick();
+            assertEquals("xhigh", efforts.get(efforts.size() - 1));
+            menu.update("anthropic/claude-fable-5.2", false, "xhigh", "on-request", true, true, true);
+            assertTrue(option(menu, "超高").isSelected());
+            for (String model : new String[]{"glm-5.3", "deepseek-flash"}) {
+                menu.update(model, false, "high", "on-request", true, true, true);
+                assertNull(option(menu, "中"));
+                assertNull(option(menu, "超高"));
+                assertNotNull(option(menu, "低"));
+                assertNotNull(option(menu, "最高"));
+                assertTrue(option(menu, "高").isSelected());
+            }
+        }
+    }
+
     @Test public void mainModelMenuOffersExactCloudModelsAndKeepsEffortSeparate() {
         AIAssistantActionMenu menu = menu();
         click(menu, "主模型");
@@ -26,10 +49,10 @@ public final class AIAssistantActionMenuTest {
                 "anthropic/claude-fable-5.2"})
             assertNotNull("Missing main-model choice: " + model, option(menu, model));
         assertNotNull(option(menu, "本地模型"));
-        assertNull(option(menu, "简单"));
+        assertNull(option(menu, "低"));
         click(menu, "思考强度");
         assertNull(option(menu, "glm-5.3"));
-        assertNotNull(option(menu, "简单"));
+        assertNotNull(option(menu, "低"));
     }
 
     private final List<String> efforts = new ArrayList<>(), policies = new ArrayList<>();
@@ -72,7 +95,7 @@ public final class AIAssistantActionMenuTest {
         assertTrue(option(menu, "glm-5.3").isSelected());
         click(menu, "思考强度");
         assertNull(option(menu, "glm-5.3"));
-        assertNotNull(option(menu, "深度"));
+        assertNotNull(option(menu, "最高"));
     }
 
     @Test public void primaryModelIsTheFirstSectionAndSharesTheExistingInlineMenu() {
@@ -91,7 +114,7 @@ public final class AIAssistantActionMenuTest {
         assertNotNull("Choosing a source must keep its options in this menu", option(menu, "deepseek-flash"));
         click(menu, "思考强度");
         assertNull(option(menu, "本地模型"));
-        assertNotNull(option(menu, "简单"));
+        assertNotNull(option(menu, "低"));
     }
 
     @Test public void preparingKeepsTheCommittedSourceAndFailedRestoreStillAllowsRecovery() {
@@ -117,13 +140,13 @@ public final class AIAssistantActionMenuTest {
         AIAssistantActionMenu menu = menu();
         Object parent = menu.getParent();
         click(menu, "思考强度");
-        assertNotNull("Effort options must appear inside the original popup", option(menu, "简单"));
-        assertNotNull(option(menu, "标准"));
-        assertNotNull(option(menu, "深度"));
+        assertNotNull("Effort options must appear inside the original popup", option(menu, "低"));
+        assertNotNull(option(menu, "高"));
+        assertNotNull(option(menu, "最高"));
         assertSame(parent, menu.getParent());
         assertNull("Expanding must not create a centered system dialog", ShadowAlertDialog.getLatestAlertDialog());
         click(menu, "操作权限");
-        assertNull(option(menu, "简单"));
+        assertNull(option(menu, "低"));
         assertNotNull(option(menu, "请求批准"));
         assertNotNull(option(menu, "帮我批准"));
         assertNotNull(option(menu, "完全访问"));
@@ -134,15 +157,16 @@ public final class AIAssistantActionMenuTest {
     @Test public void choosingAnOptionKeepsTheSectionOpenAndSameValueDoesNotSaveAgain() {
         AIAssistantActionMenu menu = menu();
         click(menu, "思考强度");
-        assertTrue(option(menu, "标准").isSelected());
-        option(menu, "标准").performClick();
+        assertNotNull("The acknowledged effort needs its frozen display label", option(menu, "高"));
+        assertTrue(option(menu, "高").isSelected());
+        option(menu, "高").performClick();
         assertTrue(efforts.isEmpty());
-        option(menu, "深度").performClick();
+        option(menu, "最高").performClick();
         assertEquals(List.of("max"), efforts);
-        assertNotNull("Selection must keep this popup section open", option(menu, "简单"));
+        assertNotNull("Selection must keep this popup section open", option(menu, "低"));
         menu.update("deepseek-flash", false, "max", "on-request", true, true, true);
-        assertTrue(option(menu, "深度").isSelected());
-        assertFalse(option(menu, "标准").isSelected());
+        assertTrue(option(menu, "最高").isSelected());
+        assertFalse(option(menu, "高").isSelected());
         click(menu, "操作权限");
         assertTrue(option(menu, "请求批准").isSelected());
         option(menu, "请求批准").performClick();

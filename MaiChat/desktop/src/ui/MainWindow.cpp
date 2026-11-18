@@ -5729,8 +5729,7 @@ void MainWindow::rebuildAgentPage() {
           &MainWindow::requestAgentModelChange);
   connect(agentPanel_, &AgentChatPanel::reasoningEffortChangeRequested, this,
           [this](const QString& effort) {
-            if (effort != QStringLiteral("low") && effort != QStringLiteral("high") &&
-                effort != QStringLiteral("max")) return;
+            // Controller 按目标模型统一校验，宿主不能用固定三档挡掉 Fable 的合法强度。
             if (agentPanel_->sessionId().isEmpty()) agentPanel_->openSession();
             AgentController::SessionModelConfiguration configuration;
             if (!agentController_->sessionModelConfiguration(agentPanel_->sessionId(),

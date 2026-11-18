@@ -21,6 +21,7 @@
 #include "MaiThread.h"
 #include "MaiAgent.h"
 #include "MaiMemoryStore.h"
+#include "MaiSqliteStore.h"
 #include "MaiFakeModelClient.h"
 #include "MaiFileSystem.h"
 #include "MaiSessionTools.h"
@@ -95,6 +96,140 @@ static void test_session_crud_and_events() {
     // 删不存在的不该发事件
     agent.submit(MaiDeleteSession{"ses_nope"});
     CHECK(deleted == 1);
+}
+
+static std::vector<MaiSession> model_effort_session_contract(
+    std::unique_ptr<MaiSessionStore> store) {
+    auto* stored = store.get();
+    MaiAgent::Options options;
+    options.defaultModel = "anthropic/claude-fable-5.2";
+    MaiAgent agent(std::move(store), nullptr, nullptr, options);
+    std::vector<MaiSession> expectedPersisted;
+    for (const auto& effort : {"low", "medium", "high", "xhigh", "max"}) {
+        const auto created = agent.submit(
+            MaiCreateSession{"", "Fable effort", "anthropic/claude-fable-5.2", effort});
+        CHECK(created);
+        if (created) {
+            MaiSession session;
+            CHECK(agent.getSession(created.value(), session));
+            CHECK(session.reasoningEffort == effort);
+            expectedPersisted.push_back(session);
+        }
+    }
+    for (const auto& model : {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+                              "anthropic/claude-fable-5.2-preview", "fixture"}) {
+        for (const auto& effort : {"medium", "xhigh"}) {
+            const auto rejected =
+                agent.submit(MaiCreateSession{"", "Invalid effort", model, effort});
+            CHECK(!rejected && rejected.error().code() == MaiErrorCode::InvalidInput);
+        }
+        for (const auto& effort : {"low", "high", "max"})
+            CHECK(agent.submit(MaiCreateSession{"", "Existing effort", model, effort}));
+    }
+    for (const auto& effort : {"medium", "xhigh"}) {
+        // 空 model 按宿主默认 Fable 校验，但不把继承标记改成显式型号。
+        const auto inherited = agent.submit(MaiCreateSession{"", "Inherited model", "", effort});
+        CHECK(inherited);
+        if (inherited) {
+            MaiSession session;
+            CHECK(agent.getSession(inherited.value(), session));
+            CHECK(session.model.empty() && session.reasoningEffort == effort);
+        }
+        const auto defaultUpdate =
+            agent.submit(MaiCreateSession{"", "Default model update", "", "high"});
+        CHECK(defaultUpdate);
+        if (defaultUpdate) {
+            CHECK(agent.submit(MaiUpdateSession{defaultUpdate.value(), "", "", "", "", effort}));
+            MaiSession session;
+            CHECK(agent.getSession(defaultUpdate.value(), session));
+            CHECK(session.model.empty() && session.reasoningEffort == effort);
+            session.reasoningEffort = effort;
+            expectedPersisted.push_back(session);
+        }
+        for (const auto& target : {"deepseek-flash", "glm-5.3"}) {
+            const auto created = agent.submit(
+                MaiCreateSession{"", "Original title", "anthropic/claude-fable-5.2", "high"});
+            CHECK(created);
+            if (!created) continue;
+            const auto id = created.value();
+            CHECK(agent.submit(MaiUpdateSession{id, "", "", "", "", effort}));
+            MaiSession selected;
+            CHECK(agent.getSession(id, selected));
+            CHECK(selected.reasoningEffort == effort);
+            // 注入旧工作区可能已有的选择，让转型断言独立于上面的新值写入断言。
+            CHECK(stored->mutateSession(
+                id, [&](MaiSession& value) { value.reasoningEffort = effort; }));
+            MaiSession before;
+            CHECK(agent.getSession(id, before));
+            const auto rejected =
+                agent.submit(MaiUpdateSession{id, "Must not change", target, "", "", effort});
+            CHECK(!rejected && rejected.error().code() == MaiErrorCode::InvalidInput);
+            MaiSession unchanged;
+            CHECK(agent.getSession(id, unchanged));
+            CHECK(unchanged.title == before.title && unchanged.titleEdited == before.titleEdited &&
+                  unchanged.model == before.model &&
+                  unchanged.reasoningEffort == before.reasoningEffort &&
+                  unchanged.updated == before.updated);
+            CHECK(agent.submit(MaiUpdateSession{id, "Switched atomically", target}));
+            MaiSession switched;
+            CHECK(agent.getSession(id, switched));
+            CHECK(switched.model == target && switched.reasoningEffort == "high" &&
+                  switched.title == "Switched atomically");
+            switched.reasoningEffort = "high";
+            expectedPersisted.push_back(switched);
+            const auto invalidUpdate =
+                agent.submit(MaiUpdateSession{id, "Must remain switched", "", "", "", effort});
+            CHECK(!invalidUpdate && invalidUpdate.error().code() == MaiErrorCode::InvalidInput);
+            CHECK(agent.getSession(id, unchanged));
+            CHECK(unchanged.title == "Switched atomically" && unchanged.model == target &&
+                  unchanged.reasoningEffort == "high");
+            const auto promoted =
+                agent.submit(MaiCreateSession{"", "Compound target", target, "low"});
+            CHECK(promoted);
+            if (promoted) {
+                CHECK(agent.submit(MaiUpdateSession{promoted.value(), "Fable selected",
+                                                    "anthropic/claude-fable-5.2", "", "", effort}));
+                MaiSession session;
+                CHECK(agent.getSession(promoted.value(), session));
+                CHECK(session.model == "anthropic/claude-fable-5.2" &&
+                      session.reasoningEffort == effort && session.title == "Fable selected");
+                session.model = "anthropic/claude-fable-5.2";
+                session.reasoningEffort = effort;
+                session.title = "Fable selected";
+                expectedPersisted.push_back(session);
+            }
+        }
+    }
+    return expectedPersisted;
+}
+
+static void test_model_specific_effort_creation_updates_and_reopen() {
+    model_effort_session_contract(makeMaiMemoryStore());
+    const auto path = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8("mai-model-effort-" + MaiIdGenerator::newSessionId() + ".sqlite"));
+    auto opened = makeMaiSqliteStore(path.toUtf8());
+    CHECK(opened);
+    if (!opened) return;
+    const auto expected = model_effort_session_contract(std::move(opened.value()));
+    auto reopened = makeMaiSqliteStore(path.toUtf8());
+    CHECK(reopened);
+    if (reopened) {
+        for (const auto& before : expected) {
+            MaiSession after;
+            CHECK(reopened.value()->getSession(before.id, after));
+            CHECK(after.model == before.model && after.reasoningEffort == before.reasoningEffort &&
+                  after.title == before.title);
+        }
+        reopened.value().reset();
+    }
+    MaiFileSystem::removeFile(path);
+    MaiAgent::Options defaults;
+    defaults.defaultModel = "deepseek-flash";
+    MaiAgent other(makeMaiMemoryStore(), nullptr, nullptr, defaults);
+    for (const auto& effort : {"medium", "xhigh"}) {
+        const auto rejected = other.submit(MaiCreateSession{"", "Inherited non-Fable", "", effort});
+        CHECK(!rejected && rejected.error().code() == MaiErrorCode::InvalidInput);
+    }
 }
 
 static void test_model_session_tools_use_the_existing_session_operations() {
@@ -559,6 +694,35 @@ static bool wait_for_interrupt_test(Predicate predicate) {
     return true;
 }
 
+static void test_model_specific_effort_changes_remain_busy_guarded() {
+    auto gate = std::make_shared<MaiInterruptTestGate>();
+    MaiAgent agent(makeMaiMemoryStore(),
+                   std::make_unique<MaiInterruptTestModel>(
+                       std::vector<std::shared_ptr<MaiInterruptTestGate>>{gate}),
+                   nullptr);
+    const auto created =
+        agent.submit(MaiCreateSession{"", "Active Fable", "anthropic/claude-fable-5.2", "low"});
+    CHECK(created);
+    if (!created) return;
+    const auto session = created.value();
+    CHECK(agent.submit(MaiSendPrompt{session, "Hold the effort snapshot"}));
+    CHECK(wait_for_interrupt_test([&] { return gate->entered.load(); }));
+    for (const auto& effort : {"medium", "xhigh"}) {
+        const auto blocked =
+            agent.submit(MaiUpdateSession{session, "Must not change", "", "", "", effort});
+        CHECK(!blocked && blocked.error().code() == MaiErrorCode::Busy);
+    }
+    const auto blockedModel =
+        agent.submit(MaiUpdateSession{session, "Must not change", "deepseek-flash"});
+    CHECK(!blockedModel && blockedModel.error().code() == MaiErrorCode::Busy);
+    MaiSession unchanged;
+    CHECK(agent.getSession(session, unchanged));
+    CHECK(unchanged.title == "Active Fable" && unchanged.model == "anthropic/claude-fable-5.2" &&
+          unchanged.reasoningEffort == "low");
+    gate->released.store(true);
+    agent.waitIdle();
+}
+
 static void test_interrupt_turn_rejects_wrong_target_and_cancels_the_matching_stream() {
     auto gate = std::make_shared<MaiInterruptTestGate>();
     MaiAgent agent(makeMaiMemoryStore(),
@@ -871,7 +1035,13 @@ static void test_interrupt_turn_empty_target_keeps_legacy_session_stop() {
     agent.waitIdle();
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--model-efforts") {
+        test_model_specific_effort_creation_updates_and_reopen();
+        test_model_specific_effort_changes_remain_busy_guarded();
+        std::printf("model effort session checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
     test_interrupt_turn_rejects_wrong_target_and_cancels_the_matching_stream();
     test_interrupt_of_completed_turn_does_not_stop_its_successor();
     test_interrupt_turn_preserves_wrong_permission_and_wakes_matching_permission();
@@ -882,6 +1052,8 @@ int main() {
     test_exact_message_query_uses_the_requested_session();
     test_id_prefix_and_monotonic();
     test_session_crud_and_events();
+    test_model_specific_effort_creation_updates_and_reopen();
+    test_model_specific_effort_changes_remain_busy_guarded();
     test_model_session_tools_use_the_existing_session_operations();
     test_session_workspace_tool_effective_next_turn();
     test_media_only_prompt_has_no_placeholder_text();

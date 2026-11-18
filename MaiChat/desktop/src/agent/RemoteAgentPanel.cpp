@@ -130,9 +130,12 @@ bool sameModelRoom(const QJsonObject& first, const QJsonObject& second) {
 }
 
 QString sessionEffortTitle(const QString& effort) {
-    if (effort == QStringLiteral("low")) return QStringLiteral("简单");
-    if (effort == QStringLiteral("high")) return QStringLiteral("标准");
-    if (effort == QStringLiteral("max")) return QStringLiteral("深度");
+    if (effort == QStringLiteral("low")) return QStringLiteral("低");
+    if (effort == QStringLiteral("medium")) return QStringLiteral("中");
+    if (effort == QStringLiteral("high")) return QStringLiteral("高");
+    if (effort == QStringLiteral("xhigh")) return QStringLiteral("超高");
+    if (effort == QStringLiteral("max")) return QStringLiteral("最高");
+    if (effort.isEmpty()) return QStringLiteral("跟随默认");
     return QStringLiteral("未确认");
 }
 
@@ -849,7 +852,8 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
     auto* effortOptionsLayout = new QVBoxLayout(runtime_->effortOptions);
     effortOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
     effortOptionsLayout->setSpacing(0);
-    for (const auto& effort : {QStringLiteral("low"), QStringLiteral("high"), QStringLiteral("max")}) {
+    for (const auto& effort : {QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high"),
+                               QStringLiteral("xhigh"), QStringLiteral("max")}) {
         auto* option = new QPushButton(sessionEffortTitle(effort), runtime_->effortOptions);
         option->setObjectName(QStringLiteral("remoteAgentEffortOption-") + effort);
         option->setProperty("reasoningEffort", effort);
@@ -1427,7 +1431,9 @@ void RemoteAgentPanel::updateSessionModelControls() {
         option->setEnabled(available);
     }
     for (auto* option : runtime_->effortButtons) {
-        option->setChecked(option->property("reasoningEffort").toString() == effort);
+        const auto value = option->property("reasoningEffort").toString();
+        option->setVisible(maiIsValidReasoningEffortForModel(model.toStdString(), value.toStdString()));
+        option->setChecked(value == effort);
         option->setEnabled(effortAvailable);
     }
 }
@@ -1460,10 +1466,15 @@ void RemoteAgentPanel::sendSessionModelCommand(const QJsonObject& requested) {
     if (!runtime_->command || !validModelOwner(owner) || !owner.value(QStringLiteral("online")).toBool() ||
         runtime_->modelRequestByOwner.contains(key)) return;
     const bool changing = requested.value(QStringLiteral("action")) == QStringLiteral("set_model");
-    if (changing && (owner.value(QStringLiteral("busy")).toBool() ||
-                     !runtime_->modelConfigurations.contains(key))) return;
+    if (changing && (owner.value(QStringLiteral("busy")).toBool() || !runtime_->modelConfigurations.contains(key)))
+        return;
     if (runtime_->modelRequests.size() >= 128) return;
     QJsonObject command = requested;
+    if (changing && command.contains(QStringLiteral("reasoningEffort")) &&
+        (!command.value(QStringLiteral("reasoningEffort")).isString() ||
+         !maiIsValidReasoningEffortForModel(command.value(QStringLiteral("model")).toString().toStdString(),
+                                            command.value(QStringLiteral("reasoningEffort")).toString().toStdString())))
+        return;
     const auto requestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     command.insert(QStringLiteral("requestId"), requestId);
     runtime_->modelRequests.insert(requestId, {owner, command});
@@ -1472,7 +1483,8 @@ void RemoteAgentPanel::sendSessionModelCommand(const QJsonObject& requested) {
     QPointer<RemoteAgentPanel> guard(this);
     const auto fail = [guard, key, requestId, changing](const QString& error) {
         if (!guard || !guard->runtime_->modelRequests.contains(requestId) ||
-            guard->runtime_->modelRequestByOwner.value(key) != requestId) return;
+            guard->runtime_->modelRequestByOwner.value(key) != requestId)
+            return;
         guard->runtime_->modelRequests.remove(requestId);
         guard->runtime_->modelRequestByOwner.remove(key);
         // A lost enqueue/ACK can leave a completed owner mutation. Require a new
@@ -1509,23 +1521,25 @@ bool RemoteAgentPanel::receiveSessionModelResult(const QJsonObject& owner, const
         const auto wire = result.value(QStringLiteral("wire")).toString();
         const bool local = model.startsWith(QStringLiteral("local:")) && model.size() > 6 && model.size() <= 256 &&
                            !QRegularExpression(QStringLiteral("[\\x00-\\x1f\\x7f]")).match(model).hasMatch();
-        const bool validEffort = effort == QStringLiteral("low") || effort == QStringLiteral("high") ||
-                                 effort == QStringLiteral("max");
-        const bool validWire = wire == QStringLiteral("chat_completions") || wire == QStringLiteral("responses") ||
-                               wire == QStringLiteral("local");
+        const bool validEffort = result.value(QStringLiteral("reasoningEffort")).isString() &&
+                                 maiIsValidReasoningEffortForModel(model.toStdString(), effort.toStdString());
+        const auto capability = maiCloudModelInfo(model.toStdString());
+        // 型号、强度和线协议是同一份确认配置，不能只验证 wire 是某个合法枚举。
+        const bool validWire = local ? wire == QStringLiteral("local")
+                                     : capability && wire == QString::fromUtf8(maiWireApiToString(capability->wire));
         if (result.value(QStringLiteral("session")) != expectedSession ||
-            (!sessionModelChoices().contains(model) && !local) ||
-            !validEffort || !validWire)
+            (!sessionModelChoices().contains(model) && !local) || !validEffort || !validWire)
             return true;
         if (request.command.value(QStringLiteral("action")) == QStringLiteral("set_model") &&
             (request.command.value(QStringLiteral("model")) != result.value(QStringLiteral("model")) ||
              (request.command.contains(QStringLiteral("reasoningEffort")) &&
-              request.command.value(QStringLiteral("reasoningEffort")) != result.value(QStringLiteral("reasoningEffort")))))
+              request.command.value(QStringLiteral("reasoningEffort")) !=
+                  result.value(QStringLiteral("reasoningEffort")))))
             return true;
         const QJsonObject configuration{{QStringLiteral("session"), result.value(QStringLiteral("session"))},
-                                         {QStringLiteral("model"), model},
-                                         {QStringLiteral("reasoningEffort"), effort},
-                                         {QStringLiteral("wire"), wire}};
+                                        {QStringLiteral("model"), model},
+                                        {QStringLiteral("reasoningEffort"), effort},
+                                        {QStringLiteral("wire"), wire}};
         runtime_->modelConfigurations.insert(key, {request.owner, configuration});
         runtime_->modelConfigurationOrder.removeAll(key);
         runtime_->modelConfigurationOrder.append(key);

@@ -287,6 +287,7 @@ struct AIAssistantView: View {
                             changingModelSource: model.changingModelSource,
                             selectedEffort: model.selectedRemote != nil && model.selectedRemote?.model == nil
                                 ? "unavailable" : model.settings.effectiveReasoningEffort,
+                            supportedReasoningEfforts: model.availableReasoningEfforts,
                             selectedPolicy: model.settings.policy,
                             canChangeModel: model.canChangeSessionModel,
                             canChangeEffort: model.canChangeSessionReasoningEffort,
@@ -1361,6 +1362,7 @@ private struct AIActionPanel: View {
     let allowLocalModel: Bool
     let changingModelSource: Bool
     let selectedEffort: String
+    let supportedReasoningEfforts: [String]
     let selectedPolicy: String
     let canChangeModel: Bool
     let canChangeEffort: Bool
@@ -1418,9 +1420,10 @@ private struct AIActionPanel: View {
                 )
                 if expandedSection == .effort {
                     optionGroup(identifier: "ai-effort-menu") {
-                        effortOption("简单", value: "low")
-                        effortOption("标准", value: "high")
-                        effortOption("深度", value: "max")
+                        // Inheritance remains stored state, not an extra selectable effort.
+                        ForEach(supportedReasoningEfforts.filter { !$0.isEmpty }, id: \.self) { effort in
+                            effortOption(effortTitle(effort), value: effort)
+                        }
                     }
                     .disabled(!canChangeEffort)
                 }
@@ -1515,15 +1518,14 @@ private struct AIActionPanel: View {
 
     private func effortOption(_ title: String, value: String) -> some View {
         option(title, selected: selectedEffort == value) { selectEffort(value) }
+            .accessibilityIdentifier("ai-effort-" + value)
     }
 
     private func effortTitle(_ value: String) -> String {
-        switch value {
-        case "low": return "简单"
-        case "max": return "深度"
-        case "unavailable": return "未提供"
-        default: return "标准"
-        }
+        if value == "unavailable" { return "未提供" }
+        // A stale/unsupported explicit value must not be presented as the standard effort.
+        guard !value.isEmpty, supportedReasoningEfforts.contains(value) else { return "不可用" }
+        return AIModelSettings.reasoningEffortTitle(value, for: selectedModelID)
     }
 
     private func policyOption(_ title: String, value: String) -> some View {

@@ -17,6 +17,7 @@
 #include <set>
 #include <tuple>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -217,6 +218,9 @@ MaiError validateOutput(const Json& output) {
 // 工具结果引用原调用标识；图像准备失败时直接返回错误，不能发送缺媒体的请求。
 MaiResult<std::string> buildBody(const MaiModelRequest& request,
                                  const MaiModelImagePreparer& prepareImage) {
+    // 显式档位按选中型号校验；不能静默丢弃不支持值，也不能把 Fable 的五档压回旧三档。
+    if (!maiIsValidReasoningEffortForModel(request.model, request.reasoningEffort))
+        return {MaiErrorCode::InvalidInput, "Unsupported reasoning effort for the selected model"};
     Json input = Json::array();
     const auto capability = maiCloudModelInfo(request.model);
     std::size_t latestUser = request.messages.size();
@@ -298,8 +302,7 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
     Json body{
         {"model", request.model}, {"input", std::move(input)}, {"stream", true}, {"store", false}};
     if (request.maxOutputTokens != 0) body["max_output_tokens"] = request.maxOutputTokens;
-    if (capability && (request.reasoningEffort == "low" || request.reasoningEffort == "high" ||
-                       request.reasoningEffort == "max"))
+    if (capability && !request.reasoningEffort.empty())
         body["reasoning"] = Json{{"effort", request.reasoningEffort}};
     if (!request.baseInstructions.empty()) body["instructions"] = request.baseInstructions;
     if (request.temperature >= 0.0) body["temperature"] = request.temperature;
@@ -345,6 +348,8 @@ struct StreamContext {
     bool hasTerminalOutput = false;
     std::string rawBody;
     std::string terminalError;
+    // 仅保存已校验的数字秒，-1 表示缺失/无效；原响应头可能带凭据，不能保留或写入诊断。
+    long retryAfterSeconds = -1;
     bool sawOutput = false;
     bool done = false;
     bool inactive = false;
@@ -675,16 +680,34 @@ void handleLine(StreamContext& context, const std::string& line) {
     if (event.is_object()) handleEvent(context, event);
 }
 
+// Retry-After 本轮只支持 0..86400 的数字秒；HTTP-date、符号、小数和溢出均不推断。
+long parseRetryAfterSeconds(std::string_view value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string_view::npos) return -1;
+    const auto last = value.find_last_not_of(" \t\r\n");
+    value = value.substr(first, last - first + 1);
+    long seconds = 0;
+    for (const char digit : value) {
+        if (digit < '0' || digit > '9' || seconds > (86400 - (digit - '0')) / 10) return -1;
+        seconds = seconds * 10 + (digit - '0');
+    }
+    return seconds;
+}
+
 std::size_t headerCallback(char* bytes, std::size_t size, std::size_t count, void* user) {
     auto& context = *static_cast<StreamContext*>(user);
     if (count != 0 && size > SIZE_MAX / count) return 0;
     const auto length = size * count;
-    if (context.manualRedirects && length >= 5 && std::memcmp(bytes, "HTTP/", 5) == 0) {
-        const std::string line(bytes, length);
-        const auto space = line.find(' ');
-        const int status = space == std::string::npos ? 0 : std::atoi(line.c_str() + space + 1);
-        context.redirectStatus = status >= 300 && status < 400;
-        context.redirectResponse = false;
+    if (length >= 5 && std::memcmp(bytes, "HTTP/", 5) == 0) {
+        // 100 Continue、代理与重定向都可带来多个响应；后续响应不能继承前一个 Retry-After。
+        context.retryAfterSeconds = -1;
+        if (context.manualRedirects) {
+            const std::string line(bytes, length);
+            const auto space = line.find(' ');
+            const int status = space == std::string::npos ? 0 : std::atoi(line.c_str() + space + 1);
+            context.redirectStatus = status >= 300 && status < 400;
+            context.redirectResponse = false;
+        }
     } else if (context.manualRedirects && context.redirectStatus && !context.redirectResponse &&
                length > 9) {
         const std::string name(bytes, 9);
@@ -696,7 +719,15 @@ std::size_t headerCallback(char* bytes, std::size_t size, std::size_t count, voi
             context.redirectResponse = value.find_first_not_of(" \t\r\n") != std::string::npos;
         }
     }
-    // 响应头到达也是真实通信；只记时间，不保存可能带凭据的头字段。
+    constexpr std::size_t retryAfterNameLength = 12;
+    if (length >= retryAfterNameLength &&
+        std::equal(bytes, bytes + retryAfterNameLength,
+                   "retry-after:", [](unsigned char left, unsigned char right) {
+                       return std::tolower(left) == right;
+                   }))
+        context.retryAfterSeconds = parseRetryAfterSeconds(
+            std::string_view(bytes + retryAfterNameLength, length - retryAfterNameLength));
+    // 响应头到达也是真实通信；除已校验秒数外只记时间，不保存可能带凭据的原头字段。
     if (length > 0) context.lastStreamActivity = std::chrono::steady_clock::now();
     return context.cancel->load(std::memory_order_relaxed) ? 0 : length;
 }
@@ -758,6 +789,32 @@ std::string providerError(const std::string& body) {
     const std::string message = stringField(error, "message");
     const std::string code = stringField(error, "code");
     return message.empty() ? code : code.empty() ? message : message + " (" + code + ")";
+}
+
+// 只输出匹配已核合同的静态分类值，不回显任意 metadata、remedy_hint 或原响应头。
+// RateLimited 用于告诉调用方这是临时预算竞争；它不改变 HTTP 402 的自动重试策略。
+std::string openRouterCreditDiagnostic(const std::string& body, long retryAfterSeconds,
+                                       MaiErrorCode& code) {
+    const Json parsed = Json::parse(body, nullptr, false);
+    if (!parsed.is_object()) return {};
+    const Json error = parsed.value("error", Json{});
+    if (!error.is_object()) return {};
+    const Json metadata = error.value("metadata", Json{});
+    const std::string reason = stringField(metadata, "reason");
+    const std::string source = stringField(metadata, "limit_source");
+    if (reason == "in_flight_budget_exhausted" && source == "openrouter_in_flight_budget") {
+        code = MaiErrorCode::RateLimited;
+        std::string diagnostic =
+            " [OpenRouter limit_source=openrouter_in_flight_budget "
+            "reason=in_flight_budget_exhausted";
+        if (retryAfterSeconds >= 0)
+            diagnostic += " retry_after_seconds=" + std::to_string(retryAfterSeconds);
+        return diagnostic + "]";
+    }
+    if (reason == "weight_exceeds_budget" && source == "openrouter_credits")
+        return " [OpenRouter category=single_request_budget_exceeded "
+               "limit_source=openrouter_credits reason=weight_exceeds_budget]";
+    return {};
 }
 
 class ResponsesClient final : public MaiModelClient {
@@ -933,7 +990,8 @@ public:
                                           " seconds");
             const bool transient =
                 transfer != CURLE_OK ? isRetryable(transfer) : status == 408 || status >= 500;
-            if (transient && !context.sawOutput && attempt < mConfig.maxRetries) {
+            // 已收到的 402 拒绝不能因错误正文截断/RST 被降级成自动传输重试。
+            if (status != 402 && transient && !context.sawOutput && attempt < mConfig.maxRetries) {
                 const long delay = mConfig.retryInitialDelayMs * (1L << attempt);
                 for (long waited = 0; waited < delay; waited += 25) {
                     if (cancel.load(std::memory_order_relaxed))
@@ -952,13 +1010,16 @@ public:
                              : curl_easy_strerror(transfer)));
             if (status >= 400) {
                 const std::string detail = providerError(context.rawBody);
-                const std::string message =
+                std::string message =
                     "HTTP " + std::to_string(status) + (detail.empty() ? "" : ": " + detail);
-                const MaiErrorCode code = status == 401 || status == 403
-                                              ? MaiErrorCode::NotConfigured
-                                          : status == 429 ? MaiErrorCode::RateLimited
-                                          : status >= 500 ? MaiErrorCode::Network
-                                                          : MaiErrorCode::Protocol;
+                MaiErrorCode code = status == 401 || status == 403 ? MaiErrorCode::NotConfigured
+                                    : status == 429                ? MaiErrorCode::RateLimited
+                                    : status >= 500                ? MaiErrorCode::Network
+                                                                   : MaiErrorCode::Protocol;
+                const auto capability = maiCloudModelInfo(request.model);
+                if (status == 402 && capability && capability->provider == "openrouter")
+                    message += openRouterCreditDiagnostic(context.rawBody,
+                                                          context.retryAfterSeconds, code);
                 return MaiError::make(code, message);
             }
             if (!context.done)
