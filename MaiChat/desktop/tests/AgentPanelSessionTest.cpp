@@ -33,8 +33,10 @@
 #include <QTextBlock>
 #include <QTextCursor>
 #include <QThreadPool>
+#include <QThread>
 #include <QTimer>
 #include <QUrl>
+#include <QWindow>
 #include <QtConcurrent/QtConcurrentRun>
 #include <QtTest>
 
@@ -59,6 +61,7 @@
 #include "markdown/MarkdownView.h"
 #include "ui/ComposerTextEdit.h"
 #include "ui/DesktopAudioPlayback.h"
+#include "ui/ImagePreviewDialog.h"
 #include "ui/UiZoom.h"
 
 // AI 面板：**别的会话说的话不能灌进这个会话的界面**。
@@ -708,6 +711,7 @@ private slots:
     void composerPlaceholderFitsAtMinimumHeight();
     void conversationUsesAvailableWidth();
     void pastedImageUsesTheSharedComposerAndReachesTheModel();
+    void sentImagesOpenNormalPreviewLiveAndAfterRestore();
     void mediaImportDoesNotWaitForUnrelatedGlobalPoolWork();
     void cancelingMediaImportKeepsTextAndIgnoresLateCompletion();
     void mediaImportDeadlineReleasesTheComposer();
@@ -3617,6 +3621,131 @@ void AgentPanelSessionTest::pastedImageUsesTheSharedComposerAndReachesTheModel()
     QVERIFY(panel.findChild<MarkdownView*>()->itemCount() >= 2);
     panel.openSession(sessionId);
     QVERIFY(panel.findChild<MarkdownView*>()->itemCount() >= 2);
+}
+
+// Click actual rendered pixels through the window, rather than assuming a
+// particular thumbnail control. Both live acceptance and a cold history page
+// must open the retained full image without depending on the imported source.
+void AgentPanelSessionTest::sentImagesOpenNormalPreviewLiveAndAfterRestore() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString original = directory.filePath(QStringLiteral("owned-sent-image.png"));
+    const QString database = directory.filePath(QStringLiteral("agent.sqlite"));
+    const QColor color(109, 63, 145);
+    QImage image(960, 720, QImage::Format_ARGB32_Premultiplied);
+    image.fill(color);
+    QVERIFY(image.save(original, "PNG"));
+    QString sessionId, retained;
+    const auto thumbnail = [color](AgentChatPanel& panel) -> QLabel* {
+        for (auto* label : panel.findChildren<QLabel*>()) {
+            const QPixmap pixels = label->pixmap();
+            if (!pixels.isNull() && pixels.width() >= 100 &&
+                pixels.toImage().pixelColor(pixels.width() / 2, pixels.height() / 2) == color)
+                return label;
+        }
+        return nullptr;
+    };
+    struct PreviewResult { bool opened = false, fullSource = false, pixels = false; };
+    const auto open = [&](AgentChatPanel& panel, QLabel* source, bool keyboard,
+                          const QString& capture, bool missing = false) {
+        PreviewResult result;
+        const int outerLoop = QThread::currentThread()->loopLevel();
+        QTimer closer;
+        closer.setInterval(10);
+        connect(&closer, &QTimer::timeout, &panel, [&] {
+            for (auto* window : QApplication::topLevelWidgets()) {
+                auto* dialog = qobject_cast<ImagePreviewDialog*>(window);
+                // Cocoa may expose a native window while show() is still in
+                // progress. Close only after exec() has entered its modal loop.
+                if (!dialog || !dialog->isVisible() ||
+                    QThread::currentThread()->loopLevel() <= outerLoop) continue;
+                closer.stop();
+                result.opened = true;
+                result.fullSource = dialog->sourceImage().size() == image.size();
+                const auto pixels = dialog->sourceImage().toImage();
+                result.pixels = pixels.pixelColor(pixels.width() / 2, pixels.height() / 2) == color;
+                captureAgentFixture(*dialog, capture);
+                QTest::keyClick(dialog, Qt::Key_Escape);
+                return;
+            }
+        });
+        closer.start();
+        if (keyboard) {
+            source->parentWidget()->setFocus();
+            QTest::keyClick(source->parentWidget(), Qt::Key_Space);
+        } else {
+            const auto pixels = source->pixmap();
+            const QPoint local(source->width() - pixels.width() / 2, source->height() / 2);
+            QTest::mouseClick(panel.windowHandle(), Qt::LeftButton, Qt::NoModifier,
+                              source->mapTo(&panel, local));
+        }
+        QElapsedTimer deadline;
+        deadline.start();
+        while (!result.opened && deadline.elapsed() < 3000) {
+            QTest::qWait(10);
+            if (missing) {
+                auto* view = panel.findChild<MarkdownView*>();
+                view->selectAll();
+                const bool explained = view->selectedText().contains(QStringLiteral("图片无法打开"));
+                view->clearSelection();
+                if (explained) break;
+            }
+        }
+        return result;
+    };
+    {
+        auto model = std::make_unique<CapturingModel>();
+        auto* captured = model.get();
+        AgentController controller(std::move(model), database);
+        AgentChatPanel panel(controller);
+        panel.resize(900, 700);
+        panel.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&panel));
+        sessionId = controller.createSession(directory.path(), QStringLiteral("Owned image preview"));
+        QVERIFY(controller.setModel(sessionId, QStringLiteral("glm-5.3-flash")));
+        panel.openSession(sessionId);
+        auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+        QVERIFY(editor);
+        QMimeData mime;
+        mime.setUrls({QUrl::fromLocalFile(original)});
+        dropOwnedComposerMime(*editor, mime);
+        QTRY_VERIFY(editor->toPlainText().contains(QChar(0xFFFC)));
+        QSignalSpy finished(&controller, &AgentController::turnFinished);
+        QTest::mouseClick(panel.findChild<QPushButton*>(QStringLiteral("agentSendButton")), Qt::LeftButton);
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 15000);
+        const auto request = captured->request();
+        QVERIFY(!request.messages.empty() && request.messages.back().images.size() == 1);
+        retained = QString::fromStdString(request.messages.back().images.front().path);
+        QVERIFY(retained != original && QFileInfo(retained).isFile());
+        QVERIFY(QFile::remove(original));
+        auto* source = thumbnail(panel);
+        QTRY_VERIFY((source = thumbnail(panel)) && source->isVisible());
+        const auto live = open(panel, source, false, QStringLiteral("sent-image-live-preview"));
+        QVERIFY2(live.opened, "Clicking the sent image must open the ordinary enlarged preview");
+        QVERIFY(live.fullSource && live.pixels);
+        QVERIFY(captureAgentFixture(panel, QStringLiteral("sent-image-thumbnail-after-close")));
+    }
+    {
+        AgentController controller(std::make_unique<SilentModel>(), database);
+        AgentChatPanel panel(controller);
+        panel.resize(900, 700);
+        panel.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&panel));
+        panel.openSession(sessionId);
+        auto* source = thumbnail(panel);
+        QTRY_VERIFY((source = thumbnail(panel)) && source->isVisible());
+        const auto restored = open(panel, source, false, QStringLiteral("sent-image-history-preview"));
+        QVERIFY(restored.opened && restored.fullSource && restored.pixels);
+        const auto keyboard = open(panel, source, true, QStringLiteral("sent-image-keyboard-preview"));
+        QVERIFY(keyboard.opened && keyboard.fullSource && keyboard.pixels);
+        QVERIFY(QFile::remove(retained));
+        QVERIFY(!open(panel, source, false, {}, true).opened);
+        auto* view = panel.findChild<MarkdownView*>();
+        view->selectAll();
+        QVERIFY(view->selectedText().contains(QStringLiteral("图片无法打开")));
+        view->clearSelection();
+        QVERIFY(captureAgentFixture(panel, QStringLiteral("sent-image-missing-source")));
+    }
 }
 
 void AgentPanelSessionTest::mediaImportDoesNotWaitForUnrelatedGlobalPoolWork() {

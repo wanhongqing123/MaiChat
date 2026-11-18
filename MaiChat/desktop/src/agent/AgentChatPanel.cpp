@@ -4567,13 +4567,52 @@ void AgentChatPanel::appendUserImages(const QString& messageId, const QStringLis
         options.max_output_height = UiZoom::s(420);
         const QPixmap pixmap = QPixmap::fromImage(desktopReadRasterFile(path, options).image);
         if (pixmap.isNull()) continue;
-        auto* preview = new QLabel;
-        preview->setPixmap(
-            pixmap.scaled(UiZoom::s(280), UiZoom::s(210), Qt::KeepAspectRatio, Qt::SmoothTransformation));
-        preview->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        preview->setStyleSheet(QStringLiteral("background:transparent;border:none;"));
-        preview->setToolTip(QFileInfo(path).fileName());
+        // Keep the sent image at the trailing edge, but give its actual pixels
+        // a native button hit target. A passive QLabel cannot open a preview.
+        const QPixmap thumbnail =
+            pixmap.scaled(UiZoom::s(280), UiZoom::s(210), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        const QSize thumbnailSize = (QSizeF(thumbnail.size()) / thumbnail.devicePixelRatioF()).toSize();
+        auto* preview = new QWidget;
+        auto* row = new QHBoxLayout(preview);
+        row->setContentsMargins(0, 0, 0, 0);
+        row->addStretch(1);
+        auto* open = new QPushButton(preview);
+        open->setObjectName(QStringLiteral("agentUserImageOpen"));
+        open->setAutoDefault(false);
+        open->setFocusPolicy(Qt::StrongFocus);
+        open->setFixedSize(thumbnailSize);
+        open->setCursor(Qt::PointingHandCursor);
+        open->setStyleSheet(QStringLiteral("background:transparent;border:0;padding:0;"));
+        open->setToolTip(QStringLiteral("查看大图：%1").arg(QFileInfo(path).fileName()));
+        open->setAccessibleName(QStringLiteral("查看图片 %1").arg(QFileInfo(path).fileName()));
+        auto* image = new QLabel(open);
+        image->setPixmap(thumbnail);
+        image->setAlignment(Qt::AlignCenter);
+        image->setGeometry(QRect(QPoint(), thumbnailSize));
+        image->setAttribute(Qt::WA_TransparentForMouseEvents);
+        row->addWidget(open);
         const QString id = QStringLiteral("local-image-%1").arg(++runtime_->noticeSerial);
+        connect(open, &QPushButton::clicked, this, [this, open, path, id] {
+            const QScreen* target = screen();
+            const qreal dpr = target ? target->devicePixelRatio() : 1;
+            const QSize viewport = target ? target->availableGeometry().size() : QSize(1200, 900);
+            const QString session = runtime_->sessionId;
+            const QPointer<AgentChatPanel> panel(this);
+            // Reuse the ordinary bounded loader and zoom/pan dialog. Bind the
+            // result to this retained message item, not its viewport visibility:
+            // scrolling may hide a valid item while a large image is decoding.
+            MessageImageLoader::instance().load(path, (QSizeF(viewport) * dpr).toSize(), open,
+                [panel, session, id](const QPixmap& image) {
+                    if (!panel || panel->sessionId() != session || !panel->runtime_->view->contains(id)) return;
+                    auto* dialog = new ImagePreviewDialog(image, panel.data());
+                    dialog->setAttribute(Qt::WA_DeleteOnClose);
+                    dialog->exec();
+                },
+                [panel, session, id] {
+                    if (panel && panel->sessionId() == session && panel->runtime_->view->contains(id))
+                        panel->appendNotice(QStringLiteral("图片无法打开，文件可能已移动、删除或损坏。"), true);
+                });
+        });
         runtime_->view->addWidget(id, preview);
         recordMessageItem(messageId, id);
     }
