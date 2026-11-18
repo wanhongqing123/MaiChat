@@ -691,6 +691,10 @@ struct AISteeringUITestRoot: View {
                     Text("发送记录").font(.caption)
                         .accessibilityIdentifier("steering-ledger")
                         .accessibilityValue(probe.ledger)
+                    if ProcessInfo.processInfo.arguments.contains("--ai-question-remote-echo-ui-test") {
+                        Button("同步已完成问题") { model.publishRemoteQuestionEchoUITestHistory(completed: true) }
+                            .accessibilityIdentifier("question-publish-completed")
+                    }
                     if probe.holdsFirstAcknowledgement {
                         Button("放行首条回执") { probe.releaseAcknowledgementGate() }
                             .accessibilityIdentifier("steering-release-first-ack")
@@ -722,6 +726,10 @@ struct AISteeringUITestRoot: View {
                 appState.hasCompletedInitialLogin = true
                 if ProcessInfo.processInfo.arguments.contains("--ai-remote-image-ui-test") {
                     AIAssistantModel.shared.installRemoteImageUITestFixture()
+                } else if ProcessInfo.processInfo.arguments.contains("--ai-question-remote-echo-ui-test") {
+                    AIAssistantModel.shared.installRemoteQuestionEchoUITestFixture { request in
+                        try await probe.answerQuestion(request)
+                    }
                 } else if ProcessInfo.processInfo.arguments.contains("--ai-question-conversation-ui-test") {
                     AIAssistantModel.shared.installQuestionConversationUITestFixture { request in
                         try await probe.answerQuestion(request)

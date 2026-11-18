@@ -2572,18 +2572,26 @@ final class AIAssistantModel: ObservableObject {
         let parts = Set(message.parts.map(\.id))
         return Dictionary(currentAcceptedQuestionAnswers.compactMap { echo in
             let part = echo.question.partId ?? "question-part-" + echo.question.id
-            return parts.contains(part) ? (part, echo.text) : nil
+            // A pending-only question uses a synthetic display row until its
+            // source message arrives. This exception is display-only: canonical
+            // retirement still requires the captured real message/part identity.
+            let pendingProjection = message.questionProjection == true &&
+                message.id == "question-pending-" + echo.question.id &&
+                message.sessionId == echo.question.sessionId
+            let sameMessage = pendingProjection || (echo.question.messageId.map { $0 == message.id } ?? true)
+            let sameSession = echo.question.sessionId.flatMap { expected in
+                message.sessionId.map { $0 == expected }
+            } ?? true
+            return sameMessage && sameSession && parts.contains(part) ? (part, echo.text) : nil
         }, uniquingKeysWith: { _, newest in newest })
     }
 
     private func reconcileQuestionAnswerEchoes() {
         guard !acceptedQuestionAnswers.isEmpty else { return }
-        let finished = Set((messages + questionMessages + updatedRootMessages).flatMap { $0.parts }
-            .filter { $0.questionAnswer != nil }.map(\.id))
         let conversation = outgoingConversationID(session: selected, remote: selectedRemote)
         let retained = acceptedQuestionAnswers.filter { _, echo in
             echo.owner.accountID != screenFrameCurrentAccountID || echo.owner.conversationID != conversation ||
-                echo.question.partId.map { !finished.contains($0) } != false
+                !hasCanonicalQuestionAnswer(echo.question)
         }
         if retained.count != acceptedQuestionAnswers.count { acceptedQuestionAnswers = retained }
     }
@@ -2617,7 +2625,8 @@ final class AIAssistantModel: ObservableObject {
 
     /// Feeds an owned fake peer's receipt through the exact production tuple/ACK decoder.
     func deliverSessionModelUITestReceipt(owner: AIRemoteSession, id: String, result: [String: Any]) async {
-        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") else { return }
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") ||
+              ProcessInfo.processInfo.arguments.contains("--ai-question-remote-echo-ui-test") else { return }
         let payload: [String: Any] = ["type": "command_result", "command_id": id, "result": result]
         let value: [String: Any] = ["id": 1, "kind": "event", "session_id": owner.sessionID,
             "client_message_id": id, "from_slot": owner.deviceSlot,
@@ -4992,8 +5001,17 @@ final class AIAssistantModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 do {
-                    try await remoteTransport.sendCommand(to: remote, encodedPayload: encoded,
-                                                          messageID: id)
+                    #if DEBUG && targetEnvironment(simulator)
+                    // Owned question fixtures replace peer I/O, retaining the production ACK decoder.
+                    if ProcessInfo.processInfo.arguments.contains("--ai-question-remote-echo-ui-test"),
+                       let handler = self.uiTestSupport.remoteQuestionCommandHandler {
+                        try await handler(remote, id, payload)
+                    } else {
+                        try await remoteTransport.sendCommand(to: remote, encodedPayload: encoded, messageID: id)
+                    }
+                    #else
+                    try await remoteTransport.sendCommand(to: remote, encodedPayload: encoded, messageID: id)
+                    #endif
                     await onForwarded?()
                 } catch {
                     finishRemoteSteering(id, result: .failure(AIBackendError(
@@ -5017,12 +5035,41 @@ final class AIAssistantModel: ObservableObject {
         return "local:" + session
     }
 
+    /// Question receipts name the original question, while ordinary sends name a
+    /// new message. Match captured owner/message/part identity, never answer text;
+    /// two deliberate sends with identical text must remain independent.
+    private func hasCanonicalQuestionAnswer(_ question: AIQuestion) -> Bool {
+        guard let partID = question.partId, !partID.isEmpty else { return false }
+        return (messages + questionMessages + updatedRootMessages).contains { message in
+            if let messageID = question.messageId, !messageID.isEmpty, message.id != messageID { return false }
+            // Child-task questions keep their source session when projected into a parent.
+            if let session = question.sessionId, let actual = message.sessionId, session != actual { return false }
+            return message.parts.contains { $0.id == partID && $0.questionAnswer != nil }
+        }
+    }
+
+    private func outgoingEntryHasCanonicalHistory(_ entry: AIOutgoingMessageQueueEntry) -> Bool {
+        guard entry.state == .accepted, entry.owner.accountID == screenFrameCurrentAccountID,
+              entry.owner.workspaceID == "assistant",
+              entry.owner.conversationID == outgoingConversationID(session: selected, remote: selectedRemote),
+              let receiptID = entry.acceptedMessageID,
+              let payload = try? JSONDecoder().decode(AIOutgoingMessagePayload.self, from: entry.payloadData)
+        else { return false }
+        if let questionID = payload.questionID {
+            guard entry.binding?.mode == .answer, entry.binding?.questionID == questionID,
+                  receiptID == questionID, let question = payload.question, question.id == questionID
+            else { return false }
+            return hasCanonicalQuestionAnswer(question)
+        }
+        return messages.contains { $0.id == receiptID }
+    }
+
     var visibleOutgoingRows: [AIOutgoingMessageRow] {
         let conversation = outgoingConversationID(session: selected, remote: selectedRemote)
         return outgoingEntries.compactMap { entry in
             guard entry.owner.accountID == screenFrameCurrentAccountID,
                   entry.owner.conversationID == conversation,
-                  !(entry.state == .accepted && messages.contains { $0.id == entry.acceptedMessageID }),
+                  !outgoingEntryHasCanonicalHistory(entry),
                   let payload = try? JSONDecoder().decode(AIOutgoingMessagePayload.self, from: entry.payloadData)
             else { return nil }
             if payload.questionID != nil, entry.state == .accepted, acceptedQuestionAnswers[entry.id] != nil { return nil }
@@ -5218,7 +5265,10 @@ final class AIAssistantModel: ObservableObject {
                     #endif
                     self.scrollRequest += 1
                 }
-                if self.messages.contains(where: { $0.id == entry.acceptedMessageID }) {
+                // History may arrive before or after its ACK. Use the same identity
+                // rule for rendering and durable retirement in either order.
+                self.reconcileQuestionAnswerEchoes()
+                if self.outgoingEntryHasCanonicalHistory(entry) {
                     _ = try? await queue.removeAccepted(id: entry.id, expectedRevision: entry.revision)
                 }
                 if let current = self.outgoingPump { await current.publish() }
@@ -5259,10 +5309,7 @@ final class AIAssistantModel: ObservableObject {
                 .importedFiles(workspace: workspacePath)) ?? []
         }
         outgoingEntries = entries
-        let conversation = outgoingConversationID(session: selected, remote: selectedRemote)
-        let canonical = Set(messages.map(\.id))
-        let confirmed = entries.filter { $0.owner.conversationID == conversation && $0.state == .accepted &&
-            $0.acceptedMessageID.map(canonical.contains) == true }
+        let confirmed = entries.filter(outgoingEntryHasCanonicalHistory)
         if !confirmed.isEmpty, let pump = outgoingPump {
             Task { @MainActor in
                 for entry in confirmed { _ = try? await pump.queue.removeAccepted(id: entry.id, expectedRevision: entry.revision) }

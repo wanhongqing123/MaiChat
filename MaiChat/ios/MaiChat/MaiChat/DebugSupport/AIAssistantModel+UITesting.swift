@@ -19,6 +19,9 @@ final class AIAssistantModelUITestSupport: ObservableObject {
     var screenFrameAccountID: String?
     // Isolated composer fixtures confirm routing without contacting a model.
     var steeringHandler: ((AISteeringRequest) async throws -> String)?
+    var remoteQuestionCommandHandler: (@MainActor (AIRemoteSession, String, [String: Any]) async throws -> Void)?
+    var remoteQuestionAnswer = ""
+    var remoteQuestionMessage: AIMessage?
     var questionHandler: ((AIQuestionAnswerUITestRequest) async throws -> String)?
     // Simulator-owned files replace only the final download boundary.
     var remoteImageSources: [String: URL] = [:]
@@ -720,6 +723,48 @@ extension AIAssistantModel {
                 AIPart(id: "question-intro", kind: "text", text: "请在下方聊天输入框直接回答。"),
                 AIPart(id: "question-part", kind: "tool", tool: "question",
                     input: String(decoding: input, as: UTF8.self), state: "running")])]
+    }
+
+    /// Keep the normal remote queue, tuple-bound ACK decoder and history projection.
+    /// Only the owned peer transport is replaced; no credentials or model task are used.
+    func installRemoteQuestionEchoUITestFixture(
+        handler: @escaping (AIQuestionAnswerUITestRequest) async throws -> String
+    ) {
+        installQuestionConversationUITestFixture(handler: handler)
+        let peer = AIRemoteSession(sessionID: "switch-A", title: "自有远端问题", updatedAt: 1,
+            busy: true, deviceSlot: "mac", deviceName: "Owned peer", deviceID: "owned-question-peer",
+            loginSessionID: "owned-question-login", online: true, turnId: "owned-question-turn")
+        uiTestSupport.remoteQuestionMessage = messages.first
+        applyUITestMutation(.remoteSessions([peer]))
+        publishRemoteQuestionEchoUITestHistory(completed: false)
+        uiTestSupport.remoteQuestionCommandHandler = { [weak self] remote, id, payload in
+            guard let self, let text = payload["text"] as? String,
+                  let request = payload["requestId"] as? String, let question = payload["id"] as? String,
+                  payload["action"] as? String == "answer" else { throw CancellationError() }
+            let answer = try await handler(AIQuestionAnswerUITestRequest(sessionID: remote.sessionID,
+                questionID: question, requestID: request, text: text))
+            self.uiTestSupport.remoteQuestionAnswer = text
+            await self.deliverSessionModelUITestReceipt(owner: remote, id: id,
+                result: ["ok": true, "question_id": answer])
+        }
+    }
+
+    func publishRemoteQuestionEchoUITestHistory(completed: Bool) {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-question-remote-echo-ui-test"),
+              let peer = remoteSessions.first, let original = uiTestSupport.remoteQuestionMessage else { return }
+        var parts = original.parts
+        if completed, let index = parts.firstIndex(where: { $0.id == "question-part" }) {
+            parts[index].state = "completed"
+            parts[index].output = uiTestSupport.remoteQuestionAnswer
+        }
+        let message = AIMessage(id: original.id, role: original.role, created: original.created,
+            completed: original.completed, active: original.active, parts: parts, sessionId: original.sessionId)
+        var page = AIResponse(ok: true)
+        let pendingOnly = !completed && ProcessInfo.processInfo.arguments.contains("--ai-question-missing-owner-ui-test")
+        page.messages = pendingOnly ? [] : [message]; page.questions = completed ? [] : questions
+        page.busy = true; page.turnId = "owned-question-turn"; page.session = peer.sessionID
+        guard let data = try? JSONEncoder().encode(page) else { return }
+        applyUITestMutation(.remoteImagePage(data, peer))
     }
 
     func installScreenFrameUITestWorkspace(_ path: String, accountID: String) {

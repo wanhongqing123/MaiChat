@@ -951,18 +951,21 @@ private struct AIAssistantMessageList: View {
         #if DEBUG
         let _ = AISessionDrawerDiagnostics.listBody()
         #endif
+        // Pending/child question projections are real transcript rows even when
+        // the current root history page has not arrived yet.
+        let displayedMessages = model.visibleMessages
         GeometryReader { geometry in
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 24) {
-                        if model.messages.isEmpty && model.visibleOutgoingRows.isEmpty && model.historyLoaded {
+                        if displayedMessages.isEmpty && model.visibleOutgoingRows.isEmpty && model.historyLoaded {
                             welcome
                         }
                         if hasBrowserEntryInCurrentSession && browser.sourceMessageID.isEmpty {
                             // 没有前置消息的普通 App 调用留在时间线起点，不随后来消息移动。
                             browserEntry
                         }
-                        if !model.messages.isEmpty {
+                        if !displayedMessages.isEmpty {
                             if model.hasOlderVisibleMessages {
                                 Button("查看更早消息", action: requestOlderMessages)
                                     .font(AppTypography.detail.weight(.medium))
@@ -972,7 +975,7 @@ private struct AIAssistantMessageList: View {
                             }
                             // 只把已开放的一页交给视图，由真实行高决定可滚动范围。
                             VStack(alignment: .leading, spacing: 24) {
-                                ForEach(model.visibleMessages, id: \.displayIdentity) { message in
+                                ForEach(displayedMessages, id: \.displayIdentity) { message in
                                     let hasInlineBrowser = hasBrowserEntryInCurrentSession &&
                                         browser.sourceMessageID == message.id && !browser.sourcePartID.isEmpty
                                     VStack(alignment: .leading, spacing: 16) {
@@ -1020,7 +1023,7 @@ private struct AIAssistantMessageList: View {
                     .padding(.bottom, 24)
                     .frame(
                         minHeight: geometry.size.height,
-                        alignment: model.messages.isEmpty && model.historyLoaded &&
+                        alignment: displayedMessages.isEmpty && model.historyLoaded &&
                             model.permissions.isEmpty && model.questions.isEmpty ? .center : .bottom
                     )
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1029,7 +1032,7 @@ private struct AIAssistantMessageList: View {
                             restoreInitialScrollableHistory: isActive && followsLatest &&
                                 !model.visibleMessages.isEmpty,
                             allowsBottomFollowing: isActive && followsLatest &&
-                                !model.messages.isEmpty,
+                                !displayedMessages.isEmpty,
                             bottomCorrectionRequest: bottomCorrectionRequest,
                             userScrollAwayThreshold: 60,
                             minimumOlderDragDistance: 24,
@@ -1055,7 +1058,7 @@ private struct AIAssistantMessageList: View {
                 }
                 .scrollDisabled(blocksVerticalScrolling)
                 .modifier(MessageInitialScrollAnchor(
-                    startsAtLatest: !model.messages.isEmpty))
+                    startsAtLatest: !displayedMessages.isEmpty))
                 .contentShape(Rectangle())
                 .onTapGesture {
                     focusController.dismiss()
@@ -1701,9 +1704,7 @@ struct AIMessageRow: View, Equatable {
                                         .lineSpacing(ChatTypography.lineSpacing)
                                         .foregroundStyle(RemoteIMStyle.textPrimary)
                                         .textSelection(.enabled)
-                                        .padding(14)
-                                        .background(Color(uiColor: .secondarySystemBackground),
-                                                    in: RoundedRectangle(cornerRadius: 18))
+                                        .modifier(AICreationSenderBubble())
                                 }
                             }
                         } else if part.kind == "tool", part.id == browserPartID, let sessionID = browserSessionID {
@@ -1986,8 +1987,7 @@ struct AIMessageRow: View, Equatable {
             .lineSpacing(ChatTypography.lineSpacing)
             .foregroundStyle(RemoteIMStyle.textPrimary)
             .textSelection(.enabled)
-            .padding(14)
-            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
+            .modifier(AICreationSenderBubble())
     }
 
     private func remoteImageCard(_ part: AIPart) -> some View {

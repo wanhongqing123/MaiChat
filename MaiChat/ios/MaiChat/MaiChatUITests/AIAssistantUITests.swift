@@ -255,6 +255,52 @@ final class AIAssistantUITests: XCTestCase {
         answered.lifetime = .keepAlways; add(answered)
     }
 
+    /// An answer ACK identifies a question, not a new user-message row. A later
+    /// owner history update must replace the accepted echo without resurrecting it.
+    @MainActor func testRemoteQuestionAnswerStaysSingleAfterCanonicalHistory() {
+        checkRemoteQuestionAnswerEcho(missingOwner: false)
+    }
+
+    @MainActor func testRemoteQuestionAnswerRemainsVisibleBeforeOwnerMessageArrives() {
+        checkRemoteQuestionAnswerEcho(missingOwner: true)
+    }
+
+    @MainActor private func checkRemoteQuestionAnswerEcho(missingOwner: Bool) {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-steering-ui-test", "--ai-question-remote-echo-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        if missingOwner { app.launchArguments.append("--ai-question-missing-owner-ui-test") }
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch(); defer { app.terminate() }
+        XCTAssertTrue(app.buttons["创作中心"].waitForExistence(timeout: 15))
+        app.buttons["创作中心"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@",
+            "复现测试问题：选择哪份素材？")).firstMatch.waitForExistence(timeout: 10))
+        let answer = "Same owned answer"
+        let composer = app.textViews["ai-composer"]
+        composer.tap(); composer.typeText(answer + "\n")
+        let receipt = app.staticTexts["steering-receipt"]
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate:
+            NSPredicate(format: "label == %@", "已回答 question-fixture · " + answer), object: receipt)],
+            timeout: 10), .completed)
+        let echoes = app.staticTexts.matching(NSPredicate(format: "label == %@", answer))
+        let answerVisible = echoes.firstMatch.waitForExistence(timeout: 5)
+        XCTAssertEqual(echoes.count, 1, "An accepted answer remains visible while its owner message is outside history")
+        XCTAssertTrue(answerVisible)
+        // Use the ordinary input-mode control to close the keyboard without requesting recording.
+        app.buttons["切换到按住转文字"].tap()
+        app.buttons["question-publish-completed"].tap()
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "remote-question-after-canonical-history"; shot.lifetime = .keepAlways; add(shot)
+        XCTAssertEqual(echoes.count, 1, "A question receipt must not reappear as a second delivered message")
+        XCTAssertEqual(app.staticTexts.matching(NSPredicate(format:
+            "identifier BEGINSWITH %@", "outgoing-status-")).count, 0)
+        // Repeated canonical pages are idempotent; no text-based deduplication is involved.
+        app.buttons["question-publish-completed"].tap()
+        XCTAssertEqual(echoes.count, 1)
+    }
+
     @MainActor private func launchRemoteToolDetailFixture(checks: Bool = false, busy: Bool = false, fixtureOverride: String? = nil) throws -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()

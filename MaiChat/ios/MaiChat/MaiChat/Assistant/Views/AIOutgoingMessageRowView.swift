@@ -2,6 +2,15 @@
 import MaiChatCore
 import SwiftUI
 
+/// One sender appearance across pending rows, accepted question echoes and history.
+/// Delivery status remains outside the bubble and does not change its identity/color.
+struct AICreationSenderBubble: ViewModifier {
+    func body(content: Content) -> some View {
+        content.padding(14)
+            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
+    }
+}
+
 struct AIOutgoingMessageRowView: View {
     let row: AIOutgoingMessageRow
     let retry: () -> Void
@@ -18,7 +27,10 @@ struct AIOutgoingMessageRowView: View {
                             .font(AppTypography.metadata).lineLimit(2)
                     }
                 }
-                .padding(12).background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 14))
+                .font(ChatTypography.body)
+                .lineSpacing(ChatTypography.lineSpacing)
+                .foregroundStyle(RemoteIMStyle.textPrimary)
+                .modifier(AICreationSenderBubble())
                 HStack(spacing: 8) {
                     Text(row.status).foregroundStyle(.secondary)
                         .accessibilityIdentifier("outgoing-status-" + row.entry.requestID)
