@@ -44,4 +44,6 @@ Additional authorized checks:
   metadata, bounded numeric Retry-After, supplier isolation and zero automatic
   retries. Preserve output-budget behavior and unknown-error truthfulness.
 
-- [ ] Independently verify the normal iOS 230 Release install and running process.
+- [x] Verify normal iOS 230 Release/signature/install and independent device version.
+- [ ] Verify ordinary launch and independent PID after the device is unlocked;
+  the first launch was explicitly Locked and no new-bundle process was observed.

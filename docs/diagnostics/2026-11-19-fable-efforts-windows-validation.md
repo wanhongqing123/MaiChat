@@ -52,7 +52,10 @@ Android 最终双 ARM ABI 已实际正常编译（37 秒）；未宣称 Android 
 Apple CAPI 同一最终测试旧源 23/43 失败，新源 107/0，供应商 HTTP 为 0。
 正常 iOS 模拟器三业务 3/0，包括迟到历史页不能覆盖新选择、跨 owner 的空默认值不能
 借用前一 owner。完整 Apple 与真实普通检索证据见
-`2026-11-19-ios-model-efforts-web-retrieval.md`；230 真机安装需独立回执，当前不预称完成。
+`2026-11-19-ios-model-efforts-web-retrieval.md`。
+后续正常 Release 已安装 230，独立设备 metadata 确认；普通启动被系统 Locked 拒绝，
+没有匹配新包的 PID。启动验证待用户解锁，完整边界见
+`2026-11-19-ios230-model-efforts-web-delivery.md`，不把已安装写成已正常运行。
 
 ## 402 边界
 
@@ -69,3 +72,14 @@ RateLimited，单请求估价过大单列，缺失或不匹配的 metadata 不�
 Mac 普通消费者在同 ABI 档案上更新最终 v2 八对象后，v3 再独立编译 RemotePanel
 0/4.867 秒，36 个 agent 成员逐等（1 新、35 复用），完整 App link 0/0.463 秒。
 这不是本轮全部对象重编，且没有运行、签包或替换 Mac 现装。
+
+## 已推送源码的 Windows 候选
+
+实现提交 `f785e2c2bae85129774686125828d85b409fa82f` 已正常推送并独立核对 main。
+私有正常候选 `MaiChat-win64-v3.0.1-20261119-f785e2c2.zip` 为 242,390,800 字节，
+SHA256 `e05688a5fac54d20262102fba1677e9f20e47e7468c5df982d9cc4cc6e5f741d`；
+exe SHA256 为 `8252529a6d87e7cb883edbef47328601ca0c732a23241966e93a7bd75f0adc99`。
+正常 staging 和实际 ZIP 提取目录各运行一次 `--smoke`，退出均为 0
+（1.973/4.498 秒），PATH 只有 Windows/System32，Qt 环境已清除。
+该启动检查不等于登录后的真实模型任务验收。原现装 PID 59396 的路径仍为
+`D:\Program Files\MaiChat\maichat.exe`，未停止或替换；候选未发布上传。
