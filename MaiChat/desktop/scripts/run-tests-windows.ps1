@@ -34,6 +34,16 @@ if (-not (Test-Path -LiteralPath $qtTestDll)) {
 # Windows can omit Qt's bin directory and display a blocking system error dialog for Qt6Test.dll.
 # Network fixtures use the shared curl/OpenSSL backend; Qt supplies UI runtime only.
 $env:PATH = "$qtBin;$env:PATH"
+# 子进程会继承测试环境。产品部署只带 windows 平台插件，但自有 DPR/偏好
+# 用例显式使用 offscreen；从同一 SDK 查找它，避免子进程在 Qt 平台错误框中阻塞。
+$qtPlugins = [System.IO.Path]::GetFullPath((Join-Path $qtBin "..\plugins"))
+if (Test-Path -LiteralPath $qtPlugins) {
+    $env:QT_PLUGIN_PATH = if ([string]::IsNullOrWhiteSpace($env:QT_PLUGIN_PATH)) {
+        $qtPlugins
+    } else {
+        "$qtPlugins;$env:QT_PLUGIN_PATH"
+    }
+}
 
 # Missing runtime DLLs and native crashes must be reported to the console, never as a modal system
 # dialog that blocks an unattended test run.

@@ -347,6 +347,8 @@ private slots:
     void contactsCurrentSelectionDoesNotLeaveContactsPage();
     void settingsNavigationShowsAccountWithoutDiagnostics();
     void profileAndPreferencesHaveSeparateNavigation();
+    void settingsTextSizeOffersSmallAndPreservesExistingChoices_data();
+    void settingsTextSizeOffersSmallAndPreservesExistingChoices();
     void remoteDesktopSettingsHaveNoDeviceList();
     void settingsAvatarUpdatesWhenSelfProfileArrives();
     void conversationAvatarLoadsWhenWindowIsCreatedAfterConnection();
@@ -3197,6 +3199,67 @@ void MainWindowLayoutTest::remoteDesktopSettingsHaveNoDeviceList() {
         window.show();
         QCoreApplication::processEvents();
         QVERIFY(remotePanel->grab().save(QString::fromUtf8(capture)));
+    }
+}
+
+void MainWindowLayoutTest::settingsTextSizeOffersSmallAndPreservesExistingChoices_data() {
+    QTest::addColumn<QString>("preset");
+    for (const char* preset : {"small", "standard", "large", "extraLarge"})
+        QTest::newRow(preset) << QString::fromLatin1(preset);
+}
+
+void MainWindowLayoutTest::settingsTextSizeOffersSmallAndPreservesExistingChoices() {
+    QFETCH(QString, preset);
+    ScopedNotificationSettings isolatedSettings;
+    const QString previousPreset = UiZoom::textPreset();
+    const qreal previousZoom = UiZoom::factor();
+    const QFont previousFont = QApplication::font();
+    const auto restore = qScopeGuard([&] {
+        UiZoom::setTextPreset(previousPreset);
+        UiZoom::setFactor(previousZoom);
+        UiZoom::refreshText();
+        QApplication::setFont(previousFont);
+    });
+    UiZoom::setFactor(1.0);
+    UiZoom::setTextPreset(preset);
+    RemoteIMApplication app(QStringLiteral("text-size-preferences-fixture"), std::make_unique<FakeRemoteIMClient>());
+    {
+        MainWindow window(app);
+        auto* choice = window.findChild<QComboBox*>(QStringLiteral("settingsTextSize"));
+        QVERIFY(choice);
+        QCOMPARE(choice->count(), 4);
+        const QStringList labels{QStringLiteral("小"), QStringLiteral("标准"), QStringLiteral("大"), QStringLiteral("特大")};
+        const QStringList presets{QStringLiteral("small"), QStringLiteral("standard"), QStringLiteral("large"), QStringLiteral("extraLarge")};
+        for (int index = 0; index < labels.size(); ++index) {
+            QCOMPARE(choice->itemText(index), labels.at(index));
+            QCOMPARE(choice->itemData(index).toString(), presets.at(index));
+        }
+        QCOMPARE(choice->currentData().toString(), preset);
+        choice->setCurrentIndex(choice->findData(QStringLiteral("small")));
+        QCOMPARE(UiZoom::textPreset(), QStringLiteral("small"));
+        QCOMPARE(UiZoom::textPixels(UiZoom::TextRole::Body), 14);
+        QCOMPARE(QSettings().value(QStringLiteral("ui/textSize")).toString(), QStringLiteral("small"));
+    }
+    MainWindow reopened(app);
+    auto* choice = reopened.findChild<QComboBox*>(QStringLiteral("settingsTextSize"));
+    QVERIFY(choice);
+    QCOMPARE(choice->currentData().toString(), QStringLiteral("small"));
+    const QString capture = qEnvironmentVariable("MAICHAT_SMALL_TEXT_CAPTURE");
+    if (!capture.isEmpty() && preset == QStringLiteral("small")) {
+        QVERIFY(QDir().mkpath(capture));
+        reopened.resize(1100, 760);
+        reopened.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&reopened));
+        auto* preferences = reopened.findChild<QPushButton*>(QStringLiteral("preferencesNavButton"));
+        QVERIFY(preferences);
+        QTest::mouseClick(preferences, Qt::LeftButton);
+        QTRY_VERIFY(choice->isVisible());
+        QVERIFY(reopened.grab().save(QDir(capture).filePath(QStringLiteral("small-font-settings.png"))));
+        choice->showPopup();
+        QTRY_VERIFY(choice->view()->window()->isVisible());
+        QVERIFY(choice->view()->window()->grab().save(
+            QDir(capture).filePath(QStringLiteral("small-font-options.png"))));
+        choice->hidePopup();
     }
 }
 

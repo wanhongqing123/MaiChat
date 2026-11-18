@@ -3277,6 +3277,7 @@ void MainWindow::buildUi() {
   auto *fontChoice = new QComboBox(settingsContent);
   fontChoice->setObjectName(QStringLiteral("settingsTextSize"));
   fontChoice->setAccessibleName(QStringLiteral("字体大小"));
+  fontChoice->addItem(QStringLiteral("小"), QStringLiteral("small"));
   fontChoice->addItem(QStringLiteral("标准"), QStringLiteral("standard"));
   fontChoice->addItem(QStringLiteral("大"), QStringLiteral("large"));
   fontChoice->addItem(QStringLiteral("特大"), QStringLiteral("extraLarge"));

@@ -16,6 +16,8 @@ namespace UiZoom {
 
 // 字号独立于窗口缩放；同类文字使用角色，不能把文字大小当作几何尺寸。
 enum class TextRole { Body, Detail, Metadata, Heading1, Heading2, Heading3, Title, Section, Display, Hero };
+// 预设使用稳定字符串 small/standard/large/extraLarge；小字号为标准的 0.875 倍，
+// 系统 DPI 仍由 Qt 处理，未知偏好统一回到标准，不改变已有档位的实际大小。
 QString textPreset();
 QString fontFamilyId();
 void setFontFamilyId(const QString& family);

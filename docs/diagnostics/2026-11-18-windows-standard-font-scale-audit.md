@@ -54,3 +54,35 @@ other platforms and system display scaling unchanged.
 Measurements, fixture source/binary/font hashes and owned screenshots remain
 under `.cache/windows-font-standard-20261118/`. No source-level font repair,
 normal build reconfiguration or installed-App replacement is claimed.
+
+## User-approved small preset, 2026-11-19
+
+The user clarified the desired change: add a small option alongside standard,
+large and extra-large. This supersedes the proposed change of the standard
+baseline. The Qt common implementation now adds stable ID `small`, factor
+0.875: body sizes are 14/16/18/20 logical px. At Windows 150% DPI they map to
+21/24/27/30 physical px, before any separate application zoom. Other typography
+roles and Markdown use the same factor. Existing valid IDs and current user
+selection remain unchanged; invalid old stored values normalize to standard.
+The setting UI order is small/standard/large/extra-large. iOS/Android typography
+and the shared typography token file were not changed.
+
+TDD: actual old behavior failed one small-preset check plus four settings-menu
+rows. Nine child-process timeouts were separately identified as test-runtime
+failures, not product RED: the deployed test directory had only qwindows,
+while explicit offscreen children needed the matching SDK plugin directory.
+The test wrapper now makes that directory available through QT_PLUGIN_PATH;
+the same isolated single-child timeout became a 377 ms pass without extending
+its timeout. Full UiZoomTest passed 18/0 in 3.201s; the four settings rows plus
+setup/cleanup passed 6/0 in 3.022s. This covers real subprocess preference
+reopen, both DPR1 and DPR1.5 logical-pixel probes, all role sizes, invalid old
+values, editor/Markdown refresh and draft retention. Normal maichat build and
+the existing runtime gate passed (3 components/114 PE imports).
+
+The owned MainWindow settings and combo popup were actually rendered and
+inspected: all four entries fit and small is selected. An optional capture
+hook on the same normal settings test saves only that fixture's widgets.
+This component test startup is not a claim of installed-App update or identical
+bundled-font initialization. No user preference, system scaling or installed
+program was changed. Evidence is under
+`.cache/openrouter-fable52-20261118/small-font-*`.

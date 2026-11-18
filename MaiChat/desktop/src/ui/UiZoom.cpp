@@ -19,6 +19,8 @@ constexpr qreal kMinFactor = 0.8;
 constexpr qreal kMaxFactor = 2.0;
 constexpr qreal kStep = 0.1;
 constexpr qreal kDefaultFactor = 1.0;
+// 小字号只扩展桌面偏好，所有文字角色和 Markdown 共用同一倍率；不改跨端标准令牌。
+constexpr qreal kSmallTextFactor = 0.875;
 
 bool loaded = false;
 qreal current = kDefaultFactor;
@@ -27,6 +29,12 @@ QString currentFontFamily = QStringLiteral("system");
 
 qreal clampFactor(qreal value) {
     return qBound(kMinFactor, value, kMaxFactor);
+}
+
+QString normalizedTextPreset(const QString& preset) {
+    return preset == QStringLiteral("small") || preset == QStringLiteral("large")
+            || preset == QStringLiteral("extraLarge")
+        ? preset : QStringLiteral("standard");
 }
 
 bool canPersist() {
@@ -41,7 +49,8 @@ void ensureLoaded() {
     QSettings settings;
     current = clampFactor(settings.value(QStringLiteral("ui/zoomFactor"), kDefaultFactor).toReal());
     currentFontFamily = settings.value(QString::fromLatin1(TypographyTokens::kFontFamilyPreferenceKey), QStringLiteral("system")).toString();
-    currentTextPreset = settings.value(QStringLiteral("ui/textSize"), QStringLiteral("standard")).toString();
+    // 加载和写入共用合法值边界，旧的未知值不会因菜单插入小字号而选中第一项。
+    currentTextPreset = normalizedTextPreset(settings.value(QStringLiteral("ui/textSize"), QStringLiteral("standard")).toString());
 }
 
 }  // namespace
@@ -93,14 +102,14 @@ QStringList fontFamilies() {
 
 void setTextPreset(const QString& preset) {
     ensureLoaded();
-    currentTextPreset = preset == QStringLiteral("large") || preset == QStringLiteral("extraLarge")
-        ? preset : QStringLiteral("standard");
+    currentTextPreset = normalizedTextPreset(preset);
     if (canPersist()) QSettings().setValue(QStringLiteral("ui/textSize"), currentTextPreset);
 }
 
 qreal textFactor() {
     ensureLoaded();
-    return currentTextPreset == QStringLiteral("large") ? TypographyTokens::kLargeScale
+    return currentTextPreset == QStringLiteral("small") ? kSmallTextFactor
+        : currentTextPreset == QStringLiteral("large") ? TypographyTokens::kLargeScale
         : currentTextPreset == QStringLiteral("extraLarge") ? TypographyTokens::kExtraLargeScale : TypographyTokens::kStandardScale;
 }
 
