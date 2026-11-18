@@ -241,6 +241,12 @@ public:
     MaiError readError;
     MaiError displayCaptureError;
     MaiError secureInputError;
+    MaiError stateError;
+    std::optional<std::vector<DesktopNativeElement>> nativeElements;
+    int elementReads = 0;
+    int stateCalls = 0;
+    std::function<void()> onElements;
+    std::function<void()> onState;
     std::function<void(int)> onWindows;
     std::function<void()> onActivate;
     std::function<void()> onCapture;
@@ -340,8 +346,30 @@ public:
         return {};
     }
     MaiResult<std::vector<DesktopNativeElement>> elements(const DesktopNativeWindow& window) override {
+        ++elementReads;
+        if (onElements) onElements();
+        if (nativeElements) return *nativeElements;
         return std::vector<DesktopNativeElement>{
             {"text", "Isolated editor input", window.x + 20, window.y + 20, 100, 30}};
+    }
+    MaiError setWindowState(const DesktopNativeWindow& window, DesktopWindowStateAction action,
+                              const std::function<bool()>& isCanceled) override {
+        ++stateCalls;
+        if (onState) onState();
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "fixture window state canceled"};
+        if (stateError) return stateError;
+        for (auto& current : visible) {
+            if (current.id != window.id) continue;
+            current.minimized = action == DesktopWindowStateAction::Minimize;
+            current.boundsAvailable = !current.minimized;
+            if (!current.minimized) {
+                current.x = 100;
+                current.y = 200;
+                current.width = 400;
+                current.height = 300;
+            }
+        }
+        return {};
     }
     MaiError capture(const DesktopNativeWindow& window, MaiScreenshot& output) override {
         ++captureCount;
@@ -2094,7 +2122,7 @@ void verifyUnobservableDiscoveryCannotIssueWindowToken() {
             makeWindowUnavailable(fixture.backend->visible.front(), state);
             const auto observed = fixture.controller.observe("owner", "", fixture.workspace.path().toUtf8().toStdString(),
                                                                false, 101, image);
-            CHECK(!observed);
+            CHECK(bool(observed) == (!image && state < 2));
             if (!observed) CHECK(observed.error().code() == MaiErrorCode::Busy ||
                                  observed.error().code() == MaiErrorCode::InvalidInput);
             CHECK(fixture.backend->captureCount == 0 && fixture.backend->activationCount == 0);
@@ -2112,11 +2140,453 @@ void verifyUnobservableDiscoveryCannotIssueWindowToken() {
         context.sessionId = "unobservable-window";
         context.root = fixture.workspace.path().toUtf8().toStdString();
         const auto result = tool->execute(R"({"action":"observe","window_id":"101","include_elements":false})", context);
-        CHECK(result.hasError());
+        CHECK(result.hasError() == (state == 2));
         if (result.hasError()) CHECK(result.error().code() == MaiErrorCode::Busy ||
                                      result.error().code() == MaiErrorCode::InvalidInput);
         CHECK(fixture.backend->captureCount == 0 && fixture.backend->activationCount == 0);
         CHECK(fixture.backend->inputSessionCreations == 0 && fixture.backend->inputs.empty());
+    }
+}
+
+void verifyMinimizedMetadataObservationAndNoHoldsRelease() {
+    {
+        Fixture fixture;
+        fixture.backend->visible.front().minimized = true;
+        fixture.backend->visible.front().boundsAvailable = false;
+        const auto observed = fixture.controller.observe("owner", "", fixture.workspace.path().toUtf8().toStdString(),
+                                                           false, 101, false, {}, "state-turn");
+        CHECK(observed);
+        if (observed) {
+            const auto output = Json::parse(observed.value().json);
+            CHECK(output["minimized"] == true);
+            CHECK(!output.value("snapshot_id", std::string()).empty());
+        }
+        CHECK(fixture.backend->captureCount == 0 && fixture.backend->activationCount == 0);
+        CHECK(fixture.backend->inputSessionCreations == 0);
+    }
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        auto action = display ? fixture.observeDisplay() : fixture.observe();
+        CHECK(!fixture.controller.releaseInput("owner"));
+        CHECK(!fixture.controller.perform("owner", action));
+        CHECK(fixture.backend->inputs.empty() && fixture.backend->inputSessionCreations == 0);
+    }
+}
+
+void verifyWindowStateOperations() {
+    Fixture fixture;
+    auto minimize = fixture.observe("minimize");
+    minimize.dryRun = true;
+    DesktopComputerActionProgress progress;
+    const auto dry = fixture.controller.perform("owner", minimize, &progress);
+    CHECK(dry && dry.value().dryRun && !dry.value().dispatched);
+    CHECK(fixture.backend->stateCalls == 0 && fixture.backend->activationCount == 0);
+    CHECK(!progress.windowOperationAttempted && !progress.inputDispatchAttempted);
+    minimize.dryRun = false;
+    const auto minimized = fixture.controller.perform("owner", minimize, &progress);
+    CHECK(minimized);
+    if (minimized) {
+        CHECK(minimized.value().beforeWindow && !minimized.value().beforeWindow->minimized);
+        CHECK(minimized.value().afterWindow && minimized.value().afterWindow->minimized);
+        CHECK(minimized.value().focused && *minimized.value().focused);
+    }
+    CHECK(progress.windowOperationAttempted && !progress.inputDispatchAttempted && progress.needsObservation);
+    CHECK(fixture.backend->stateCalls == 1 && fixture.backend->activationCount == 0);
+    CHECK(!fixture.controller.perform("owner", minimize));
+    const auto observed = fixture.controller.observe("owner", "", fixture.workspace.path().toUtf8().toStdString(),
+                                                       true, 101, false);
+    CHECK(observed);
+    if (!observed) return;
+    DesktopComputerAction restore;
+    restore.action = "restore";
+    restore.windowId = 101;
+    restore.snapshotId = Json::parse(observed.value().json).value("snapshot_id", std::string());
+    const auto restored = fixture.controller.perform("owner", restore);
+    CHECK(restored && restored.value().afterWindow && !restored.value().afterWindow->minimized);
+    CHECK(fixture.backend->stateCalls == 2 && fixture.backend->inputs.empty());
+    for (const int changed : {0, 1}) {
+        Fixture invalid;
+        auto action = invalid.observe("minimize");
+        if (changed == 0) ++invalid.backend->visible[0].processId;
+        else invalid.backend->visible[0].cloaked = true;
+        CHECK(!invalid.controller.perform("owner", action));
+        CHECK(invalid.backend->stateCalls == 0);
+    }
+    Fixture held;
+    const auto native = holdControl(held, false, "state-turn");
+    auto state = held.observe("minimize");
+    state.turnId = "state-turn";
+    CHECK(held.controller.perform("owner", state));
+    CHECK(native && native->state().empty());
+    CHECK(held.backend->stateCalls == 1);
+}
+
+DesktopComputerAction observeNativeElement(Fixture& fixture, bool display = false,
+                                            const std::string& session = "owner", const std::string& turn = {}) {
+    fixture.backend->nativeElements = std::vector<DesktopNativeElement>{
+        {"button", "Observed button", 120, 220, 100, 30, "runtime-1", "fixture-button"}};
+    DesktopComputerAction action;
+    action.action = "click";
+    action.windowId = display ? 0 : 101;
+    action.displayId = display ? 11 : 0;
+    action.desktopScope = display;
+    action.workspace = fixture.workspace.path().toUtf8().toStdString();
+    action.turnId = turn;
+    const auto observed = display ? fixture.controller.observeDisplay(session, action.workspace, 11, {}, 0, 0, 0, turn, 101)
+                                  : fixture.controller.observe(session, "", action.workspace, true, 101, false, {}, turn);
+    CHECK(observed);
+    if (!observed) return action;
+    const auto output = Json::parse(observed.value().json);
+    action.snapshotId = output.value("snapshot_id", std::string());
+    CHECK(output.contains("accessibility"));
+    CHECK(output.value("elements", Json::array()).size() == 1);
+    if (output.contains("elements") && !output["elements"].empty()) {
+        const auto& element = output["elements"][0];
+        action.elementId = element.value("element_id", std::string());
+        CHECK(!element.contains("native_id") && !element.contains("reference"));
+        CHECK(element.value("enabled", false));
+        CHECK(!element.value("offscreen", true));
+    }
+    CHECK(!action.elementId.empty());
+    return action;
+}
+
+void verifySnapshotBoundElementActions() {
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        fixture.backend->nativeElements = std::vector<DesktopNativeElement>{
+            {"button", "Inside", 120, 220, 100, 30, "inside-runtime", "inside"},
+            {"button", "Outside", 100000, 100000, 20, 20, "outside-runtime", "outside"}};
+        const auto workspace = fixture.workspace.path().toUtf8().toStdString();
+        const auto observed = display ? fixture.controller.observeDisplay("owner", workspace, 11, {}, 0, 0, 0, {}, 101)
+                                      : fixture.controller.observe("owner", "", workspace, true, 101, false);
+        CHECK(observed);
+        if (observed) {
+            const auto output = Json::parse(observed.value().json);
+            CHECK(output["elements"].size() == 1);
+            CHECK(output["accessibility"]["returned_elements"] == output["elements"].size());
+        }
+    }
+    for (const bool display : {false, true}) {
+        for (const char* kind : {"click", "double_click", "right_click"}) {
+            Fixture fixture;
+            auto action = observeNativeElement(fixture, display);
+            action.action = kind;
+            const auto acted = fixture.controller.perform("owner", action);
+            CHECK(acted);
+            CHECK(fixture.backend->inputs.size() == 1);
+            if (!fixture.backend->inputs.empty()) {
+                CHECK(fixture.backend->inputs[0].x == 170 && fixture.backend->inputs[0].y == 235);
+                CHECK(fixture.backend->inputs[0].desktopScope == display);
+            }
+            CHECK(fixture.backend->activationCount == (display ? 0 : 1));
+            CHECK(!fixture.controller.perform("owner", action));
+        }
+        for (int change = 0; change < 9; ++change) {
+            Fixture fixture;
+            const auto action = observeNativeElement(fixture, display);
+            auto& elements = *fixture.backend->nativeElements;
+            if (change == 0) elements[0].label += " changed";
+            if (change == 1) elements[0].x += 1;
+            if (change == 2) elements[0].enabled = false;
+            if (change == 3) elements[0].offscreen = true;
+            if (change == 4) elements[0].automationId += " changed";
+            if (change == 5) elements.clear();
+            if (change == 6) elements.push_back(elements[0]);
+            if (change == 7) ++fixture.backend->visible[0].processId;
+            if (change == 8) elements[0].role = "text";
+            CHECK(!fixture.controller.perform("owner", action));
+            CHECK(fixture.backend->inputs.empty() && fixture.backend->activationCount == 0);
+        }
+        Fixture fixture;
+        const auto old = observeNativeElement(fixture, display, "owner", "old-turn");
+        const auto fresh = observeNativeElement(fixture, display, "owner", "new-turn");
+        CHECK(old.elementId != fresh.elementId);
+        CHECK(!fixture.controller.releaseInput("owner", "old-turn"));
+        auto wrong = fresh;
+        wrong.elementId = old.elementId;
+        CHECK(!fixture.controller.perform("owner", wrong));
+        CHECK(!fixture.controller.perform("other-session", fresh));
+        CHECK(fixture.controller.perform("owner", fresh));
+    }
+}
+
+void verifyCompletedTurnReleasesSnapshotReferences() {
+    class ElementReference final : public DesktopNativeElementReference {};
+    for (const bool display : {false, true}) {
+        for (const bool clear : {false, true}) {
+            Fixture fixture;
+            auto reference = std::make_shared<ElementReference>();
+            const std::weak_ptr<const DesktopNativeElementReference> weak = reference;
+            fixture.backend->nativeElements = std::vector<DesktopNativeElement>{
+                {"button", "Retained control", 120, 220, 100, 30, "reference-runtime", "reference-button",
+                 true, false, reference}};
+            const auto workspace = fixture.workspace.path().toUtf8().toStdString();
+            const auto observed = display ? fixture.controller.observeDisplay(
+                "owner", workspace, 11, {}, 0, 0, 0, "reference-turn", 101)
+                : fixture.controller.observe("owner", "", workspace, true, 101, false, {}, "reference-turn");
+            CHECK(observed);
+            reference.reset();
+            fixture.backend->nativeElements.reset();
+            CHECK(!weak.expired());  // The observation is now the sole native-reference owner.
+            if (clear)
+                CHECK(!fixture.controller.clear("owner"));
+            else
+                CHECK(!fixture.controller.releaseInput("owner", "reference-turn"));
+            CHECK(weak.expired());
+            CHECK(fixture.backend->inputSessionCreations == 0);
+        }
+        Fixture fixture;
+        const auto workspace = fixture.workspace.path().toUtf8().toStdString();
+        auto reference = std::make_shared<ElementReference>();
+        const std::weak_ptr<const DesktopNativeElementReference> old = reference;
+        const auto observeReference = [&](const std::string& turn) {
+            fixture.backend->nativeElements = std::vector<DesktopNativeElement>{
+                {"button", "Retained control", 120, 220, 100, 30, "reference-runtime", "reference-button",
+                 true, false, reference}};
+            const auto observed = display ? fixture.controller.observeDisplay("owner", workspace, 11, {}, 0, 0, 0, turn, 101)
+                                          : fixture.controller.observe("owner", "", workspace, true, 101, false, {}, turn);
+            CHECK(observed);
+            reference.reset();
+            fixture.backend->nativeElements.reset();
+        };
+        observeReference("old-reference-turn");
+        CHECK(!old.expired());
+        reference = std::make_shared<ElementReference>();
+        const std::weak_ptr<const DesktopNativeElementReference> current = reference;
+        observeReference("new-reference-turn");
+        CHECK(old.expired() && !current.expired());
+        CHECK(!fixture.controller.releaseInput("owner", "old-reference-turn"));
+        CHECK(!current.expired());
+        CHECK(!fixture.controller.releaseInput("owner", "new-reference-turn"));
+        CHECK(current.expired());
+    }
+}
+
+void verifyDefaultElementResolverRejectsIncompleteSnapshots() {
+    class SnapshotBackend final : public RecordingBackend {
+    public:
+        std::string status = "available";
+        bool truncated = false;
+        MaiResult<DesktopNativeAccessibilitySnapshot> inspectElements(
+            const DesktopNativeWindow& window, const std::function<bool()>& isCanceled) override {
+            auto result = DesktopComputerBackend::inspectElements(window, isCanceled);
+            if (result) {
+                result.value().status = status;
+                result.value().truncated = truncated;
+            }
+            return result;
+        }
+    };
+    for (int incomplete = 0; incomplete < 3; ++incomplete) {
+        auto backend = std::make_shared<SnapshotBackend>();
+        backend->nativeElements = std::vector<DesktopNativeElement>{
+            {"button", "Unique partial match", 120, 220, 100, 30, "partial-runtime", "partial-button"}};
+        DesktopComputerController controller(backend);
+        QTemporaryDir workspace;
+        const auto observed = controller.observe("owner", "", workspace.path().toUtf8().toStdString(), true, 101, false);
+        CHECK(observed);
+        if (!observed) continue;
+        const auto output = Json::parse(observed.value().json);
+        DesktopComputerAction action;
+        action.action = "click";
+        action.windowId = 101;
+        action.snapshotId = output.value("snapshot_id", std::string());
+        action.elementId = output["elements"][0].value("element_id", std::string());
+        backend->status = incomplete == 0 ? "partial" : incomplete == 1 ? "unavailable" : "available";
+        backend->truncated = incomplete == 2;
+        const auto result = controller.perform("owner", action);
+        CHECK(!result);
+        CHECK(backend->inputs.empty() && backend->activationCount == 0 && backend->inputSessionCreations == 0);
+    }
+}
+
+void verifyElementToolValidationAndFailureFacts() {
+    Fixture fixture;
+    fixture.backend->nativeElements = std::vector<DesktopNativeElement>{
+        {"button", "Observed button", 120, 220, 100, 30, "runtime-1", "fixture-button"}};
+    auto controller = std::shared_ptr<DesktopComputerController>(&fixture.controller, [](DesktopComputerController*) {});
+    MaiToolRegistry registry;
+    registerDesktopComputerTools(registry, controller);
+    const auto tool = registry.find("desktop_computer");
+    CHECK(tool);
+    if (!tool) return;
+    MaiToolContext context;
+    context.sessionId = "owner";
+    context.root = fixture.workspace.path().toUtf8().toStdString();
+    const auto observed = tool->execute(R"({"action":"observe","window_id":"101"})", context);
+    CHECK(!observed.hasError());
+    if (observed.hasError()) return;
+    const auto output = Json::parse(observed.output());
+    Json args{{"action", "click"}, {"window_id", "101"}, {"snapshot_id", output["snapshot_id"]},
+              {"element_id", output["elements"][0].value("element_id", std::string())}};
+    for (int bad = 0; bad < 4; ++bad) {
+        auto invalid = args;
+        if (bad == 0) invalid["x_ratio"] = 0.5;
+        if (bad == 1) { invalid["x_ratio"] = 0.5; invalid["y_ratio"] = 0.5; }
+        if (bad == 2) invalid["element_id"] = 2;
+        if (bad == 3) invalid["element_id"] = "";
+        const auto result = tool->execute(invalid.dump(), context);
+        CHECK(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput);
+    }
+    CHECK(fixture.backend->inputs.empty() && fixture.backend->activationCount == 0);
+    fixture.backend->inputError = {MaiErrorCode::Busy, "fixture partial input"};
+    const auto failed = tool->execute(args.dump(), context);
+    CHECK(failed.hasError() && failed.error().code() == MaiErrorCode::Busy);
+    const auto facts = Json::parse(failed.error().message(), nullptr, false);
+    CHECK(facts.is_object());
+    if (facts.is_object()) {
+        CHECK(facts["input_dispatch_attempted"] == true);
+        CHECK(facts["window_operation_attempted"] == true);
+        CHECK(facts["needs_observation"] == true);
+        CHECK(facts.contains("input_state") && !facts.contains("accepted_events"));
+    }
+    for (const auto& invalid : {Json{{"action", "observe"}, {"target", "display"}, {"display_id", "bad"}},
+                                Json{{"action", "observe"}, {"target", "display"}, {"display_id", "11"},
+                                     {"element_window_id", "bad"}}}) {
+        const auto result = tool->execute(invalid.dump(), context);
+        CHECK(result.hasError());
+        if (result.hasError()) CHECK(result.error().message().find(invalid.contains("element_window_id") ?
+                                     "element_window_id" : "display_id") != std::string::npos);
+    }
+}
+
+void verifyElementStateChangesAtDispatchAndMissingDisplaySource() {
+    {
+        Fixture fixture;
+        const auto action = observeNativeElement(fixture);
+        fixture.backend->onActivate = [&] { (*fixture.backend->nativeElements)[0].x += 30; };
+        const auto result = fixture.controller.perform("owner", action);
+        CHECK(!result);
+        CHECK(fixture.backend->inputs.empty());
+    }
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        const auto action = observeNativeElement(fixture, display);
+        auto& element = (*fixture.backend->nativeElements)[0];
+        element.label = "Replaced transiently";
+        CHECK(!fixture.controller.perform("owner", action));
+        element.label = "Observed button";
+        CHECK(!fixture.controller.perform("owner", action));
+        CHECK(fixture.backend->inputs.empty());
+    }
+    {
+        Fixture fixture;
+        const auto action = observeNativeElement(fixture, true);
+        fixture.backend->onInput = [&] { fixture.backend->visible.clear(); };
+        const auto result = fixture.controller.perform("owner", action);
+        CHECK(result && result.value().dispatched);
+        if (result) {
+            const auto next = Json::parse(result.value().observation.json);
+            CHECK(next["element_window_id"] == "101");
+            CHECK(next["accessibility"]["status"] == "unavailable");
+            CHECK(next["accessibility"]["limit_reason"] == "source_missing");
+            auto coordinate = action;
+            coordinate.elementId.clear();
+            coordinate.snapshotId = next.value("snapshot_id", std::string());
+            coordinate.xRatio = 0.2;
+            coordinate.yRatio = 0.3;
+            const auto again = fixture.controller.perform("owner", coordinate);
+            CHECK(again && again.value().dispatched);
+            if (again) {
+                const auto last = Json::parse(again.value().observation.json);
+                CHECK(last.value("element_window_id", std::string()) == "101");
+            }
+        }
+        CHECK(fixture.backend->inputs.size() == 2 && fixture.backend->activationCount == 0);
+    }
+}
+
+void verifyCanceledStateDryRunStillReleasesStoppedTurn() {
+    Fixture fixture;
+    const auto native = holdControl(fixture, false, "dry-state-turn");
+    auto action = fixture.observe("restore");
+    action.turnId = "dry-state-turn";
+    auto controller = std::shared_ptr<DesktopComputerController>(&fixture.controller, [](DesktopComputerController*) {});
+    MaiToolRegistry registry;
+    registerDesktopComputerTools(registry, controller);
+    const auto tool = registry.find("desktop_computer");
+    CHECK(tool && native);
+    if (!tool || !native) return;
+    std::atomic<bool> canceled{true};
+    MaiToolContext context;
+    context.sessionId = "owner";
+    context.turnId = action.turnId;
+    context.cancel = &canceled;
+    const auto result = tool->execute(Json{{"action", "restore"}, {"window_id", "101"},
+        {"snapshot_id", action.snapshotId}, {"dry_run", true}}.dump(), context);
+    CHECK(result.hasError() && result.error().code() == MaiErrorCode::Canceled);
+    CHECK(native->releaseCalls() > 0 && native->state().empty());
+    CHECK(fixture.backend->stateCalls == 0);
+}
+
+void verifyInvalidatedEvidenceProgressAndObserveDiagnostics() {
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        const auto action = display ? fixture.observeDisplay() : fixture.observe();
+        if (display) fixture.backend->availableDisplays[1].width += 20;
+        else ++fixture.backend->visible[0].processId;
+        DesktopComputerActionProgress progress;
+        CHECK(!fixture.controller.perform("owner", action, &progress));
+        CHECK(progress.needsObservation && !progress.inputDispatchAttempted && !progress.windowOperationAttempted);
+    }
+    Fixture fixture;
+    auto controller = std::shared_ptr<DesktopComputerController>(&fixture.controller, [](DesktopComputerController*) {});
+    MaiToolRegistry registry;
+    registerDesktopComputerTools(registry, controller);
+    const auto tool = registry.find("desktop_computer");
+    CHECK(tool);
+    if (!tool) return;
+    MaiToolContext context;
+    context.sessionId = "owner";
+    context.root = fixture.workspace.path().toUtf8().toStdString();
+    const std::vector<std::pair<Json, std::string>> invalid{
+        {Json{{"action", "observe"}, {"window_id", "101"}, {"bogus", 1}}, "bogus"},
+        {Json{{"action", "observe"}, {"window_id", "101"}, {"include_elements", "true"}}, "include_elements"},
+        {Json{{"action", "observe"}, {"window_id", "101"}, {"window_title", "Isolated editor"}}, "exactly one"},
+        {Json{{"action", "observe"}, {"window_id", "101"}, {"workspace", context.root}}, "workspace"},
+        {Json{{"action", "observe"}, {"target", "display"}, {"display_id", 22}}, "display_id"},
+        {Json{{"action", "observe"}, {"target", "display"}, {"display_id", "22"}, {"wait_ms", "0"}}, "wait_ms"}};
+    for (const auto& entry : invalid) {
+        const auto result = tool->execute(entry.first.dump(), context);
+        CHECK(result.hasError() && result.error().message().find(entry.second) != std::string::npos);
+    }
+    context.root.clear();
+    const auto host = tool->execute(R"({"action":"observe","window_id":"101"})", context);
+    CHECK(host.hasError() && host.error().message().find("host workspace") != std::string::npos);
+    CHECK(fixture.backend->events.empty() && fixture.backend->windowsCount == 0);
+}
+
+void verifyMissingSnapshotFieldIsDiagnosedBeforeBackendAccess() {
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        const auto action = display ? observeNativeElement(fixture, true) : fixture.observe("restore");
+        auto controller = std::shared_ptr<DesktopComputerController>(&fixture.controller,
+                                                                     [](DesktopComputerController*) {});
+        MaiToolRegistry registry;
+        registerDesktopComputerTools(registry, controller);
+        const auto tool = registry.find("desktop_computer");
+        CHECK(tool);
+        if (!tool) continue;
+        MaiToolContext context;
+        context.sessionId = "owner";
+        context.root = fixture.workspace.path().toUtf8().toStdString();
+        const Json args = display ? Json{{"action", "click"}, {"target", "display"},
+                                         {"display_id", "11"}, {"element_id", action.elementId}}
+                                  : Json{{"action", "restore"}, {"window_id", "101"}};
+        const auto windows = fixture.backend->windowsCount;
+        const auto captures = fixture.backend->captureCount;
+        const auto displayCaptures = fixture.backend->displayCaptureCount;
+        const auto elementReads = fixture.backend->elementReads;
+        fixture.backend->events.clear();
+        const auto result = tool->execute(args.dump(), context);
+        CHECK(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(result.error().message().find("snapshot_id is required") != std::string::npos);
+        CHECK(fixture.backend->events.empty() && fixture.backend->inputs.empty());
+        CHECK(fixture.backend->windowsCount == windows && fixture.backend->captureCount == captures &&
+              fixture.backend->displayCaptureCount == displayCaptures && fixture.backend->elementReads == elementReads);
+        CHECK(fixture.backend->activationCount == 0 && fixture.backend->stateCalls == 0 &&
+              fixture.backend->inputSessionCreations == 0);
     }
 }
 
@@ -2552,6 +3022,8 @@ void verifyFailureAndCancellationBoundaries() {
         CHECK(fixture.backend->activationCount == 0);
         CHECK(fixture.backend->inputs.empty());
         canceled = false;
+        CHECK(!fixture.controller.perform("owner", action));
+        action = fixture.observe();
         CHECK(fixture.controller.perform("owner", action));
     }
     {
@@ -3269,6 +3741,16 @@ int main(int argc, char** argv) {
     verifySecureKeyboardInput();
     verifyWindowDiscoveryMetadataAndUntitledSelection();
     verifyUnobservableDiscoveryCannotIssueWindowToken();
+    verifyMinimizedMetadataObservationAndNoHoldsRelease();
+    verifyWindowStateOperations();
+    verifySnapshotBoundElementActions();
+    verifyCompletedTurnReleasesSnapshotReferences();
+    verifyDefaultElementResolverRejectsIncompleteSnapshots();
+    verifyElementToolValidationAndFailureFacts();
+    verifyElementStateChangesAtDispatchAndMissingDisplaySource();
+    verifyCanceledStateDryRunStillReleasesStoppedTurn();
+    verifyInvalidatedEvidenceProgressAndObserveDiagnostics();
+    verifyMissingSnapshotFieldIsDiagnosedBeforeBackendAccess();
     verifyWindowDiscoveryStateChangeDuringObservation();
     verifyWindowDiscoveryStateRevokesInputAndHeldControls();
     verifyWindowSelection();

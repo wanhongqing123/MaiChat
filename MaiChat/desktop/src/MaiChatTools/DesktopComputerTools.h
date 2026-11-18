@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <functional>
+#include <optional>
 
 #include "MaiChatTools/DesktopComputerPlatform.h"
 
@@ -46,6 +47,9 @@ struct DesktopComputerAction {
     std::string turnId;
     bool dryRun = false;
     std::function<bool()> isCanceled;
+    // Only click/double_click/right_click accept snapshot-local opaque IDs.
+    // The ordinary API ignores ratios for this locator; tool JSON enforces XOR.
+    std::string elementId;
 };
 
 struct DesktopComputerActionResult {
@@ -58,6 +62,17 @@ struct DesktopComputerActionResult {
     std::string observationError;
     DesktopNativeInputState inputState;
     std::size_t acceptedEvents = 0;
+    std::optional<DesktopNativeWindow> beforeWindow;
+    std::optional<DesktopNativeWindow> afterWindow;
+    std::optional<bool> focused;
+};
+
+// Attempt facts survive a failed Result; they do not assert receiver delivery
+// or invent a completed-event count for a partially accepted native batch.
+struct DesktopComputerActionProgress {
+    bool inputDispatchAttempted = false;
+    bool windowOperationAttempted = false;
+    bool needsObservation = false;
 };
 
 // Session-owned observed window state. A later action must match the same
@@ -70,7 +85,8 @@ public:
     DesktopComputerController(const DesktopComputerController&) = delete;
     DesktopComputerController& operator=(const DesktopComputerController&) = delete;
 
-    // Cancellation is polled during observation and is never retained in session state.
+    // Cancellation is polled during observation and is never retained. A
+    // minimized/cloaked target permits metadata only (includeImage=false).
     MaiResult<DesktopComputerObservation> observe(const std::string& sessionId, const std::string& windowTitle,
                                                   const std::string& workspace, bool includeElements,
                                                   std::uint64_t windowId = 0, bool includeImage = true,
@@ -84,12 +100,16 @@ public:
     // Observe a whole display using the resident capture worker. The token binds
     // this Session, input bounds and PNG dimensions. Desktop actions may switch
     // foreground applications and provide a subsequent screen observation.
+    // elementWindowId optionally selects one native accessibility source; it
+    // does not narrow or activate the display's existing native input scope.
     MaiResult<DesktopComputerObservation> observeDisplay(const std::string& sessionId, const std::string& workspace,
                                                          std::uint64_t displayId, std::function<bool()> isCanceled = {},
                                                          std::uint64_t afterFrameSequence = 0,
                                                          std::int64_t afterFrameReceivedAtMs = 0, int waitMs = 0,
-                                                         const std::string& turnId = {});
-    MaiResult<DesktopComputerActionResult> perform(const std::string& sessionId, const DesktopComputerAction& action);
+                                                         const std::string& turnId = {},
+                                                         std::uint64_t elementWindowId = 0);
+    MaiResult<DesktopComputerActionResult> perform(const std::string& sessionId, const DesktopComputerAction& action,
+                                                   DesktopComputerActionProgress* progress = nullptr);
     MaiError act(const std::string& sessionId, const std::string& action, const std::string& snapshotId,
                  std::uint64_t windowId, double xRatio, double yRatio, const std::string& text, const std::string& key,
                  int scrollLines);

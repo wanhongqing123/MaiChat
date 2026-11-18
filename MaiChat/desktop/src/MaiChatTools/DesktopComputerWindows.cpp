@@ -607,63 +607,279 @@ MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows() {
     return windows;
 }
 
-MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(const DesktopNativeWindow& window) {
+namespace {
+
+template<class Interface>
+struct ReleaseAutomation {
+    void operator()(Interface* value) const {
+        if (value) value->Release();
+    }
+};
+
+template<class Interface>
+using AutomationPointer = std::unique_ptr<Interface, ReleaseAutomation<Interface>>;
+
+// Runtime IDs are opaque arrays, unique only on their desktop and potentially
+// reusable over time. Preserve the complete array only for equality; the
+// controller separately checks current role/name/automation identity and bounds.
+std::string runtimeIdentity(IUIAutomationElement* element) {
+    SAFEARRAY* identity = nullptr;
+    const HRESULT status = element->GetRuntimeId(&identity);
+    const auto release = qScopeGuard([&] { if (identity) SafeArrayDestroy(identity); });
+    if (FAILED(status) || !identity || SafeArrayGetDim(identity) != 1 || SafeArrayGetElemsize(identity) != sizeof(int))
+        return {};
+    LONG first = 0;
+    LONG last = -1;
+    if (FAILED(SafeArrayGetLBound(identity, 1, &first)) || FAILED(SafeArrayGetUBound(identity, 1, &last)) ||
+        last < first || std::int64_t(last) - first >= 128)
+        return {};
+    int* values = nullptr;
+    if (FAILED(SafeArrayAccessData(identity, reinterpret_cast<void**>(&values)))) return {};
+    const auto unlock = qScopeGuard([&] { SafeArrayUnaccessData(identity); });
+    if (!values) return {};
+    std::string result = "uia-runtime";
+    for (std::int64_t index = 0; index <= std::int64_t(last) - first; ++index)
+        result += ":" + std::to_string(values[index]);
+    return result;
+}
+
+struct AccessibilityTraversal {
+    DesktopNativeAccessibilitySnapshot snapshot;
+    DesktopNativeElement match;
+    std::size_t matches = 0;
+    bool complete = true;
+};
+
+MaiResult<AccessibilityTraversal> inspectAccessibility(const DesktopNativeWindow& window,
+                                                       const std::string& soughtIdentity,
+                                                       const std::function<bool()>& isCanceled) {
     DpiScope dpi;
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "accessibility inspection canceled"};
     if (!windowMatchesProcess(window))
         return {MaiErrorCode::NotFound, "selected window no longer belongs to the observed process"};
+    AccessibilityTraversal result;
+    auto& snapshot = result.snapshot;
+    snapshot.provider = "windows_uia_control_view";
+    snapshot.countsKnown = true;
+    // A budget is checked between provider calls. UIA2 additionally bounds its
+    // provider requests when supported; neither mechanism promises to forcibly
+    // interrupt an already blocked remote provider call.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    bool timedOut = false;
+    bool providerError = false;
+    bool nodeLimit = false;
+    bool elementLimit = false;
+    const auto expired = [&] {
+        timedOut = timedOut || std::chrono::steady_clock::now() >= deadline;
+        return timedOut || (isCanceled && isCanceled());
+    };
     ComScope com;
-    const auto opened = automation();
-    if (!opened) return opened.error();
-    IUIAutomation* ui = opened.value();
-    IUIAutomationElement* root = nullptr;
-    const HRESULT found = ui->ElementFromHandle(handle(window), &root);
+    IUIAutomation* rawUi = nullptr;
+    HRESULT opened = CoCreateInstance(CLSID_CUIAutomation8, nullptr, CLSCTX_INPROC_SERVER, IID_IUIAutomation,
+                                       reinterpret_cast<void**>(&rawUi));
+    if (FAILED(opened) || !rawUi) {
+        if (rawUi) rawUi->Release();
+        rawUi = nullptr;
+        opened = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_IUIAutomation,
+                                    reinterpret_cast<void**>(&rawUi));
+    }
+    AutomationPointer<IUIAutomation> ui(rawUi);
+    if (FAILED(opened) || !ui) {
+        snapshot.status = "unavailable";
+        snapshot.limitReason = "provider_error";
+        result.complete = false;
+        return result;
+    }
+    IUIAutomation2* rawUi2 = nullptr;
+    if (SUCCEEDED(ui->QueryInterface(IID_IUIAutomation2, reinterpret_cast<void**>(&rawUi2))) && rawUi2) {
+        AutomationPointer<IUIAutomation2> ui2(rawUi2);
+        ui2->put_ConnectionTimeout(200);
+        ui2->put_TransactionTimeout(200);
+    }
+    if (expired()) {
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "accessibility inspection canceled"};
+        snapshot.status = "partial";
+        snapshot.truncated = true;
+        snapshot.limitReason = "time_budget";
+        result.complete = false;
+        return result;
+    }
+    IUIAutomationElement* rawRoot = nullptr;
+    const HRESULT found = ui->ElementFromHandle(handle(window), &rawRoot);
+    AutomationPointer<IUIAutomationElement> root(rawRoot);
     if (FAILED(found) || !root) {
-        ui->Release();
-        return {MaiErrorCode::NotFound, "selected window is unavailable to UI Automation"};
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "accessibility inspection canceled"};
+        snapshot.status = "unavailable";
+        snapshot.limitReason = "provider_error";
+        result.complete = false;
+        return result;
     }
-    IUIAutomationTreeWalker* walker = nullptr;
-    if (FAILED(ui->get_ControlViewWalker(&walker)) || !walker) {
-        root->Release();
-        ui->Release();
-        return {MaiErrorCode::NotConfigured, "UI Automation walker is unavailable"};
+    int rootProcess = 0;
+    if (expired() || FAILED(root->get_CurrentProcessId(&rootProcess)) ||
+        std::uint64_t(rootProcess) != window.processId) {
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "accessibility inspection canceled"};
+        snapshot.status = "unavailable";
+        snapshot.truncated = timedOut;
+        snapshot.limitReason = timedOut ? "time_budget" : "provider_error";
+        result.complete = false;
+        return result;
     }
-    std::vector<DesktopNativeElement> output;
-    std::vector<IUIAutomationElement*> pending{root};
-    for (std::size_t index = 0; index < pending.size() && index < 250; ++index) {
-        IUIAutomationElement* current = pending[index];
+    IUIAutomationTreeWalker* rawWalker = nullptr;
+    const HRESULT walked = ui->get_ControlViewWalker(&rawWalker);
+    AutomationPointer<IUIAutomationTreeWalker> walker(rawWalker);
+    if (FAILED(walked) || !walker) {
+        snapshot.status = "unavailable";
+        snapshot.limitReason = "provider_error";
+        result.complete = false;
+        return result;
+    }
+    // Every COM object stays on this call's apartment. Snapshot identity is
+    // value-only; fresh resolution never dereferences a retained COM pointer.
+    std::vector<AutomationPointer<IUIAutomationElement>> pending;
+    pending.push_back(std::move(root));
+    for (std::size_t index = 0; index < pending.size() && !expired(); ++index) {
+        auto* current = pending[index].get();
+        ++snapshot.visitedNodes;
         DesktopNativeElement item;
-        BSTR name = nullptr;
-        if (SUCCEEDED(current->get_CurrentName(&name)) && name) {
-            if (SysStringLen(name) <= 4096) item.label = utf8(std::wstring(name, SysStringLen(name)));
-            SysFreeString(name);
-        }
+        item.nativeId = runtimeIdentity(current);
+        bool propertiesValid = !expired();
+        const auto readString = [&](auto getter, std::string& output) {
+            if (expired()) return false;
+            BSTR text = nullptr;
+            const HRESULT status = (current->*getter)(&text);
+            const auto release = qScopeGuard([&] { if (text) SysFreeString(text); });
+            if (FAILED(status) || (text && SysStringLen(text) > 4096)) return false;
+            if (text) output = utf8(std::wstring(text, SysStringLen(text)));
+            return !expired();
+        };
+        propertiesValid = readString(&IUIAutomationElement::get_CurrentName, item.label) && propertiesValid;
+        propertiesValid = readString(&IUIAutomationElement::get_CurrentAutomationId, item.automationId) && propertiesValid;
         CONTROLTYPEID type = 0;
-        current->get_CurrentControlType(&type);
-        item.role = controlRole(type);
+        BOOL enabled = FALSE;
+        BOOL offscreen = TRUE;
         RECT frame{};
-        if (!item.label.empty() && SUCCEEDED(current->get_CurrentBoundingRectangle(&frame)) &&
-            frame.right > frame.left && frame.bottom > frame.top && output.size() < 80) {
+        if (expired()) break;
+        propertiesValid = SUCCEEDED(current->get_CurrentControlType(&type)) && propertiesValid;
+        item.role = controlRole(type);
+        if (expired()) break;
+        propertiesValid = SUCCEEDED(current->get_CurrentIsEnabled(&enabled)) && propertiesValid;
+        item.enabled = enabled != FALSE;
+        if (expired()) break;
+        propertiesValid = SUCCEEDED(current->get_CurrentIsOffscreen(&offscreen)) && propertiesValid;
+        item.offscreen = offscreen != FALSE;
+        if (expired()) break;
+        propertiesValid = SUCCEEDED(current->get_CurrentBoundingRectangle(&frame)) && propertiesValid;
+        providerError = providerError || !propertiesValid;
+        if (propertiesValid && frame.right > frame.left && frame.bottom > frame.top &&
+            (!item.label.empty() || !item.nativeId.empty())) {
             item.x = frame.left;
             item.y = frame.top;
-            item.width = frame.right - frame.left;
-            item.height = frame.bottom - frame.top;
-            output.push_back(std::move(item));
-        }
-        IUIAutomationElement* child = nullptr;
-        if (SUCCEEDED(walker->GetFirstChildElement(current, &child)) && child) {
-            while (child && pending.size() < 250) {
-                pending.push_back(child);
-                IUIAutomationElement* next = nullptr;
-                walker->GetNextSiblingElement(child, &next);
-                child = next;
+            item.width = double(frame.right) - frame.left;
+            item.height = double(frame.bottom) - frame.top;
+            if (!soughtIdentity.empty()) {
+                if (item.nativeId == soughtIdentity) {
+                    ++result.matches;
+                    result.match = std::move(item);
+                }
+            } else if (snapshot.elements.size() < 80) {
+                snapshot.elements.push_back(std::move(item));
+            } else {
+                elementLimit = true;
             }
-            if (child) child->Release();
         }
-        current->Release();
+        if (expired()) break;
+        IUIAutomationElement* rawChild = nullptr;
+        const HRESULT children = walker->GetFirstChildElement(current, &rawChild);
+        AutomationPointer<IUIAutomationElement> child(rawChild);
+        providerError = providerError || FAILED(children);
+        while (child && !expired()) {
+            if (pending.size() >= 250) {
+                nodeLimit = true;
+                break;
+            }
+            auto* siblingOf = child.get();
+            pending.push_back(std::move(child));
+            IUIAutomationElement* rawNext = nullptr;
+            const HRESULT next = walker->GetNextSiblingElement(siblingOf, &rawNext);
+            child.reset(rawNext);
+            providerError = providerError || FAILED(next);
+        }
     }
-    walker->Release();
-    ui->Release();
-    return output;
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "accessibility inspection canceled"};
+    if (!windowMatchesProcess(window))
+        return {MaiErrorCode::NotFound, "selected window changed during accessibility inspection"};
+    timedOut = timedOut || std::chrono::steady_clock::now() >= deadline;
+    result.complete = !timedOut && !nodeLimit && !providerError;
+    snapshot.truncated = timedOut || nodeLimit || elementLimit;
+    snapshot.status = snapshot.truncated || providerError ? "partial" : "available";
+    if (timedOut) snapshot.limitReason = "time_budget";
+    else if (nodeLimit) snapshot.limitReason = "node_limit";
+    else if (elementLimit) snapshot.limitReason = "element_limit";
+    else if (providerError) snapshot.limitReason = "provider_error";
+    return result;
+}
+
+}  // namespace
+
+MaiResult<DesktopNativeAccessibilitySnapshot> maiDesktopInspectElements(const DesktopNativeWindow& window,
+                                                                        const std::function<bool()>& isCanceled) {
+    const auto inspected = inspectAccessibility(window, {}, isCanceled);
+    if (!inspected) return inspected.error();
+    return inspected.value().snapshot;
+}
+
+MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(const DesktopNativeWindow& window) {
+    const auto inspected = maiDesktopInspectElements(window);
+    if (!inspected) return inspected.error();
+    if (inspected.value().status == "unavailable")
+        return {MaiErrorCode::NotConfigured, "selected window is unavailable to UI Automation"};
+    return inspected.value().elements;
+}
+
+MaiResult<DesktopNativeElement> maiDesktopResolveElement(const DesktopNativeWindow& window,
+                                                         const DesktopNativeElement& observedElement,
+                                                         const std::function<bool()>& isCanceled) {
+    if (observedElement.nativeId.empty())
+        return {MaiErrorCode::InvalidInput, "observed control has no re-resolvable UI Automation identity"};
+    const auto inspected = inspectAccessibility(window, observedElement.nativeId, isCanceled);
+    if (!inspected) return inspected.error();
+    if (!inspected.value().complete)
+        return {MaiErrorCode::Busy, "UI Automation could not complete identity verification; observe again"};
+    if (inspected.value().matches != 1)
+        return {MaiErrorCode::NotFound, "observed UI Automation identity is missing or ambiguous; observe again"};
+    return inspected.value().match;
+}
+
+MaiError maiDesktopSetWindowState(const DesktopNativeWindow& window, DesktopWindowStateAction action,
+                                  const std::function<bool()>& isCanceled) {
+    DpiScope dpi;
+    const auto validate = [&]() -> MaiError {
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "window state operation canceled"};
+        if (!windowMatchesProcess(window) || !IsWindowVisible(handle(window)))
+            return {MaiErrorCode::NotFound, "selected window no longer belongs to the observed visible process"};
+        DWORD cloaked = 0;
+        if (FAILED(DwmGetWindowAttribute(handle(window), DWMWA_CLOAKED, &cloaked, sizeof(cloaked))))
+            return {MaiErrorCode::NotConfigured, "could not verify selected window desktop visibility"};
+        if (cloaked) return {MaiErrorCode::NotSupported, "cloaked window cannot be moved between virtual desktops"};
+        return {};
+    };
+    if (const auto invalid = validate()) return invalid;
+    const bool minimized = action == DesktopWindowStateAction::Minimize;
+    if (bool(IsIconic(handle(window))) == minimized) return {};
+    // These normal show requests change state without claiming foreground
+    // rights. Queueing succeeds independently of the eventual readback result.
+    const int command = minimized ? SW_SHOWMINNOACTIVE : SW_SHOWNOACTIVATE;
+    if (!ShowWindowAsync(handle(window), command))
+        return {MaiErrorCode::Busy, "Windows did not accept the selected window state request"};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    do {
+        if (const auto invalid = validate()) return invalid;
+        if (bool(IsIconic(handle(window))) == minimized) return {};
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    } while (std::chrono::steady_clock::now() < deadline);
+    if (const auto invalid = validate()) return invalid;
+    if (bool(IsIconic(handle(window))) == minimized) return {};
+    return {MaiErrorCode::Busy, "Windows did not reach the requested window state before the verification deadline"};
 }
 
 MaiError maiDesktopActivateWindow(const DesktopNativeWindow& window) {

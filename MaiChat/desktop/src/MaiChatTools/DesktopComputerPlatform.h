@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -28,13 +29,42 @@ struct DesktopNativeWindow {
     std::string className;
 };
 
+enum class DesktopWindowStateAction { Minimize, Restore };
+
+// Snapshot-owned native identity. Platform references retain only the selected
+// object and are never serialized or accepted from model arguments.
+class DesktopNativeElementReference {
+public:
+    virtual ~DesktopNativeElementReference() = default;
+};
+
 struct DesktopNativeElement {
     std::string role;
     std::string label;
+    // Screen bounds use Windows physical pixels or macOS native screen points,
+    // independently of PNG dimensions and the model's selected-target ratios.
     double x = 0;
     double y = 0;
     double width = 0;
     double height = 0;
+    // Internal provider identity; an absent identity/reference never receives a
+    // fabricated actionable element ID merely from its label and rectangle.
+    std::string nativeId;
+    std::string automationId;
+    bool enabled = true;
+    bool offscreen = false;
+    std::shared_ptr<const DesktopNativeElementReference> reference;
+};
+
+struct DesktopNativeAccessibilitySnapshot {
+    std::vector<DesktopNativeElement> elements;
+    std::string provider = "backend";
+    std::string status = "available";
+    std::size_t visitedNodes = 0;
+    // Legacy elements() backends cannot claim complete traversal counts.
+    bool countsKnown = false;
+    bool truncated = false;
+    std::string limitReason;
 };
 
 // Bounds use native pointer coordinates; the observation reports PNG pixels
@@ -147,6 +177,13 @@ std::shared_ptr<DesktopNativeInputSession> maiDesktopCreateInputSession();
 MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows();
 MaiResult<std::vector<DesktopNativeDisplay>> maiDesktopDisplays();
 MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(const DesktopNativeWindow& window);
+MaiResult<DesktopNativeAccessibilitySnapshot> maiDesktopInspectElements(
+    const DesktopNativeWindow& window, const std::function<bool()>& isCanceled = {});
+MaiResult<DesktopNativeElement> maiDesktopResolveElement(
+    const DesktopNativeWindow& window, const DesktopNativeElement& observedElement,
+    const std::function<bool()>& isCanceled = {});
+MaiError maiDesktopSetWindowState(const DesktopNativeWindow& window, DesktopWindowStateAction action,
+                                   const std::function<bool()>& isCanceled = {});
 MaiError maiDesktopActivateWindow(const DesktopNativeWindow& window);
 // Callback is valid only during this synchronous call. Queued platform work
 // must abandon activation and clear its callback before the waiter returns.

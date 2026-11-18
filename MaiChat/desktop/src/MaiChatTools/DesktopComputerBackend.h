@@ -23,6 +23,15 @@ public:
     virtual MaiError captureDisplay(const DesktopNativeDisplay& display, MaiScreenshot& output,
                                     const CaptureOptions& options);
     virtual MaiResult<std::vector<DesktopNativeElement>> elements(const DesktopNativeWindow& window) = 0;
+    // Legacy backends retain elements(); richer providers report bounded
+    // coverage and re-resolve the exact observed native identity before input.
+    virtual MaiResult<DesktopNativeAccessibilitySnapshot> inspectElements(
+        const DesktopNativeWindow& window, const std::function<bool()>& isCanceled = {});
+    virtual MaiResult<DesktopNativeElement> resolveElement(
+        const DesktopNativeWindow& window, const DesktopNativeElement& observedElement,
+        const std::function<bool()>& isCanceled = {});
+    virtual MaiError setWindowState(const DesktopNativeWindow& window, DesktopWindowStateAction action,
+                                     const std::function<bool()>& isCanceled = {});
     virtual MaiError capture(const DesktopNativeWindow& window, MaiScreenshot& output) = 0;
     virtual MaiError activate(const DesktopNativeWindow& window) = 0;
     virtual MaiError activate(const DesktopNativeWindow& window, const std::function<bool()>& isCanceled);

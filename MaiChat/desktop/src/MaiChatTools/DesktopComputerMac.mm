@@ -7,6 +7,7 @@
 #include <IOKit/hidsystem/IOLLEvent.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -97,7 +98,13 @@ bool currentWindowFrame(const DesktopNativeWindow& window, CGRect& frame) {
     return found;
 }
 
-AXUIElementRef accessibilityWindow(const DesktopNativeWindow& window) {
+AXUIElementRef accessibilityWindow(const DesktopNativeWindow& window,
+                                    const std::function<bool()>& isCanceled = {}, bool bounded = false) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
+    const auto stopped = [&] {
+        return (isCanceled && isCanceled()) || (bounded && std::chrono::steady_clock::now() >= deadline);
+    };
+    if (stopped()) return nullptr;
     CGRect frame{};
     if (!currentWindowFrame(window, frame)) return nullptr;
     AXUIElementRef application = AXUIElementCreateApplication(pid_t(window.processId));
@@ -105,14 +112,31 @@ AXUIElementRef accessibilityWindow(const DesktopNativeWindow& window) {
     AXUIElementSetMessagingTimeout(application, 0.1f);
     CFTypeRef value = nullptr;
     AXUIElementRef found = nullptr;
-    if (AXUIElementCopyAttributeValue(application, kAXWindowsAttribute, &value) ==
-            kAXErrorSuccess && value && CFGetTypeID(value) == CFArrayGetTypeID()) {
+    AXError copied = kAXErrorFailure;
+    if (bounded) {
+        CFIndex count = 0;
+        copied = AXUIElementGetAttributeValueCount(application, kAXWindowsAttribute, &count);
+        // A partial window list cannot establish a unique CG/AX identity.
+        if (copied == kAXErrorSuccess && count > 0 && count <= 128 && !stopped()) {
+            CFArrayRef array = nullptr;
+            copied = AXUIElementCopyAttributeValues(application, kAXWindowsAttribute, 0, count, &array);
+            value = array;
+        }
+    } else {
+        copied = AXUIElementCopyAttributeValue(application, kAXWindowsAttribute, &value);
+    }
+    bool aborted = false;
+    if (copied == kAXErrorSuccess && value && CFGetTypeID(value) == CFArrayGetTypeID()) {
         const CFArrayRef windows = static_cast<CFArrayRef>(value);
         for (CFIndex index = 0; index < CFArrayGetCount(windows); ++index) {
+            if (stopped()) { aborted = true; break; }
             AXUIElementRef candidate = static_cast<AXUIElementRef>(
                 const_cast<void*>(CFArrayGetValueAtIndex(windows, index)));
             DesktopNativeElement candidateFrame;
-            if (CFGetTypeID(candidate) == AXUIElementGetTypeID() &&
+            pid_t process = 0;
+            if (candidate && CFGetTypeID(candidate) == AXUIElementGetTypeID() &&
+                (!bounded || (AXUIElementGetPid(candidate, &process) == kAXErrorSuccess &&
+                    std::uint64_t(process) == window.processId && attribute(candidate, kAXTitleAttribute) == window.title)) &&
                 bounds(candidate, candidateFrame) &&
                 std::abs(candidateFrame.x - frame.origin.x) < 3 &&
                 std::abs(candidateFrame.y - frame.origin.y) < 3 &&
@@ -131,6 +155,7 @@ AXUIElementRef accessibilityWindow(const DesktopNativeWindow& window) {
             }
         }
     }
+    if (aborted || stopped()) { if (found) CFRelease(found); found = nullptr; }
     if (value) CFRelease(value);
     CFRelease(application);
     return found;
@@ -202,6 +227,80 @@ bool sameProcessElement(CFTypeRef value, pid_t process) {
     pid_t actual = 0;
     return AXUIElementGetPid(static_cast<AXUIElementRef>(value), &actual) ==
         kAXErrorSuccess && actual == process;
+}
+
+// Snapshot references retain exact native objects, never an identity reconstructed
+// from a label/rectangle. The opaque ID is process-local and is not a pointer.
+class MacAXElementReference final : public DesktopNativeElementReference {
+public:
+    MacAXElementReference(AXUIElementRef value, AXUIElementRef root, const DesktopNativeWindow& owner)
+        : element(value), window(root), windowId(owner.id), processId(owner.processId) {
+        CFRetain(element); CFRetain(window);
+        static std::atomic<std::uint64_t> sequence{0};
+        nativeId = "mac_ax:" + std::to_string(processId) + ":" + std::to_string(windowId) +
+                   ":" + std::to_string(++sequence);
+    }
+    ~MacAXElementReference() override { CFRelease(element); CFRelease(window); }
+    AXUIElementRef const element;
+    AXUIElementRef const window;
+    const std::uint64_t windowId;
+    const std::uint64_t processId;
+    std::string nativeId;
+};
+
+bool validAXWindowIdentity(const DesktopNativeWindow& window) {
+    return window.id && window.id <= (std::numeric_limits<CGWindowID>::max)() &&
+        window.processId && window.processId <= std::uint64_t((std::numeric_limits<pid_t>::max)());
+}
+
+bool axBoolean(AXUIElementRef element, CFStringRef name, bool& result) {
+    const auto value = copiedAttribute(element, name);
+    if (!value || CFGetTypeID(value.get()) != CFBooleanGetTypeID()) return false;
+    result = CFBooleanGetValue(static_cast<CFBooleanRef>(value.get()));
+    return true;
+}
+
+bool axElementBelongsToWindow(AXUIElementRef element, AXUIElementRef window, pid_t process,
+                             const std::function<bool()>& isCanceled) {
+    if (!sameProcessElement(element, process) || !sameProcessElement(window, process)) return false;
+    if (CFEqual(element, window)) return true;
+    const auto owner = copiedAttribute(element, kAXWindowAttribute);
+    if (owner) return sameProcessElement(owner.get(), process) && CFEqual(owner.get(), window);
+    // Some non-view nodes omit AXWindow. Require an actual bounded parent chain;
+    // a same-process sibling or an unreadable object never inherits ownership.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    CFRetain(element);
+    ScopedCFValue current(element);
+    for (int depth = 0; depth < 24; ++depth) {
+        if ((isCanceled && isCanceled()) || std::chrono::steady_clock::now() >= deadline) return false;
+        auto parent = copiedAttribute(static_cast<AXUIElementRef>(current.get()), kAXParentAttribute);
+        if (!sameProcessElement(parent.get(), process) || CFEqual(parent.get(), current.get())) return false;
+        if (CFEqual(parent.get(), window)) return true;
+        current = std::move(parent);
+    }
+    return false;
+}
+
+bool readAXElement(AXUIElementRef value, AXUIElementRef window, const DesktopNativeWindow& owner,
+                   DesktopNativeElement& result) {
+    result.role = attribute(value, kAXRoleAttribute);
+    result.label = attribute(value, kAXTitleAttribute);
+    if (result.label.empty()) result.label = attribute(value, kAXDescriptionAttribute);
+    if (result.label.empty()) result.label = attribute(value, kAXPlaceholderValueAttribute);
+    result.automationId = attribute(value, kAXIdentifierAttribute);
+    if (result.role.empty() || !bounds(value, result) || !std::isfinite(result.x) ||
+        !std::isfinite(result.y) || !std::isfinite(result.width) || !std::isfinite(result.height) ||
+        result.width <= 0 || result.height <= 0) return false;
+    // AXEnabled is not required for windows. Unknown control state is kept
+    // non-actionable instead of claiming that an unreadable control is enabled.
+    result.enabled = false;
+    if (!axBoolean(value, kAXEnabledAttribute, result.enabled) && CFEqual(value, window)) result.enabled = true;
+    CGRect frame{};
+    bool minimized = false;
+    if (!currentWindowFrame(owner, frame) || !axBoolean(window, kAXMinimizedAttribute, minimized)) return false;
+    result.offscreen = minimized || !CGRectIntersectsRect(frame,
+        CGRectMake(result.x, result.y, result.width, result.height));
+    return true;
 }
 
 // Only public AX ownership proves that a focused sheet/panel belongs to this
@@ -1042,8 +1141,10 @@ MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows() {
         return {MaiErrorCode::NotConfigured,
                 "grant MaiChat Screen & System Audio Recording permission and restart it"};
     std::vector<DesktopNativeWindow> output;
+    const auto minimizedDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    unsigned minimizedLookups = 0;
     CFArrayRef windows = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID);
     if (!windows) return {MaiErrorCode::NotSupported, "could not list visible macOS windows"};
     for (CFIndex index = 0; index < CFArrayGetCount(windows) && output.size() < 200; ++index) {
@@ -1083,53 +1184,175 @@ MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows() {
         window.y = frame.origin.y;
         window.width = frame.size.width;
         window.height = frame.size.height;
+        const bool onScreen = CFDictionaryGetValue(details, kCGWindowIsOnscreen) == kCFBooleanTrue;
+        if (!onScreen) {
+            // Off-screen and hidden windows are not discovery targets. Only a
+            // unique public AX match that explicitly reports minimized is added.
+            if (!AXIsProcessTrusted() || minimizedLookups >= 16 ||
+                std::chrono::steady_clock::now() >= minimizedDeadline) continue;
+            ++minimizedLookups;
+            const ScopedCFValue selected(accessibilityWindow(window, [&] {
+                return std::chrono::steady_clock::now() >= minimizedDeadline;
+            }, true));
+            bool minimized = false;
+            if (!selected || !axBoolean(static_cast<AXUIElementRef>(selected.get()), kAXMinimizedAttribute,
+                                         minimized) || !minimized) continue;
+            window.minimized = true;
+            window.boundsAvailable = false;
+            window.x = window.y = window.width = window.height = 0;
+        }
         output.push_back(std::move(window));
     }
     CFRelease(windows);
     return output;
 }
 
-MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(
-    const DesktopNativeWindow& window) {
+MaiResult<DesktopNativeAccessibilitySnapshot> maiDesktopInspectElements(
+    const DesktopNativeWindow& window, const std::function<bool()>& isCanceled) {
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility inspection canceled"};
+    if (!validAXWindowIdentity(window)) return {MaiErrorCode::InvalidInput, "a valid observed window is required"};
+    DesktopNativeAccessibilitySnapshot result;
+    result.provider = "mac_ax";
+    if (!AXIsProcessTrusted()) {
+        result.status = "unavailable"; result.limitReason = "not_authorized";
+        return result;
+    }
+    const ScopedCFValue selected(accessibilityWindow(window, isCanceled, true));
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility inspection canceled"};
+    if (!selected) {
+        result.status = "unavailable"; result.limitReason = "provider_error";
+        return result;
+    }
+    const auto root = static_cast<AXUIElementRef>(selected.get());
+    struct Node { ScopedCFValue value; int depth; };
+    std::vector<Node> pending;
+    CFRetain(root); pending.push_back({ScopedCFValue(root), 0});
+    const ScopedCFValue visited(CFSetCreateMutable(kCFAllocatorDefault, 0, &kCFTypeSetCallBacks));
+    const auto seen = static_cast<CFMutableSetRef>(const_cast<void*>(visited.get()));
+    if (!seen) return {MaiErrorCode::NotSupported, "could not allocate accessibility traversal"};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    result.countsKnown = true;
+    auto partial = [&](const char* reason) {
+        result.status = "partial"; result.truncated = true;
+        if (result.limitReason.empty()) result.limitReason = reason;
+    };
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility inspection canceled"};
+        if (std::chrono::steady_clock::now() >= deadline) { partial("time_limit"); break; }
+        const auto current = static_cast<AXUIElementRef>(pending[index].value.get());
+        if (!sameProcessElement(current, pid_t(window.processId))) { partial("provider_error"); continue; }
+        if (CFSetContainsValue(seen, current)) continue;
+        CFSetAddValue(seen, current); ++result.visitedNodes;
+        DesktopNativeElement element;
+        const bool readable = readAXElement(current, root, window, element);
+        if (!readable) partial("provider_error");
+        if (readable) {
+            if (result.elements.size() >= 80) { partial("element_limit"); break; }
+            auto reference = std::make_shared<MacAXElementReference>(current, root, window);
+            element.nativeId = reference->nativeId; element.reference = std::move(reference);
+            result.elements.push_back(std::move(element));
+        }
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility inspection canceled"};
+        CFStringRef name = kAXVisibleChildrenAttribute;
+        CFIndex count = 0;
+        AXError error = AXUIElementGetAttributeValueCount(current, name, &count);
+        if (error == kAXErrorAttributeUnsupported || error == kAXErrorNoValue) {
+            name = kAXChildrenAttribute;
+            error = AXUIElementGetAttributeValueCount(current, name, &count);
+        }
+        if (error == kAXErrorAttributeUnsupported || error == kAXErrorNoValue) continue;
+        if (error != kAXErrorSuccess || count < 0) { partial("provider_error"); continue; }
+        if (!count) continue;
+        if (pending[index].depth >= 32) { partial("depth_limit"); continue; }
+        const CFIndex remaining = CFIndex(250 - pending.size());
+        if (remaining <= 0) { partial("node_limit"); continue; }
+        const CFIndex requested = std::min(count, remaining);
+        CFArrayRef values = nullptr;
+        error = AXUIElementCopyAttributeValues(current, name, 0, requested, &values);
+        const ScopedCFValue children(values);
+        if (error != kAXErrorSuccess || !values || CFGetTypeID(values) != CFArrayGetTypeID()) {
+            partial("provider_error"); continue;
+        }
+        if (CFArrayGetCount(values) != requested) partial("provider_error");
+        if (count > requested) partial("node_limit");
+        const int depth = pending[index].depth + 1;
+        for (CFIndex child = 0; child < CFArrayGetCount(values) && pending.size() < 250; ++child) {
+            const auto value = CFArrayGetValueAtIndex(values, child);
+            if (!sameProcessElement(value, pid_t(window.processId))) { partial("provider_error"); continue; }
+            if (CFSetContainsValue(seen, value)) continue;
+            CFRetain(value); pending.push_back({ScopedCFValue(value), depth});
+        }
+    }
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility inspection canceled"};
+    return result;
+}
+
+MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(const DesktopNativeWindow& window) {
+    // Preserve the legacy error contract; only the richer observation API can
+    // represent an unavailable provider alongside a coordinate-only snapshot.
     const MaiError permission = accessPermission();
     if (permission) return permission;
-    AXUIElementRef root = accessibilityWindow(window);
-    if (!root) return {MaiErrorCode::NotFound, "window is unavailable to macOS Accessibility"};
-    std::vector<DesktopNativeElement> output;
-    std::vector<AXUIElementRef> pending{root};
-    for (std::size_t index = 0; index < pending.size() && index < 250; ++index) {
-        AXUIElementRef current = pending[index];
-        DesktopNativeElement element;
-        element.role = attribute(current, kAXRoleAttribute);
-        element.label = attribute(current, kAXTitleAttribute);
-        if (element.label.empty())
-            element.label = attribute(current, kAXDescriptionAttribute);
-        if (element.label.empty())
-            element.label = attribute(current, kAXPlaceholderValueAttribute);
-        if (!element.role.empty() && !element.label.empty() && bounds(current, element) &&
-            element.width > 0 && element.height > 0 && output.size() < 80)
-            output.push_back(std::move(element));
-        CFTypeRef children = nullptr;
-        if (AXUIElementCopyAttributeValue(current, kAXChildrenAttribute, &children) ==
-                kAXErrorSuccess && children && CFGetTypeID(children) == CFArrayGetTypeID()) {
-            const CFArrayRef array = static_cast<CFArrayRef>(children);
-            for (CFIndex child = 0; child < CFArrayGetCount(array) && pending.size() < 250;
-                 ++child) {
-                AXUIElementRef value = static_cast<AXUIElementRef>(
-                    const_cast<void*>(CFArrayGetValueAtIndex(array, child)));
-                if (CFGetTypeID(value) == AXUIElementGetTypeID()) {
-                    CFRetain(value);
-                    pending.push_back(value);
-                }
-            }
-        }
-        if (children) CFRelease(children);
-        CFRelease(current);
-    }
-    // Any retained children after the traversal cap still belong to this call.
-    for (std::size_t index = std::min<std::size_t>(pending.size(), 250);
-         index < pending.size(); ++index) CFRelease(pending[index]);
-    return output;
+    if (!validAXWindowIdentity(window))
+        return {MaiErrorCode::NotFound, "window is unavailable to macOS Accessibility"};
+    auto result = maiDesktopInspectElements(window);
+    if (!result) return result.error();
+    if (result.value().status == "unavailable")
+        return {MaiErrorCode::NotFound, "window is unavailable to macOS Accessibility"};
+    return std::move(result.value().elements);
+}
+
+MaiResult<DesktopNativeElement> maiDesktopResolveElement(
+    const DesktopNativeWindow& window, const DesktopNativeElement& observed,
+    const std::function<bool()>& isCanceled) {
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility resolution canceled"};
+    const MaiError permission = accessPermission();
+    if (permission) return permission;
+    const auto reference = std::dynamic_pointer_cast<const MacAXElementReference>(observed.reference);
+    if (!validAXWindowIdentity(window) || !reference || reference->windowId != window.id ||
+        reference->processId != window.processId || reference->nativeId != observed.nativeId)
+        return {MaiErrorCode::NotFound, "the observed accessibility reference is no longer available"};
+    const ScopedCFValue selected(accessibilityWindow(window, isCanceled, true));
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility resolution canceled"};
+    const bool belongs = selected && CFEqual(selected.get(), reference->window) &&
+        axElementBelongsToWindow(reference->element, reference->window, pid_t(window.processId), isCanceled);
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility resolution canceled"};
+    if (!belongs)
+        return {MaiErrorCode::NotFound, "the observed accessibility object left its selected window"};
+    DesktopNativeElement result;
+    if (!readAXElement(reference->element, reference->window, window, result))
+        return {MaiErrorCode::NotFound, "the observed accessibility object is no longer readable"};
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility resolution canceled"};
+    // Core compares these fresh fields and invalidates the snapshot if changed;
+    // the adapter does not invent a second layout/label tolerance policy.
+    result.nativeId = reference->nativeId; result.reference = reference;
+    return result;
+}
+
+MaiError maiDesktopSetWindowState(const DesktopNativeWindow& window, DesktopWindowStateAction action,
+                                   const std::function<bool()>& isCanceled) {
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native window state request canceled before dispatch"};
+    if (!validAXWindowIdentity(window)) return {MaiErrorCode::InvalidInput, "a valid observed window is required"};
+    if (action != DesktopWindowStateAction::Minimize && action != DesktopWindowStateAction::Restore)
+        return {MaiErrorCode::InvalidInput, "a valid minimized window state is required"};
+    const MaiError permission = accessPermission();
+    if (permission) return permission;
+    if (!interactiveDesktopIsAvailable()) return {MaiErrorCode::NotSupported, "interactive macOS desktop is unavailable"};
+    const ScopedCFValue selected(accessibilityWindow(window, isCanceled, true));
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native window state request canceled before dispatch"};
+    if (!selected) return {MaiErrorCode::NotFound, "selected window cannot be uniquely resolved"};
+    const auto target = static_cast<AXUIElementRef>(selected.get());
+    Boolean settable = false;
+    if (AXUIElementIsAttributeSettable(target, kAXMinimizedAttribute, &settable) != kAXErrorSuccess || !settable)
+        return {MaiErrorCode::NotSupported, "the selected window does not support changing its minimized state"};
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native window state request canceled before dispatch"};
+    const AXError error = AXUIElementSetAttributeValue(target, kAXMinimizedAttribute,
+        action == DesktopWindowStateAction::Minimize ? kCFBooleanTrue : kCFBooleanFalse);
+    if (error != kAXErrorSuccess) return {MaiErrorCode::Busy, "macOS rejected the selected window state request"};
+    // A dispatched OS request is not rolled back by cancellation. Core performs
+    // its ordinary window readback rather than claiming synchronous completion.
+    if (isCanceled && isCanceled())
+        return {MaiErrorCode::Canceled, "native window state request was dispatched before cancellation; observe again"};
+    return {};
 }
 
 MaiError maiDesktopActivateWindow(const DesktopNativeWindow& window) {

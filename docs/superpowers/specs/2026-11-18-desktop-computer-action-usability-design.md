@@ -30,6 +30,11 @@ the caller to observe again. Native requests use normal OS APIs, bounded state
 verification and cancellation. Cloaked windows are reported, not moved across
 virtual desktops. Failed or denied focus is reported honestly.
 
+Cancellation before the OS request makes no state request. After an OS request
+has been queued, cancellation cannot undo a change the OS may already apply;
+the receipt must retain window-operation-attempted and require observation
+rather than reporting NotStarted or promising rollback.
+
 Window observations retain their existing normalized element bounds and add
 an opaque `element_id` for a native element with a re-resolvable identity.
 IDs are unique to the observation, rather than reusable e1/e2 indices. Only

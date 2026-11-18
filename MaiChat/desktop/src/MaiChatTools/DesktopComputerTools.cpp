@@ -47,19 +47,33 @@ struct ObservedWindow {
     std::uint64_t inputGeneration = 0;
     std::string token;
     std::string turnId;
+    std::optional<DesktopNativeWindow> elementWindow;
+    std::uint64_t elementWindowId = 0;
+    std::map<std::string, DesktopNativeElement> elements;
     std::atomic<bool> invalidated{false};
     std::chrono::steady_clock::time_point observedAt;
     std::mutex mutex;
 };
+
+bool windowIdentityMatches(const DesktopNativeWindow& before, const DesktopNativeWindow& now) {
+    return before.id == now.id && before.processId == now.processId && before.title == now.title &&
+           before.application == now.application && before.ownerId == now.ownerId && before.className == now.className;
+}
 
 bool currentWindowMatches(const DesktopNativeWindow& before, const DesktopNativeWindow& now) {
     // Discovery includes windows that cannot issue or retain an actionable
     // observation. Recheck this state after capture and before using old tokens.
     return !before.minimized && !before.cloaked && before.boundsAvailable &&
            !now.minimized && !now.cloaked && now.boundsAvailable &&
-           before.id == now.id && before.processId == now.processId && before.title == now.title &&
+           windowIdentityMatches(before, now) &&
            std::abs(before.x - now.x) < 3 && std::abs(before.y - now.y) < 3 && std::abs(before.width - now.width) < 3 &&
            std::abs(before.height - now.height) < 3;
+}
+
+bool observationWindowMatches(const DesktopNativeWindow& before, const DesktopNativeWindow& now) {
+    if (before.minimized != now.minimized || before.cloaked != now.cloaked ||
+        before.boundsAvailable != now.boundsAvailable || !windowIdentityMatches(before, now)) return false;
+    return (before.minimized || before.cloaked) ? true : currentWindowMatches(before, now);
 }
 
 bool ratio(double value) {
@@ -81,6 +95,14 @@ Json displayJson(const DesktopNativeDisplay& display) {
     return {{"display_id", std::to_string(display.id)},
             {"primary", display.primary},
             {"bounds", {{"x", display.x}, {"y", display.y}, {"width", display.width}, {"height", display.height}}}};
+}
+
+const char* nativeScreenUnit() {
+#if defined(Q_OS_WIN)
+    return "screen_physical_pixels";
+#else
+    return "screen_points";
+#endif
 }
 
 MaiToolResult failure(const MaiError& error) {
@@ -135,6 +157,19 @@ public:
     }
     MaiResult<std::vector<DesktopNativeElement>> elements(const DesktopNativeWindow& window) override {
         return maiDesktopElements(window);
+    }
+    MaiResult<DesktopNativeAccessibilitySnapshot> inspectElements(
+        const DesktopNativeWindow& window, const std::function<bool()>& isCanceled) override {
+        return maiDesktopInspectElements(window, isCanceled);
+    }
+    MaiResult<DesktopNativeElement> resolveElement(
+        const DesktopNativeWindow& window, const DesktopNativeElement& observedElement,
+        const std::function<bool()>& isCanceled) override {
+        return maiDesktopResolveElement(window, observedElement, isCanceled);
+    }
+    MaiError setWindowState(const DesktopNativeWindow& window, DesktopWindowStateAction action,
+                             const std::function<bool()>& isCanceled) override {
+        return maiDesktopSetWindowState(window, action, isCanceled);
     }
     MaiError capture(const DesktopNativeWindow& window, MaiScreenshot& output) override {
         MaiScreenshotRequest request;
@@ -213,15 +248,16 @@ bool desktopLauncherKey(const DesktopKeyChord& chord) {
 #endif
 }
 
-MaiResult<std::uint64_t> windowIdFrom(const Json& value) {
-    if (!value.is_string()) return {MaiErrorCode::InvalidInput, "window_id must be a decimal string"};
+MaiResult<std::uint64_t> windowIdFrom(const Json& value, const std::string& field = "window_id") {
+    if (!value.is_string()) return {MaiErrorCode::InvalidInput, field + " must be a decimal string"};
     const std::string id = value.get<std::string>();
     if (id.empty() || id.size() > 20 || !std::all_of(id.begin(), id.end(), [](char c) { return c >= '0' && c <= '9'; }))
-        return {MaiErrorCode::InvalidInput, "invalid window ID"};
+        return {MaiErrorCode::InvalidInput, field + " must be a nonzero decimal ID string"};
     errno = 0;
     char* end = nullptr;
     const auto parsed = std::strtoull(id.c_str(), &end, 10);
-    if (errno == ERANGE || !end || *end || !parsed) return {MaiErrorCode::InvalidInput, "invalid window ID"};
+    if (errno == ERANGE || !end || *end || !parsed)
+        return {MaiErrorCode::InvalidInput, field + " must be a nonzero decimal ID string within uint64 range"};
     return std::uint64_t(parsed);
 }
 
@@ -236,7 +272,59 @@ Json windowJson(const DesktopNativeWindow& window) {
             {"tool_window", window.toolWindow},
             {"owner_window_id", std::to_string(window.ownerId)},
             {"class_name", window.className},
+            {"native_screen_bounds_unit", nativeScreenUnit()},
             {"bounds", {{"x", window.x}, {"y", window.y}, {"width", window.width}, {"height", window.height}}}};
+}
+
+bool validElementBounds(const DesktopNativeElement& element) {
+    return std::isfinite(element.x) && std::isfinite(element.y) && std::isfinite(element.width) &&
+           std::isfinite(element.height) && element.width > 0 && element.height > 0 &&
+           std::isfinite(element.x + element.width) && std::isfinite(element.y + element.height);
+}
+
+bool elementMatches(const DesktopNativeElement& before, const DesktopNativeElement& now) {
+    return before.nativeId == now.nativeId && before.role == now.role && before.label == now.label &&
+           before.automationId == now.automationId && before.enabled == now.enabled && before.offscreen == now.offscreen &&
+           now.enabled && !now.offscreen && validElementBounds(now) && before.x == now.x && before.y == now.y &&
+           before.width == now.width && before.height == now.height;
+}
+
+void unavailableAccessibility(Json& output, const std::string& reason, const std::string& detail = {}) {
+    output["elements"] = Json::array();
+    output["accessibility"] = {{"provider", "backend"}, {"status", "unavailable"}, {"visited_nodes", 0},
+                               {"returned_elements", 0}, {"counts_known", false}, {"truncated", false},
+                               {"limit_reason", reason}};
+    if (!detail.empty()) output["element_error"] = detail;
+}
+
+void publishElements(Json& output, ObservedWindow& state, const DesktopNativeAccessibilitySnapshot& snapshot,
+                     double x, double y, double width, double height) {
+    Json items = Json::array();
+    for (const auto& item : snapshot.elements) {
+        if (!validElementBounds(item)) continue;
+        const double centerX = (item.x + item.width / 2 - x) / width;
+        const double centerY = (item.y + item.height / 2 - y) / height;
+        if (!ratio(centerX) || !ratio(centerY)) continue;
+        const QString label = QString::fromUtf8(item.label.c_str(), int(item.label.size())).left(160);
+        Json element{{"role", item.role}, {"label", label.toUtf8().toStdString()},
+                     {"enabled", item.enabled}, {"offscreen", item.offscreen},
+                     {"center_x_ratio", centerX}, {"center_y_ratio", centerY},
+                     {"bounds", {{"x_ratio", (item.x - x) / width}, {"y_ratio", (item.y - y) / height},
+                                  {"width_ratio", item.width / width}, {"height_ratio", item.height / height}}}};
+        if (!item.automationId.empty()) element["automation_id"] = item.automationId;
+        if (!item.nativeId.empty() || item.reference) {
+            const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+            state.elements.emplace(id, item);
+            element["element_id"] = id;
+        }
+        items.push_back(std::move(element));
+    }
+    output["elements"] = std::move(items);
+    output["accessibility"] = {{"provider", snapshot.provider}, {"status", snapshot.status},
+                               {"visited_nodes", snapshot.visitedNodes}, {"returned_elements", output["elements"].size()},
+                               {"provider_elements", snapshot.elements.size()},
+                               {"counts_known", snapshot.countsKnown}, {"truncated", snapshot.truncated},
+                               {"limit_reason", snapshot.limitReason}};
 }
 
 Json inputStateJson(const DesktopNativeInputState& state) {
@@ -369,12 +457,23 @@ struct DesktopComputerController::Impl {
         const auto found = sessions.find(sessionId);
         return found == sessions.end() ? nullptr : found->second;
     }
-    void invalidate(const std::string& session, const std::string& turn) {
-        const auto selected = get(session);
-        // Never wait for a worker's state lock on the GUI thread. Platform
-        // layout/activation may await that same GUI; revocation is atomic.
-        if (selected && (turn.empty() || selected->turnId.empty() || selected->turnId == turn))
+    void invalidate(const std::string& session, const std::string& turn, bool allowLegacy = false) {
+        std::shared_ptr<ObservedWindow> revoked;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto found = sessions.find(session);
+            if (found == sessions.end()) return;
+            const auto& selected = found->second;
+            if (!turn.empty() && selected->turnId != turn && !(allowLegacy && selected->turnId.empty())) return;
+            // Never wait for a worker's state mutex: platform work may await
+            // this GUI thread. Its local shared_ptr keeps state alive while
+            // atomic revocation cancels it; a completed turn leaves no cache.
             selected->invalidated.store(true);
+            revoked = std::move(found->second);
+            sessions.erase(found);
+        }
+        // Native AX/provider reference destruction may perform platform work.
+        // Drop the cache's ownership only after releasing the sessions mutex.
     }
 };
 
@@ -407,12 +506,13 @@ MaiResult<DesktopInputFeedbackBatch> DesktopComputerController::feedback(const s
 }
 
 MaiError DesktopComputerController::releaseInput(const std::string& sessionId, const std::string& expectedTurn) {
+    // Revocation is independent of a native input session or held controls and
+    // precedes native cleanup so an in-flight operation sees Stop immediately.
+    // A late completion from an older turn cannot revoke its replacement.
+    impl_->invalidate(sessionId, expectedTurn);
     bool released = false;
     const auto result = impl_->inputOwnership->release(sessionId, expectedTurn, &released);
-    // Release is callable without a valid snapshot. Only invalidate an observed
-    // token when cleanup concerns the current task; a late old-turn event must
-    // not disturb a replacement task's input state or token.
-    if (released) impl_->invalidate(sessionId, expectedTurn);
+    if (released) impl_->invalidate(sessionId, expectedTurn, true);
     return result;
 }
 
@@ -427,6 +527,45 @@ MaiError DesktopComputerController::resetInput(const std::string& sessionId, con
 
 MaiResult<std::vector<DesktopNativeDisplay>> DesktopComputerBackend::displays() {
     return {MaiErrorCode::NotSupported, "display observation is unavailable in this backend"};
+}
+
+MaiResult<DesktopNativeAccessibilitySnapshot> DesktopComputerBackend::inspectElements(
+    const DesktopNativeWindow& window, const std::function<bool()>& isCanceled) {
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "element inspection canceled"};
+    const auto found = elements(window);
+    if (!found) return found.error();
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "element inspection canceled"};
+    DesktopNativeAccessibilitySnapshot result;
+    result.elements = found.value();
+    return result;  // Legacy providers do not know traversal coverage counts.
+}
+
+MaiResult<DesktopNativeElement> DesktopComputerBackend::resolveElement(
+    const DesktopNativeWindow& window, const DesktopNativeElement& observedElement,
+    const std::function<bool()>& isCanceled) {
+    if (observedElement.nativeId.empty())
+        return {MaiErrorCode::NotSupported, "element has no re-resolvable native identity; observe again"};
+    const auto fresh = inspectElements(window, isCanceled);
+    if (!fresh) return fresh.error();
+    // A single match in a partial traversal does not prove uniqueness. Native
+    // providers and the legacy fallback must agree before deriving a click.
+    if (fresh.value().status != "available" || fresh.value().truncated)
+        return {MaiErrorCode::Busy, "element inspection is incomplete; observe again before selecting a control"};
+    DesktopNativeElement selected;
+    std::size_t count = 0;
+    for (const auto& item : fresh.value().elements) {
+        if (item.nativeId != observedElement.nativeId) continue;
+        selected = item;
+        ++count;
+    }
+    if (count != 1) return {MaiErrorCode::InvalidInput, "observed element is missing or ambiguous; observe again"};
+    return selected;
+}
+
+MaiError DesktopComputerBackend::setWindowState(const DesktopNativeWindow&, DesktopWindowStateAction,
+                                                const std::function<bool()>& isCanceled) {
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "window state operation canceled"};
+    return {MaiErrorCode::NotSupported, "window state operations are unavailable in this backend"};
 }
 
 MaiError DesktopComputerBackend::captureDisplay(const DesktopNativeDisplay&, MaiScreenshot& output) {
@@ -452,7 +591,7 @@ MaiResult<std::vector<DesktopNativeDisplay>> DesktopComputerController::displays
 MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
     const std::string& sessionId, const std::string& workspace, std::uint64_t displayId,
     std::function<bool()> isCanceled, std::uint64_t afterFrameSequence, std::int64_t afterFrameReceivedAtMs, int waitMs,
-    const std::string& turnId) {
+    const std::string& turnId, std::uint64_t elementWindowId) {
     impl_->inputOwnership->touch(sessionId, turnId);
     const auto canceled = [&] { return isCanceled && isCanceled(); };
     const auto cleanupOnCancel = qScopeGuard([&] {
@@ -547,6 +686,7 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
     state->inputGeneration = inputGeneration;
     state->token = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
     state->turnId = turnId;
+    state->elementWindowId = elementWindowId;
     state->observedAt = std::chrono::steady_clock::now();
     Json output = displayJson(selected);
     output["target"] = "display";
@@ -559,6 +699,50 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
     output["frame_sequence"] = screenshot.frameSequence;
     output["frame_received_at_ms"] = screenshot.frameReceivedAtMs;
     output["coordinate_space"] = "relative fractions 0..1 within the captured display";
+    output["native_screen_bounds_unit"] = nativeScreenUnit();
+    if (elementWindowId) {
+        output["element_window_id"] = std::to_string(elementWindowId);
+        const auto sources = impl_->backend->windows();
+        std::size_t matches = 0;
+        DesktopNativeWindow source;
+        if (sources) {
+            for (const auto& window : sources.value()) {
+                if (window.id != elementWindowId) continue;
+                source = window;
+                ++matches;
+            }
+        }
+        if (!sources || matches != 1) {
+            unavailableAccessibility(output, "source_missing", sources ? "selected element source is missing or ambiguous"
+                                                                         : sources.error().message());
+        } else {
+            state->elementWindow = source;
+            output["element_window"] = windowJson(source);
+            const bool intersects = source.x < selected.x + selected.width && source.x + source.width > selected.x &&
+                                    source.y < selected.y + selected.height && source.y + source.height > selected.y;
+            if (!currentWindowMatches(source, source) || !intersects) {
+                unavailableAccessibility(output, "source_outside_input_bounds");
+            } else {
+                const auto elements = impl_->backend->inspectElements(source, isCanceled);
+                if (!elements)
+                    unavailableAccessibility(output, "provider_error", elements.error().message());
+                else {
+                    const auto currentSources = impl_->backend->windows();
+                    if (!currentSources || std::count_if(currentSources.value().begin(), currentSources.value().end(),
+                        [&](const auto& now) { return currentWindowMatches(source, now); }) != 1)
+                        unavailableAccessibility(output, "source_changed");
+                    else
+                        publishElements(output, *state, elements.value(), selected.x, selected.y, selected.width,
+                                        selected.height);
+                }
+            }
+        }
+    }
+    if (canceled() || desktopInputGeneration.load() != inputGeneration) {
+        MaiFileSystem::removeFile(MaiFilePath::fromUtf8(destination));
+        return {canceled() ? MaiErrorCode::Canceled : MaiErrorCode::Busy,
+                "desktop observation changed during element inspection; observe again"};
+    }
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->sessions[sessionId] = state;
@@ -595,10 +779,11 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(
     if (count != 1)
         return {MaiErrorCode::NotFound, count == 0 ? "exact visible window title was not found"
                                                    : "window title is ambiguous; select a unique title"};
-    if (selected.minimized || selected.cloaked)
-        return {MaiErrorCode::Busy, "selected window is minimized or cloaked and cannot currently be observed"};
-    if (!selected.boundsAvailable || !std::isfinite(selected.width) || !std::isfinite(selected.height) || selected.width <= 0 ||
-        selected.height <= 0)
+    const bool metadataOnly = selected.minimized || selected.cloaked;
+    if (metadataOnly && includeImage)
+        return {MaiErrorCode::Busy, "minimized or cloaked windows support metadata observation only; no screenshot is available"};
+    if (!metadataOnly && (!selected.boundsAvailable || !std::isfinite(selected.width) ||
+        !std::isfinite(selected.height) || selected.width <= 0 || selected.height <= 0))
         return {MaiErrorCode::InvalidInput, "selected window has invalid bounds"};
 
     MaiScreenshot capture;
@@ -632,7 +817,7 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(
     const auto afterCapture = impl_->backend->windows();
     if (!afterCapture) return afterCapture.error();
     if (std::none_of(afterCapture.value().begin(), afterCapture.value().end(),
-                     [&](const DesktopNativeWindow& now) { return currentWindowMatches(selected, now); }))
+                     [&](const DesktopNativeWindow& now) { return observationWindowMatches(selected, now); }))
         return {MaiErrorCode::InvalidInput, "selected window changed while observing; observe again"};
     std::string imagePath;
     if (includeImage) {
@@ -661,6 +846,9 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(
         {"title", selected.title},
         {"application", selected.application},
         {"process_id", selected.processId},
+        {"minimized", selected.minimized},
+        {"cloaked", selected.cloaked},
+        {"bounds_available", selected.boundsAvailable},
         {"bounds", {{"x", selected.x}, {"y", selected.y}, {"width", selected.width}, {"height", selected.height}}},
         {"image_width", capture.width},
         {"image_height", capture.height},
@@ -670,34 +858,26 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(
         output["image_path"] = relativeImagePath;
         output["mime_type"] = "image/png";
     }
+    auto state = std::make_shared<ObservedWindow>();
+    state->window = selected;
+    output["native_screen_bounds_unit"] = nativeScreenUnit();
     if (includeElements) {
-        const auto elements = impl_->backend->elements(selected);
-        if (elements) {
-            Json items = Json::array();
-            for (const auto& item : elements.value()) {
-                const double centerX = (item.x + item.width / 2 - selected.x) / selected.width;
-                const double centerY = (item.y + item.height / 2 - selected.y) / selected.height;
-                if (!ratio(centerX) || !ratio(centerY)) continue;
-                const QString label = QString::fromUtf8(item.label.c_str(), int(item.label.size())).left(160);
-                items.push_back({{"role", item.role},
-                                 {"label", label.toUtf8().toStdString()},
-                                 {"center_x_ratio", centerX},
-                                 {"center_y_ratio", centerY},
-                                 {"bounds",
-                                  {{"x_ratio", (item.x - selected.x) / selected.width},
-                                   {"y_ratio", (item.y - selected.y) / selected.height},
-                                   {"width_ratio", item.width / selected.width},
-                                   {"height_ratio", item.height / selected.height}}}});
-            }
-            output["elements"] = items;
-        } else {
-            output["elements"] = Json::array();
-            output["element_error"] = elements.error().message();
+        if (metadataOnly)
+            unavailableAccessibility(output, "window_has_no_input_geometry");
+        else {
+            state->elementWindow = selected;
+            const auto elements = impl_->backend->inspectElements(selected, isCanceled);
+            if (elements)
+                publishElements(output, *state, elements.value(), selected.x, selected.y, selected.width, selected.height);
+            else
+                unavailableAccessibility(output, "provider_error", elements.error().message());
+            const auto current = impl_->backend->windows();
+            if (!current || std::count_if(current.value().begin(), current.value().end(),
+                [&](const auto& now) { return currentWindowMatches(selected, now); }) != 1)
+                return {MaiErrorCode::InvalidInput, "selected window changed during element inspection; observe again"};
         }
     }
     if (canceled()) return {MaiErrorCode::Canceled, "computer observation canceled"};
-    auto state = std::make_shared<ObservedWindow>();
-    state->window = selected;
     state->token = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
     state->turnId = turnId;
     state->observedAt = std::chrono::steady_clock::now();
@@ -727,7 +907,9 @@ MaiError DesktopComputerController::act(const std::string& sessionId, const std:
 }
 
 MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const std::string& sessionId,
-                                                                          const DesktopComputerAction& request) {
+                                                                          const DesktopComputerAction& request,
+                                                                          DesktopComputerActionProgress* progress) {
+    if (progress) *progress = {};
     // Keep validation and failure cleanup in the same serialized operation.
     // A reset cannot slip between unlocking input and an older failure guard.
     std::unique_lock<std::mutex> desktopLock(desktopOperationMutex, std::try_to_lock);
@@ -738,13 +920,16 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         auto error = maiDesktopValidateInputEvents(request.events);
         if (!error) error = maiDesktopValidateInputOptions(request.inputOptions);
         if (error) {
-            if (!request.dryRun) releaseInput(sessionId, request.turnId);
+            if (!request.dryRun) {
+                releaseInput(sessionId, request.turnId);
+                if (progress) progress->needsObservation = true;
+            }
             return error;
         }
         if (maiDesktopInputEventsOnlyRelease(request.events)) {
             // Owned cleanup is independent of screenshots, focus and canceled
             // tasks. A previous turn cannot release a replacement turn's lease.
-            if (request.isCanceled && request.isCanceled()) releaseInput(sessionId, request.turnId);
+            if (!request.dryRun && request.isCanceled && request.isCanceled()) releaseInput(sessionId, request.turnId);
 
             const auto native = impl_->inputOwnership->prepare(sessionId, request, false, true);
             if (!native) return native.error();
@@ -753,8 +938,9 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
             receipt.dryRun = request.dryRun;
             if (!request.dryRun && native.value()) {
                 DesktopInputBatch batch;
+                if (progress) { progress->inputDispatchAttempted = true; progress->needsObservation = true; }
                 const auto sent = native.value()->inputEvents(request.events, {}, {}, request.inputOptions);
-                impl_->invalidate(sessionId, request.turnId);
+                impl_->invalidate(sessionId, request.turnId, true);
                 if (sent) return inputDispatchFailure(sent);
                 receipt.dispatched = true;
                 receipt.acceptedEvents = request.events.size();
@@ -767,7 +953,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         if (action == "mouse_up" && (int(request.button) < int(DesktopMouseButton::Left) ||
                                      int(request.button) > int(DesktopMouseButton::Forward)))
             return {MaiErrorCode::InvalidInput, "invalid mouse button"};
-        if (request.isCanceled && request.isCanceled()) releaseInput(sessionId, request.turnId);
+        if (!request.dryRun && request.isCanceled && request.isCanceled()) releaseInput(sessionId, request.turnId);
         if (action == "key_up") {
             const auto parsed = maiDesktopParseKey(request.key);
             if (!parsed) return parsed.error();
@@ -788,8 +974,9 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
             input.button = request.button;
             input.key = request.key;
             DesktopInputBatch batch;
+            if (progress) { progress->inputDispatchAttempted = true; progress->needsObservation = true; }
             const auto result = native.value()->input(input);
-            impl_->invalidate(sessionId, request.turnId);
+            impl_->invalidate(sessionId, request.turnId, true);
             if (result) return inputDispatchFailure(result);
             receipt.dispatched = true;
         }
@@ -798,7 +985,19 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     }
     bool completed = false;
     const auto cleanupOnFailure = qScopeGuard([&] {
-        if (!completed && !request.dryRun) releaseInput(sessionId, request.turnId);
+        if (completed || request.dryRun) return;
+        if (request.isCanceled && request.isCanceled())
+            releaseInput(sessionId, request.turnId);
+        else {
+            // Ordinary syntax/stale-call rejection only retires an owned native
+            // lease. It must not revoke a newer observation after a replay.
+            bool released = false;
+            impl_->inputOwnership->release(sessionId, request.turnId, &released);
+            if (released) impl_->invalidate(sessionId, request.turnId, true);
+        }
+        const auto selected = impl_->get(sessionId);
+        if (progress && (!selected || selected->invalidated.load() || selected->token.empty()))
+            progress->needsObservation = true;
     });
     const auto success = [&](DesktopComputerActionResult receipt) -> MaiResult<DesktopComputerActionResult> {
         receipt.inputState = inputState(sessionId);
@@ -807,6 +1006,12 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     };
     const bool positioned = action == "click" || action == "double_click" || action == "right_click" ||
                             action == "drag" || action == "scroll" || action == "move" || action == "mouse_down";
+    const bool windowState = action == "minimize" || action == "restore";
+    const bool elementClick = action == "click" || action == "double_click" || action == "right_click";
+    if (!request.elementId.empty() && !elementClick)
+        return {MaiErrorCode::InvalidInput, "element_id is supported only for click, double_click and right_click"};
+    if (windowState && request.desktopScope)
+        return {MaiErrorCode::InvalidInput, "window state operations require target=window"};
     const bool writesText = action == "type" || action == "replace_text";
     const bool batchText =
         eventBatch && std::any_of(request.events.begin(), request.events.end(),
@@ -817,10 +1022,10 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     if (action == "scroll" && request.scrollAxis != DesktopScrollAxis::Vertical &&
         request.scrollAxis != DesktopScrollAxis::Horizontal)
         return {MaiErrorCode::InvalidInput, "invalid scroll axis"};
-    if (action != "focus" && !eventBatch && !positioned && !writesText && action != "key" && action != "key_down" &&
+    if (action != "focus" && !windowState && !eventBatch && !positioned && !writesText && action != "key" && action != "key_down" &&
         action != "verify")
         return {MaiErrorCode::InvalidInput, "unknown computer action"};
-    if (positioned && (!ratio(request.xRatio) || !ratio(request.yRatio)))
+    if (positioned && request.elementId.empty() && (!ratio(request.xRatio) || !ratio(request.yRatio)))
         return {MaiErrorCode::InvalidInput, "window coordinates must be fractions from 0 to 1"};
     if (action == "drag" && (!ratio(request.toXRatio) || !ratio(request.toYRatio) || request.durationMs < 1 ||
                              request.durationMs > (request.desktopScope ? 5000 : 200)))
@@ -884,8 +1089,56 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     const auto inputCanceled = [&request, state] {
         return state->invalidated.load() || (request.isCanceled && request.isCanceled());
     };
-    const auto allowed = impl_->inputOwnership->prepare(sessionId, request, false);
-    if (!allowed) return allowed.error();
+    const auto evidenceFailure = [&](const std::string& message) -> MaiError {
+        if (!request.dryRun) {
+            state->invalidated.store(true);
+            if (progress) progress->needsObservation = true;
+        }
+        return {MaiErrorCode::InvalidInput, message};
+    };
+    if (!request.dryRun) {
+        const auto allowed = impl_->inputOwnership->prepare(sessionId, request, false);
+        if (!allowed) return allowed.error();
+    }
+    std::optional<std::pair<double, double>> elementPoint;
+    const auto resolveElementPoint = [&]() -> MaiError {
+        if (request.elementId.empty()) return {};
+        const auto found = state->elements.find(request.elementId);
+        if (found == state->elements.end() || !state->elementWindow)
+            return {MaiErrorCode::InvalidInput, "element_id does not belong to this Session snapshot; observe again"};
+        bool resolved = false;
+        const auto revokeChangedEvidence = qScopeGuard([&] {
+            if (!resolved && !request.dryRun) {
+                state->invalidated.store(true);
+                if (progress) progress->needsObservation = true;
+            }
+        });
+        const auto& observed = found->second;
+        if (!observed.enabled || observed.offscreen)
+            return {MaiErrorCode::InvalidInput, "observed element is disabled or offscreen; observe again"};
+        const auto sources = impl_->backend->windows();
+        if (!sources) return sources.error();
+        if (std::count_if(sources.value().begin(), sources.value().end(),
+            [&](const auto& now) { return currentWindowMatches(*state->elementWindow, now); }) != 1)
+            return {MaiErrorCode::InvalidInput, "element source window changed; observe again"};
+        const auto fresh = impl_->backend->resolveElement(*state->elementWindow, observed, inputCanceled);
+        if (!fresh) return fresh.error();
+        if (!elementMatches(observed, fresh.value()))
+            return {MaiErrorCode::InvalidInput, "observed element changed, is disabled or is offscreen; observe again"};
+        const auto after = impl_->backend->windows();
+        if (!after || std::count_if(after.value().begin(), after.value().end(),
+            [&](const auto& now) { return currentWindowMatches(*state->elementWindow, now); }) != 1)
+            return {MaiErrorCode::InvalidInput, "element source window changed while resolving; observe again"};
+        const auto& target = state->desktopScope ? state->display : DesktopNativeDisplay{
+            state->window.id, state->window.x, state->window.y, state->window.width, state->window.height};
+        const double x = fresh.value().x + fresh.value().width / 2;
+        const double y = fresh.value().y + fresh.value().height / 2;
+        if (x < target.x || y < target.y || x >= target.x + target.width || y >= target.y + target.height)
+            return {MaiErrorCode::InvalidInput, "element center is outside the selected input bounds; observe again"};
+        elementPoint = {x, y};
+        resolved = true;
+        return {};
+    };
     if (writesText || batchText) {
         for (const auto& key : inputState(sessionId).keysDown) {
             const auto parsed = maiDesktopParseKey(key);
@@ -897,17 +1150,19 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     }
     if (state->desktopScope) {
         if (state->inputGeneration != desktopInputGeneration.load())
-            return {MaiErrorCode::InvalidInput, "desktop input changed since this snapshot; observe again"};
+            return evidenceFailure("desktop input changed since this snapshot; observe again");
         if (request.workspace.empty() ||
             MaiFileSystem::resolve(MaiFilePath::fromUtf8(request.workspace)).toUtf8() != state->workspace)
-            return {MaiErrorCode::InvalidInput, "workspace changed; observe this display again"};
+            return evidenceFailure("workspace changed; observe this display again");
         if (request.windowId != 0 || action == "focus" || action == "verify")
             return {MaiErrorCode::InvalidInput, "desktop actions use a display and visual observation"};
         const auto current = impl_->backend->displays();
         if (!current) return current.error();
         if (std::count_if(current.value().begin(), current.value().end(),
                           [&](const auto& display) { return displayMatches(state->display, display); }) != 1)
-            return {MaiErrorCode::InvalidInput, "display geometry changed; observe again"};
+            return evidenceFailure("display geometry changed; observe again");
+        const auto resolved = resolveElementPoint();
+        if (resolved) return resolved;
         DesktopComputerActionResult receipt;
         if (request.dryRun) {
             receipt.state = "validated";
@@ -932,6 +1187,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         input.isCanceled = inputCanceled;
         input.x = state->display.x + request.xRatio * (std::max)(1.0, state->display.width - 1);
         input.y = state->display.y + request.yRatio * (std::max)(1.0, state->display.height - 1);
+        if (elementPoint) { input.x = elementPoint->first; input.y = elementPoint->second; }
         input.toX = state->display.x + request.toXRatio * (std::max)(1.0, state->display.width - 1);
         input.toY = state->display.y + request.toYRatio * (std::max)(1.0, state->display.height - 1);
         input.kind = action == "move"           ? DesktopNativeInputKind::Move
@@ -951,6 +1207,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         if (!created) return created.error();
         const auto native = created.value();
         state->token.clear();
+        if (progress) { progress->inputDispatchAttempted = true; progress->needsObservation = true; }
         DesktopInputBatch inputBatch;
         const MaiError sent =
             eventBatch ? native->inputEvents(request.events, input,
@@ -965,7 +1222,8 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         if (eventBatch) receipt.acceptedEvents = request.events.size();
         receipt.inputState = inputState(sessionId);
         const auto next = observeDisplay(sessionId, state->workspace, state->display.id, request.isCanceled,
-                                         state->frameSequence, MaiTime::getCurrentTime(), 0, request.turnId);
+                                         state->frameSequence, MaiTime::getCurrentTime(), 0, request.turnId,
+                                         state->elementWindowId);
         if (next)
             receipt.observation = next.value();
         else {
@@ -978,19 +1236,56 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     const auto listed = impl_->backend->windows();
     if (!listed) return listed.error();
     bool stillVisible = false;
+    DesktopNativeWindow currentWindow;
     for (const auto& window : listed.value()) {
         if (window.id == request.windowId) {
-            stillVisible = currentWindowMatches(state->window, window);
+            stillVisible = windowState ? observationWindowMatches(state->window, window)
+                                      : currentWindowMatches(state->window, window);
+            currentWindow = window;
             break;
         }
     }
-    if (!stillVisible) return {MaiErrorCode::InvalidInput, "selected window changed; observe again"};
+    if (!stillVisible) return evidenceFailure("selected window changed; observe again");
+    if (windowState && currentWindow.cloaked)
+        return {MaiErrorCode::NotSupported, "cloaked windows cannot change state across virtual desktops"};
+    const auto resolved = resolveElementPoint();
+    if (resolved) return resolved;
     if (canceled()) return {MaiErrorCode::Canceled, "computer operation canceled"};
     DesktopComputerActionResult receipt;
     if (request.dryRun) {
         receipt.state = "validated";
         receipt.dryRun = true;
         return success(std::move(receipt));  // No activation, input, focused text read or token consumption.
+    }
+    if (windowState) {
+        // Retire this owner's holds without revoking the authorization that the
+        // setter is about to consume. External Stop still uses atomic revoke.
+        const auto released = impl_->inputOwnership->release(sessionId, request.turnId);
+        if (released) return released;
+        if (inputCanceled()) return {MaiErrorCode::Canceled, "window state operation canceled"};
+        state->token.clear();
+        if (progress) { progress->windowOperationAttempted = true; progress->needsObservation = true; }
+        DesktopInputBatch batch;
+        const auto changed = impl_->backend->setWindowState(currentWindow, action == "minimize" ?
+            DesktopWindowStateAction::Minimize : DesktopWindowStateAction::Restore, inputCanceled);
+        if (changed) return changed;
+        const auto after = impl_->backend->windows();
+        if (!after) return after.error();
+        std::size_t count = 0;
+        for (const auto& window : after.value()) {
+            if (!windowIdentityMatches(currentWindow, window)) continue;
+            receipt.afterWindow = window;
+            ++count;
+        }
+        if (count != 1 || receipt.afterWindow->cloaked || receipt.afterWindow->minimized != (action == "minimize"))
+            return {MaiErrorCode::Busy, "window state request was not verified; observe again"};
+        if (inputCanceled()) return {MaiErrorCode::Canceled, "window state operation canceled after request"};
+        receipt.beforeWindow = currentWindow;
+        const auto focus = impl_->backend->isFocused(*receipt.afterWindow);
+        if (focus) receipt.focused = focus.value();
+        receipt.state = action == "minimize" ? "minimized" : "restored";
+        receipt.dispatched = true;
+        return success(std::move(receipt));
     }
     if (action == "verify") {
         const auto focused = impl_->backend->isFocused(state->window);
@@ -1015,6 +1310,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     // Once an OS operation is attempted its outcome may be partial. Require a
     // new observation even when activation or an input batch reports failure.
     state->token.clear();
+    if (progress) { progress->windowOperationAttempted = true; progress->needsObservation = true; }
     DesktopInputBatch inputBatch;
     const MaiError activated = action == "focus" ? impl_->backend->activate(state->window, inputCanceled)
                                                  : impl_->backend->activateForInput(state->window, inputCanceled);
@@ -1027,6 +1323,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     if (action == "focus") {
         receipt.state = "focused";
         receipt.dispatched = true;
+        receipt.focused = focused.value();
         return success(std::move(receipt));
     }
     if (writesText || batchText || keyNeedsInputCheck) {
@@ -1035,6 +1332,11 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         if (secure.value())
             return {MaiErrorCode::NotSupported, "password and other secure inputs need manual user entry"};
     }
+    // Activation can change layout or replace a control. The early locator
+    // check avoids focusing an already invalid target; this read guards the
+    // exact native point immediately before the existing input executor runs.
+    const auto resolvedAfterActivation = resolveElementPoint();
+    if (resolvedAfterActivation) return resolvedAfterActivation;
     DesktopNativeInput input;
     input.expectedWindowId = state->window.id;
     input.expectedProcessId = state->window.processId;
@@ -1047,6 +1349,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     input.scrollAxis = request.scrollAxis;
     input.x = state->window.x + request.xRatio * (std::max)(1.0, state->window.width - 1);
     input.y = state->window.y + request.yRatio * (std::max)(1.0, state->window.height - 1);
+    if (elementPoint) { input.x = elementPoint->first; input.y = elementPoint->second; }
     input.toX = state->window.x + request.toXRatio * (std::max)(1.0, state->window.width - 1);
     input.toY = state->window.y + request.toYRatio * (std::max)(1.0, state->window.height - 1);
     input.kind = action == "move"           ? DesktopNativeInputKind::Move
@@ -1071,6 +1374,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
             return {MaiErrorCode::InvalidInput, "typed window input needs active native display geometry"};
         port = inputPort(state->window.x, state->window.y, state->window.width, state->window.height, displays.value());
     }
+    if (progress) progress->inputDispatchAttempted = true;
     const MaiError sent = eventBatch ? native->inputEvents(request.events, input, port, request.inputOptions)
                                     : native->input(input);
     if (sent) return inputDispatchFailure(sent);
@@ -1084,10 +1388,12 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
 }
 
 MaiError DesktopComputerController::clear(const std::string& sessionId) {
+    const bool hadObservation = bool(impl_->get(sessionId));
     const auto released = releaseInput(sessionId);
     if (released) return released;
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->sessions.erase(sessionId) == 0) return {MaiErrorCode::NotFound, "this Session has no selected window"};
+    if (impl_->sessions.erase(sessionId) == 0 && !hadObservation)
+        return {MaiErrorCode::NotFound, "this Session has no selected window"};
     return {};
 }
 
@@ -1110,7 +1416,7 @@ public:
                "observation timing from the task and current state; no fixed click/type sequence is required.\n"
                "CAPABILITIES: list discovers windows, list_displays discovers displays, and list_keys "
                "lists named keys. Discovery can include minimized/cloaked windows and unavailable bounds; "
-               "being listed does not mean a window can currently be observed or receive input. "
+               "minimized/cloaked windows can be observed as metadata, but need available bounds for ordinary input. "
                "Use window_id to select an untitled window. target=display observe provides a whole-screen image and "
                "native "
                "bounds; target=window observe provides window bounds and Accessibility/UIA elements "
@@ -1119,6 +1425,17 @@ public:
                "double_click and drag accept a mouse button; right_click is a fixed right-button alias. "
                "move positions the pointer, scroll supports either axis, key taps a key/chord, and type "
                "inserts Unicode text. These actions may be selected independently as needed.\n"
+               "WINDOW STATE: minimize/restore require target=window and its current snapshot_id. Results include "
+               "before_window, after_window and actual focused when readable; observe again afterwards. Cloaked "
+               "windows are never moved across virtual desktops. ELEMENTS: click/double_click/right_click can use "
+               "element_id from the same current snapshot OR x_ratio and y_ratio, exclusively. Native identities "
+               "are re-resolved before input; changed/disabled/offscreen elements require a new observation. For "
+               "a popup or taskbar, observe target=display with element_window_id selecting that one discovered "
+               "window as accessibility source; input remains display-scoped and does not force-focus the source. "
+               "Accessibility status/counts describe bounded provider coverage. Native bounds use labeled Windows "
+               "screen_physical_pixels or macOS screen_points; model ratios keep their existing meaning. "
+               "Failures report input_dispatch_attempted/window_operation_attempted, owned input_state and "
+               "needs_observation; attempted input may be partial, so inspect state before retrying.\n"
                "PRIMITIVE BATCHES: input_events sends an ordered typed event batch through the same "
                "target and owner: absolute/relative motion, stationary buttons, wheel in 120 units per "
                "tick, raw physical keys and Unicode. Touch and pen use separate system pointer types; "
@@ -1195,11 +1512,13 @@ public:
     }
     std::string parametersSchema() const override {
         return maiDesktopComputerInputSchema(R"({"type":"object","properties":{
-          "action":{"type":"string","enum":["list","list_displays","list_keys","observe","focus","move","click","double_click","right_click","drag","mouse_down","mouse_up","type","replace_text","key","key_down","key_up","scroll","input_state","reset_inputs","release_all","verify","clear"]},
+          "action":{"type":"string","enum":["list","list_displays","list_keys","observe","focus","minimize","restore","move","click","double_click","right_click","drag","mouse_down","mouse_up","type","replace_text","key","key_down","key_up","scroll","input_state","reset_inputs","release_all","verify","clear"]},
           "button":{"type":"string","enum":["left","right","middle","back","forward"],"description":"Button for click/double_click/drag/mouse_down/mouse_up; default left. right_click always means right."},
           "axis":{"type":"string","enum":["vertical","horizontal"],"description":"Scroll axis, default vertical. Positive lines mean up vertically or right horizontally."},
           "target":{"type":"string","enum":["window","display"],"description":"Set explicitly on observe/input. display: selected whole screen and its bound image (preferred for visual work). window: selected window bounds/UIA, no window image. Omitted means window."},
           "display_id":{"type":"string","description":"Exact ID from list_displays; required for display observe/input. Keep the image, display_id and snapshot_id from the same observation."},
+          "element_window_id":{"type":"string","description":"Display observe only: inspect this one discovered window for UIA/AX elements (including separate popup/taskbar). Accessibility source only; input stays scoped to display_id."},
+          "element_id":{"type":"string","minLength":1,"description":"Opaque ID from the current snapshot for click/double_click/right_click. Supply element_id OR both x_ratio/y_ratio, never both; changed native evidence requires observing again."},
           "window_title":{"type":"string","maxLength":500,"description":"Exact title for window observe; supply this OR window_id, not both."},
           "window_id":{"type":"string","description":"ID from list/window observe. Required for window input; coordinates refer to this window's full observed bounds."},
           "include_elements":{"type":"boolean","description":"Window observe only: include Accessibility/UIA elements. Their center_x_ratio/center_y_ratio can be used directly for window input."},
@@ -1248,6 +1567,8 @@ public:
             (args["action"] == "release_all" || args["action"] == "reset_inputs" || args["action"] == "mouse_up" ||
              args["action"] == "key_up" || args["action"] == "input_state" || releaseEvents);
         if (context.isCanceled()) {
+            // Host Stop retires the turn independently of action dry-run. A
+            // validation-only request cannot keep canceled synthetic holds.
             controller_->releaseInput(context.sessionId, context.turnId);
             if (!cleanup) return MaiToolResult::failure(MaiErrorCode::Canceled, "computer operation canceled");
         }
@@ -1255,6 +1576,33 @@ public:
             return MaiToolResult::failure(MaiErrorCode::NotConfigured, "a local Desktop Session is required");
         if (!args.is_object() || !args.value("action", Json{}).is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "computer action is required");
+        // Validate types before .value<T>() and before any backend access.
+        // Workspace belongs to the host context; it is never a tool argument.
+        for (auto field = args.begin(); field != args.end(); ++field) {
+            const auto& name = field.key();
+            const bool known = name == "action" || name == "target" || name == "window_title" ||
+                name == "window_id" || name == "display_id" || name == "element_window_id" || name == "element_id" ||
+                name == "include_elements" || name == "include_image" || name == "snapshot_id" || name == "wait_ms" ||
+                name == "x_ratio" || name == "y_ratio" || name == "to_x_ratio" || name == "to_y_ratio" ||
+                name == "duration_ms" || name == "text" || name == "key" || name == "lines" || name == "expected_text" ||
+                name == "dry_run" || name == "button" || name == "axis" || name == "events" || name == "input_options";
+            if (!known) return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                                      "unexpected desktop_computer parameter: " + name);
+            if ((name == "window_id" || name == "display_id" || name == "element_window_id") &&
+                !field.value().is_string())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, name + " must be a decimal string");
+            if ((name == "target" || name == "window_title" || name == "snapshot_id" || name == "element_id" ||
+                 name == "text" || name == "key" || name == "expected_text" || name == "button" || name == "axis") &&
+                !field.value().is_string())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, name + " must be a string");
+            if ((name == "include_elements" || name == "dry_run") && !field.value().is_boolean())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, name + " must be boolean");
+            if ((name == "x_ratio" || name == "y_ratio" || name == "to_x_ratio" || name == "to_y_ratio") &&
+                !field.value().is_number())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, name + " must be a number");
+            if ((name == "lines" || name == "wait_ms" || name == "duration_ms") && !field.value().is_number_integer())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, name + " must be an integer");
+        }
         if (args["action"] == "input_capabilities") {
             if (args.size() != 1)
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "input_capabilities has no other parameters");
@@ -1313,7 +1661,7 @@ public:
             request.desktopScope = args.value("target", std::string("window")) == "display";
             for (const char* field : {"display_id", "window_id"})
                 if (args.contains(field)) {
-                    const auto id = windowIdFrom(args[field]);
+                    const auto id = windowIdFrom(args[field], field);
                     if (!id) return failure(id.error());
                     if (std::string(field) == "display_id")
                         request.displayId = id.value();
@@ -1382,12 +1730,17 @@ public:
             if (args.contains("include_image"))
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                               "observe returns metadata only; use screenshot for screen images");
-            if (!exact({"action", "window_title", "window_id", "include_elements"}) ||
-                (args.contains("window_title") == args.contains("window_id")) ||
-                (args.contains("window_title") && !args["window_title"].is_string()) ||
-                (args.contains("include_elements") && !args["include_elements"].is_boolean()) || context.root.empty())
+            for (auto field = args.begin(); field != args.end(); ++field)
+                if (field.key() != "action" && field.key() != "window_title" && field.key() != "window_id" &&
+                    field.key() != "include_elements")
+                    return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                                  "unexpected window observe parameter: " + field.key());
+            if (args.contains("window_title") == args.contains("window_id"))
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                              "observe needs one exact window title or ID and a workspace");
+                                              "window observe needs exactly one of window_title or window_id");
+            if (context.root.empty())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "host workspace is missing; observe requires host context.root");
             std::uint64_t id = 0;
             if (args.contains("window_id")) {
                 const auto parsed = windowIdFrom(args["window_id"]);
@@ -1411,6 +1764,8 @@ public:
                 R"({"state":"cleared","scope":"window_observation",)"
                 R"("text_changed":false,"next_step":"Call observe before any further window action."})");
         }
+        if (!args.contains("snapshot_id"))
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "snapshot_id is required for window actions");
         if (!args.value("snapshot_id", Json{}).is_string() || !args.value("window_id", Json{}).is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                           "action needs an observed snapshot and window ID");
@@ -1421,19 +1776,23 @@ public:
         const bool buttonAction =
             action == "click" || action == "double_click" || action == "drag" || action == "mouse_down";
         const bool writesText = action == "type" || action == "replace_text";
+        const bool elementClick = action == "click" || action == "double_click" || action == "right_click";
         for (auto field = args.begin(); field != args.end(); ++field) {
             const std::string& name = field.key();
             const bool allowed =
                 name == "action" || name == "snapshot_id" || name == "window_id" || name == "dry_run" ||
                 (positioned && (name == "x_ratio" || name == "y_ratio")) ||
+                (elementClick && name == "element_id") ||
                 (action == "drag" && (name == "to_x_ratio" || name == "to_y_ratio" || name == "duration_ms")) ||
                 (writesText && name == "text") || ((action == "key" || action == "key_down") && name == "key") ||
                 (buttonAction && name == "button") || (action == "scroll" && (name == "lines" || name == "axis")) ||
                 (action == "verify" && name == "expected_text");
             if (!allowed)
-                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "unexpected computer action parameter");
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "unexpected computer action parameter: " + name);
         }
-        if ((positioned &&
+        const auto locator = validateLocator(args, positioned, elementClick);
+        if (locator) return failure(locator);
+        if ((positioned && !args.contains("element_id") &&
              (!args.value("x_ratio", Json{}).is_number() || !args.value("y_ratio", Json{}).is_number())) ||
             (writesText && !args.value("text", Json{}).is_string()) ||
             ((action == "key" || action == "key_down") && !args.value("key", Json{}).is_string()) ||
@@ -1447,6 +1806,7 @@ public:
         DesktopComputerAction request;
         request.action = action;
         request.snapshotId = args["snapshot_id"].get<std::string>();
+        request.elementId = args.value("element_id", std::string());
         request.windowId = id.value();
         request.xRatio = args.value("x_ratio", 0.0);
         request.yRatio = args.value("y_ratio", 0.0);
@@ -1475,8 +1835,9 @@ public:
         }
         request.dryRun = args.value("dry_run", false);
         request.isCanceled = [&context] { return context.isCanceled(); };
-        const auto acted = controller_->perform(context.sessionId, request);
-        if (!acted) return failure(acted.error());
+        DesktopComputerActionProgress progress;
+        const auto acted = controller_->perform(context.sessionId, request, &progress);
+        if (!acted) return actionFailure(acted.error(), context.sessionId, progress);
         Json output{
             {"state", acted.value().state},
             {"action", action},
@@ -1489,6 +1850,9 @@ public:
                  ? "No input was sent; the snapshot remains available."
                  : "Observe the same window again before the next action. Verify business persistence separately."}};
         output["input_state"] = inputStateJson(controller_->inputState(context.sessionId));
+        if (acted.value().beforeWindow) output["before_window"] = windowJson(*acted.value().beforeWindow);
+        if (acted.value().afterWindow) output["after_window"] = windowJson(*acted.value().afterWindow);
+        if (acted.value().focused) output["focused"] = *acted.value().focused;
         if (action == "verify") {
             const QString actual =
                 QString::fromUtf8(acted.value().actualText.data(), int(acted.value().actualText.size()));
@@ -1499,6 +1863,29 @@ public:
     }
 
 private:
+    MaiError validateLocator(const Json& args, bool positioned, bool elementClick) const {
+        if (!positioned) return {};
+        const bool element = args.contains("element_id");
+        const bool x = args.contains("x_ratio");
+        const bool y = args.contains("y_ratio");
+        if (element) {
+            if (!elementClick || !args["element_id"].is_string() || args["element_id"].get<std::string>().empty())
+                return {MaiErrorCode::InvalidInput, "element_id must be a nonempty ID for click, double_click or right_click"};
+            if (x || y) return {MaiErrorCode::InvalidInput, "use element_id OR both x_ratio and y_ratio, exclusively"};
+        } else if (!x || !y)
+            return {MaiErrorCode::InvalidInput, "positioned input needs both x_ratio and y_ratio, or a supported element_id"};
+        return {};
+    }
+
+    MaiToolResult actionFailure(const MaiError& error, const std::string& session,
+                                const DesktopComputerActionProgress& progress) const {
+        Json output{{"error", error.message()}, {"error_code", maiErrorCodeToString(error.code())},
+                    {"input_dispatch_attempted", progress.inputDispatchAttempted},
+                    {"window_operation_attempted", progress.windowOperationAttempted},
+                    {"needs_observation", progress.needsObservation},
+                    {"input_state", inputStateJson(controller_->inputState(session))}};
+        return MaiToolResult::failure(error.code(), output.dump());
+    }
     MaiToolResult executeInputEvents(const Json& args, const MaiToolContext& context) {
         for (auto field = args.begin(); field != args.end(); ++field)
             if (field.key() != "action" && field.key() != "target" && field.key() != "window_id" &&
@@ -1531,7 +1918,7 @@ private:
         request.dryRun = args.value("dry_run", false);
         const char* targetField = display ? "display_id" : "window_id";
         if (!releasing || args.contains(targetField)) {
-            const auto target = windowIdFrom(args.value(targetField, Json{}));
+            const auto target = windowIdFrom(args.value(targetField, Json{}), targetField);
             if (!target) return failure(target.error());
             if (display)
                 request.displayId = target.value();
@@ -1549,8 +1936,9 @@ private:
                 return MaiToolResult::failure(MaiErrorCode::NotSupported,
                                               "Desktop screen operation requires an image-capable primary model");
         }
-        const auto result = controller_->perform(context.sessionId, request);
-        if (!result) return failure(result.error());
+        DesktopComputerActionProgress progress;
+        const auto result = controller_->perform(context.sessionId, request, &progress);
+        if (!result) return actionFailure(result.error(), context.sessionId, progress);
         Json output{{"action", "input_events"},
                     {"state", result.value().state},
                     {"dispatched", result.value().dispatched},
@@ -1593,7 +1981,7 @@ private:
             return MaiToolResult::failure(
                 MaiErrorCode::NotSupported,
                 "Desktop screen operation requires an image-capable primary model; window metadata remains available.");
-        const auto parsedId = windowIdFrom(args.value("display_id", Json{}));
+        const auto parsedId = windowIdFrom(args.value("display_id", Json{}), "display_id");
         if (!parsedId) return failure(parsedId.error());
         const bool observing = action == "observe";
         const bool positioned = action == "move" || action == "click" || action == "double_click" ||
@@ -1602,14 +1990,17 @@ private:
         const bool buttonAction =
             action == "click" || action == "double_click" || action == "drag" || action == "mouse_down";
         const bool writesText = action == "type" || action == "replace_text";
+        const bool elementClick = action == "click" || action == "double_click" || action == "right_click";
         if (!observing && !positioned && !writesText && action != "key" && action != "key_down")
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "unsupported desktop action");
         for (auto field = args.begin(); field != args.end(); ++field) {
             const std::string& name = field.key();
             const bool allowed =
-                name == "action" || name == "target" || name == "display_id" || (observing && name == "wait_ms") ||
+                name == "action" || name == "target" || name == "display_id" ||
+                (observing && (name == "wait_ms" || name == "element_window_id")) ||
                 (!observing && (name == "snapshot_id" || name == "dry_run")) ||
                 (positioned && (name == "x_ratio" || name == "y_ratio")) ||
+                (elementClick && name == "element_id") ||
                 (action == "drag" && (name == "to_x_ratio" || name == "to_y_ratio" || name == "duration_ms")) ||
                 (writesText && name == "text") || ((action == "key" || action == "key_down") && name == "key") ||
                 (buttonAction && name == "button") || (action == "scroll" && (name == "lines" || name == "axis"));
@@ -1618,18 +2009,30 @@ private:
                                               "unexpected desktop action parameter: " + name);
         }
         if (observing) {
+            if (context.root.empty()) return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                "host workspace is missing; display observe requires host context.root");
+            std::uint64_t sourceId = 0;
+            if (args.contains("element_window_id")) {
+                const auto source = windowIdFrom(args["element_window_id"], "element_window_id");
+                if (!source) return failure(source.error());
+                sourceId = source.value();
+            }
             if (args.contains("wait_ms") && (!args["wait_ms"].is_number_integer() ||
                                              args["wait_ms"].get<double>() < 0 || args["wait_ms"].get<double>() > 5000))
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "display observation wait must be 0..5000ms");
             const auto observed = controller_->observeDisplay(
                 context.sessionId, context.root, parsedId.value(), [&context] { return context.isCanceled(); }, 0, 0,
-                args.value("wait_ms", 0), context.turnId);
+                args.value("wait_ms", 0), context.turnId, sourceId);
             if (!observed) return failure(observed.error());
             return MaiToolResult::successWithImages(observed.value().json,
                                                     {MaiToolImage{observed.value().imagePath, "image/png"}});
         }
+        const auto locator = validateLocator(args, positioned, elementClick);
+        if (locator) return failure(locator);
+        if (!args.contains("snapshot_id"))
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "snapshot_id is required for display actions");
         if (!args.value("snapshot_id", Json{}).is_string() ||
-            (positioned &&
+            (positioned && !args.contains("element_id") &&
              (!args.value("x_ratio", Json{}).is_number() || !args.value("y_ratio", Json{}).is_number())) ||
             (writesText && !args.value("text", Json{}).is_string()) ||
             ((action == "key" || action == "key_down") && !args.value("key", Json{}).is_string()) ||
@@ -1650,6 +2053,7 @@ private:
         request.displayId = parsedId.value();
         request.action = action;
         request.snapshotId = args["snapshot_id"].get<std::string>();
+        request.elementId = args.value("element_id", std::string());
         request.xRatio = args.value("x_ratio", 0.0);
         request.yRatio = args.value("y_ratio", 0.0);
         request.toXRatio = args.value("to_x_ratio", 0.0);
@@ -1671,8 +2075,9 @@ private:
         }
         request.dryRun = args.value("dry_run", false);
         request.isCanceled = [&context] { return context.isCanceled(); };
-        const auto result = controller_->perform(context.sessionId, request);
-        if (!result) return failure(result.error());
+        DesktopComputerActionProgress progress;
+        const auto result = controller_->perform(context.sessionId, request, &progress);
+        if (!result) return actionFailure(result.error(), context.sessionId, progress);
         Json output{{"target", "display"},
                     {"display_id", std::to_string(request.displayId)},
                     {"action", action},
