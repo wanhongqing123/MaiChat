@@ -7,6 +7,21 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public final class AIAssistantSessionModelTest {
+    @Test public void openRouterSessionUsesItsOwnEndpointAndExactSelection() throws Exception {
+        JSONObject snapshot = new JSONObject().put("sessions", new JSONArray()
+            .put(new JSONObject().put("id", "fable").put("model", "anthropic/claude-fable-5.2")
+                .put("reasoningEffort", "max").put("wire", "responses")));
+        assertEquals("anthropic/claude-fable-5.2", state(snapshot, "fable").model);
+        assertEquals("https://openrouter.ai/api/v1", state(snapshot, "fable").baseUrl);
+        assertEquals("max", state(snapshot, "fable").reasoningEffort);
+        JSONObject selection = AIAssistantSessionModels.selection("fable", "anthropic/claude-fable-5.2", "low");
+        assertEquals("fable", selection.getString("session"));
+        assertEquals("anthropic/claude-fable-5.2", selection.getString("model"));
+        assertFalse(selection.has("apiKey"));
+        assertFalse(selection.has("baseUrl"));
+        assertEquals("deepseek-flash", state(snapshot, "").model);
+    }
+
     @Test public void anUnreadRemoteModelIsUnknownRatherThanThePhonesAccountDefault() throws Exception {
         JSONObject owner = new JSONObject().put("id", "remote-a").put("device_slot", "mac")
             .put("login_session_id", "login-a");
@@ -24,7 +39,7 @@ public final class AIAssistantSessionModelTest {
     @Test public void selectingAnotherSessionRestoresItsOwnExactModel() throws Exception {
         JSONObject snapshot = new JSONObject().put("sessions", new JSONArray()
             .put(new JSONObject().put("id", "a").put("model", "glm-5.3-flash")
-                .put("reasoningEffort", "max").put("wire", "chat_completions"))
+                .put("reasoningEffort", "max").put("wire", "responses"))
             .put(new JSONObject().put("id", "b").put("model", "deepseek-v4-pro")
                 .put("reasoningEffort", "low").put("wire", "responses")));
         assertEquals("glm-5.3-flash", state(snapshot, "a").model);
@@ -95,8 +110,7 @@ public final class AIAssistantSessionModelTest {
 
     private JSONObject receipt(String session, String model, String effort) throws Exception {
         return new JSONObject().put("ok", true).put("session", session).put("model", model)
-            .put("reasoningEffort", effort).put("wire", model.startsWith("glm-")
-                ? "chat_completions" : "responses");
+            .put("reasoningEffort", effort).put("wire", "responses");
     }
 
     @Test public void remoteSelectionWaitsForOwnerAckAndFailureRetainsTheCommittedModel() throws Exception {

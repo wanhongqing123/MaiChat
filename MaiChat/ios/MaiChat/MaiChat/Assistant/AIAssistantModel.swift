@@ -46,9 +46,22 @@ private func aiMobileAgentSessionChanged(_ sessionID: UnsafePointer<CChar>?) {
 }
 
 struct AIModelSettings: Codable, Sendable, Equatable {
-    static let glmChatUrl = "https://open.bigmodel.cn/api/paas/v4"
-    static let cloudModels = ["deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash"]
+    // All supported cloud models use Responses; provider keys remain distinct.
+    static let glmResponsesUrl = "https://open.bigmodel.cn/api/v1"
+    static let openRouterUrl = "https://openrouter.ai/api/v1"
+    static let fableModel = "anthropic/claude-fable-5.2"
+    static let cloudModels = ["deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash", fableModel]
     static let deepSeekUrl = "https://api.deepseek.com"
+
+    // Exact catalog membership prevents unknown/remote IDs from taking a GLM key.
+    static func cloudProvider(for model: String) -> String? {
+        switch model {
+        case "deepseek-flash", "deepseek-v4-pro": return "deepseek"
+        case "glm-5.3", "glm-5.3-flash": return "glm"
+        case fableModel: return "openrouter"
+        default: return nil
+        }
+    }
 
     var baseUrl = AIModelSettings.deepSeekUrl
     var model = "deepseek-flash"
@@ -76,6 +89,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
         case "glm-5.3": return "GLM-5.3"
         case "glm-5.3-flash": return "GLM-5.3-Flash"
         case "deepseek-v4-pro": return "DeepSeek V4 Pro"
+        case Self.fableModel: return "Claude Fable 5.2"
         default: return "DeepSeek Flash"
         }
     }
@@ -100,7 +114,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     }
     var policy = "on-request"
     var effectiveWire: String {
-        isLocalModel ? "local" : (["glm-5.3", "glm-5.3-flash"].contains(model) ? "chat_completions" : "responses")
+        isLocalModel ? "local" : "responses"
     }
 
     mutating func selectModel(_ selected: String) {
@@ -108,7 +122,9 @@ struct AIModelSettings: Codable, Sendable, Equatable {
         if ["deepseek-flash", "deepseek-v4-pro"].contains(selected) {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.deepSeekUrl
         } else if ["glm-5.3", "glm-5.3-flash"].contains(selected) {
-            cloudModel = selected; modelProvider = "remote"; baseUrl = Self.glmChatUrl
+            cloudModel = selected; modelProvider = "remote"; baseUrl = Self.glmResponsesUrl
+        } else if selected == Self.fableModel {
+            cloudModel = selected; modelProvider = "remote"; baseUrl = Self.openRouterUrl
         }
     }
 
@@ -188,7 +204,7 @@ final class AICloudCredentialStore: @unchecked Sendable {
 
     func replaceAccountModelKeys(_ next: [String: String]) {
         lock.lock()
-        for provider in ["glm", "deepseek", "minimax"] {
+        for provider in ["glm", "deepseek", "minimax", "openrouter"] {
             if let key = next[provider], !key.isEmpty { values[provider] = key }
             else { values.removeValue(forKey: provider) }
         }
@@ -281,7 +297,7 @@ enum AICloudCredentialSync {
         guard let issued = try await MaiChatAuthClient.shared.accountModelKeysIfAvailable()
         else { return false }
         var valid: [String: String] = [:]
-        for provider in ["glm", "deepseek", "minimax"] {
+        for provider in ["glm", "deepseek", "minimax", "openrouter"] {
             guard let key = issued.apiKeys[provider], !key.isEmpty,
                   key.utf8.count <= 4_096,
                   key.unicodeScalars.allSatisfy({
@@ -1659,7 +1675,8 @@ actor AIAssistantBackend {
     }
     #endif
     private func storedKey(for model: String) -> String {
-        AICloudCredentialStore.shared.apiKey(["deepseek-flash", "deepseek-v4-pro"].contains(model) ? "deepseek" : "glm")
+        guard let provider = AIModelSettings.cloudProvider(for: model) else { return "" }
+        return AICloudCredentialStore.shared.apiKey(provider)
     }
 
     init() {
@@ -1848,12 +1865,14 @@ actor AIAssistantBackend {
         let workspace = root.appendingPathComponent("Workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let appRootPath = AIAssistantPathPolicy.appRoot(workspacePath: workspace.path)
-        var routeURLs: [String: Any] = ["glmBaseUrl": AIModelSettings.glmChatUrl,
-                                        "deepseekBaseUrl": AIModelSettings.deepSeekUrl]
+        var routeURLs: [String: Any] = ["glmBaseUrl": AIModelSettings.glmResponsesUrl,
+                                        "deepseekBaseUrl": AIModelSettings.deepSeekUrl,
+                                        "openrouterBaseUrl": AIModelSettings.openRouterUrl]
         #if DEBUG && targetEnvironment(simulator)
         if AIPrimaryModelUITestSupport.isSessionConfigurationRequested {
             let environment = ProcessInfo.processInfo.environment
-            for (provider, field) in [("GLM", "glmBaseUrl"), ("DEEPSEEK", "deepseekBaseUrl")] {
+            for (provider, field) in [("GLM", "glmBaseUrl"), ("DEEPSEEK", "deepseekBaseUrl"),
+                                      ("OPENROUTER", "openrouterBaseUrl")] {
                 guard let port = Int(environment["MAICHAT_SESSION_MODELS_" + provider + "_PORT"] ?? ""),
                       (1...65535).contains(port) else { throw AIBackendError(message: "缺少隔离测试端口") }
                 routeURLs[field] = "http://127.0.0.1:\(port)"
@@ -3556,7 +3575,7 @@ final class AIAssistantModel: ObservableObject {
         guard ["", "low", "high", "max"].contains(effort) else { return false }
         if model.hasPrefix("local:"), model.count > "local:".count { return wire == "local" }
         guard AIModelSettings.cloudModels.contains(model) else { return false }
-        return wire == (["glm-5.3", "glm-5.3-flash"].contains(model) ? "chat_completions" : "responses")
+        return wire == "responses"
     }
 
     private func applyRemoteHistory(_ data: Data, source: AIRemoteSession,

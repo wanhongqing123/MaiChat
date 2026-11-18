@@ -11,6 +11,7 @@ const { generatePngQrCode } = require('@juit/qrcode');
 const Database = require('better-sqlite3');
 const { openStore } = require('./store');
 const { createAuthService } = require('./service');
+const { createAccountModelKeyIssuer } = require('./account-model-keys');
 const { completeAccountDeletion } = require('./account-deletion');
 const { bindLegacy } = require('./bind-legacy');
 
@@ -414,6 +415,31 @@ test('main chat keys require a signed-in account', async () => {
   assert.equal(issued, 1);
   setup.db.close();
 
+});
+
+test('all signed-in accounts receive OpenRouter through the existing model key route', async () => {
+  let issued = 0;
+  const keys = { glm: '', deepseek: '', minimax: '', openrouter: 'openrouter-test-key' };
+  const setup = fixture({ issueAccountModelKeys: createAccountModelKeyIssuer({
+    MAICHAT_AUTH_SERVICE_TOKEN: 'abcdef0123456789abcdef0123456789'
+  }, async () => {
+    ++issued;
+    return { ok: true, async text() { return JSON.stringify({ api_keys: keys }); } };
+  }) });
+  try {
+    const path = '/v1/model/api-keys';
+    assert.equal((await setup.call('GET', path)).statusCode, 401);
+    assert.equal(issued, 0);
+    for (const phone of ['13900000001', '13900000002']) {
+      const signedIn = await signInWithSms(setup, phone);
+      const result = await setup.call('GET', path, {}, signedIn.body.access_token);
+      assert.equal(result.statusCode, 200);
+      assert.deepEqual(result.body, { api_keys: keys });
+    }
+    assert.equal(issued, 2);
+  } finally {
+    setup.db.close();
+  }
 });
 
 test('media signing requires a signed-in account', async () => {

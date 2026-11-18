@@ -538,6 +538,7 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
         DesktopAccountModelClient::Config config;
         config.glmBaseUrl = model.glmBaseUrl;
         config.deepseekBaseUrl = model.deepseekBaseUrl;
+        config.openrouterBaseUrl = model.openrouterBaseUrl;
         config.keyProvider = model.accountModelKeyProvider;
 #if defined(MAICHAT_EMBEDDED_FFMPEG)
         MaiFfmpegEngine ffmpegEngine{mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check,

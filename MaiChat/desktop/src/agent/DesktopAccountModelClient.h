@@ -14,6 +14,7 @@ public:
     struct Config {
         QString glmBaseUrl;
         QString deepseekBaseUrl;
+        QString openrouterBaseUrl;
         // 只读取宿主缓存，不发网络请求；纯配置查询也可在 UI 线程调用。
         std::function<QString(const QString&)> keyProvider;
         MaiModelImagePreparer prepareImage;

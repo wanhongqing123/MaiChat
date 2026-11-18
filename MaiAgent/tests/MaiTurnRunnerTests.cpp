@@ -3,8 +3,7 @@
 // test_request_is_assembled_correctly；检查可观察结果而非实现细节。
 // agent loop 的测试：从 submit(Prompt) 到事件流吐完的完整一圈。
 //
-// 用假的 Chat Completions 服务端当模型，所以不需要 API key、不花钱、结果完全确定。
-// 真实 GLM 说的是同一个协议，切过去只改 baseUrl。
+// 用进程内合成模型驱动回调，不访问供应商、凭据或网络；结果完全确定。
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -43,7 +42,7 @@ static int failures = 0;
 
 namespace {
 
-// ── 假模型：一个真的 Chat Completions 端点 ─────────────────────
+// ── 合成模型：直接驱动客户端回调 ─────────────────────────────
 // 默认应答：分三片吐出来，好让上层收到多条 delta。
 //
 // 不再起假 HTTP 服务端。这个文件测的是"一轮对话的生命周期"——事件顺序、part 归属、落库内容、中断、
@@ -62,6 +61,119 @@ MaiFakeModelClient::Turn defaultTurn(int chunkDelayMilliseconds = 0) {
     turn.chunkDelayMilliseconds = chunkDelayMilliseconds;
     return turn;
 }
+
+// 只拒绝首次携带续接状态的写入；真实内存后端继续负责读取和其余领域操作。
+class ContinuationWriteFailureStore final : public MaiSessionStore {
+public:
+    int rejectedWrites = 0;
+    void putSession(const MaiSession& value) override {
+        mInner->putSession(value);
+    }
+    bool getSession(const std::string& id, MaiSession& out) const override {
+        return mInner->getSession(id, out);
+    }
+    std::vector<MaiSession> listSessions() const override {
+        return mInner->listSessions();
+    }
+    bool removeSession(const std::string& id) override {
+        return mInner->removeSession(id);
+    }
+    bool clearMessages(const std::string& id) override {
+        return mInner->clearMessages(id);
+    }
+    void putMessage(const std::string& id, const MaiMessage& value) override {
+        if (mFailed) return;
+        for (const auto& part : value.parts) {
+            const auto* reasoning = std::get_if<MaiReasoningPart>(&part.body);
+            if (reasoning && reasoning->continuation) {
+                ++rejectedWrites;
+                mFailed = true;
+                return;
+            }
+        }
+        mInner->putMessage(id, value);
+    }
+    std::vector<MaiMessage> listMessages(const std::string& id) const override {
+        return mInner->listMessages(id);
+    }
+    std::vector<MaiMessage> listMessagesPage(const std::string& id, const std::string& before,
+                                             std::size_t limit) const override {
+        return mInner->listMessagesPage(id, before, limit);
+    }
+    bool getMessage(const std::string& id, const std::string& message,
+                    MaiMessage& out) const override {
+        return mInner->getMessage(id, message, out);
+    }
+    void recoverInterruptedTools(const std::string& error, std::int64_t completed) override {
+        mInner->recoverInterruptedTools(error, completed);
+    }
+    MaiError lastWriteError() const override {
+        return mFailed ? MaiError{MaiErrorCode::Internal, "Owned storage write failed."}
+                       : mInner->lastWriteError();
+    }
+    bool mutateSession(const std::string& id,
+                       const std::function<void(MaiSession&)>& mutation) override {
+        return mInner->mutateSession(id, mutation);
+    }
+    bool getContextCheckpoint(const std::string& id, MaiContextCheckpoint& out) const override {
+        return mInner->getContextCheckpoint(id, out);
+    }
+    MaiError advanceContextCheckpoint(const std::string& id, std::uint64_t revision,
+                                      const MaiContextCheckpoint& value) override {
+        return mInner->advanceContextCheckpoint(id, revision, value);
+    }
+    MaiError insertSpecialistTask(const MaiSpecialistTask& value) override {
+        return mInner->insertSpecialistTask(value);
+    }
+    bool getSpecialistTask(const std::string& id, const std::string& owner,
+                           MaiSpecialistTask& out) const override {
+        return mInner->getSpecialistTask(id, owner, out);
+    }
+    MaiError deleteCompletedSpecialistTask(const std::string& id,
+                                           const std::string& owner) override {
+        return mInner->deleteCompletedSpecialistTask(id, owner);
+    }
+    MaiError appendSpecialistText(const std::string& id, const std::string& owner,
+                                  const std::string& text, MaiMillis checked) override {
+        return mInner->appendSpecialistText(id, owner, text, checked);
+    }
+    MaiError updateSpecialistProgress(const std::string& id, const std::string& owner,
+                                      MaiMillis checked) override {
+        return mInner->updateSpecialistProgress(id, owner, checked);
+    }
+    MaiError recoverStatusCheckFailures() override {
+        return mInner->recoverStatusCheckFailures();
+    }
+    MaiError finishSpecialistTask(const std::string& id, const std::string& owner,
+                                  MaiSpecialistTaskStatus status, const std::string& text,
+                                  const std::string& path, MaiMillis finished) override {
+        return mInner->finishSpecialistTask(id, owner, status, text, path, finished);
+    }
+    std::vector<MaiSpecialistTask> listActiveSpecialistTasks(std::size_t limit) const override {
+        return mInner->listActiveSpecialistTasks(limit);
+    }
+    std::vector<MaiSpecialistTask> listUnnotifiedSpecialistTasks(std::size_t limit) const override {
+        return mInner->listUnnotifiedSpecialistTasks(limit);
+    }
+    MaiResult<std::string> reserveSpecialistNotification(const std::string& id,
+                                                         const std::string& owner,
+                                                         const std::string& message,
+                                                         MaiMillis attempted) override {
+        return mInner->reserveSpecialistNotification(id, owner, message, attempted);
+    }
+    MaiError markSpecialistNotified(const std::string& id, const std::string& owner,
+                                    const std::string& message, MaiMillis notified) override {
+        return mInner->markSpecialistNotified(id, owner, message, notified);
+    }
+    MaiError markSpecialistResultAlreadyDelivered(const std::string& id, const std::string& owner,
+                                                  MaiMillis notified) override {
+        return mInner->markSpecialistResultAlreadyDelivered(id, owner, notified);
+    }
+
+private:
+    std::unique_ptr<MaiSessionStore> mInner = makeMaiMemoryStore();
+    bool mFailed = false;
+};
 
 class GatedStreamModel final : public MaiModelClient {
 public:
@@ -644,6 +756,405 @@ void test_reasoning_goes_to_its_own_part() {
     for (const auto& message : model->lastRequest().messages)
         if (message.content.find("let me think") != std::string::npos) leaked = true;
     CHECK(!leaked);
+}
+
+MaiModelContinuationState syntheticContinuation(bool withTools, bool finalResponse) {
+    MaiModelContinuationState state;
+    state.format = "responses.output.v1";
+    state.provider = "openrouter";
+    state.model = "anthropic/claude-fable-5.2";
+    if (finalResponse) {
+        state.payload = R"([{"id":"rs_final","type":"reasoning",)"
+                        R"("encrypted_content":"synthetic-final-cipher",)"
+                        R"("signature":"synthetic-final-signature","summary":[]},)"
+                        R"({"id":"msg_final","type":"message","role":"assistant",)"
+                        R"("content":[{"type":"output_text","text":"Synthetic final answer."}]}])";
+    } else if (withTools) {
+        state.payload =
+            R"([{"id":"rs_first","type":"reasoning",)"
+            R"("encrypted_content":"synthetic-first-cipher",)"
+            R"("signature":"synthetic-first-signature",)"
+            R"("opaque":{"order":[3,1,2]},"summary":[]},)"
+            R"({"id":"fc_first_a","type":"function_call","call_id":"call_continuation_a",)"
+            R"("name":"continuation_probe","arguments":"{}"},)"
+            R"({"id":"fc_first_b","type":"function_call","call_id":"call_continuation_b",)"
+            R"("name":"continuation_probe","arguments":"{}"}])";
+    } else {
+        state.payload = R"([{"id":"rs_first","type":"reasoning",)"
+                        R"("encrypted_content":"synthetic-first-cipher",)"
+                        R"("signature":"synthetic-first-signature",)"
+                        R"("opaque":{"order":[3,1,2]},"summary":[]}])";
+    }
+    return state;
+}
+
+bool sameContinuation(const MaiModelContinuationState& left,
+                      const MaiModelContinuationState& right) {
+    return left.format == right.format && left.provider == right.provider &&
+           left.model == right.model && left.payload == right.payload;
+}
+
+std::vector<MaiReasoningPart> storedContinuationParts(const std::vector<MaiMessage>& history) {
+    std::vector<MaiReasoningPart> result;
+    for (const auto& message : history)
+        for (const auto& part : message.parts)
+            if (const auto* reasoning = std::get_if<MaiReasoningPart>(&part.body))
+                if (reasoning->continuation) result.push_back(*reasoning);
+    return result;
+}
+
+class ContinuationStreamModel final : public MaiModelClient {
+public:
+    enum class Outcome { MetadataOnly, ToolBatch, Failure, Canceled };
+    Outcome outcome = Outcome::ToolBatch;
+    std::atomic<bool>* cancelDuringStream = nullptr;
+    std::vector<MaiModelRequest> requests;
+    int publishedStates = 0;
+
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::Responses;
+    }
+    MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                    const std::atomic<bool>& cancel) override {
+        requests.push_back(request);
+        if (outcome == Outcome::Failure || outcome == Outcome::Canceled) {
+            // 失败流只发布不完整显示文本。成功状态 callback 的门禁归 wire 测试，
+            // 此处不构造“已承诺成功状态、随后又失败”的自相矛盾客户端。
+            if (sink.onReasoning) sink.onReasoning("Synthetic unfinished reasoning.");
+            if (outcome == Outcome::Canceled) {
+                if (cancelDuringStream) cancelDuringStream->store(true);
+                return {MaiErrorCode::Canceled, "Synthetic canceled response."};
+            }
+            return {MaiErrorCode::Network, "Synthetic interrupted response."};
+        }
+        CHECK(requests.size() <= 2);
+        if (requests.size() > 2)
+            return {MaiErrorCode::Protocol, "Unexpected synthetic response iteration."};
+        CHECK(static_cast<bool>(sink.onContinuationState));
+        const bool finalResponse = requests.size() == 2;
+        if (sink.onContinuationState) {
+            sink.onContinuationState(
+                syntheticContinuation(outcome == Outcome::ToolBatch, finalResponse));
+            ++publishedStates;
+        }
+        // 状态更新的同步订阅者也可触发 Stop。模拟 wire 在交付工具前的取消复检，
+        // 此时成功快照已交给 Runner，但后续工具 callback 尚未发生。
+        if (cancel.load(std::memory_order_relaxed))
+            return {MaiErrorCode::Canceled, "Synthetic cancellation during metadata publication."};
+        if (finalResponse) {
+            if (sink.onText) sink.onText("Synthetic final answer.");
+        } else if (outcome == Outcome::ToolBatch) {
+            if (sink.onToolCall) {
+                sink.onToolCall({"call_continuation_a", "continuation_probe", "{}"});
+                sink.onToolCall({"call_continuation_b", "continuation_probe", "{}"});
+            }
+        }
+        return {};
+    }
+};
+
+class ContinuationProbeTool final : public MaiTool {
+public:
+    MaiSessionStore* store = nullptr;
+    int executions = 0;
+    std::vector<bool> durableBeforeExecution;
+    std::atomic<bool>* cancelAfterFirstExecution = nullptr;
+
+    std::string name() const override {
+        return "continuation_probe";
+    }
+    std::string description() const override {
+        return "Observe committed synthetic continuation state before execution.";
+    }
+    std::string parametersSchema() const override {
+        return "{}";
+    }
+    bool requiresWorkingDirectory(const std::string&) const override {
+        return false;
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
+        ++executions;
+        const auto carriers = storedContinuationParts(store->listMessages(context.sessionId));
+        const bool committed =
+            carriers.size() == 1 && carriers.front().text.empty() &&
+            sameContinuation(*carriers.front().continuation, syntheticContinuation(true, false));
+        durableBeforeExecution.push_back(committed);
+        CHECK(committed);
+        MaiToolExecution execution;
+        execution.status = MaiToolExecutionStatus::Completed;
+        execution.effectStatus = MaiToolEffectStatus::Confirmed;
+        execution.started = true;
+        execution.exitCode = 0;
+        auto result = MaiToolResult::success("Synthetic tool completed.");
+        result.withExecution(execution);
+        if (cancelAfterFirstExecution && executions == 1) cancelAfterFirstExecution->store(true);
+        return result;
+    }
+};
+
+struct ContinuationRunnerFixture {
+    std::unique_ptr<MaiSessionStore> store;
+    MaiEventBus bus;
+    MaiEventEmitter emitter{bus};
+    MaiContextBuilder context;
+    MaiToolRegistry tools;
+    MaiSession session;
+    MaiMessage assistant;
+    ContinuationStreamModel model;
+    ContinuationProbeTool* probe = nullptr;
+    std::atomic<bool> cancel{false};
+    std::set<std::string> updatedContinuationParts;
+    std::vector<MaiEvent> errors;
+    bool cancelOnContinuationUpdate = false;
+
+    explicit ContinuationRunnerFixture(
+        std::unique_ptr<MaiSessionStore> selectedStore = makeMaiMemoryStore())
+        : store(std::move(selectedStore)) {
+        session.id = "ses_response_continuation";
+        session.title = "Synthetic continuation test";
+        session.model = "anthropic/claude-fable-5.2";
+        store->putSession(session);
+        MaiMessage user;
+        user.id = "msg_continuation_user";
+        user.role = MaiRole::User;
+        user.parts.push_back(
+            {"prt_continuation_user", MaiTextPart{"Continue the synthetic task."}, 1});
+        store->putMessage(session.id, user);
+        assistant.id = "msg_continuation_assistant";
+        assistant.role = MaiRole::Assistant;
+        store->putMessage(session.id, assistant);
+        auto tool = std::make_unique<ContinuationProbeTool>();
+        probe = tool.get();
+        tool->store = store.get();
+        tools.add(std::move(tool));
+        model.cancelDuringStream = &cancel;
+        bus.subscribe([this](const MaiEvent& event) {
+            if (event.type == MaiEventType::SessionError) errors.push_back(event);
+            if (event.type != MaiEventType::MessagePartUpdated) return;
+            // 回调时从正式 store 精读，不能用 Runner 内存副本证明已持久化。
+            for (const auto& message : store->listMessages(session.id))
+                for (const auto& part : message.parts)
+                    if (part.id == event.partId)
+                        if (const auto* reasoning = std::get_if<MaiReasoningPart>(&part.body)) {
+                            if (!reasoning->continuation) continue;
+                            updatedContinuationParts.insert(part.id);
+                            if (cancelOnContinuationUpdate) cancel.store(true);
+                        }
+        });
+    }
+
+    bool run() {
+        MaiTurnRunner::Dependencies dependencies;
+        dependencies.store = store.get();
+        dependencies.model = &model;
+        dependencies.tools = &tools;
+        dependencies.emitter = &emitter;
+        dependencies.context = &context;
+        dependencies.defaultModel = session.model;
+        MaiTurnRunner runner(dependencies, session.id, assistant);
+        runner.run(cancel);
+        return runner.succeeded();
+    }
+};
+
+void checkContinuationCarriersAndReplay(const ContinuationRunnerFixture& fixture, bool withTools) {
+    const auto history = fixture.store->listMessages(fixture.session.id);
+    const auto carriers = storedContinuationParts(history);
+    CHECK(carriers.size() == 2);
+    if (carriers.size() == 2) {
+        CHECK(carriers[0].text.empty());
+        CHECK(carriers[1].text.empty());
+        CHECK(sameContinuation(*carriers[0].continuation, syntheticContinuation(withTools, false)));
+        CHECK(sameContinuation(*carriers[1].continuation, syntheticContinuation(withTools, true)));
+    }
+    // 无显示文本也要发布独立 metadata 更新，第二次响应不能覆盖第一次的载体。
+    CHECK(fixture.updatedContinuationParts.size() == 2);
+    CHECK(fixture.model.publishedStates == 2);
+    CHECK(fixture.model.requests.size() == 2);
+    if (fixture.model.requests.size() != 2) return;
+    const auto& followup = fixture.model.requests[1];
+    std::size_t replayed = 0;
+    std::vector<std::string> results;
+    for (const auto& message : followup.messages) {
+        if (message.continuation) {
+            ++replayed;
+            CHECK(message.role == MaiModelRole::Assistant);
+            CHECK(message.content.empty());
+            CHECK(sameContinuation(*message.continuation, syntheticContinuation(withTools, false)));
+        }
+        if (message.role == MaiModelRole::ToolResult) results.push_back(message.toolCallId);
+    }
+    CHECK(replayed == 1);
+    if (withTools)
+        CHECK((results == std::vector<std::string>{"call_continuation_a", "call_continuation_b"}));
+    else
+        CHECK(results.empty());
+}
+
+void test_metadata_only_response_state_survives_empty_text_and_followup() {
+    ContinuationRunnerFixture fixture;
+    fixture.model.outcome = ContinuationStreamModel::Outcome::MetadataOnly;
+    CHECK(fixture.run());
+    CHECK(fixture.probe->executions == 0);
+    CHECK(fixture.errors.empty());
+    checkContinuationCarriersAndReplay(fixture, false);
+}
+
+void test_response_state_is_durable_before_every_tool_and_not_duplicated() {
+    ContinuationRunnerFixture fixture;
+    CHECK(fixture.run());
+    CHECK(fixture.probe->executions == 2);
+    CHECK((fixture.probe->durableBeforeExecution == std::vector<bool>{true, true}));
+    CHECK(fixture.errors.empty());
+    checkContinuationCarriersAndReplay(fixture, true);
+}
+
+void test_failed_or_canceled_response_has_no_replayable_success_state() {
+    for (const auto outcome :
+         {ContinuationStreamModel::Outcome::Failure, ContinuationStreamModel::Outcome::Canceled}) {
+        ContinuationRunnerFixture fixture;
+        fixture.model.outcome = outcome;
+        CHECK(!fixture.run());
+        CHECK(fixture.model.publishedStates == 0);
+        CHECK(fixture.model.requests.size() == 1);
+        CHECK(fixture.probe->executions == 0);
+        CHECK(storedContinuationParts(fixture.store->listMessages(fixture.session.id)).empty());
+        CHECK(fixture.updatedContinuationParts.empty());
+    }
+}
+
+void test_continuation_write_failure_prevents_tool_execution() {
+    auto store = std::make_unique<ContinuationWriteFailureStore>();
+    auto* observedStore = store.get();
+    ContinuationRunnerFixture fixture(std::move(store));
+    CHECK(!fixture.run());
+    CHECK(observedStore->rejectedWrites == 1);
+    CHECK(fixture.model.requests.size() == 1);
+    CHECK(fixture.probe->executions == 0);
+    CHECK(storedContinuationParts(fixture.store->listMessages(fixture.session.id)).empty());
+    CHECK(!fixture.errors.empty());
+}
+
+void checkCanceledContinuationHasNoOrphanCalls(const ContinuationRunnerFixture& fixture,
+                                               bool firstToolExecuted) {
+    const auto history = fixture.store->listMessages(fixture.session.id);
+    const auto followup = fixture.context.build(history);
+    std::set<std::string> replayedCalls;
+    std::set<std::string> projectedCalls;
+    std::map<std::string, int> resultCounts;
+    std::size_t replayedStates = 0;
+    for (const auto& message : followup) {
+        if (message.role == MaiModelRole::ToolResult) {
+            ++resultCounts[message.toolCallId];
+            CHECK(!message.content.empty());
+        }
+        if (!message.continuation) {
+            for (const auto& invocation : message.invocations)
+                CHECK(projectedCalls.insert(invocation.id).second);
+            continue;
+        }
+        ++replayedStates;
+        // 不能通过删掉 opaque output 中的一项来伪装修复，也不能重建签名载荷。
+        CHECK(sameContinuation(*message.continuation, syntheticContinuation(true, false)));
+        const auto output = nlohmann::json::parse(message.continuation->payload, nullptr, false);
+        CHECK(output.is_array());
+        if (!output.is_array()) continue;
+        for (const auto& item : output) {
+            if (!item.is_object() || item.value("type", std::string{}) != "function_call") continue;
+            const auto callId = item.value("call_id", std::string{});
+            CHECK(!callId.empty());
+            CHECK(replayedCalls.insert(callId).second);
+        }
+    }
+    if (replayedStates == 0) {
+        // 尚未执行任何工具时可以整次撤下该 response；已发生的执行不能这样抹去。
+        CHECK(!firstToolExecuted);
+        CHECK(fixture.probe->executions == 0);
+        CHECK(resultCounts.size() == projectedCalls.size());
+        for (const auto& callId : projectedCalls) CHECK(resultCounts[callId] == 1);
+        return;
+    }
+    CHECK(replayedStates == 1);
+    CHECK((replayedCalls == std::set<std::string>{"call_continuation_a", "call_continuation_b"}));
+    CHECK(resultCounts.size() == replayedCalls.size());
+    for (const auto& callId : replayedCalls) CHECK(resultCounts[callId] == 1);
+
+    std::map<std::string, MaiToolPart> persisted;
+    std::map<std::string, int> persistedCounts;
+    for (const auto& message : history)
+        for (const auto& part : message.parts)
+            if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
+                persisted[tool->callId] = *tool;
+                ++persistedCounts[tool->callId];
+            }
+    for (const auto& callId : replayedCalls) {
+        CHECK(persistedCounts[callId] == 1);
+        const auto found = persisted.find(callId);
+        CHECK(found != persisted.end());
+        if (found == persisted.end()) continue;
+        const auto& tool = found->second;
+        if (firstToolExecuted && callId == "call_continuation_a") {
+            CHECK(tool.state == MaiToolState::Completed);
+            CHECK(tool.output == "Synthetic tool completed.");
+            CHECK(tool.error.empty());
+            CHECK(tool.execution.has_value());
+            if (tool.execution) {
+                CHECK(tool.execution->status == MaiToolExecutionStatus::Completed);
+                CHECK(tool.execution->effectStatus == MaiToolEffectStatus::Confirmed);
+                CHECK(tool.execution->started == std::optional<bool>(true));
+                CHECK(tool.execution->exitCode == std::optional<int>(0));
+                CHECK(!tool.execution->canceled);
+            }
+        } else {
+            CHECK(tool.state == MaiToolState::Canceled);
+            CHECK(!tool.output.empty());
+            CHECK(!tool.error.empty());
+            CHECK(tool.execution.has_value());
+            if (tool.execution) {
+                CHECK(tool.execution->status == MaiToolExecutionStatus::NotStarted ||
+                      tool.execution->status == MaiToolExecutionStatus::Canceled);
+                CHECK(tool.execution->effectStatus == MaiToolEffectStatus::None);
+                CHECK(tool.execution->started == std::optional<bool>(false));
+                CHECK(tool.execution->canceled);
+            }
+        }
+    }
+}
+
+void test_cancel_during_metadata_update_does_not_leave_orphan_state_calls() {
+    ContinuationRunnerFixture fixture;
+    fixture.cancelOnContinuationUpdate = true;
+    fixture.run();
+    CHECK(fixture.cancel.load());
+    CHECK(fixture.model.publishedStates == 1);
+    CHECK(fixture.model.requests.size() == 1);
+    CHECK(fixture.probe->executions == 0);
+    CHECK(!fixture.updatedContinuationParts.empty());
+    checkCanceledContinuationHasNoOrphanCalls(fixture, false);
+}
+
+void test_stop_after_first_tool_preserves_its_fact_and_closes_remaining_state_calls() {
+    ContinuationRunnerFixture fixture;
+    fixture.probe->cancelAfterFirstExecution = &fixture.cancel;
+    fixture.run();
+    CHECK(fixture.cancel.load());
+    CHECK(fixture.model.requests.size() == 1);
+    CHECK(fixture.probe->executions == 1);
+    CHECK((fixture.probe->durableBeforeExecution == std::vector<bool>{true}));
+    checkCanceledContinuationHasNoOrphanCalls(fixture, true);
+}
+
+void test_response_continuation_cancel_contracts() {
+    test_cancel_during_metadata_update_does_not_leave_orphan_state_calls();
+    test_stop_after_first_tool_preserves_its_fact_and_closes_remaining_state_calls();
+}
+
+void test_response_continuation_contracts() {
+    test_metadata_only_response_state_survives_empty_text_and_followup();
+    test_response_state_is_durable_before_every_tool_and_not_duplicated();
+    test_failed_or_canceled_response_has_no_replayable_success_state();
+    test_continuation_write_failure_prevents_tool_execution();
+    test_response_continuation_cancel_contracts();
 }
 
 void test_interrupt() {
@@ -2038,6 +2549,16 @@ void test_untrusted_tool_output_cannot_claim_accepted_task_identity() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--continuation-cancel") {
+        test_response_continuation_cancel_contracts();
+        std::printf("response continuation cancellation checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--continuation-state") {
+        test_response_continuation_contracts();
+        std::printf("response continuation checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--turn-cleanup") {
         test_turn_cleanup_contracts();
         std::printf("turn cleanup checks: %d failure(s)\n", failures);
@@ -2087,6 +2608,7 @@ int main(int argc, char** argv) {
     test_agent_options_supply_system_prompt();
     test_multi_turn_history();
     test_reasoning_goes_to_its_own_part();
+    test_response_continuation_contracts();
     test_interrupt();
     test_busy_session_rejects_second_turn();
     test_unknown_session();

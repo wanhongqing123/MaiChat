@@ -43,9 +43,10 @@ void maiMobileAgentDestroy(void* handle);
 // defaultReasoningEffort 仅作空 override 的显示解释，reasoningEffort 本身仍是持久原值。
 // prepare_local_model 仅本机宿主可用，带 model 和原 localModelPath/Projector/预算字段，
 // 验证后初始化 lazy slot，不加载权重或重建 Agent；远端 set_model 不接受此操作/任何路径。
-// send/enqueue/steer 不覆盖会话选择。configure 可提供 glmBaseUrl/deepseekBaseUrl，
+// send/enqueue/steer 不覆盖会话选择。configure 可提供 glmBaseUrl/deepseekBaseUrl/openrouterBaseUrl，
 // 可同时预检 localModelName/localModelPath 等现有本地参数；选择会话不重建 Agent。
-// 四个正式云型号每请求使用既有 glm_api_key/deepseek_api_key 账号回调，不沿用旧 Key 兜底。
+// 正式云型号统一 Responses，每请求使用对应 glm_api_key/deepseek_api_key/openrouter_api_key
+// 账号回调；modelProvider 仍为 remote，不沿用旧 Key 或别家供应商兜底。
 char* maiMobileAgentRequest(void* handle, const char* request);
 void maiMobileAgentFree(char* response);
 

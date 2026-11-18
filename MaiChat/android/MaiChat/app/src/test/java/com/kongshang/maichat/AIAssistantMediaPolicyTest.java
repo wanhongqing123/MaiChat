@@ -11,6 +11,7 @@ public class AIAssistantMediaPolicyTest {
         assertFalse(AIAssistantMediaPolicy.supportsImages("deepseek-v4-pro"));
         assertTrue(AIAssistantMediaPolicy.supportsImages("deepseek-flash"));
         assertTrue(AIAssistantMediaPolicy.supportsImages("glm-5.3-flash"));
+        assertTrue(AIAssistantMediaPolicy.supportsImages("anthropic/claude-fable-5.2"));
     }
 
     @Test public void recognizesVisualModelsAndSupportedImageTypes() {

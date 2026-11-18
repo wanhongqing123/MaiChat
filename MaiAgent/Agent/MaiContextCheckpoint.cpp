@@ -50,6 +50,16 @@ void appendPart(SourceDigest& digest, const MaiMessagePart& part) {
             if constexpr (std::is_same_v<Body, MaiTextPart> ||
                           std::is_same_v<Body, MaiReasoningPart>) {
                 digest.append(body.text);
+                if constexpr (std::is_same_v<Body, MaiReasoningPart>) {
+                    // 缺省状态不添加任何字节，保持旧检查点；新快照逐字段绑定来源和原始载荷。
+                    if (body.continuation) {
+                        digest.append("MaiModelContinuationState/v1");
+                        digest.append(body.continuation->format);
+                        digest.append(body.continuation->provider);
+                        digest.append(body.continuation->model);
+                        digest.append(body.continuation->payload);
+                    }
+                }
             } else if constexpr (std::is_same_v<Body, MaiImagePart> ||
                                  std::is_same_v<Body, MaiVideoPart>) {
                 digest.append(body.path);

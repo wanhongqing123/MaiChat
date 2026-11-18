@@ -153,10 +153,16 @@ std::string sanitizeUtf8(const std::string& value) {
 // 用 STATIC 的话要保证字符串活到 step 之后，而这里好几处绑的是临时量，那种错误不会立刻炸，
 // 会在某次 GC 时机变成读到垃圾。
 void bindText(sqlite3_stmt* statement, int index, const std::string& value) {
-    // SQLite 不会替调用方验证 TEXT 的编码。所有字段都经过这个唯一入口，在最靠近数据库的
-    // 边界兜住非法字节，保证磁盘里的 TEXT 始终是 UTF-8。
+    // SQLite 不会替调用方验证 TEXT 的编码。普通文本字段经过这个入口，在最靠近数据库的
+    // 边界兜住非法字节；不透明续接状态由独立绑定入口保留原字节。
     const std::string sanitized = sanitizeUtf8(value);
     sqlite3_bind_text(statement, index, sanitized.c_str(), static_cast<int>(sanitized.size()),
+                      SQLITE_TRANSIENT);
+}
+
+// 续接状态由 wire 校验；存储层不能归一化带签名/加密字段的不透明字节。
+void bindContinuationText(sqlite3_stmt* statement, int index, const std::string& value) {
+    sqlite3_bind_text(statement, index, value.data(), static_cast<int>(value.size()),
                       SQLITE_TRANSIENT);
 }
 
@@ -1702,8 +1708,9 @@ private:
     void writePartLocked(const std::string& messageId, const MaiMessagePart& part) {
         sqlite3_stmt* statement = prepareLocked(
             "INSERT INTO parts(id, message_id, kind, created, text, tool, call_id, input, "
-            "output, error, state, execution) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, "
-            "?12)");
+            "output, error, state, execution, continuation_format, continuation_provider, "
+            "continuation_model, continuation_payload) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, "
+            "?10, ?11, ?12, ?13, ?14, ?15, ?16)");
         if (!statement) return;
         Reset guard(statement);
 
@@ -1712,6 +1719,7 @@ private:
         // 而不是一坨转义过的字符串。也省掉了把 nlohmann 拖进核心。
         int kind = kText;
         std::string text, tool, callId, input, output, error, execution;
+        const MaiModelContinuationState* continuation = nullptr;
         int state = 0;
         if (const auto* textBody = std::get_if<MaiTextPart>(&part.body)) {
             kind = kText;
@@ -1719,6 +1727,7 @@ private:
         } else if (const auto* reasoningBody = std::get_if<MaiReasoningPart>(&part.body)) {
             kind = kReasoning;
             text = reasoningBody->text;
+            if (reasoningBody->continuation) continuation = &*reasoningBody->continuation;
         } else if (const auto* imageBody = std::get_if<MaiImagePart>(&part.body)) {
             kind = kImage;
             text = imageBody->path;
@@ -1754,6 +1763,14 @@ private:
         bindText(statement, 10, error);
         sqlite3_bind_int(statement, 11, state);
         bindText(statement, 12, execution);
+        if (continuation) {
+            bindContinuationText(statement, 13, continuation->format);
+            bindContinuationText(statement, 14, continuation->provider);
+            bindContinuationText(statement, 15, continuation->model);
+            bindContinuationText(statement, 16, continuation->payload);
+        } else {
+            for (int index = 13; index <= 16; ++index) sqlite3_bind_null(statement, index);
+        }
         executePreparedStatement(statement);
     }
 
@@ -1762,7 +1779,9 @@ private:
         if (succeeded) *succeeded = false;
         std::vector<MaiMessagePart> out;
         sqlite3_stmt* statement = prepareLocked(
-            "SELECT id, kind, created, text, tool, call_id, input, output, error, state, execution "
+            "SELECT id, kind, created, text, tool, call_id, input, output, error, state, "
+            "execution, "
+            "continuation_format, continuation_provider, continuation_model, continuation_payload "
             "FROM parts WHERE message_id = ?1 ORDER BY id");
         if (!statement) return out;
         Reset guard(statement);
@@ -1774,7 +1793,15 @@ private:
             const int kind = sqlite3_column_int(statement, 1);
             part.created = sqlite3_column_int64(statement, 2);
             if (kind == kReasoning) {
-                part.body = MaiReasoningPart{textColumn(statement, 3)};
+                MaiReasoningPart reasoning{textColumn(statement, 3)};
+                MaiModelContinuationState continuation{
+                    textColumn(statement, 11), textColumn(statement, 12), textColumn(statement, 13),
+                    textColumn(statement, 14)};
+                // 旧 NULL/全空列不发明状态；部分字段损坏时也保留原值，让 wire 明确拒绝。
+                if (!continuation.format.empty() || !continuation.provider.empty() ||
+                    !continuation.model.empty() || !continuation.payload.empty())
+                    reasoning.continuation = std::move(continuation);
+                part.body = std::move(reasoning);
             } else if (kind == kImage) {
                 part.body = MaiImagePart{textColumn(statement, 3), textColumn(statement, 7)};
             } else if (kind == kVideo) {
@@ -2326,6 +2353,45 @@ MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
             sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
             sqlite3_close(database);
             return {MaiErrorCode::Internal, "cannot migrate schema to v12: " + what};
+        }
+        sqlite3_free(migrationError);
+    }
+    if (readUserVersion(database) < 13) {
+        // 在写锁内检查各列，兼容并发迁移及保留新列的旧版本号；旧消息仍然没有状态。
+        char* migrationError = nullptr;
+        bool ok = sqlite3_exec(database, "BEGIN IMMEDIATE", nullptr, nullptr, &migrationError) ==
+                  SQLITE_OK;
+        std::vector<std::string> existingColumns;
+        sqlite3_stmt* columns = nullptr;
+        if (ok)
+            ok = sqlite3_prepare_v2(database, "PRAGMA table_info(parts)", -1, &columns, nullptr) ==
+                 SQLITE_OK;
+        if (ok) {
+            int code;
+            while ((code = sqlite3_step(columns)) == SQLITE_ROW)
+                existingColumns.push_back(textColumn(columns, 1));
+            ok = code == SQLITE_DONE;
+        }
+        sqlite3_finalize(columns);
+        for (const char* name : {"continuation_format", "continuation_provider",
+                                 "continuation_model", "continuation_payload"}) {
+            if (!ok) break;
+            if (std::find(existingColumns.begin(), existingColumns.end(), name) !=
+                existingColumns.end())
+                continue;
+            const std::string sql = std::string("ALTER TABLE parts ADD COLUMN ") + name + " TEXT";
+            ok =
+                sqlite3_exec(database, sql.c_str(), nullptr, nullptr, &migrationError) == SQLITE_OK;
+        }
+        if (ok)
+            ok = sqlite3_exec(database, "PRAGMA user_version=13;COMMIT;", nullptr, nullptr,
+                              &migrationError) == SQLITE_OK;
+        if (!ok) {
+            const std::string what = migrationError ? migrationError : sqlite3_errmsg(database);
+            sqlite3_free(migrationError);
+            sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
+            sqlite3_close(database);
+            return {MaiErrorCode::Internal, "cannot migrate schema to v13: " + what};
         }
         sqlite3_free(migrationError);
     }

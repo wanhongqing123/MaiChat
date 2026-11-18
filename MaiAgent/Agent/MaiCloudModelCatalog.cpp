@@ -3,14 +3,15 @@
 
 std::optional<MaiCloudModelInfo> maiCloudModelInfo(const std::string& model) {
     // 2026-11-10 官方模型页和 /models 文档；主聊天协议是产品选择，不是 Key 格式推断。
-    // GLM Coding Plan（含过期订阅）当前只支持 Chat Completions。
+    // 产品云模型统一 Responses；具体账号可用性仍由供应商真实响应决定。
+    // https://docs.bigmodel.cn/cn/guide/develop/responses/introduction
     // https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3
     // https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash
     // https://api-docs.deepseek.com/api/list-models/
     if (model == "glm-5.3" || model == "glm-5.3-flash")
         return MaiCloudModelInfo{model,
                                  "glm",
-                                 MaiWireApi::ChatCompletions,
+                                 MaiWireApi::Responses,
                                  model == "glm-5.3-flash",
                                  true,
                                  {1048576, 131072}};
@@ -18,6 +19,9 @@ std::optional<MaiCloudModelInfo> maiCloudModelInfo(const std::string& model) {
         return MaiCloudModelInfo{
             model, "deepseek",       MaiWireApi::Responses, model == "deepseek-flash",
             true,  {1048576, 393216}};
+    if (model == "anthropic/claude-fable-5.2")
+        return MaiCloudModelInfo{model, "openrouter", MaiWireApi::Responses, true, true,
+                                 {1000000, 128000}};
     return std::nullopt;
 }
 

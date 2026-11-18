@@ -4,6 +4,9 @@ const assert = require('node:assert/strict');
 const { createHash, randomBytes } = require('node:crypto');
 const test = require('node:test');
 const { createAuthService } = require('./service');
+const { createAccountModelKeyIssuer } = require('./account-model-keys');
+const { createHandler: createModelCredentialHandler } = require('../model-credentials/index');
+const { createServer: createModelCredentialServer } = require('../model-credentials/server');
 const { openStore } = require('./store');
 const { createAliyunAsrCredentialIssuer } = require('./aliyun-asr-credential');
 const { createServer, start, requireDeviceSlotFromEnv,
@@ -149,6 +152,59 @@ test('HTTP adapter rejects oversized and invalid requests without invoking auth'
     assert.equal(calls, 1);
   } finally {
     await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('HTTP model keys extend the existing authenticated control plane with OpenRouter', async () => {
+  const internalToken = 'abcdef0123456789abcdef0123456789';
+  const keys = { glm: 'glm-test-key', deepseek: 'deepseek-test-key',
+    minimax: 'minimax-test-key', openrouter: 'openrouter-test-key' };
+  const credentialServer = createModelCredentialServer(createModelCredentialHandler({ env: {
+    MAICHAT_AUTH_SERVICE_TOKEN: internalToken, MAICHAT_GLM_API_KEY: keys.glm,
+    MAICHAT_DEEPSEEK_API_KEY: keys.deepseek, MAICHAT_MINIMAX_API_KEY: keys.minimax,
+    MAICHAT_OPENROUTER_API_KEY: keys.openrouter
+  } }));
+  await new Promise(resolve => credentialServer.listen(0, '127.0.0.1', resolve));
+  const db = openStore(':memory:');
+  let smsCode = '';
+  const service = createAuthService({ db,
+    sms: { async send(_phone, code) { smsCode = code; } },
+    secret: 'test-only-auth-hmac-key-keep-on-server-123456',
+    imSecret: 'test-only-tencent-im-key-keep-on-server-123456',
+    sdkAppId: 123456789, now: () => 1_780_000_000_000,
+    issueAccountModelKeys: createAccountModelKeyIssuer({
+      MAICHAT_AUTH_SERVICE_TOKEN: internalToken,
+      MAICHAT_MODEL_CREDENTIAL_PORT: String(credentialServer.address().port)
+    }) });
+  const server = createServer(service);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const challenge = await service.handle({ method: 'POST', path: '/v1/auth/sms/challenge',
+      body: { phone: '13900000001', age_confirmed_14_plus: true }, ip: '192.0.2.1' });
+    const signedIn = await service.handle({ method: 'POST', path: '/v1/auth/sms/verify',
+      body: { phone: '13900000001', challenge_id: challenge.body.challenge_id,
+        code: smsCode, device_slot: 'ios_phone', age_confirmed_14_plus: true } });
+    assert.equal(signedIn.statusCode, 200);
+    const endpoint = `http://127.0.0.1:${server.address().port}/v1/model/api-keys`;
+    const denied = await fetch(endpoint);
+    assert.equal(denied.status, 401);
+    assert.equal(denied.headers.get('cache-control'), 'no-store');
+    const issued = await fetch(endpoint, {
+      headers: { Authorization: `Bearer ${signedIn.body.access_token}` }
+    });
+    assert.equal(issued.status, 200);
+    assert.equal(issued.headers.get('cache-control'), 'no-store');
+    const raw = await issued.text();
+    assert.deepEqual(JSON.parse(raw), { api_keys: keys });
+    assert.ok(!raw.includes(internalToken));
+    const modelRequest = await fetch(`http://127.0.0.1:${server.address().port}/v1/model/responses`, {
+      method: 'POST', body: '{}', headers: { Authorization: `Bearer ${signedIn.body.access_token}` }
+    });
+    assert.equal(modelRequest.status, 404);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    await new Promise(resolve => credentialServer.close(resolve));
+    db.close();
   }
 });
 

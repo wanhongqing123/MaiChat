@@ -21,7 +21,8 @@ class MaiContextBuilder {
 public:
     struct Options {
         // 默认不回灌历史思考草稿，避免 Chat 与 Responses 的上下文出现差异。
-        // 显式启用时才把草稿交给模型。
+        // 显式启用时才把草稿交给模型。原响应的 opaque continuation 独立保留，
+        // 不由此显示文本选项或 maxReasoningBytes 裁剪。
         bool includeReasoning = false;
         // 只保留当前用户轮次里最新的工具图片。旧像素仍在磁盘和会话存储中，
         // 但每轮都重新嵌入全部图片会让模型请求不断膨胀，最终耗尽流式期限。

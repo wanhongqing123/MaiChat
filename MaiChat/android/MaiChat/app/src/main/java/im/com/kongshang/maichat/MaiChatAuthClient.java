@@ -159,11 +159,13 @@ public final class MaiChatAuthClient {
         public final String glm;
         public final String deepseek;
         public final String minimax;
+        public final String openrouter;
 
-        AccountModelKeys(String glm, String deepseek, String minimax) {
+        AccountModelKeys(String glm, String deepseek, String minimax, String openrouter) {
             this.glm = glm;
             this.deepseek = deepseek;
             this.minimax = minimax;
+            this.openrouter = openrouter;
         }
     }
 
@@ -737,13 +739,24 @@ public final class MaiChatAuthClient {
         if (!hasSession()) return null;
         JSONObject keys = authenticatedRequest("model/api-keys", "GET", null)
             .getJSONObject("api_keys");
+        return parseAccountModelKeys(keys);
+    }
+
+    // Missing optional providers mean unavailable. Never coerce another JSON type into
+    // a credential or reject an account just because its only enabled route is OpenRouter.
+    static AccountModelKeys parseAccountModelKeys(JSONObject keys) throws Exception {
+        if (!(keys.opt("glm") instanceof String) || !(keys.opt("deepseek") instanceof String) ||
+                (keys.has("minimax") && !(keys.opt("minimax") instanceof String)) ||
+                (keys.has("openrouter") && !(keys.opt("openrouter") instanceof String)))
+            throw new IOException("主聊天模型凭据无效");
         String glm = keys.getString("glm");
         String deepseek = keys.getString("deepseek");
-        String minimax = keys.optString("minimax", "");
-        if ((glm.isEmpty() && deepseek.isEmpty() && minimax.isEmpty()) ||
-            !validModelKey(glm) || !validModelKey(deepseek) || !validModelKey(minimax))
+        String minimax = keys.has("minimax") ? keys.getString("minimax") : "";
+        String openrouter = keys.has("openrouter") ? keys.getString("openrouter") : "";
+        if ((glm.isEmpty() && deepseek.isEmpty() && minimax.isEmpty() && openrouter.isEmpty()) ||
+            !validModelKey(glm) || !validModelKey(deepseek) || !validModelKey(minimax) || !validModelKey(openrouter))
             throw new IOException("主聊天模型凭据无效");
-        return new AccountModelKeys(glm, deepseek, minimax);
+        return new AccountModelKeys(glm, deepseek, minimax, openrouter);
     }
 
     // 调用者在录音工作线程等待预取中的同一个 Future；每次取用都生成新的流标识和 URL。

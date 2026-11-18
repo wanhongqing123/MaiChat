@@ -9,15 +9,34 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public final class AIAssistantModelSettingsTest {
-    @Test public void allFourCloudChoicesKeepTheirOwnSupplierWire() throws Exception {
-        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"}) {
+    @Test public void allFiveCloudChoicesUseResponsesAndTheirOwnEndpoint() throws Exception {
+        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+                "anthropic/claude-fable-5.2"}) {
             AIAssistantModelSettings settings = AIAssistantModelSettings.fromJson(
                 new JSONObject().put("model", model));
             assertEquals("The exact session choice must survive", model, settings.model());
-            assertEquals(model.startsWith("glm-") ? "chat_completions" : "responses", settings.wire());
-            assertEquals(model.startsWith("glm-") ? "https://open.bigmodel.cn/api/paas/v4"
+            assertEquals("responses", settings.wire());
+            assertEquals(model.startsWith("glm-") ? "https://open.bigmodel.cn/api/v1"
+                : model.equals("anthropic/claude-fable-5.2") ? "https://openrouter.ai/api/v1"
                 : "https://api.deepseek.com", settings.baseUrl());
         }
+    }
+
+    @Test public void openRouterConfigurationKeepsRemoteSourceAndExactSessionChoice() throws Exception {
+        for (String effort : new String[]{"low", "high", "max"}) {
+            AIAssistantModelSettings settings = AIAssistantModelSettings.defaults()
+                .withOptions("anthropic/claude-fable-5.2", "on-request", effort);
+            JSONObject config = settings.configuration(null, "synthetic-openrouter-key");
+            assertEquals("remote", config.getString("modelProvider"));
+            assertEquals("anthropic/claude-fable-5.2", config.getString("model"));
+            assertEquals("responses", config.getString("wire"));
+            assertEquals("https://openrouter.ai/api/v1", config.getString("baseUrl"));
+            assertEquals("synthetic-openrouter-key", config.getString("apiKey"));
+            assertEquals(effort, config.getString("reasoningEffort"));
+            assertEquals("anthropic/claude-fable-5.2",
+                AIAssistantModelSettings.fromJson(settings.toJson()).model());
+        }
+        assertEquals("deepseek-flash", AIAssistantModelSettings.defaults().model());
     }
 
     @Test public void localSettingsRestoreTheirSourceInsteadOfBeingForcedToTheCloud() throws Exception {

@@ -5406,8 +5406,9 @@ void MainWindow::rebuildAgentPage() {
     QMutexLocker lock(&keyState->mutex);
     return keyState->keys.value(QStringLiteral("minimax"));
   };
-  modelConfig.glmBaseUrl = QStringLiteral("https://open.bigmodel.cn/api/paas/v4");
+  modelConfig.glmBaseUrl = QStringLiteral("https://open.bigmodel.cn/api/v1");
   modelConfig.deepseekBaseUrl = QStringLiteral("https://api.deepseek.com");
+  modelConfig.openrouterBaseUrl = QStringLiteral("https://openrouter.ai/api/v1");
   modelConfig.arkApiKeyProvider = arkApiKeyProvider_;
   modelConfig.wanCredentialsProvider = wanCredentialsProvider_;
   modelConfig.mediaServiceAccessProvider = mediaServiceAccessProvider_;

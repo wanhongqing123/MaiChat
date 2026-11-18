@@ -1397,6 +1397,10 @@ private struct AIActionPanel: View {
                             .accessibilityIdentifier("ai-primary-model-glm-5.3")
                         option("GLM-5.3-Flash", selected: selectedModelID == "glm-5.3-flash") { selectModel("glm-5.3-flash") }
                             .accessibilityIdentifier("ai-primary-model-glm-5.3-flash")
+                        option("Claude Fable 5.2", selected: selectedModelID == AIModelSettings.fableModel) {
+                            selectModel(AIModelSettings.fableModel)
+                        }
+                        .accessibilityIdentifier("ai-primary-model-" + AIModelSettings.fableModel)
                         if allowLocalModel {
                             option("本地模型", selected: isLocalModel) { selectModel("local:" + AILocalModelStore.bundledPrimaryID) }
                                 .accessibilityIdentifier("ai-primary-model-local")

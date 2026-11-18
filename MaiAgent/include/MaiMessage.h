@@ -9,6 +9,7 @@
 
 #include "MaiTime.h"
 #include "MaiToolExecution.h"
+#include "MaiModelContinuationState.h"
 
 // 一次对话里的消息和它的组成片段。
 //
@@ -41,13 +42,16 @@ struct MaiTextPart {
 
 // 模型的思考过程（OpenAI 协议里的 reasoning_content）。
 //
-// **不回灌给模型**——它是草稿，回灌会污染下一轮上下文。MaiContextBuilder 组装历史时会跳过这种片段，
-// 那里有一条用例盯着。
+// 可见草稿和 wire 要求的原始续接状态分开。不能用显示文本伪造带签名的思考项；
+// wire 是否重放文字或完整状态由原 provider/model 的实际契约决定。
 //
 // 界面上通常折叠显示，所以它和 MaiTextPart 必须是**两个片段**而不是拼在一起：混成一个的话，
 // 界面没办法只折叠思考那一段。
 struct MaiReasoningPart {
     std::string text;
+    // 每次成功响应独立保存，可为空文本。仅用于持久化和同来源模型续接，
+    // UI/普通历史展示不输出它，也不能在上下文裁剪时截断或从同批工具中间切开。
+    std::optional<MaiModelContinuationState> continuation;
 };
 
 // 一轮消息附带的图片。用户消息里的图片来自宿主文件选择器；assistant 消息里的图片来自

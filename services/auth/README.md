@@ -427,7 +427,7 @@ Workspace。切换 Workspace 时必须指定已存在 Session 的 ID 和绝对�
 | `GET /v1/im/credential` | Bearer 会话；只为当前账号签发 Tencent UserSig |
 | `GET /v1/model/seedance-credential` | 有效 Bearer 会话；返回 5 分钟、限定 Seedance 与 Seedream 的临时方舟 Key；路径保留旧名称兼容 App |
 | `GET /v1/model/bailian-credential` | 有效 Bearer 会话；返回 5 分钟百炼临时 Key 和万相 Workspace ID，供万相与百炼可灵共用 |
-| `GET /v1/model/api-keys` | 有效 Bearer 会话；返回 GLM、DeepSeek、MiniMax Key，客户端直接调用供应商 |
+| `GET /v1/model/api-keys` | 有效 Bearer 会话；返回 GLM、DeepSeek、MiniMax、OpenRouter Key，客户端直接调用供应商 |
 | `GET /v1/media/authorize` | 有效 Bearer 会话；供素材服务核验该账号可否登记素材或取得 OSS 上传签名，不返回密钥 |
 | `POST /v1/asr/credential` | 有效 Bearer 会话且空 JSON 请求体；返回 `{app_id,secret_id,secret_key,token,expires_at}`，其中 `app_id` 为数字字符串，凭据仅允许实时识别，30 分钟有效。两端登录后预取并仅在内存缓存；未配置、上游失败或无效凭据返回 503，无效会话返回 401；每账号每分钟最多 10 次。 |
 | `POST /v1/asr/aliyun-credential` | 有效 Bearer 会话且空 JSON 请求体；返回 `{app_key,token,expires_at}`，iOS 使用 NLS Token 直接访问阿里云。到期时间沿用供应商 `ExpireTime`；配置缺失或上游异常为 503，与腾讯接口共用每账号每分钟 10 次额度。 |
@@ -637,7 +637,8 @@ AppKey 必须只保存在服务端。
 - 账号服务不代理大模型或媒体字节。Seedance 与百炼临时 Key 都由账号服务经本机回环
   请求模型凭据服务签发，火山 AK/SK、百炼永久 API Key 不下发。百炼临时 Key 继承
   主 Key 的模型权限，5 分钟内如泄漏仍可使用；业务配额仍须在百炼控制台限制。
-  GLM、DeepSeek、MiniMax 由账号服务按登录会话下发。它们目前是供应商长期 Key，
+  GLM、DeepSeek、MiniMax、OpenRouter 由账号服务按登录会话下发，所有有效登录账号
+  沿用同一主模型授权范围。它们目前是供应商长期 Key，
   会进入客户端进程；退出登录无法撤销已被复制的 Key，密钥保护方式留待后续方案。
   服务端只下发凭据，绝不转发模型请求或流式响应。
 - 桌面端和已发布的旧版移动客户端仍可能持有旧 IM 签名密钥。完成迁移后需轮换
@@ -655,6 +656,19 @@ npm test
 需要具备短信发送权限；签名和验证码模板必须已经审核可用。数据库放
 `/var/lib/maichat-auth/`，目录仅授权服务账号，定期备份 SQLite 数据库与 WAL。
 部署时使用示例 systemd 服务及 Nginx 路由，并独立启动模型凭据与素材服务。
+
+主模型凭据的 `api_keys` 保留 `glm`、`deepseek`、`minimax` 三个必需字符串，新增
+可选字符串 `openrouter`；领取旧凭据进程的响应时，缺少新字段会归一化为空字符串。
+显式 `null`、其他类型、超过 4096 字符或含 ASCII 控制字符的 Key 均被拒绝；四字段
+均为空同样返回 503。原始凭据 JSON 上限为 64 KiB，为四个最大长度字段预留 UTF-8
+与 JSON 转义开销，公开响应仍带 `Cache-Control: no-store`。
+OpenRouter 长期 Key 只配置在模型凭据服务，不能放入本账号服务的环境文件。
+新增字段不改变路由、会话校验或既有供应商配置；上线顺序与受限配置回退见
+`../model-credentials/README.md`。本地假凭据回归：
+
+```sh
+node --test account-model-keys.test.js service.test.js server.test.js
+```
 
 设备名额上线顺序：
 

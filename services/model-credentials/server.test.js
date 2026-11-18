@@ -12,7 +12,8 @@ test('account service receives model keys over loopback only', async () => {
     MAICHAT_AUTH_SERVICE_TOKEN: token,
     MAICHAT_GLM_API_KEY: 'glm-test-key',
     MAICHAT_DEEPSEEK_API_KEY: 'deepseek-test-key',
-    MAICHAT_MINIMAX_API_KEY: 'minimax-test-key'
+    MAICHAT_MINIMAX_API_KEY: 'minimax-test-key',
+    MAICHAT_OPENROUTER_API_KEY: 'openrouter-test-key'
   } }));
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
@@ -21,12 +22,19 @@ test('account service receives model keys over loopback only', async () => {
     const denied = await fetch(url, { method: 'POST', body,
       headers: { Authorization: 'Bearer wrong' } });
     assert.equal(denied.status, 401);
+    assert.equal(denied.headers.get('cache-control'), 'no-store');
     const issued = await fetch(url, { method: 'POST', body,
       headers: { Authorization: `Bearer ${token}` } });
     assert.equal(issued.status, 200);
+    assert.equal(issued.headers.get('cache-control'), 'no-store');
     assert.deepEqual((await issued.json()).api_keys, {
-      glm: 'glm-test-key', deepseek: 'deepseek-test-key', minimax: 'minimax-test-key'
+      glm: 'glm-test-key', deepseek: 'deepseek-test-key', minimax: 'minimax-test-key',
+      openrouter: 'openrouter-test-key'
     });
+    const modelRequest = await fetch(`http://127.0.0.1:${server.address().port}/responses`, {
+      method: 'POST', body: '{}', headers: { Authorization: `Bearer ${token}` }
+    });
+    assert.equal(modelRequest.status, 404);
   } finally {
     await new Promise(resolve => server.close(resolve));
   }

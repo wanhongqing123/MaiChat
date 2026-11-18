@@ -17,8 +17,15 @@ std::string toUtf8(const QString& value) {
 }
 
 QString providerBaseUrl(const DesktopAccountModelClient::Config& config, const QString& provider) {
-    if (provider == QStringLiteral("glm")) return config.glmBaseUrl;
+    if (provider == QStringLiteral("glm")) {
+        // 旧官方 Chat 地址只在这个明确迁移点归一；自有/测试端点保持用户配置。
+        if (config.glmBaseUrl == QStringLiteral("https://open.bigmodel.cn/api/paas/v4") ||
+            config.glmBaseUrl == QStringLiteral("https://open.bigmodel.cn/api/paas/v4/"))
+            return QStringLiteral("https://open.bigmodel.cn/api/v1");
+        return config.glmBaseUrl;
+    }
     if (provider == QStringLiteral("deepseek")) return config.deepseekBaseUrl;
+    if (provider == QStringLiteral("openrouter")) return config.openrouterBaseUrl;
     return {};
 }
 
@@ -52,7 +59,8 @@ DesktopAccountModelClient::DesktopAccountModelClient(Config config) : config_(st
     MaiRoutedModelConfig routed;
     // 这里只列产品提供的型号，供应商、协议和能力统一来自 Core 目录。
     // 每条 route 的凭据回调在 stream 时执行，不能捕获构造时的旧 Key。
-    for (const char* model : {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"}) {
+    for (const char* model :
+         {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro", "anthropic/claude-fable-5.2"}) {
         const auto info = maiCloudModelInfo(model);
         if (!info) continue;
         const QString provider = QString::fromStdString(info->provider);

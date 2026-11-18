@@ -241,6 +241,8 @@ MaiResult<std::string> imageDataUrl(const MaiModelRequest& request, const MaiMod
 MaiResult<std::string> buildRequestBody(const MaiModelRequest& request,
                                         const ImagePreparer& prepareImage, bool includeUsage) {
     json msgs = json::array();
+    const auto capability = maiCloudModelInfo(request.model);
+    const bool isGlm = capability && capability->provider == "glm";
     if (!request.baseInstructions.empty()) {
         msgs.push_back({{"role", "system"}, {"content", request.baseInstructions}});
     }
@@ -284,8 +286,7 @@ MaiResult<std::string> buildRequestBody(const MaiModelRequest& request,
         }
         // GLM 交错思考必须随原 assistant 调用回传 reasoning_content；它不是可见正文。
         // 普通未知模型不猜此扩展；默认 Builder 不会为它们回灌旧思考。
-        if (maiCloudModelInfo(request.model) && message.role == MaiModelRole::Assistant &&
-            !message.reasoning.empty())
+        if (isGlm && message.role == MaiModelRole::Assistant && !message.reasoning.empty())
             messageNode["reasoning_content"] = message.reasoning;
         // 线上字段名是 tool_call_id（snake_case），不是我们结构体里那个 toolCallId。
         // 写错的话工具结果和它对应的调用就对不上——服务端要么直接 400，
@@ -307,9 +308,8 @@ MaiResult<std::string> buildRequestBody(const MaiModelRequest& request,
     json body{{"model", request.model}, {"messages", std::move(msgs)}, {"stream", true}};
     if (request.maxOutputTokens != 0) body["max_tokens"] = request.maxOutputTokens;
     if (includeUsage) body["stream_options"] = json{{"include_usage", true}};
-    if (maiCloudModelInfo(request.model).has_value() &&
-        (request.reasoningEffort == "low" || request.reasoningEffort == "high" ||
-         request.reasoningEffort == "max")) {
+    if (isGlm && (request.reasoningEffort == "low" || request.reasoningEffort == "high" ||
+                  request.reasoningEffort == "max")) {
         body["thinking"] = json{{"type", "enabled"}};
         body["reasoning_effort"] = request.reasoningEffort;
     }

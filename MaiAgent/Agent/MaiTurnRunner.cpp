@@ -61,6 +61,14 @@ MaiToolExecution notStartedExecution() {
     return execution;
 }
 
+bool hasResponseContinuation(const MaiMessage& message, std::size_t firstPart) {
+    for (std::size_t index = firstPart; index < message.parts.size(); ++index) {
+        const auto* reasoning = std::get_if<MaiReasoningPart>(&message.parts[index].body);
+        if (reasoning && reasoning->continuation) return true;
+    }
+    return false;
+}
+
 // continue 的参数只提供查找键；只有同会话、同工具的任务表或可信 typed 字段能证明接受身份。
 // shell、文件和供应商原始文本都可能包含 task_id 自述，不能据此升级成宿主事实。
 std::optional<MaiToolExecution> acceptedTaskExecution(const MaiToolInvocation& call,
@@ -327,8 +335,9 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
             }
             break;
         }
-        if (cancel.load(std::memory_order_relaxed)) break;
-
+        if (cancel.load(std::memory_order_relaxed) &&
+            !hasResponseContinuation(mAssistant, mResponseFirstPart))
+            break;
         const std::size_t firstToolPart = mAssistant.parts.size();
         executeTools(calls, cancel);
         hasToolResults = true;
@@ -503,6 +512,9 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     mResponseFirstPart = mAssistant.parts.size();
     mLastPersistedStreamBytes = 0;
     mResponseHasVisibleText = false;
+    // 续接载体排在本次响应的所有投影之前，压缩器才能只在完整 response 之间切分。
+    // 直到收到成功快照才插入/落库；失败的流不会产生可重放状态。
+    const std::string continuationPartId = MaiIdGenerator::newPartId();
     mTextPartId = MaiIdGenerator::newPartId();
     mReasoningPartId = MaiIdGenerator::newPartId();
 
@@ -510,6 +522,8 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     bool reasoningStarted = false;
     std::vector<MaiToolInvocation> calls;
     std::map<int, std::string> textItemParts;
+    MaiError continuationError;
+    bool continuationPublished = false;
 
     MaiStreamSink sink;
     const auto inputEstimate = mDependencies.model->estimateInputTokens(request);
@@ -573,9 +587,47 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
         mDependencies.emitter->emitDelta(mSessionId, mAssistant.id, mReasoningPartId, "text",
                                          chunk);
     };
-    sink.onToolCall = [&](const MaiToolInvocation& call) { calls.push_back(call); };
+    sink.onContinuationState = [&](const MaiModelContinuationState& state) {
+        if (continuationError) return;
+        if (continuationPublished) {
+            continuationError = {MaiErrorCode::Protocol, "multiple continuation states for one response"};
+            return;
+        }
+        continuationPublished = true;
+        MaiMessagePart carrier;
+        carrier.id = continuationPartId;
+        carrier.created = MaiTime::getCurrentTime();
+        carrier.body = MaiReasoningPart{"", state};
+        mAssistant.parts.insert(mAssistant.parts.begin() +
+                                    static_cast<std::ptrdiff_t>(mResponseFirstPart),
+                                std::move(carrier));
+        // 状态可能没有一个显示字节，不能等待文本 checkpoint 才持久化。
+        mDependencies.store->putMessage(mSessionId, mAssistant);
+        continuationError = mDependencies.store->lastWriteError();
+        if (!continuationError)
+            mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId,
+                                            mAssistant.id, continuationPartId, mInitialAssistantId);
+    };
+    sink.onToolCall = [&](const MaiToolInvocation& call) {
+        if (!continuationError) calls.push_back(call);
+    };
 
-    mError = mDependencies.model->stream(request, sink, cancel);
+    const auto streamError = mDependencies.model->stream(request, sink, cancel);
+    mError = continuationError ? continuationError : streamError;
+    if (mError && continuationPublished) {
+        // state 回调期间也可能 Stop，此时 wire 可拒绝交付后续调用元数据。
+        // 没有任何工具进入执行，撤下本次载体而保留可见草稿，避免回放无结果的调用。
+        mAssistant.parts.erase(
+            std::remove_if(mAssistant.parts.begin(), mAssistant.parts.end(),
+                           [&](const MaiMessagePart& part) { return part.id == continuationPartId; }),
+            mAssistant.parts.end());
+        mDependencies.store->putMessage(mSessionId, mAssistant);
+        if (const auto writeError = mDependencies.store->lastWriteError())
+            mError = writeError;
+        else
+            mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mSessionId, mAssistant.id);
+        calls.clear();
+    }
     return calls;
 }
 
@@ -617,13 +669,20 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
     };
     // 一旦让出执行权，本批剩余项均不再启动，不能因处理回执期间队列变化而恢复旧计划。
     bool replan = false;
+    bool canceledBatch = false;
+    const bool preserveCallPairing = hasResponseContinuation(mAssistant, mResponseFirstPart);
     const char* replanHint =
         "This tool was not executed because new user input arrived. Review the new user messages "
         "and decide whether to request this tool again.";
+    const char* canceledHint =
+        "This tool was not executed because the task was canceled. Do not retry it automatically.";
 
     for (const auto& call : calls) {
-        if (cancel.load(std::memory_order_relaxed)) break;
-        replan = replan || hasPendingInput();
+        if (!preserveCallPairing && cancel.load(std::memory_order_relaxed)) break;
+        // 已捕获的整批调用都需要回执。Stop 只阻止执行，不能留下 raw output 中
+        // 没有 function_call_output 的尾部调用；这些占位明确记为从未启动。
+        canceledBatch = canceledBatch || cancel.load(std::memory_order_relaxed);
+        replan = replan || canceledBatch || hasPendingInput();
 
         MaiMessagePart part;
         part.id = MaiIdGenerator::newPartId();
@@ -645,7 +704,7 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         body.state = replan          ? MaiToolState::Canceled
                      : needsApproval ? MaiToolState::Pending
                                      : MaiToolState::Running;
-        if (replan) body.error = body.output = replanHint;
+        if (replan) body.error = body.output = canceledBatch ? canceledHint : replanHint;
         part.body = body;
         mAssistant.parts.push_back(part);
 
@@ -662,9 +721,11 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         bool enteredExecution = false;
         std::optional<MaiToolExecution> knownTaskExecution;
         // 广播工具占位期间也可能收到输入；审批和实际执行前都要重新核对。
-        replan = replan || hasPendingInput();
+        canceledBatch = canceledBatch || cancel.load(std::memory_order_relaxed);
+        replan = replan || canceledBatch || hasPendingInput();
         if (replan) {
-            result = MaiToolResult::failure(MaiErrorCode::Canceled, replanHint);
+            result = MaiToolResult::failure(MaiErrorCode::Canceled,
+                                            canceledBatch ? canceledHint : replanHint);
         } else if (!tool) {
             // 模型有时会编一个不存在的工具名。告诉它事实，它下一圈通常会改对；
             // 直接失败整轮反而更糟。

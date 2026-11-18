@@ -1,5 +1,6 @@
 // 文件作用：提供可核对的官方容量目录和明确标为估计的中立上下文计数。
 #include "MaiModelClient.h"
+#include "MaiCloudModelCatalog.h"
 
 #include <algorithm>
 #include <limits>
@@ -61,6 +62,8 @@ MaiModelContextLimits maiOfficialModelContextLimits(const std::string& baseUrl,
     if ((endpoint == "https://api.deepseek.com" || endpoint == "https://api.deepseek.com/v1") &&
         (model == "deepseek-flash" || model == "deepseek-v4-pro"))
         return {1048576, 393216};
+    if (endpoint == "https://openrouter.ai/api/v1" && model == "anthropic/claude-fable-5.2")
+        return {1000000, 128000};
     return {};
 }
 
@@ -68,6 +71,15 @@ MaiModelTokenEstimate maiEstimateModelInputTokens(const MaiModelRequest& request
     std::size_t tokens = addSaturated(16, estimateText(request.baseInstructions));
     for (const auto& message : request.messages) {
         tokens = addSaturated(tokens, 16);
+        const auto capability = maiCloudModelInfo(request.model);
+        if (message.continuation && capability &&
+            message.continuation->format == "responses.output.v1" &&
+            message.continuation->provider == capability->provider &&
+            message.continuation->model == request.model) {
+            // wire 使用完整原始输出替代显示投影；只估真正回传的状态，避免重复计算。
+            tokens = addSaturated(tokens, estimateText(message.continuation->payload));
+            continue;
+        }
         tokens = addSaturated(tokens, estimateText(message.content));
         tokens = addSaturated(tokens, estimateText(message.reasoning));
         tokens = addSaturated(tokens, estimateText(message.toolCallId));

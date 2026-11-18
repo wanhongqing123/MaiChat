@@ -58,8 +58,8 @@ public:
 
     struct ModelConfig {
         // 不带末尾斜杠，也不带具体路径。例如：
-        //   https://open.bigmodel.cn/api/coding/paas/v4   GLM 编程套餐
-        //   http://127.0.0.1:11434/v1                     Ollama
+        //   https://open.bigmodel.cn/api/v1   GLM Responses
+        //   http://127.0.0.1:11434/v1         自有端点
         QString baseUrl;
         QString apiKey;
         // 即使主模型选 DeepSeek，媒体专用模型仍使用 GLM 凭据。
@@ -73,6 +73,7 @@ public:
         std::function<QString()> miniMaxApiKeyProvider;
         QString glmBaseUrl;
         QString deepseekBaseUrl;
+        QString openrouterBaseUrl;
         QString wanApiKey;
         QString wanWorkspaceId;
         // 短期 Ark/百炼凭据由账号会话提供；工具执行时实时读取，不捕获构造时的旧密钥。
@@ -90,7 +91,7 @@ public:
     struct SessionModelConfiguration {
         QString model;
         QString reasoningEffort;
-        MaiWireApi wire = MaiWireApi::ChatCompletions;
+        MaiWireApi wire = MaiWireApi::Responses;
         bool configured = false;
     };
 

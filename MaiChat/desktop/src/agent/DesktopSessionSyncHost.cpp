@@ -158,7 +158,12 @@ QJsonObject serializeMessage(const MaiMessage& message, bool busy, const std::st
     QJsonArray parts;
     const auto history = maiProjectIMHistoryForDisplay(message);
     if (history.state == MaiIMHistoryDisplayState::NotImported) {
-        for (const auto& part : message.parts) parts.append(serializePart(part));
+        for (const auto& part : message.parts) {
+            const auto* reasoning = std::get_if<MaiReasoningPart>(&part.body);
+            // 空文本续接载体只留在模型 owner 的存储中，不生成远端空思考卡。
+            if (reasoning && reasoning->continuation && reasoning->text.empty()) continue;
+            parts.append(serializePart(part));
+        }
     } else {
         // These snapshots feed UI only, never MaiContextBuilder. Collapse even
         // malformed imported parts so no old path/tool payload survives failure.

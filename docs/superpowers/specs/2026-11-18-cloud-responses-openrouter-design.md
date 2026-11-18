@@ -17,13 +17,16 @@ new third-party library, model proxy, or additional execution core.
 - Mobile `modelProvider` stays `remote`; configuration adds
   `openrouterBaseUrl` beside `glmBaseUrl` and `deepseekBaseUrl`.
 - Credential response adds optional string `api_keys.openrouter`; absence
-  means empty. Preserve the three old string fields and credentials. Never
+  means empty. Preserve the three old string fields and credentials except
+  the user's separately authorized replacement of the newly tested GLM key. Never
   use another provider's key as fallback. The native host callback is
   `openrouter_api_key` with the same key-result shape as existing callbacks.
 - Provider keys remain in the existing restricted credential service; the
   authenticated account control plane distributes them under its existing
   authorization. Clients call providers directly. The supplied key remains
   with the Mac operator and is not copied to source, tests, logs or Root.
+  The final server-environment update is restricted to the GLM and OpenRouter
+  key fields; DeepSeek/MiniMax and all unrelated bytes remain unchanged.
 
 Existing generic Chat library support is not an implicit cloud fallback.
 GLM cloud migration changes both wire and base URL. Official GLM Responses

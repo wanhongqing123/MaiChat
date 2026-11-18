@@ -243,14 +243,14 @@ extension AIAssistantModel {
         }
         let a = owner("A"), b = owner("B"), local = owner("local")
         var states: [String: [String: Any]] = [
-            a.sessionID: ["model": "glm-5.3", "reasoningEffort": "low", "wire": "chat_completions"],
+            a.sessionID: ["model": "glm-5.3", "reasoningEffort": "low", "wire": "responses"],
             b.sessionID: ["model": "deepseek-flash", "reasoningEffort": "high", "wire": "responses"],
             local.sessionID: ["model": "local:owned-model", "reasoningEffort": "", "wire": "local"]]
         var commands: [(AIRemoteSession, String, [String: Any])] = []
         var readCount = 0
         func result(_ peer: AIRemoteSession, model: String? = nil, effort: String? = nil) -> [String: Any] {
             var value = states[peer.sessionID] ?? [:]
-            if let model { value["model"] = model; value["wire"] = model.hasPrefix("glm-") ? "chat_completions" : "responses" }
+            if let model { value["model"] = model; value["wire"] = "responses" }
             if let effort { value["reasoningEffort"] = effort }
             value["ok"] = true; value["session"] = peer.sessionID; value["defaultReasoningEffort"] = "high"
             return value
@@ -289,6 +289,9 @@ extension AIAssistantModel {
         await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: result(a, model: "glm-5.3-flash", effort: "max"))
         await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: result(a, model: "deepseek-v4-pro", effort: "low"))
         require(selectedRemote?.model == "glm-5.3", "mismatched tuple/model/effort consumed the pending request")
+        var wrongWire = accepted; wrongWire["wire"] = "chat_completions"
+        await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: wrongWire)
+        require(selectedRemote?.model == "glm-5.3", "legacy Chat wire ACK was accepted")
         await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: accepted)
         require(selectedRemote?.model == "deepseek-v4-pro" && settings.effectiveReasoningEffort == "max", "valid ACK was lost after malformed receipts")
         await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: result(a))
@@ -408,15 +411,29 @@ extension AIAssistantModel {
                 "messages": [], "permissions": [], "questions": [], "questionMessages": [], "busy": false, "turnId": ""])
         }
         do {
-            try await publishSessionModelUITestState(page("glm-5.3", effort: "low", wire: "chat_completions"))
+            try await publishSessionModelUITestState(page("glm-5.3", effort: "low", wire: "responses"))
             let count = frames.count
             require(frames.last?["model"] as? String == "glm-5.3" && frames.last?["reasoningEffort"] as? String == "low", "ordinary publication dropped configuration")
-            try await publishSessionModelUITestState(page("glm-5.3", effort: "low", wire: "chat_completions"))
+            try await publishSessionModelUITestState(page("glm-5.3", effort: "low", wire: "responses"))
             require(frames.count == count, "unchanged configuration republished")
             try await publishSessionModelUITestState(page("deepseek-v4-pro", effort: "max", wire: "responses"))
             require(frames.count == count + 1 && frames.last?["model"] as? String == "deepseek-v4-pro", "config-only change was dropped by state digest")
         } catch { require(false, "publisher fixture failed: " + error.localizedDescription) }
         uiTestSupport.sessionModelPublishHandler = nil
+        await selectRemoteConversation(a)
+        await selectPrimaryModel(AIModelSettings.fableModel, reasoningEffort: "high")
+        if let fable = commands.last {
+            require(fable.2["action"] as? String == "set_model" &&
+                fable.2["model"] as? String == AIModelSettings.fableModel, "Fable did not target the owner model command")
+            var invalid = result(a, model: AIModelSettings.fableModel, effort: "high")
+            invalid["wire"] = "chat_completions"
+            await deliverSessionModelUITestReceipt(owner: a, id: fable.1, result: invalid)
+            require(selectedRemote?.model != AIModelSettings.fableModel, "Fable accepted the wrong wire")
+            await deliverSessionModelUITestReceipt(owner: a, id: fable.1,
+                result: result(a, model: AIModelSettings.fableModel, effort: "high"))
+            require(settings.model == AIModelSettings.fableModel && settings.displayName == "Claude Fable 5.2" &&
+                selectedRemote?.wire == "responses", "Fable owner ACK was not projected")
+        } else { require(false, "Fable owner command missing") }
         let offline = owner("offline", online: false)
         applyUITestMutation(.remoteSessions([a, b, local, offline]))
         let beforeOffline = commands.count

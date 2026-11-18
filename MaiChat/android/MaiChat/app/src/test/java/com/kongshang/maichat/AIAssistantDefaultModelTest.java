@@ -16,5 +16,7 @@ public final class AIAssistantDefaultModelTest {
             AIAssistantController.supportedModelOrDefault("deepseek-flash"));
         assertEquals("deepseek-v4-pro",
             AIAssistantController.supportedModelOrDefault("deepseek-v4-pro"));
+        assertEquals("anthropic/claude-fable-5.2",
+            AIAssistantController.supportedModelOrDefault("anthropic/claude-fable-5.2"));
     }
 }

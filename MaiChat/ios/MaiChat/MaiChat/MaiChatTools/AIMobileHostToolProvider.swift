@@ -366,6 +366,14 @@ final class AIMobileHostToolProvider {
             }
             #endif
             return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("deepseek")])
+        case "openrouter_api_key":
+            #if DEBUG && targetEnvironment(simulator)
+            if AIPrimaryModelUITestSupport.isSessionConfigurationRequested {
+                return Self.jsonSuccess(["key": "synthetic-session-openrouter-key"])
+            }
+            #endif
+            // Internal provider callback only; never exposed as a model tool.
+            return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("openrouter")])
         case "minimax_api_key":
             return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("minimax")])
         case "wan_credentials":

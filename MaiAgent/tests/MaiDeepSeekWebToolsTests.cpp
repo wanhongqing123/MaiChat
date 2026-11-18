@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -31,6 +32,7 @@
 
 #include "MaiAgent.h"
 #include "MaiArkMediaTools.h"
+#include "MaiCloudModelCatalog.h"
 #include "MaiFakeModelClient.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
@@ -590,11 +592,15 @@ void test_read_only_retrieval_runs_without_approval_under_every_policy() {
     }
 }
 
-void test_full_access_keeps_paid_media_confirmation() {
-    // 使用实际媒体工具和空凭据，确认只读检索的修复没有放宽付费提交闸门。
-    // 在权限事件中直接拒绝；即使回归使闸门失效，空凭据也保证不会发送真实付费请求。
+void test_paused_image_generation_is_rejected_before_approval_or_credentials() {
+    // 暂停的图像生成应直接返回明确错误，不弹付费确认、不读取凭据。
+    // 仍走实际 Agent 和存储；空凭据保证执行层回归也不会发出真实付费请求。
+    std::atomic<unsigned> credentialReads{0};
     auto tools = std::make_unique<MaiToolRegistry>();
-    tools->add(makeMaiSeedreamImageTool([] { return std::string(); }));
+    tools->add(makeMaiSeedreamImageTool([&] {
+        ++credentialReads;
+        return std::string();
+    }));
     MaiFakeModelClient::Turn submit;
     submit.invocations.push_back(
         {"call_paid", "seedream_image", R"({"action":"delegate","message":"Create an image"})"});
@@ -602,6 +608,7 @@ void test_full_access_keeps_paid_media_confirmation() {
     done.textChunks = {"Skipped."};
     auto model = std::make_unique<MaiFakeModelClient>(
         std::vector<MaiFakeModelClient::Turn>{std::move(submit), std::move(done)});
+    const auto* observer = model.get();
     std::atomic<unsigned> approvalRequests{0};
     MaiAgent::Options options;
     options.defaultModel = "test-model";
@@ -609,14 +616,7 @@ void test_full_access_keeps_paid_media_confirmation() {
     options.permissionTimeoutMs = 30;
     MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools), options);
     agent.eventBus().subscribe([&](const MaiEvent& event) {
-        if (event.type != MaiEventType::PermissionAsked) return;
-        ++approvalRequests;
-        const auto pending = agent.listPendingPermissions();
-        CHECK(pending.size() == 1);
-        if (pending.empty()) return;
-        CHECK(pending[0].toolName == "seedream_image" && !pending[0].allowForSession);
-        CHECK(
-            agent.submit(MaiReplyPermission{pending[0].id, MaiPermissionDecision::Denied}).isOk());
+        if (event.type == MaiEventType::PermissionAsked) ++approvalRequests;
     });
     const auto session =
         agent.submit(MaiCreateSession{MaiFileSystem::temporaryDirectory().toUtf8(), "", ""});
@@ -624,7 +624,35 @@ void test_full_access_keeps_paid_media_confirmation() {
     if (!session.isOk()) return;
     CHECK(agent.submit(MaiSendPrompt{session.value(), "Create an image."}).isOk());
     agent.waitIdle();
-    CHECK(approvalRequests == 1 && agent.listPendingPermissions().empty());
+    CHECK(approvalRequests == 0 && agent.listPendingPermissions().empty());
+    CHECK(credentialReads == 0);
+    unsigned storedResults = 0;
+    for (const auto& message : agent.listMessages(session.value()))
+        for (const auto& part : message.parts) {
+            const auto* tool = std::get_if<MaiToolPart>(&part.body);
+            if (!tool || tool->callId != "call_paid") continue;
+            ++storedResults;
+            CHECK(tool->tool == "seedream_image" && tool->state == MaiToolState::Error);
+            const auto error = Json::parse(tool->error, nullptr, false);
+            CHECK(error.is_object() &&
+                  error.value("code", std::string{}) == "temporarily_disabled");
+            CHECK(tool->output == tool->error);
+            CHECK(tool->execution.has_value());
+            if (tool->execution) {
+                CHECK(tool->execution->status == MaiToolExecutionStatus::NotStarted);
+                CHECK(tool->execution->effectStatus == MaiToolEffectStatus::None);
+                CHECK(tool->execution->started == std::optional<bool>(false));
+            }
+        }
+    CHECK(storedResults == 1);
+    bool modelSawPausedResult = false;
+    for (std::size_t index = 0; index < observer->requestCount(); ++index)
+        for (const auto& message : observer->request(index).messages)
+            if (message.role == MaiModelRole::ToolResult && message.toolCallId == "call_paid") {
+                modelSawPausedResult = true;
+                CHECK(message.content.find("temporarily_disabled") != std::string::npos);
+            }
+    CHECK(modelSawPausedResult);
 }
 
 void test_redirect_never_forwards_authorization() {
@@ -836,6 +864,81 @@ void test_glm_filters_do_not_make_count_a_hard_response_limit() {
           "RESPONSE_TOO_LARGE");
 }
 
+void test_provider_web_discovery_requires_a_native_provider_contract() {
+    unsigned deepseekKeyReads = 0;
+    unsigned glmKeyReads = 0;
+    MaiProviderWebOptions options;
+    options.deepseek.apiKey = [&] {
+        ++deepseekKeyReads;
+        return std::string("synthetic-deepseek-web-key");
+    };
+    options.glm.apiKey = [&] {
+        ++glmKeyReads;
+        return std::string("synthetic-glm-web-key");
+    };
+    MaiToolRegistry registry;
+    registerMaiProviderWebTools(registry, std::move(options));
+    const auto fable = maiCloudModelInfo("anthropic/claude-fable-5.2");
+    CHECK(fable && fable->provider == "openrouter");
+    // 型号进入主聊天目录不代表它有 GLM/DeepSeek 原生网页合同。
+    CHECK(registry.specs("anthropic/claude-fable-5.2").empty());
+    for (const auto* name : {"web_search", "web_fetch"}) {
+        auto* tool = registry.find(name);
+        CHECK(tool != nullptr);
+        if (!tool) continue;
+        CHECK(!tool->isAvailableForModel("anthropic/claude-fable-5.2"));
+        CHECK(registry.findForModel(name, "anthropic/claude-fable-5.2") == nullptr);
+        CHECK(registry.findForModel(name, "unconfigured-model") == nullptr);
+        CHECK(registry.findForModel(name, "local:synthetic-model") == nullptr);
+        for (const auto* model : {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
+            CHECK(registry.findForModel(name, model) != nullptr);
+    }
+    // 空型号仍是无执行/凭据读取的普通工具目录，保持既有发现入口。
+    CHECK(registry.specs().size() == 2);
+    CHECK(deepseekKeyReads == 0);
+    CHECK(glmKeyReads == 0);
+}
+
+void test_provider_web_direct_execution_rejects_fable_without_keys_or_http() {
+    MaiDeepSeekFakeProvider deepseek;
+    MaiDeepSeekFakeProvider glm;
+    MaiToolRegistry registry;
+    registerMaiProviderWebTools(registry, {deepseek.options(), glm.glmOptions()});
+    const auto fable = maiCloudModelInfo("anthropic/claude-fable-5.2");
+    CHECK(fable && fable->provider == "openrouter");
+    MaiToolContext context;
+    context.sessionId = "ses_native_web_provider_guard";
+    for (const auto* model : {"anthropic/claude-fable-5.2", "glm-unknown", "unconfigured-model",
+                              "local:synthetic-model", ""}) {
+        context.model = model;
+        for (const auto* name : {"web_search", "web_fetch"}) {
+            // 直接普通调用绕过发现过滤；执行入口也必须在取 Key 和选择 HTTP 前拒绝。
+            auto* tool = registry.find(name);
+            CHECK(tool != nullptr);
+            if (!tool) continue;
+            const auto result = tool->execute(std::string(name) == "web_search"
+                                                  ? R"({"query":"synthetic provider guard"})"
+                                                  : R"({"url":"https://example.com/article"})",
+                                              context);
+            CHECK(result.hasError());
+            CHECK(result.error().code() == MaiErrorCode::NotSupported);
+            CHECK(deepseek.keyReads() == 0);
+            CHECK(glm.keyReads() == 0);
+            CHECK(deepseek.requests().empty());
+            CHECK(glm.requests().empty());
+        }
+    }
+    // 正控证明同一夹具与观察器会看到允许路由的 Key 和 HTTP，避免“没接上”假绿。
+    context.model = "deepseek-v4-pro";
+    const auto allowed = registry.find("web_search")
+                             ->execute(R"({"query":"synthetic native positive control"})", context);
+    CHECK(!allowed.hasError());
+    CHECK(deepseek.keyReads() == 1);
+    CHECK(deepseek.requests().size() == 1);
+    CHECK(glm.keyReads() == 0);
+    CHECK(glm.requests().empty());
+}
+
 void test_glm_errors_cancel_and_provider_dispatch_never_fallback() {
     MaiDeepSeekFakeProvider deepseek, glm;
     glm.searchReplies({{200, glmSearchResult().dump(), {}, 0}});
@@ -914,6 +1017,15 @@ int main(int argc, char** argv) {
     setenv("NO_PROXY", "*", 1);
     setenv("no_proxy", "*", 1);
 #endif
+    if (argc == 2 && std::string(argv[1]) == "--provider-dispatch") {
+        test_provider_web_discovery_requires_a_native_provider_contract();
+        test_provider_web_direct_execution_rejects_fable_without_keys_or_http();
+        test_glm_errors_cancel_and_provider_dispatch_never_fallback();
+        std::printf("native web provider dispatch checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    test_provider_web_discovery_requires_a_native_provider_contract();
+    test_provider_web_direct_execution_rejects_fable_without_keys_or_http();
     test_glm_filters_do_not_make_count_a_hard_response_limit();
     test_glm_native_search_reader_and_exact_limits();
     test_glm_errors_cancel_and_provider_dispatch_never_fallback();
@@ -925,7 +1037,7 @@ int main(int argc, char** argv) {
     test_cancellation_and_response_byte_limit();
     test_tools_share_the_client_contract_and_strict_read_only_protocol();
     test_read_only_retrieval_runs_without_approval_under_every_policy();
-    test_full_access_keeps_paid_media_confirmation();
+    test_paused_image_generation_is_rejected_before_approval_or_credentials();
     test_redirect_never_forwards_authorization();
 #if defined(MAI_DEEPSEEK_WEB_TLS_TESTS)
     test_tls_peer_hostname_and_https_to_http_redirect();

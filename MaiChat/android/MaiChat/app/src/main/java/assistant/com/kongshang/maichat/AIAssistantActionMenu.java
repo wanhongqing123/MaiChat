@@ -47,7 +47,7 @@ final class AIAssistantActionMenu extends LinearLayout {
     private static final String[] EFFORTS = {"low", "high", "max"};
     private static final String[] POLICIES = {"on-request", "unless-trusted", "never"};
     private static final String[] MODELS = {"glm-5.3", "glm-5.3-flash", "deepseek-flash",
-        "deepseek-v4-pro", AIAssistantSessionModels.LOCAL};
+        "deepseek-v4-pro", AIAssistantModelSettings.OPENROUTER_MODEL, AIAssistantSessionModels.LOCAL};
     private String model = "deepseek-flash";
     private String effort = "high", policy = "on-request";
     private boolean changingModelSource, changeModelAllowed, changeAllowed, clearAllowed;
@@ -62,7 +62,8 @@ final class AIAssistantActionMenu extends LinearLayout {
         this.listener = listener;
         this.sizeChanged = sizeChanged;
         this.remote = remote;
-        this.models = remote ? java.util.Arrays.copyOf(MODELS, 4) : MODELS;
+        // The local model is always last; remote menus include every cloud model.
+        this.models = remote ? java.util.Arrays.copyOf(MODELS, MODELS.length - 1) : MODELS;
         setOrientation(VERTICAL);
         // The PopupWindow owns the single material background and outline. A second opaque
         // background here would hide its frost and make expanded groups look like flat blocks.
@@ -73,8 +74,9 @@ final class AIAssistantActionMenu extends LinearLayout {
         modelHeading = heading("主模型", R.drawable.ic_ai_menu_cpu, modelValue, modelChevron,
             ignored -> toggle(MODEL_SECTION));
         addView(modelHeading, match(dp(52)));
-        String[] titles = {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro", "本地模型"};
-        modelGroup = options(remote ? java.util.Arrays.copyOf(titles, 4) : titles, models,
+        String[] titles = {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+            AIAssistantModelSettings.OPENROUTER_MODEL, "本地模型"};
+        modelGroup = options(remote ? java.util.Arrays.copyOf(titles, models.length) : titles, models,
             modelChoices, modelChecks, MODEL_SECTION);
         addView(modelGroup, match(LayoutParams.WRAP_CONTENT));
         addDivider();

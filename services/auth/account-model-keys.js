@@ -16,16 +16,19 @@ function createAccountModelKeyIssuer(env, fetcher = fetch) {
     });
     if (!response.ok) throw new Error('Account model key issuer rejected the request');
     const raw = await response.text();
-    if (Buffer.byteLength(raw) > 16_384)
+    // 四个各 4096 字符的 Key 还会产生 UTF-8 与 JSON 转义开销；保持整包有界。
+    if (Buffer.byteLength(raw) > 65_536)
       throw new Error('Account model key response is too large');
     const keys = JSON.parse(raw).api_keys;
+    // 旧凭据进程没有此字段，视为未配置；显式 null 或其他类型仍须拒绝。
+    const openrouter = keys?.openrouter === undefined ? '' : keys.openrouter;
     if (!keys || typeof keys !== 'object' || Array.isArray(keys) ||
-        !['glm', 'deepseek', 'minimax'].every(name => typeof keys[name] === 'string' &&
-          keys[name].length <= 4096 && !/[\x00-\x1f\x7f]/.test(keys[name])) ||
-        (!keys.glm && !keys.deepseek && !keys.minimax))
+        ![keys.glm, keys.deepseek, keys.minimax, openrouter].every(key =>
+          typeof key === 'string' && key.length <= 4096 && !/[\x00-\x1f\x7f]/.test(key)) ||
+        (!keys.glm && !keys.deepseek && !keys.minimax && !openrouter))
       throw new Error('Account model key response is invalid');
     return { api_keys: { glm: keys.glm, deepseek: keys.deepseek,
-      minimax: keys.minimax } };
+      minimax: keys.minimax, openrouter } };
   };
 }
 

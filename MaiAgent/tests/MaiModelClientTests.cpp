@@ -184,6 +184,8 @@ struct Collected {
     std::vector<MaiModelTextItem> startedItems;
     std::vector<MaiModelTextItem> completedItems;
     std::vector<MaiModelUsage> usage;
+    std::vector<MaiModelContinuationState> continuations;
+    std::vector<std::string> deliveries;
     std::string error;
     MaiErrorCode code = MaiErrorCode::Ok;
     bool done = false;
@@ -209,7 +211,12 @@ Collected runAgainst(FakeServer& fake, const MaiModelRequest& request,
     sink.onText = [&collected](std::string_view text) { collected.text.append(text); };
     sink.onReasoning = [&collected](std::string_view text) { collected.reasoning.append(text); };
     sink.onToolCall = [&collected](const MaiToolInvocation& invocation) {
+        collected.deliveries.push_back("call:" + invocation.id);
         collected.calls.push_back(invocation);
+    };
+    sink.onContinuationState = [&](const MaiModelContinuationState& state) {
+        collected.deliveries.push_back("state");
+        collected.continuations.push_back(state);
     };
 
     const std::atomic<bool> cancel{false};
@@ -259,6 +266,12 @@ Collected run(const std::string& script, std::size_t chunk) {
 // 不是被测代码的问题。转义交给库最省事。
 std::string sse(const json& j) {
     return "data: " + j.dump() + "\n\n";
+}
+
+// 旧实现缺少新字段时应产生 CHECK 失败，不能由 const operator[] 的缺失键断言中止整个 RED。
+json wireValue(const json& document, const char* path) {
+    const json::json_pointer pointer(path);
+    return document.contains(pointer) ? document.at(pointer) : json{};
 }
 
 // 构造一条 tool_calls 增量。传 nullptr 表示这一帧不带该字段。
@@ -1498,13 +1511,16 @@ void test_responses_message_items_remain_distinct_in_agent_history() {
     const auto messages = agent.listMessages(session);
     CHECK(messages.size() == 2);
     if (messages.size() != 2) return;
-    CHECK(messages[1].parts.size() == 2);
-    if (messages[1].parts.size() != 2) return;
-    const auto* a = std::get_if<MaiTextPart>(&messages[1].parts[0].body);
-    const auto* b = std::get_if<MaiTextPart>(&messages[1].parts[1].body);
+    std::vector<const MaiMessagePart*> textParts;
+    for (const auto& part : messages[1].parts)
+        if (std::holds_alternative<MaiTextPart>(part.body)) textParts.push_back(&part);
+    CHECK(textParts.size() == 2);
+    if (textParts.size() != 2) return;
+    const auto* a = std::get_if<MaiTextPart>(&textParts[0]->body);
+    const auto* b = std::get_if<MaiTextPart>(&textParts[1]->body);
     CHECK(a && a->text == "A");
     CHECK(b && b->text == "B");
-    CHECK(messages[1].parts[0].id != messages[1].parts[1].id);
+    CHECK(textParts[0]->id != textParts[1]->id);
 }
 
 // 兼容服务可能只在 terminal 提供最终快照；补尾必须归还原来的 item，
@@ -1614,7 +1630,446 @@ void test_responses_serializes_history_images_and_flat_tools() {
     MaiFileSystem::removeRecursively(root);
 }
 
-// 官方型号矩阵：四个主聊天型号均支持 low/high/max；逐次核对实际发出的线格式。
+// 续接必须保留整个 output 的顺序，而不是把 reasoning、message、function_call 分组重建。
+// 所有签名和加密值均为合成数据；未知成员和显式 null 也属于需要原样往返的响应快照。
+void test_responses_continuation_replays_original_output_before_tool_results() {
+    const std::string reasoning = "Inspect\r\n\xE7\x95\x8C";
+    const json thought{
+        {"id", "rs_signed"},
+        {"type", "reasoning"},
+        {"summary", json::array()},
+        {"content", json::array({json{{"type", "reasoning_text"}, {"text", reasoning}}})},
+        {"signature", "synthetic-signature+/=="},
+        {"encrypted_content", nullptr},
+        {"format", "anthropic-claude-v1"},
+        {"provider_extension", {{"nullable", nullptr}, {"values", {1, true, "x"}}}}};
+    const json commentary{{"id", "msg_commentary"},
+                          {"type", "message"},
+                          {"role", "assistant"},
+                          {"status", "completed"},
+                          {"phase", "commentary"},
+                          {"content", json::array({json{{"type", "output_text"},
+                                                        {"text", "Checking"},
+                                                        {"annotations", json::array()}}})}};
+    const json firstCall{{"id", "fc_item_a"},
+                         {"type", "function_call"},
+                         {"call_id", "call_a"},
+                         {"name", "lookup"},
+                         {"arguments", R"({"path":"a"})"}};
+    const json encrypted{{"id", "rs_encrypted"},
+                         {"type", "reasoning"},
+                         {"summary", json::array()},
+                         {"content", json::array()},
+                         {"encrypted_content", "synthetic-encrypted+/=="},
+                         {"signature", nullptr}};
+    const json secondCall{{"id", "fc_item_b"},
+                          {"type", "function_call"},
+                          {"call_id", "call_b"},
+                          {"name", "lookup"},
+                          {"arguments", R"({"path":"b"})"}};
+    const json output = json::array({thought, commentary, firstCall, encrypted, secondCall});
+    for (const std::size_t chunk : {std::size_t(1), std::size_t(17), std::size_t(8192)}) {
+        FakeServer fake;
+        fake.chunk = chunk;
+        fake.script =
+            ": OPENROUTER PROCESSING\n\n" +
+            sse(json{{"type", "response.reasoning_text.delta"},
+                     {"output_index", 0},
+                     {"content_index", 0},
+                     {"item_id", "rs_signed"},
+                     {"delta", "Inspect\r\n"}}) +
+            sse(json{{"type", "response.reasoning_text.done"},
+                     {"output_index", 0},
+                     {"content_index", 0},
+                     {"item_id", "rs_signed"},
+                     {"text", reasoning}}) +
+            sse(json{{"type", "response.output_text.delta"},
+                     {"output_index", 1},
+                     {"content_index", 0},
+                     {"delta", "Check"}}) +
+            sse(json{
+                {"type", "response.output_item.done"}, {"output_index", 0}, {"item", thought}}) +
+            sse(json{{"type", "response.output_item.added"},
+                     {"output_index", 4},
+                     {"item",
+                      {{"type", "function_call"},
+                       {"id", "fc_item_b"},
+                       {"call_id", "call_b"},
+                       {"name", "lookup"},
+                       {"arguments", ""}}}}) +
+            sse(json{{"type", "response.output_item.added"},
+                     {"output_index", 2},
+                     {"item",
+                      {{"type", "function_call"},
+                       {"id", "fc_item_a"},
+                       {"call_id", "call_a"},
+                       {"name", "lookup"},
+                       {"arguments", ""}}}}) +
+            sse(json{{"type", "response.function_call_arguments.delta"},
+                     {"output_index", 4},
+                     {"delta", "{\"path\":"}}) +
+            sse(json{{"type", "response.function_call_arguments.delta"},
+                     {"output_index", 2},
+                     {"delta", R"({"path":"a"})"}}) +
+            sse(json{{"type", "response.function_call_arguments.delta"},
+                     {"output_index", 4},
+                     {"delta", "\"b\"}"}}) +
+            sse(json{
+                {"type", "response.output_item.done"}, {"output_index", 4}, {"item", secondCall}}) +
+            sse(json{
+                {"type", "response.output_item.done"}, {"output_index", 2}, {"item", firstCall}}) +
+            sse(json{
+                {"type", "response.output_item.done"}, {"output_index", 1}, {"item", commentary}}) +
+            sse(json{
+                {"type", "response.output_item.done"}, {"output_index", 3}, {"item", encrypted}}) +
+            sse(json{{"type", "response.completed"},
+                     {"response", {{"status", "completed"}, {"output", output}}}});
+        fake.start();
+        MaiModelRequest request;
+        request.model = "anthropic/claude-fable-5.2";
+        request.reasoningEffort = "max";
+        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        CHECK(answer.done);
+        CHECK(answer.text == "Checking");
+        CHECK(answer.reasoning == reasoning);
+        CHECK(answer.continuations.size() == 1);
+        CHECK(answer.deliveries ==
+              std::vector<std::string>({"state", "call:call_a", "call:call_b"}));
+        CHECK(answer.calls.size() == 2);
+        if (answer.continuations.size() != 1 || answer.calls.size() != 2) continue;
+        const auto& state = answer.continuations.front();
+        CHECK(state.format == "responses.output.v1");
+        CHECK(state.provider == "openrouter");
+        CHECK(state.model == request.model);
+        CHECK(json::parse(state.payload) == output);
+        MaiModelMessage user;
+        user.content = "Check both files";
+        request.messages.push_back(user);
+        MaiModelMessage assistant;
+        assistant.role = MaiModelRole::Assistant;
+        assistant.content = "Display projection must not be duplicated";
+        assistant.reasoning = "Display projection is not signed reasoning";
+        assistant.invocations = answer.calls;
+        assistant.continuation = state;
+        request.messages.push_back(assistant);
+        for (const auto& call : answer.calls) {
+            MaiModelMessage result;
+            result.role = MaiModelRole::ToolResult;
+            result.toolCallId = call.id;
+            result.content = "Result for " + call.id;
+            request.messages.push_back(result);
+        }
+        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        const json body = json::parse(fake.lastBody);
+        CHECK(wireValue(body, "/store") == false);
+        CHECK(!body.contains("previous_response_id"));
+        CHECK(wireValue(body, "/reasoning/effort") == "max");
+        CHECK(!body.contains("thinking"));
+        CHECK(!body.contains("reasoning_effort"));
+        const json input = wireValue(body, "/input");
+        CHECK(input.is_array() && input.size() == 1 + output.size() + 2);
+        if (!input.is_array() || input.size() != 1 + output.size() + 2) continue;
+        for (std::size_t index = 0; index < output.size(); ++index)
+            CHECK(input[index + 1] == output[index]);
+        CHECK(wireValue(body, "/input/6/type") == "function_call_output");
+        CHECK(wireValue(body, "/input/6/call_id") == "call_a");
+        CHECK(wireValue(body, "/input/7/call_id") == "call_b");
+    }
+}
+
+// item.done 是独立的完整快照；终态不重复 output 时也不能丢掉签名、摘要或加密数据。
+void test_responses_continuation_uses_completed_items_without_terminal_output() {
+    const json thought{
+        {"id", "rs_summary"},
+        {"type", "reasoning"},
+        {"summary", json::array({json{{"type", "summary_text"}, {"text", "Summary"}}})},
+        {"encrypted_content", "synthetic-encrypted-only"},
+        {"signature", "synthetic-late-signature"}};
+    FakeServer fake;
+    fake.script =
+        sse(json{{"type", "response.reasoning_summary_text.delta"},
+                 {"output_index", 0},
+                 {"summary_index", 0},
+                 {"delta", "Sum"}}) +
+        sse(json{{"type", "response.reasoning_summary_text.done"},
+                 {"output_index", 0},
+                 {"summary_index", 0},
+                 {"text", "Summary"}}) +
+        sse(json{{"type", "response.output_item.done"}, {"output_index", 0}, {"item", thought}}) +
+        sse(json{{"type", "response.completed"}, {"response", {{"status", "completed"}}}});
+    fake.start();
+    MaiModelRequest request;
+    request.model = "anthropic/claude-fable-5.2";
+    const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+    CHECK(answer.done);
+    CHECK(answer.reasoning == "Summary");
+    CHECK(answer.text.empty());
+    CHECK(answer.continuations.size() == 1);
+    if (answer.continuations.size() == 1)
+        CHECK(json::parse(answer.continuations.front().payload) == json::array({thought}));
+}
+
+// 显式终态数组是权威结果；此前 item.done 不能把终态已删除的调用重新变成可执行工具。
+void test_responses_explicit_empty_terminal_does_not_recover_old_tool() {
+    const json call{{"type", "function_call"},
+                    {"id", "fc_removed"},
+                    {"call_id", "call_removed"},
+                    {"name", "lookup"},
+                    {"arguments", "{}"}};
+    FakeServer fake;
+    fake.script =
+        sse(json{{"type", "response.output_item.done"}, {"output_index", 0}, {"item", call}}) +
+        sse(json{{"type", "response.completed"},
+                 {"response", {{"status", "completed"}, {"output", json::array()}}}});
+    fake.start();
+    MaiModelRequest request;
+    request.model = "anthropic/claude-fable-5.2";
+    const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+    CHECK(!answer.done);
+    CHECK(answer.code == MaiErrorCode::Protocol);
+    CHECK(answer.continuations.empty());
+    CHECK(answer.calls.empty());
+    CHECK(answer.deliveries.empty());
+}
+
+// 已完成 reasoning 前缀不能证明整份响应完整；漏掉后面的可见 item 会让下轮回放丢掉答案。
+void test_responses_item_snapshot_fallback_rejects_unfinished_visible_item() {
+    const json thought{{"type", "reasoning"},
+                       {"id", "rs_prefix"},
+                       {"summary", json::array()},
+                       {"content", json::array()},
+                       {"signature", "synthetic-prefix-signature"},
+                       {"encrypted_content", "synthetic-prefix-encrypted"}};
+    FakeServer fake;
+    fake.script =
+        sse(json{{"type", "response.output_item.done"}, {"output_index", 0}, {"item", thought}}) +
+        sse(json{{"type", "response.output_text.delta"},
+                 {"output_index", 1},
+                 {"content_index", 0},
+                 {"item_id", "msg_unfinished"},
+                 {"delta", "Visible answer"}}) +
+        sse(json{{"type", "response.completed"}, {"response", {{"status", "completed"}}}});
+    fake.start();
+    MaiModelRequest request;
+    request.model = "anthropic/claude-fable-5.2";
+    const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+    CHECK(answer.text == "Visible answer");
+    CHECK(!answer.done);
+    CHECK(answer.code == MaiErrorCode::Protocol);
+    CHECK(answer.continuations.empty());
+    CHECK(answer.calls.empty());
+    CHECK(answer.deliveries.empty());
+}
+
+// 有一个调用无效时也不能先交付前面的有效调用或可重放状态；失败草稿不属于成功响应。
+void test_responses_never_publishes_continuation_or_tools_from_unsuccessful_output() {
+    const json call{{"type", "function_call"},
+                    {"id", "fc_valid"},
+                    {"call_id", "call_valid"},
+                    {"name", "lookup"},
+                    {"arguments", "{}"}};
+    const std::string prefix =
+        sse(json{{"type", "response.output_item.done"}, {"output_index", 0}, {"item", call}});
+    const json partialCall{{"type", "function_call"},
+                           {"id", "fc_invalid"},
+                           {"call_id", "call_invalid"},
+                           {"name", "lookup"}};
+    const std::vector<std::string> scripts{
+        prefix,
+        prefix + "data: [DONE]\n\n",
+        prefix + sse(json{{"type", "response.incomplete"},
+                          {"response",
+                           {{"output", json::array({call})},
+                            {"incomplete_details", {{"reason", "max_output_tokens"}}}}}}),
+        prefix + sse(json{{"type", "response.failed"},
+                          {"response",
+                           {{"output", json::array({call})},
+                            {"error", {{"message", "synthetic failure"}}}}}}),
+        prefix + sse(json{{"type", "error"}, {"error", {{"message", "synthetic stream error"}}}}),
+        prefix + sse(json{{"type", "response.completed"},
+                          {"response", {{"status", "completed"}, {"output", "invalid"}}}}),
+        prefix +
+            sse(json{{"type", "response.completed"},
+                     {"response",
+                      {{"status", "completed"}, {"output", json::array({call, partialCall})}}}}),
+    };
+    for (const auto& script : scripts) {
+        FakeServer fake;
+        fake.script = script;
+        fake.start();
+        MaiModelRequest request;
+        request.model = "anthropic/claude-fable-5.2";
+        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        CHECK(!answer.done);
+        CHECK(answer.calls.empty());
+        CHECK(answer.continuations.empty());
+    }
+}
+
+// state 持久化回调可以接受取消；返回后不能继续交付已生成的工具调用。
+void test_responses_cancel_during_state_callback_prevents_tool_delivery() {
+    const json call{{"type", "function_call"},
+                    {"id", "fc_cancel"},
+                    {"call_id", "call_cancel"},
+                    {"name", "lookup"},
+                    {"arguments", "{}"}};
+    FakeServer fake;
+    fake.script =
+        sse(json{{"type", "response.completed"},
+                 {"response", {{"status", "completed"}, {"output", json::array({call})}}}});
+    fake.start();
+    MaiModelConfig config;
+    config.baseUrl = fake.base();
+    config.wire = MaiWireApi::Responses;
+    config.apiKey = "synthetic-cancel-key";
+    auto client = makeMaiModelClient(config);
+    MaiModelRequest request;
+    request.model = "anthropic/claude-fable-5.2";
+    std::atomic<bool> cancel{false};
+    int states = 0, calls = 0;
+    MaiStreamSink sink;
+    sink.onContinuationState = [&](const MaiModelContinuationState&) {
+        ++states;
+        cancel.store(true);
+    };
+    sink.onToolCall = [&](const MaiToolInvocation&) { ++calls; };
+    CHECK(client->stream(request, sink, cancel).code() == MaiErrorCode::Canceled);
+    CHECK(states == 1);
+    CHECK(calls == 0);
+}
+
+// 续接状态只属于原 provider/model；同来源损坏数据必须在发 HTTP 前报错，不能静默降级。
+void test_responses_continuation_checks_source_and_rejects_corruption() {
+    FakeServer fake;
+    fake.script = sse(json{{"type", "response.completed"},
+                           {"response", {{"status", "completed"}, {"output", json::array()}}}});
+    fake.start();
+    MaiModelRequest request;
+    request.model = "anthropic/claude-fable-5.2";
+    MaiModelMessage assistant;
+    assistant.role = MaiModelRole::Assistant;
+    assistant.content = "Visible history";
+    assistant.reasoning = "Unsigned display history";
+    assistant.continuation =
+        MaiModelContinuationState{"responses.output.v1", "openrouter", request.model, "not-json"};
+    request.messages.push_back(assistant);
+    for (const char* payload :
+         {"not-json", "{}", "[null]", R"([{"type":"reasoning","content":"invalid"}])"}) {
+        request.messages[0].continuation->payload = payload;
+        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        CHECK(!answer.done);
+        CHECK(answer.code == MaiErrorCode::Protocol);
+        CHECK(fake.requestCount.load() == 0);
+    }
+    request.messages[0].continuation->provider = "deepseek";
+    CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+    request.messages[0].continuation->provider = "openrouter";
+    request.messages[0].continuation->model = "anthropic/other-model";
+    CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+    request.messages[0].continuation.reset();
+    CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+    std::lock_guard<std::mutex> lock(fake.mutex);
+    for (const auto& wire : fake.requestBodies) {
+        const json body = json::parse(wire);
+        CHECK(wireValue(body, "/input").size() == 1);
+        CHECK(wireValue(body, "/input/0/type") == "message");
+        CHECK(wireValue(body, "/input/0/content") == "Visible history");
+        CHECK(wire.find("Unsigned display history") == std::string::npos);
+        CHECK(wire.find("invalid") == std::string::npos);
+    }
+}
+
+// 现代状态不匹配时也不能把它的显示思考转成另一个供应商的未签名 reasoning item。
+// 无状态旧记录的兼容行为由原 GLM/DeepSeek fixture 单独覆盖。
+void test_responses_foreign_continuation_uses_only_ordinary_history() {
+    const json signedOutput = json::array(
+        {json{{"type", "reasoning"},
+              {"id", "rs_foreign"},
+              {"summary", json::array()},
+              {"content",
+               json::array({json{{"type", "reasoning_text"}, {"text", "Foreign signed text"}}})},
+              {"signature", "synthetic-foreign-signature"},
+              {"encrypted_content", "synthetic-foreign-encrypted"}}});
+    struct RouteCase {
+        const char* sourceProvider;
+        const char* sourceModel;
+        const char* targetModel;
+    };
+    const RouteCase cases[] = {
+        {"openrouter", "anthropic/claude-fable-5.2", "glm-5.3"},
+        {"openrouter", "anthropic/claude-fable-5.2", "deepseek-flash"},
+        {"deepseek", "deepseek-flash", "deepseek-v4-pro"},
+    };
+    FakeServer fake;
+    fake.script = sse(json{{"type", "response.completed"},
+                           {"response", {{"status", "completed"}, {"output", json::array()}}}});
+    fake.start();
+    for (const auto& route : cases) {
+        MaiModelRequest request;
+        request.model = route.targetModel;
+        MaiModelMessage assistant;
+        assistant.role = MaiModelRole::Assistant;
+        assistant.content = "Visible history";
+        assistant.reasoning = "Foreign display reasoning";
+        assistant.invocations = {{"call_foreign", "lookup", "{}"}};
+        assistant.continuation = MaiModelContinuationState{
+            "responses.output.v1", route.sourceProvider, route.sourceModel, signedOutput.dump()};
+        request.messages.push_back(assistant);
+        MaiModelMessage result;
+        result.role = MaiModelRole::ToolResult;
+        result.toolCallId = "call_foreign";
+        result.content = "Retained tool result";
+        request.messages.push_back(result);
+        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        const json body = json::parse(fake.lastBody);
+        CHECK(wireValue(body, "/input").size() == 3);
+        CHECK(wireValue(body, "/input/0/type") == "message");
+        CHECK(wireValue(body, "/input/0/content") == "Visible history");
+        CHECK(wireValue(body, "/input/1/type") == "function_call");
+        CHECK(wireValue(body, "/input/1/call_id") == "call_foreign");
+        CHECK(wireValue(body, "/input/2/type") == "function_call_output");
+        CHECK(wireValue(body, "/input/2/call_id") == "call_foreign");
+        CHECK(fake.lastBody.find("Foreign display reasoning") == std::string::npos);
+        CHECK(fake.lastBody.find("Foreign signed text") == std::string::npos);
+        CHECK(fake.lastBody.find("synthetic-foreign-signature") == std::string::npos);
+        CHECK(fake.lastBody.find("synthetic-foreign-encrypted") == std::string::npos);
+    }
+}
+
+// GLM Responses 官方终态没有 Chat 的 [DONE]；空文本和加密快照仍需发布独立状态。
+void test_glm_responses_completes_without_done_and_keeps_metadata_only_state() {
+    const json thought{{"type", "reasoning"},
+                       {"id", "glm_reasoning"},
+                       {"content", json::array()},
+                       {"summary", json::array()},
+                       {"encrypted_content", "synthetic-glm-state"}};
+    FakeServer fake;
+    fake.script =
+        sse(json{{"type", "response.completed"},
+                 {"response", {{"status", "completed"}, {"output", json::array({thought})}}}});
+    fake.start();
+    for (const char* model : {"glm-5.3", "glm-5.3-flash"}) {
+        MaiModelRequest request;
+        request.model = model;
+        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        CHECK(answer.done);
+        CHECK(answer.text.empty() && answer.reasoning.empty());
+        CHECK(answer.continuations.size() == 1);
+        if (answer.continuations.size() == 1) {
+            CHECK(answer.continuations[0].provider == "glm");
+            CHECK(answer.continuations[0].model == model);
+            CHECK(json::parse(answer.continuations[0].payload) == json::array({thought}));
+        }
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        const json body = json::parse(fake.lastBody);
+        CHECK(wireValue(body, "/store") == false);
+        CHECK(body.contains("input") && !body.contains("messages"));
+    }
+}
+
+// 官方型号矩阵：产品云端统一 Responses；generic Chat 仅保留 GLM 的旧兼容扩展。
 void test_cloud_effort_levels_reach_the_selected_wire() {
     for (const MaiWireApi wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
         FakeServer fake;
@@ -1624,8 +2079,8 @@ void test_cloud_effort_levels_reach_the_selected_wire() {
                            {"response", {{"status", "completed"}, {"output", json::array()}}}})
                 : "data: [DONE]\n\n";
         fake.start();
-        for (const char* model :
-             {"deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash"}) {
+        for (const char* model : {"deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash",
+                                  "anthropic/claude-fable-5.2"}) {
             for (const char* effort : {"low", "high", "max"}) {
                 MaiModelRequest request;
                 request.model = model;
@@ -1643,9 +2098,12 @@ void test_cloud_effort_levels_reach_the_selected_wire() {
                 CHECK(body["model"] == model);
                 if (wire == MaiWireApi::Responses) {
                     CHECK(body["reasoning"]["effort"] == effort);
-                } else {
+                } else if (std::string(model).find("glm-") == 0) {
                     CHECK(body["thinking"]["type"] == "enabled");
                     CHECK(body["reasoning_effort"] == effort);
+                } else {
+                    CHECK(!body.contains("thinking"));
+                    CHECK(!body.contains("reasoning_effort"));
                 }
             }
         }
@@ -1661,20 +2119,21 @@ void test_cloud_effort_levels_reach_the_selected_wire() {
     }
 }
 
-// 真 loopback 请求验证两个不同 wire 与账号凭据不可交叉，也不因鉴权错误回退供应商。
+// 三个供应商均使用 Responses；账号凭据不可交叉，也不因鉴权错误回退到其它供应商。
 void test_routed_models_keep_wire_key_and_failure_isolation() {
-    FakeServer glm, deepseek;
-    glm.script = "data: [DONE]\n\n";
-    deepseek.script = sse(json{{"type", "response.completed"},
-                               {"response", {{"status", "completed"}, {"output", json::array()}}}});
+    FakeServer glm, deepseek, openrouter;
+    glm.script = deepseek.script = openrouter.script =
+        sse(json{{"type", "response.completed"},
+                 {"response", {{"status", "completed"}, {"output", json::array()}}}});
     glm.start();
     deepseek.start();
-    int glmKeyReads = 0, deepseekKeyReads = 0;
+    openrouter.start();
+    int glmKeyReads = 0, deepseekKeyReads = 0, openrouterKeyReads = 0;
     std::string glmKey = "synthetic-glm-key", deepseekKey = "synthetic-deepseek-key";
     MaiModelRoute glmRoute;
     glmRoute.modelNames = {"glm-5.3", "glm-5.3-flash"};
     glmRoute.config.baseUrl = glm.base();
-    glmRoute.config.wire = MaiWireApi::ChatCompletions;
+    glmRoute.config.wire = MaiWireApi::Responses;
     glmRoute.apiKeyProvider = [&] {
         ++glmKeyReads;
         return glmKey;
@@ -1688,12 +2147,22 @@ void test_routed_models_keep_wire_key_and_failure_isolation() {
         ++deepseekKeyReads;
         return deepseekKey;
     };
-    auto client = makeMaiRoutedModelClient({{glmRoute, deepseekRoute}});
-    CHECK(client->wireApi() == MaiWireApi::Mixed);
-    CHECK(client->wireApiForModel("glm-5.3") == MaiWireApi::ChatCompletions);
+    MaiModelRoute openrouterRoute;
+    openrouterRoute.modelNames = {"anthropic/claude-fable-5.2"};
+    openrouterRoute.config.baseUrl = openrouter.base();
+    openrouterRoute.config.wire = MaiWireApi::Responses;
+    openrouterRoute.config.maxRetries = 0;
+    openrouterRoute.apiKeyProvider = [&] {
+        ++openrouterKeyReads;
+        return "synthetic-openrouter-key";
+    };
+    auto client = makeMaiRoutedModelClient({{glmRoute, deepseekRoute, openrouterRoute}});
+    CHECK(client->wireApi() == MaiWireApi::Responses);
+    CHECK(client->wireApiForModel("glm-5.3") == MaiWireApi::Responses);
     CHECK(client->wireApiForModel("deepseek-v4-pro") == MaiWireApi::Responses);
+    CHECK(client->wireApiForModel("anthropic/claude-fable-5.2") == MaiWireApi::Responses);
     CHECK(!client->wireApiForModel("glm-unknown"));
-    CHECK(glmKeyReads == 0 && deepseekKeyReads == 0);
+    CHECK(glmKeyReads == 0 && deepseekKeyReads == 0 && openrouterKeyReads == 0);
     std::atomic<bool> cancel{false};
     MaiModelRequest request;
     request.reasoningEffort = "low";
@@ -1708,22 +2177,35 @@ void test_routed_models_keep_wire_key_and_failure_isolation() {
     output.toolCallId = "raw_reasoning_call";
     output.content = "Result";
     request.messages.push_back(output);
-    for (const char* model : {"glm-5.3", "deepseek-v4-pro", "glm-5.3-flash", "deepseek-flash"}) {
+    for (const char* model : {"glm-5.3", "deepseek-v4-pro", "glm-5.3-flash", "deepseek-flash",
+                              "anthropic/claude-fable-5.2"}) {
         request.model = model;
         CHECK(!client->stream(request, {}, cancel));
     }
     CHECK(glmKeyReads == 2 && deepseekKeyReads == 2);
     CHECK(glm.requestCount == 2 && deepseek.requestCount == 2);
+    CHECK(openrouterKeyReads == 1 && openrouter.requestCount == 1);
     {
         std::lock_guard<std::mutex> lock(glm.mutex);
         CHECK(glm.lastAuthorization == "Bearer synthetic-glm-key");
         const auto body = json::parse(glm.lastBody);
-        CHECK(body["reasoning_effort"] == "low" && body.contains("messages") &&
-              !body.contains("input"));
-        CHECK(body["messages"][0]["reasoning_content"] == assistant.reasoning);
-        CHECK(body["messages"][0]["content"] == "Tool status");
-        CHECK(body["messages"][0]["tool_calls"][0]["id"] == "raw_reasoning_call");
-        CHECK(body["messages"][1]["tool_call_id"] == "raw_reasoning_call");
+        CHECK(body["reasoning"]["effort"] == "low" && body.contains("input") &&
+              !body.contains("messages"));
+        CHECK(body["input"][0]["type"] == "reasoning");
+        CHECK(body["input"][0]["content"][0]["text"] == assistant.reasoning);
+        CHECK(body["input"][1]["content"] == "Tool status");
+        CHECK(body["input"][2]["call_id"] == "raw_reasoning_call");
+        CHECK(body["input"][3]["call_id"] == "raw_reasoning_call");
+    }
+    {
+        std::lock_guard<std::mutex> lock(openrouter.mutex);
+        CHECK(openrouter.lastAuthorization == "Bearer synthetic-openrouter-key");
+        const auto body = json::parse(openrouter.lastBody);
+        CHECK(wireValue(body, "/reasoning/effort") == "low");
+        CHECK(wireValue(body, "/input/0/type") == "message");
+        CHECK(wireValue(body, "/input/1/call_id") == "raw_reasoning_call");
+        CHECK(wireValue(body, "/input/2/call_id") == "raw_reasoning_call");
+        CHECK(wireValue(body, "/store") == false);
     }
     {
         std::lock_guard<std::mutex> lock(deepseek.mutex);
@@ -1735,6 +2217,7 @@ void test_routed_models_keep_wire_key_and_failure_isolation() {
     request.model = "not-in-directory";
     CHECK(client->stream(request, {}, cancel).code() == MaiErrorCode::InvalidInput);
     CHECK(glmKeyReads == 2 && deepseekKeyReads == 2);
+    CHECK(openrouterKeyReads == 1 && openrouter.requestCount == 1);
     glmKey = "rotated-glm-key";
     request.model = "glm-5.3";
     CHECK(!client->stream(request, {}, cancel));
@@ -1745,6 +2228,7 @@ void test_routed_models_keep_wire_key_and_failure_isolation() {
     glm.status = 401;
     CHECK(client->stream(request, {}, cancel).hasError());
     CHECK(deepseekKeyReads == 2 && deepseek.requestCount == 2);
+    CHECK(openrouterKeyReads == 1 && openrouter.requestCount == 1);
     glmKey.clear();
     const auto glmRequests = glm.requestCount.load();
     CHECK(client->stream(request, {}, cancel).code() == MaiErrorCode::NotConfigured);
@@ -2288,6 +2772,29 @@ void test_context_limits_output_budget_and_actual_usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--continuation-completeness") {
+        test_responses_explicit_empty_terminal_does_not_recover_old_tool();
+        test_responses_item_snapshot_fallback_rejects_unfinished_visible_item();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--foreign-continuation") {
+        test_responses_foreign_continuation_uses_only_ordinary_history();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--cloud-responses") {
+        test_responses_continuation_replays_original_output_before_tool_results();
+        test_responses_continuation_uses_completed_items_without_terminal_output();
+        test_responses_explicit_empty_terminal_does_not_recover_old_tool();
+        test_responses_item_snapshot_fallback_rejects_unfinished_visible_item();
+        test_responses_never_publishes_continuation_or_tools_from_unsuccessful_output();
+        test_responses_cancel_during_state_callback_prevents_tool_delivery();
+        test_responses_continuation_checks_source_and_rejects_corruption();
+        test_responses_foreign_continuation_uses_only_ordinary_history();
+        test_glm_responses_completes_without_done_and_keeps_metadata_only_state();
+        test_cloud_effort_levels_reach_the_selected_wire();
+        test_routed_models_keep_wire_key_and_failure_isolation();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--chat-proxy") {
         test_responses_proxy_redirects(MaiWireApi::ChatCompletions);
         test_responses_proxy_same_origin_redirect(MaiWireApi::ChatCompletions);
@@ -2364,6 +2871,15 @@ int main(int argc, char** argv) {
     test_responses_message_items_remain_distinct_in_agent_history();
     test_responses_terminal_snapshots_update_their_original_items();
     test_responses_serializes_history_images_and_flat_tools();
+    test_responses_continuation_replays_original_output_before_tool_results();
+    test_responses_continuation_uses_completed_items_without_terminal_output();
+    test_responses_explicit_empty_terminal_does_not_recover_old_tool();
+    test_responses_item_snapshot_fallback_rejects_unfinished_visible_item();
+    test_responses_never_publishes_continuation_or_tools_from_unsuccessful_output();
+    test_responses_cancel_during_state_callback_prevents_tool_delivery();
+    test_responses_continuation_checks_source_and_rejects_corruption();
+    test_responses_foreign_continuation_uses_only_ordinary_history();
+    test_glm_responses_completes_without_done_and_keeps_metadata_only_state();
     test_cloud_effort_levels_reach_the_selected_wire();
     test_routed_models_keep_wire_key_and_failure_isolation();
     test_responses_needs_terminal_event_and_reports_incomplete();

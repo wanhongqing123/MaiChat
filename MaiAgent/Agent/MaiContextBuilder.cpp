@@ -260,6 +260,14 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
         pending.role = MaiModelRole::Assistant;
         std::vector<const MaiToolPart*> batch;
 
+        const auto flush_pending = [&] {
+            if (!pending.content.empty() || !pending.invocations.empty() || pending.continuation ||
+                (preserveReasoning && !pending.reasoning.empty()))
+                out.push_back(std::move(pending));
+            pending = MaiModelMessage{};
+            pending.role = MaiModelRole::Assistant;
+        };
+
         auto flush_batch = [&] {
             if (batch.empty()) return;
             // 先发 assistant + 它发起的这批调用
@@ -344,6 +352,13 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
                 if (!pending.content.empty()) pending.content += "\n";
                 pending.content += text->text;
             } else if (const auto* toolResult = std::get_if<MaiReasoningPart>(&part.body)) {
+                if (toolResult->continuation) {
+                    // 一个 carrier 就是一个成功 response 边界。即便前一个响应没有
+                    // 工具或可见文字，也必须独立输出；状态不经过文本裁剪或拼接。
+                    flush_batch();
+                    if (pending.continuation) flush_pending();
+                    pending.continuation = toolResult->continuation;
+                }
                 flush_batch();
                 if (preserveReasoning) {
                     // 供应商原字节属于这份 assistant 的调用，不能注入换行或可见正文。
@@ -381,10 +396,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
         }
         flush_batch();
 
-        if (!pending.content.empty() || !pending.invocations.empty() ||
-            (preserveReasoning && !pending.reasoning.empty())) {
-            out.push_back(std::move(pending));
-        }
+        flush_pending();
     }
     // 对未回灌的旧图明确告知模型：文件仍存在，只是本轮上下文没有携带像素。
     if (omittedImages != 0) {

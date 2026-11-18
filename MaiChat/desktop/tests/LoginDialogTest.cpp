@@ -288,6 +288,8 @@ public:
                                                                           ? QStringLiteral("bad\nkey")
                                                                           : QString(40, QLatin1Char('D'))},
                                          {QStringLiteral("minimax"), QString(40, QLatin1Char('M'))}}}};
+                                if (!mainModelKeysOverride.isEmpty())
+                                    response.insert(QStringLiteral("api_keys"), mainModelKeysOverride);
                             }
                         } else if (headers.startsWith("get /v1/model/bailian-credential ")) {
                             ++bailianCredentialRequestCount;
@@ -421,6 +423,7 @@ public:
     bool invalidMainModelKey = false;
     bool missingGlmKey = false;
     bool invalidMainModelShape = false;
+    QJsonObject mainModelKeysOverride;
     int bailianCredentialRequestCount = 0;
     bool modelAccessDenied = false;
     int modelCredentialExpiresIn = 300;
@@ -1194,6 +1197,7 @@ void LoginDialogTest::fetchesAccountModelKeysThroughAccountSession() {
     QCOMPARE(keys.value(QStringLiteral("glm")), QString(40, QLatin1Char('G')));
     QCOMPARE(keys.value(QStringLiteral("deepseek")), QString(40, QLatin1Char('D')));
     QCOMPARE(keys.value(QStringLiteral("minimax")), QString(40, QLatin1Char('M')));
+    QVERIFY(!keys.contains(QStringLiteral("openrouter")));
     const auto mediaAccess = auth.mediaServiceAccessProvider()();
     QUrl expectedMediaUrl = server.url();
     expectedMediaUrl.setPath(QStringLiteral("/maichat"));
@@ -1255,6 +1259,34 @@ void LoginDialogTest::fetchesAccountModelKeysThroughAccountSession() {
     QVERIFY(keys.isEmpty());
     QVERIFY(!error.isEmpty());
     QCOMPARE(server.mainModelRequestCount, 5);
+
+    // Optional OpenRouter credentials can be the account's only enabled route.
+    // Invalid optional fields reject the whole response instead of being coerced.
+    const QJsonObject openRouterOnly{{QStringLiteral("glm"), QString()},
+                                     {QStringLiteral("deepseek"), QString()},
+                                     {QStringLiteral("minimax"), QString()},
+                                     {QStringLiteral("openrouter"), QStringLiteral("synthetic-openrouter-key")}};
+    for (const QJsonValue& value :
+         {QJsonValue(QStringLiteral("synthetic-openrouter-key")), QJsonValue(QString()), QJsonValue(42),
+          QJsonValue(QJsonValue::Null), QJsonValue(QStringLiteral("bad\nkey"))}) {
+        server.mainModelKeysOverride = openRouterOnly;
+        server.mainModelKeysOverride.insert(QStringLiteral("openrouter"), value);
+        finished = false;
+        auth.fetchAccountModelKeys([&](const QHash<QString, QString>& received, const QString& failure) {
+            keys = received;
+            error = failure;
+            finished = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(finished, 5000);
+        if (value.isString() && !value.toString().isEmpty() && !value.toString().contains(QLatin1Char('\n'))) {
+            QVERIFY(error.isEmpty());
+            QCOMPARE(keys.size(), 1);
+            QCOMPARE(keys.value(QStringLiteral("openrouter")), value.toString());
+        } else {
+            QVERIFY(!error.isEmpty());
+            QVERIFY(keys.isEmpty());
+        }
+    }
 }
 
 void LoginDialogTest::refusesMalformedTemporaryModelCredentials() {

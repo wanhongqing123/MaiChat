@@ -113,7 +113,8 @@ QString sessionKey(const QJsonObject& value) {
 
 const QStringList& sessionModelChoices() {
     static const QStringList models{QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
-                                    QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")};
+                                    QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro"),
+                                    QStringLiteral("anthropic/claude-fable-5.2")};
     return models;
 }
 

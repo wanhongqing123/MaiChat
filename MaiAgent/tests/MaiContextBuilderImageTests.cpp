@@ -385,6 +385,76 @@ void testStoredReasoningDoesNotEnterDefaultHistory() {
     CHECK(request[1].reasoning.empty());
 }
 
+void testResponseContinuationKeepsEveryResponseAndToolBatch() {
+    const auto state = [](std::string payload) {
+        return MaiModelContinuationState{"responses.output.v1", "openrouter",
+                                         "anthropic/claude-fable-5.2", std::move(payload)};
+    };
+    const auto first =
+        state("[{\"type\":\"reasoning\",\"id\":\"rs_fixture\",\"encrypted_content\":\"" +
+              std::string(40000, 'x') +
+              "\"},{\"type\":\"function_call\",\"id\":\"fc_a\",\"call_id\":\"call_a\","
+              "\"name\":\"first\",\"arguments\":\"{}\"},{\"type\":\"function_call\","
+              "\"id\":\"fc_b\",\"call_id\":\"call_b\",\"name\":\"second\",\"arguments\":\"{}\"}]");
+    const auto second =
+        state(R"([{"type":"reasoning","id":"rs_second","encrypted_content":"owned-second"}])");
+    const auto third = state(
+        R"([{"type":"message","id":"msg_final","role":"assistant","content":[{"type":"output_text","text":"Final"}]}])");
+    MaiMessage assistant;
+    assistant.role = MaiRole::Assistant;
+    const auto append = [&](auto body) {
+        MaiMessagePart part;
+        part.id = "part-" + std::to_string(assistant.parts.size());
+        part.body = std::move(body);
+        assistant.parts.push_back(std::move(part));
+    };
+    append(MaiReasoningPart{"", first});
+    for (const auto& id : {"call_a", "call_b"}) {
+        MaiToolPart tool;
+        tool.callId = id;
+        tool.tool = id == std::string("call_a") ? "first" : "second";
+        tool.input = "{}";
+        tool.output = "owned result";
+        tool.state = MaiToolState::Completed;
+        append(std::move(tool));
+    }
+    append(MaiReasoningPart{"", second});
+    append(MaiReasoningPart{"", third});
+    append(MaiTextPart{"Final"});
+    MaiContextBuilder::Options options;
+    options.maxReasoningBytes = 8;
+    const auto request = MaiContextBuilder(options).build(
+        {userMessage("Question", {}), assistant, userMessage("Follow-up", {})});
+    CHECK(request.size() == 7);
+    if (request.size() != 7) return;
+    CHECK(request[1].continuation.has_value());
+    if (request[1].continuation) CHECK(request[1].continuation->payload == first.payload);
+    CHECK(request[1].invocations.size() == 2);
+    CHECK(request[2].role == MaiModelRole::ToolResult && request[2].toolCallId == "call_a");
+    CHECK(request[3].role == MaiModelRole::ToolResult && request[3].toolCallId == "call_b");
+    CHECK(request[4].continuation.has_value());
+    if (request[4].continuation) CHECK(request[4].continuation->payload == second.payload);
+    CHECK(request[4].content.empty() && request[4].invocations.empty());
+    CHECK(request[5].continuation.has_value());
+    if (request[5].continuation) CHECK(request[5].continuation->payload == third.payload);
+    CHECK(request[5].content == "Final");
+    CHECK(request[6].role == MaiModelRole::User && request[6].content == "Follow-up");
+}
+
+void testResponseContinuationContributesToInputBudget() {
+    MaiModelRequest request;
+    request.model = "anthropic/claude-fable-5.2";
+    MaiModelMessage message;
+    message.role = MaiModelRole::Assistant;
+    request.messages.push_back(message);
+    const auto before = maiEstimateModelInputTokens(request);
+    request.messages.front().continuation = MaiModelContinuationState{
+        "responses.output.v1", "openrouter", "anthropic/claude-fable-5.2", std::string(40000, 'x')};
+    const auto after = maiEstimateModelInputTokens(request);
+    CHECK(after.tokens > before.tokens + 10000);
+    CHECK(!after.exact);
+}
+
 }  // namespace
 
 int main() {
@@ -403,5 +473,7 @@ int main() {
     testExplicitZeroTextBudgetsMeanUnlimited();
     testQuotedAssistantMediaUsesDeliveredArtifact();
     testStoredReasoningDoesNotEnterDefaultHistory();
+    testResponseContinuationKeepsEveryResponseAndToolBatch();
+    testResponseContinuationContributesToInputBudget();
     return failures == 0 ? 0 : 1;
 }

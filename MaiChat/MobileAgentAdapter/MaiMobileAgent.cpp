@@ -674,9 +674,11 @@ struct MaiMobileAgent {
         const auto defaultCapability = maiCloudModelInfo(requestedModel);
         if (!isLocal && defaultCapability) {
             config.wire = defaultCapability->wire;
-            // 旧 GLM Responses 官方配置只在这个精确已知迁移点改到兼容 Coding Plan 的 Chat。
-            if (defaultCapability->provider == "glm" && config.baseUrl == "https://open.bigmodel.cn/api/v1")
-                config.baseUrl = "https://open.bigmodel.cn/api/paas/v4";
+            // 只迁移已知旧官方 Chat 地址；自有端点/loopback 配置不得被改到别处。
+            if (defaultCapability->provider == "glm" &&
+                (config.baseUrl == "https://open.bigmodel.cn/api/paas/v4" ||
+                 config.baseUrl == "https://open.bigmodel.cn/api/paas/v4/"))
+                config.baseUrl = "https://open.bigmodel.cn/api/v1";
         }
         const bool hasLocalConfiguration = isLocal || !request.value("localModelPath", std::string{}).empty();
         const auto nextLocalName = isLocal ? requestedModel : request.value("localModelName", std::string{});
@@ -721,19 +723,29 @@ struct MaiMobileAgent {
                                                                                  : std::string{};
         };
         MaiRoutedModelConfig nextRoutes;
-        for (const std::string providerName : {"glm", "deepseek"}) {
+        for (const std::string providerName : {"glm", "deepseek", "openrouter"}) {
             MaiModelRoute route;
-            route.modelNames = providerName == "glm" ? std::vector<std::string>{"glm-5.3", "glm-5.3-flash"}
-                                                     : std::vector<std::string>{"deepseek-flash", "deepseek-v4-pro"};
+            if (providerName == "glm")
+                route.modelNames = {"glm-5.3", "glm-5.3-flash"};
+            else if (providerName == "deepseek")
+                route.modelNames = {"deepseek-flash", "deepseek-v4-pro"};
+            else
+                route.modelNames = {"anthropic/claude-fable-5.2"};
             route.config = config;
             route.config.apiKey.clear();
-            route.config.wire = providerName == "glm" ? MaiWireApi::ChatCompletions : MaiWireApi::Responses;
-            const char* field = providerName == "glm" ? "glmBaseUrl" : "deepseekBaseUrl";
+            route.config.wire = MaiWireApi::Responses;
+            const std::string field = providerName + "BaseUrl";
             const char* official =
-                providerName == "glm" ? "https://open.bigmodel.cn/api/paas/v4" : "https://api.deepseek.com";
+                providerName == "glm" ? "https://open.bigmodel.cn/api/v1"
+                : providerName == "deepseek" ? "https://api.deepseek.com"
+                                             : "https://openrouter.ai/api/v1";
             route.config.baseUrl = request.value(field, defaultCapability && defaultCapability->provider == providerName
                                                             ? config.baseUrl
                                                             : std::string(official));
+            if (providerName == "glm" &&
+                (route.config.baseUrl == "https://open.bigmodel.cn/api/paas/v4" ||
+                 route.config.baseUrl == "https://open.bigmodel.cn/api/paas/v4/"))
+                route.config.baseUrl = "https://open.bigmodel.cn/api/v1";
             route.apiKeyProvider = [accountKey, providerName] { return accountKey(providerName); };
             nextRoutes.routes.push_back(std::move(route));
         }
@@ -1236,6 +1248,12 @@ struct MaiMobileAgent {
             }
             Json parts = Json::array();
             for (const auto& part : message.parts) {
+                if (const auto* reasoning = std::get_if<MaiReasoningPart>(&part.body);
+                    reasoning && reasoning->continuation && reasoning->text.empty()) {
+                    // 私有 response 续接载体不是空思考气泡，也不把签名状态带入 UI/IM。
+                    if (!message.isInProgress() && liveOverride == nullptr) liveParts.erase(part.id);
+                    continue;
+                }
                 Json value = {{"id", part.id}, {"created", part.created}};
                 std::visit(
                     [&](const auto& body) {

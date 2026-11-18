@@ -2,17 +2,30 @@ import XCTest
 import Foundation
 @preconcurrency import Network
 
-/// Owned HTTP/1.1 fixtures use real native Chat/Responses requests. No provider account is used.
+/// Owned HTTP/1.1 fixtures use the native Responses wire for every cloud provider.
+/// Provider-specific synthetic keys catch accidental route/key fallback without a real account.
 private final class SessionModelHTTPFixture: @unchecked Sendable {
+    enum Provider: String {
+        case glm, deepseek, openrouter
+
+        var reply: String {
+            switch self {
+            case .glm: return "Fixture GLM reply"
+            case .deepseek: return "Fixture DeepSeek reply"
+            case .openrouter: return "Fixture OpenRouter reply"
+            }
+        }
+    }
+
     private let listener: NWListener
     private let queue = DispatchQueue(label: "maichat.session-model-http")
     private let lock = NSLock()
     private var captured: [[String: Any]] = []
     private(set) var port: UInt16 = 0
-    private let glm: Bool
+    private let provider: Provider
 
-    init(glm: Bool) throws {
-        self.glm = glm
+    init(provider: Provider) throws {
+        self.provider = provider
         listener = try NWListener(using: .tcp, on: .any)
         let ready = DispatchSemaphore(value: 0)
         listener.stateUpdateHandler = { [weak self] state in
@@ -56,15 +69,11 @@ private final class SessionModelHTTPFixture: @unchecked Sendable {
     private func respond(_ connection: NWConnection, header: String, body: Data) {
         let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]
         lock.lock(); captured.append(object); lock.unlock()
-        let expected = glm ? "/chat/completions" : "/responses"
-        let key = glm ? "synthetic-session-glm-key" : "synthetic-session-deepseek-key"
-        let authorized = header.contains("POST " + expected + " ") && header.lowercased().contains("authorization: bearer " + key)
-        let reply: String
-        if glm {
-            reply = "data: {\"choices\":[{\"delta\":{\"content\":\"Fixture GLM reply\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
-        } else {
-            reply = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Fixture DeepSeek reply\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
-        }
+        let key = "synthetic-session-" + provider.rawValue + "-key"
+        let authorized = header.contains("POST /responses ") &&
+            header.lowercased().contains("authorization: bearer " + key)
+        let reply = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"" +
+            provider.reply + "\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
         let bytes = Data((authorized ? reply : "{}").utf8)
         let encoded = Data("HTTP/1.1 \(authorized ? "200 OK" : "401 Unauthorized")\r\nContent-Type: text/event-stream\r\nContent-Length: \(bytes.count)\r\nConnection: close\r\n\r\n".utf8) + bytes
         connection.send(content: encoded, completion: .contentProcessed { _ in connection.cancel() })
@@ -76,8 +85,9 @@ final class SessionModelsUITests: XCTestCase {
     @MainActor
     func testRemoteOwnerConfigurationAndScopedReceipts() throws {
         continueAfterFailure = false
-        let glm = try SessionModelHTTPFixture(glm: true)
-        let deepseek = try SessionModelHTTPFixture(glm: false)
+        let glm = try SessionModelHTTPFixture(provider: .glm)
+        let deepseek = try SessionModelHTTPFixture(provider: .deepseek)
+        let openrouter = try SessionModelHTTPFixture(provider: .openrouter)
         XCUIDevice.shared.orientation = .portrait
         let app = XCUIApplication()
         app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test", "--ai-remote-session-model-ui-test", "--ai-session-model-ui-test",
@@ -85,6 +95,7 @@ final class SessionModelsUITests: XCTestCase {
         app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
         app.launchEnvironment["MAICHAT_SESSION_MODELS_GLM_PORT"] = String(glm.port)
         app.launchEnvironment["MAICHAT_SESSION_MODELS_DEEPSEEK_PORT"] = String(deepseek.port)
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_OPENROUTER_PORT"] = String(openrouter.port)
         app.launch(); defer { app.terminate() }
         let result = app.staticTexts["remote-session-model-checks"]
         XCTAssertTrue(result.waitForExistence(timeout: 30))
@@ -96,8 +107,9 @@ final class SessionModelsUITests: XCTestCase {
     @MainActor
     func testModelMenuFitsLandscape() throws {
         continueAfterFailure = false
-        let glm = try SessionModelHTTPFixture(glm: true)
-        let deepseek = try SessionModelHTTPFixture(glm: false)
+        let glm = try SessionModelHTTPFixture(provider: .glm)
+        let deepseek = try SessionModelHTTPFixture(provider: .deepseek)
+        let openrouter = try SessionModelHTTPFixture(provider: .openrouter)
         XCUIDevice.shared.orientation = .portrait
         let app = XCUIApplication()
         app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test", "--ai-session-model-ui-test",
@@ -105,6 +117,7 @@ final class SessionModelsUITests: XCTestCase {
         app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
         app.launchEnvironment["MAICHAT_SESSION_MODELS_GLM_PORT"] = String(glm.port)
         app.launchEnvironment["MAICHAT_SESSION_MODELS_DEEPSEEK_PORT"] = String(deepseek.port)
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_OPENROUTER_PORT"] = String(openrouter.port)
         app.launch(); defer { XCUIDevice.shared.orientation = .portrait; app.terminate() }
         XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 30))
         let configured = app.staticTexts["primary-ui-session-configuration"]
@@ -119,6 +132,9 @@ final class SessionModelsUITests: XCTestCase {
         XCTAssertTrue(panel.waitForExistence(timeout: 5))
         XCTAssertLessThanOrEqual(panel.frame.maxY, app.frame.maxY + 1)
         XCTAssertGreaterThanOrEqual(panel.frame.minY + 1, app.frame.minY)
+        let fable = app.buttons["ai-primary-model-anthropic/claude-fable-5.2"]
+        if !fable.isHittable { panel.swipeUp() }
+        XCTAssertTrue(fable.isHittable, "Fable must be reachable in the cloud-model menu")
         let local = app.buttons["ai-primary-model-local"]
         if !local.isHittable { panel.swipeUp() }
         XCTAssertTrue(local.isHittable, "Last model must be reachable by scrolling inside the viewport")
@@ -139,8 +155,9 @@ final class SessionModelsUITests: XCTestCase {
     @MainActor
     func testModelsAndEffortBelongToSessionsAndSurviveRelaunch() throws {
         continueAfterFailure = false
-        let glm = try SessionModelHTTPFixture(glm: true)
-        let deepseek = try SessionModelHTTPFixture(glm: false)
+        let glm = try SessionModelHTTPFixture(provider: .glm)
+        let deepseek = try SessionModelHTTPFixture(provider: .deepseek)
+        let openrouter = try SessionModelHTTPFixture(provider: .openrouter)
         XCUIDevice.shared.orientation = .portrait
         let app = XCUIApplication()
         app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test", "--ai-session-model-ui-test",
@@ -150,6 +167,7 @@ final class SessionModelsUITests: XCTestCase {
         app.launchEnvironment["no_proxy"] = "*"
         app.launchEnvironment["MAICHAT_SESSION_MODELS_GLM_PORT"] = String(glm.port)
         app.launchEnvironment["MAICHAT_SESSION_MODELS_DEEPSEEK_PORT"] = String(deepseek.port)
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_OPENROUTER_PORT"] = String(openrouter.port)
         app.launch(); defer { app.terminate() }
         XCUIDevice.shared.orientation = .portrait
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in app.frame.height > app.frame.width }, object: app)], timeout: 10), .completed)
@@ -159,7 +177,13 @@ final class SessionModelsUITests: XCTestCase {
         XCTAssertTrue(composer.waitForExistence(timeout: 20))
         func require(_ model: String, _ effort: String) {
             XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-                predicate: NSPredicate(format: "value CONTAINS %@ AND value CONTAINS %@", "model:\(model);", "effort:\(effort);"), object: config)], timeout: 12), .completed)
+                predicate: NSPredicate(format: "value CONTAINS %@ AND value CONTAINS %@ AND value CONTAINS %@",
+                    "model:\(model);", "effort:\(effort);", "wire:responses;"), object: config)], timeout: 12), .completed)
+            // The status reads the normal native snapshot, separately from the menu selection.
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "value CONTAINS %@ AND value CONTAINS %@",
+                    "native-model:\(model);", "native-wire:responses;"),
+                object: app.staticTexts["primary-ui-model-state"])], timeout: 12), .completed)
         }
         func sessionID() throws -> String {
             let value = try XCTUnwrap(config.value as? String)
@@ -172,6 +196,7 @@ final class SessionModelsUITests: XCTestCase {
             openPanel()
             let item = app.buttons["ai-primary-model-" + model]
             if !item.exists { app.buttons["ai-primary-model-settings"].tap() }
+            if !item.isHittable { app.descendants(matching: .any)["ai-action-panel"].swipeUp() }
             XCTAssertTrue(item.waitForExistence(timeout: 5)); XCTAssertTrue(item.isHittable); item.tap()
         }
         func chooseEffort(_ label: String) {
@@ -190,22 +215,28 @@ final class SessionModelsUITests: XCTestCase {
             let row = app.buttons["ai-conversation-" + id]
             XCTAssertTrue(row.waitForExistence(timeout: 8)); row.tap()
         }
+        func createSession() throws -> String {
+            closePanel(); app.buttons["对话列表"].tap()
+            // Keep the real untitled row distinct from the drawer's New conversation header.
+            let create = app.buttons.matching(identifier: "ai-session-drawer")
+                .matching(NSPredicate(format: "label == %@", "新对话")).firstMatch
+            XCTAssertTrue(create.waitForExistence(timeout: 5))
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "enabled == true"), object: create)], timeout: 5), .completed)
+            let old = try sessionID()
+            create.tap()
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "NOT (value CONTAINS %@)", "session:\(old);"), object: config)],
+                timeout: 10), .completed)
+            return try sessionID()
+        }
         require("deepseek-flash", "high")
         composer.tap(); composer.typeText("draft-A")
         let a = try sessionID()
         chooseModel("glm-5.3"); chooseEffort("简单"); require("glm-5.3", "low")
         closePanel(); XCTAssertEqual(composer.value as? String, "draft-A")
         let selected = XCTAttachment(screenshot: app.screenshot()); selected.name = "session-A-glm-low-with-draft"; selected.lifetime = .keepAlways; add(selected)
-        app.buttons["对话列表"].tap()
-        // safeAreaInset header inherits the drawer identifier on this supported runtime.
-        // Distinguish it from the real untitled conversation row; both are labelled New conversation.
-        let create = app.buttons.matching(identifier: "ai-session-drawer")
-            .matching(NSPredicate(format: "label == %@", "新对话")).firstMatch
-        XCTAssertTrue(create.waitForExistence(timeout: 5))
-        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: create)], timeout: 5), .completed)
-        create.tap()
-        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "NOT (value CONTAINS %@)", "session:\(a);"), object: config)], timeout: 10), .completed)
-        let b = try sessionID()
+        let b = try createSession()
         require("deepseek-flash", "high")
         chooseModel("deepseek-v4-pro"); chooseEffort("深度"); require("deepseek-v4-pro", "max")
         closePanel(); composer.tap(); composer.typeText("Reply in session B\n")
@@ -217,11 +248,31 @@ final class SessionModelsUITests: XCTestCase {
         chooseModel("glm-5.3-flash"); chooseEffort("标准"); require("glm-5.3-flash", "high")
         closePanel(); selectSession(b); require("deepseek-v4-pro", "max")
         let separate = XCTAttachment(screenshot: app.screenshot()); separate.name = "session-B-pro-max-isolated"; separate.lifetime = .keepAlways; add(separate)
+        // A third ordinary session exercises OpenRouter without changing either existing session or the default.
+        let c = try createSession()
+        require("deepseek-flash", "high")
+        let fable = "anthropic/claude-fable-5.2"
+        chooseModel(fable); chooseEffort("深度"); require(fable, "max")
+        closePanel(); composer.tap(); composer.typeText("Reply in session C\n")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value CONTAINS %@", "Fixture OpenRouter reply"),
+            object: app.staticTexts["primary-ui-model-output"])], timeout: 15), .completed)
+        let routed = XCTAttachment(screenshot: app.screenshot())
+        routed.name = "session-C-fable-responses"; routed.lifetime = .keepAlways; add(routed)
+        selectSession(a); require("glm-5.3-flash", "high")
+        selectSession(b); require("deepseek-v4-pro", "max")
+        selectSession(c); require(fable, "max")
         app.terminate(); app.launch()
         XCTAssertTrue(config.waitForExistence(timeout: 30))
         selectSession(a); require("glm-5.3-flash", "high")
         selectSession(b); require("deepseek-v4-pro", "max")
-        XCTAssertTrue(glm.requests().contains { $0["model"] as? String == "glm-5.3" && $0["reasoning_effort"] as? String == "low" })
+        selectSession(c); require(fable, "max")
+        let restored = XCTAttachment(screenshot: app.screenshot())
+        restored.name = "session-C-fable-native-wire-after-relaunch"; restored.lifetime = .keepAlways; add(restored)
+        XCTAssertTrue(glm.requests().contains { $0["model"] as? String == "glm-5.3" && ($0["reasoning"] as? [String: Any])?["effort"] as? String == "low" })
         XCTAssertTrue(deepseek.requests().contains { $0["model"] as? String == "deepseek-v4-pro" && ($0["reasoning"] as? [String: Any])?["effort"] as? String == "max" })
+        XCTAssertTrue(openrouter.requests().contains { $0["model"] as? String == fable &&
+            ($0["reasoning"] as? [String: Any])?["effort"] as? String == "max" &&
+            $0["input"] is [Any] && $0["messages"] == nil && $0["thinking"] == nil })
     }
 }

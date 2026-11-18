@@ -697,9 +697,10 @@ void AgentControllerTest::sessionEffortAndModelPersistTogetherAcrossRestart() {
     QVERIFY(directory.isValid());
     const QString database = QDir(directory.path()).filePath(QStringLiteral("session-effort.sqlite"));
     const QStringList models{QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
-                             QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")};
-    const QStringList efforts{QStringLiteral("low"), QStringLiteral("high"),
-                              QStringLiteral("max"), QStringLiteral("low")};
+                             QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro"),
+                             QStringLiteral("anthropic/claude-fable-5.2")};
+    const QStringList efforts{QStringLiteral("low"), QStringLiteral("high"), QStringLiteral("max"),
+                              QStringLiteral("low"), QStringLiteral("max")};
     QStringList sessions;
     {
         AgentController original(std::make_unique<SessionSelectionModel>(), database);
@@ -818,11 +819,13 @@ void AgentControllerTest::sessionConfigurationReflectsOnlySelectedProviderCreden
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
     QHash<QString, QString> keys{{QStringLiteral("glm"), QStringLiteral("synthetic-glm-key")},
-                                {QStringLiteral("deepseek"), QStringLiteral("synthetic-deepseek-key")}};
+                                 {QStringLiteral("deepseek"), QStringLiteral("synthetic-deepseek-key")},
+                                 {QStringLiteral("openrouter"), QStringLiteral("synthetic-openrouter-key")}};
     QStringList requestedProviders;
     AgentController::ModelConfig model;
     model.glmBaseUrl = QStringLiteral("http://127.0.0.1:1/glm-profile");
     model.deepseekBaseUrl = QStringLiteral("http://127.0.0.1:1/deepseek-profile");
+    model.openrouterBaseUrl = QStringLiteral("http://127.0.0.1:1/openrouter-profile");
     model.accountModelKeyProvider = [&](const QString& provider) {
         requestedProviders.push_back(provider);
         return keys.value(provider);
@@ -853,13 +856,30 @@ void AgentControllerTest::sessionConfigurationReflectsOnlySelectedProviderCreden
     QVERIFY(controller.setSessionModelConfiguration(session, QStringLiteral("glm-5.3-flash"),
                                                      QStringLiteral("max")));
     QVERIFY(controller.sessionModelConfiguration(session, config));
-    QCOMPARE(config.wire, MaiWireApi::ChatCompletions);
+    QCOMPARE(config.wire, MaiWireApi::Responses);
     QVERIFY(config.configured);
     QVERIFY(!controller.setSessionModelConfiguration(session, QStringLiteral("unknown-cloud-model"),
                                                       QStringLiteral("low")));
     QVERIFY(controller.sessionModelConfiguration(session, config));
     QCOMPARE(config.model, QStringLiteral("glm-5.3-flash"));
     QCOMPARE(config.reasoningEffort, QStringLiteral("max"));
+    QVERIFY(controller.setSessionModelConfiguration(session, QStringLiteral("anthropic/claude-fable-5.2"),
+                                                    QStringLiteral("low")));
+    requestedProviders.clear();
+    QVERIFY(controller.sessionModelConfiguration(session, config));
+    QCOMPARE(config.model, QStringLiteral("anthropic/claude-fable-5.2"));
+    QCOMPARE(config.reasoningEffort, QStringLiteral("low"));
+    QCOMPARE(config.wire, MaiWireApi::Responses);
+    QVERIFY(config.configured);
+    QCOMPARE(requestedProviders, (QStringList{QStringLiteral("openrouter")}));
+    keys.remove(QStringLiteral("openrouter"));
+    QVERIFY(controller.sessionModelConfiguration(session, config));
+    QVERIFY(!config.configured);
+    // Other providers remain available, but cannot authorize the selected route.
+    QVERIFY(controller.setSessionModelConfiguration(session, QStringLiteral("deepseek-flash")));
+    QVERIFY(!controller.setSessionModelConfiguration(session, QStringLiteral("anthropic/claude-fable-5.2")));
+    QVERIFY(controller.sessionModelConfiguration(session, config));
+    QCOMPARE(config.model, QStringLiteral("deepseek-flash"));
 }
 
 void AgentControllerTest::sessionConfigurationWithoutClientRejectsUnknownModel() {
@@ -972,7 +992,12 @@ void AgentControllerTest::credentialWaitDoesNotRetargetOtherSession() {
     QCOMPARE(firstRequests.size(), std::size_t(1));
     QCOMPARE(secondRequests.size(), std::size_t(1));
     QCOMPARE(firstRequests.front().body.value(QStringLiteral("model")).toString(), QStringLiteral("glm-5.3"));
-    QCOMPARE(firstRequests.front().body.value(QStringLiteral("reasoning_effort")).toString(), QStringLiteral("low"));
+    QCOMPARE(firstRequests.front()
+                 .body.value(QStringLiteral("reasoning"))
+                 .toObject()
+                 .value(QStringLiteral("effort"))
+                 .toString(),
+             QStringLiteral("low"));
     QCOMPARE(secondRequests.front().body.value(QStringLiteral("model")).toString(), QStringLiteral("deepseek-flash"));
     QCOMPARE(secondRequests.front().body.value(QStringLiteral("reasoning")).toObject()
                  .value(QStringLiteral("effort")).toString(), QStringLiteral("high"));
@@ -982,13 +1007,16 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile_data(
     QTest::addColumn<QString>("model");
     QTest::addColumn<QString>("provider");
     QTest::addColumn<QString>("effort");
-    for (const QString& model : {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
-                                 QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")}) {
+    for (const QString& model :
+         {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
+          QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2")}) {
         for (const QString& effort : {QStringLiteral("low"), QStringLiteral("high"), QStringLiteral("max")}) {
             const QByteArray name = (model + QLatin1Char('-') + effort).toUtf8();
-            QTest::newRow(name.constData()) << model
-                << (model.startsWith(QStringLiteral("glm-")) ? QStringLiteral("glm")
-                                                            : QStringLiteral("deepseek"))
+            QTest::newRow(name.constData())
+                << model
+                << (model.startsWith(QStringLiteral("glm-"))                ? QStringLiteral("glm")
+                    : model == QStringLiteral("anthropic/claude-fable-5.2") ? QStringLiteral("openrouter")
+                                                                            : QStringLiteral("deepseek"))
                 << effort;
         }
     }
@@ -1000,22 +1028,25 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile() {
     QFETCH(QString, effort);
     AccountRouteProbe glm;
     AccountRouteProbe deepseek;
-    QVERIFY(glm.port > 0 && deepseek.port > 0);
-    QVERIFY(glm.server.is_running() && deepseek.server.is_running());
+    AccountRouteProbe openrouter;
+    QVERIFY(glm.port > 0 && deepseek.port > 0 && openrouter.port > 0);
+    QVERIFY(glm.server.is_running() && deepseek.server.is_running() && openrouter.server.is_running());
     QStringList requestedProviders;
     DesktopAccountModelClient::Config config;
     config.glmBaseUrl = glm.baseUrl(QStringLiteral("glm-profile"));
     config.deepseekBaseUrl = deepseek.baseUrl(QStringLiteral("deepseek-profile"));
+    config.openrouterBaseUrl = openrouter.baseUrl(QStringLiteral("openrouter-profile"));
     config.keyProvider = [&](const QString& requestedProvider) {
         requestedProviders.push_back(requestedProvider);
         return requestedProvider + QStringLiteral("-synthetic-key");
     };
     DesktopAccountModelClient client(config);
-    QCOMPARE(client.wireApi(), MaiWireApi::Mixed);
-    QCOMPARE(client.wireApiForModel("glm-5.3").value_or(MaiWireApi::Mixed), MaiWireApi::ChatCompletions);
-    QCOMPARE(client.wireApiForModel("glm-5.3-flash").value_or(MaiWireApi::Mixed), MaiWireApi::ChatCompletions);
+    QCOMPARE(client.wireApi(), MaiWireApi::Responses);
+    QCOMPARE(client.wireApiForModel("glm-5.3").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
+    QCOMPARE(client.wireApiForModel("glm-5.3-flash").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
     QCOMPARE(client.wireApiForModel("deepseek-flash").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
     QCOMPARE(client.wireApiForModel("deepseek-v4-pro").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
+    QCOMPARE(client.wireApiForModel("anthropic/claude-fable-5.2").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
     QVERIFY(!client.wireApiForModel("unknown-cloud-model"));
     QVERIFY(requestedProviders.isEmpty());
     MaiModelRequest request;
@@ -1027,35 +1058,28 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile() {
     const MaiError error = client.stream(request, sink, cancel);
     QVERIFY2(!error, error.message().c_str());
     QCOMPARE(requestedProviders, (QStringList{provider}));
-    const bool isGlm = provider == QStringLiteral("glm");
-    const auto received = isGlm ? glm.recordedRequests() : deepseek.recordedRequests();
-    const auto unrelated = isGlm ? deepseek.recordedRequests() : glm.recordedRequests();
+    const auto received = provider == QStringLiteral("glm")        ? glm.recordedRequests()
+                          : provider == QStringLiteral("deepseek") ? deepseek.recordedRequests()
+                                                                   : openrouter.recordedRequests();
     QCOMPARE(received.size(), std::size_t(1));
-    QVERIFY(unrelated.empty());
+    QCOMPARE(glm.recordedRequests().size() + deepseek.recordedRequests().size() + openrouter.recordedRequests().size(),
+             std::size_t(1));
     QCOMPARE(received.front().authorization, QStringLiteral("Bearer ") + provider + QStringLiteral("-synthetic-key"));
     QCOMPARE(received.front().body.value(QStringLiteral("model")).toString(), model);
-    QCOMPARE(received.front().path,
-             isGlm ? QStringLiteral("/glm-profile/chat/completions")
-                   : QStringLiteral("/deepseek-profile/responses"));
-    if (isGlm) {
-        QVERIFY(received.front().body.contains(QStringLiteral("messages")));
-        QVERIFY(!received.front().body.contains(QStringLiteral("input")));
-        QCOMPARE(received.front().body.value(QStringLiteral("thinking")).toObject()
-                     .value(QStringLiteral("type")).toString(), QStringLiteral("enabled"));
-        QCOMPARE(received.front().body.value(QStringLiteral("reasoning_effort")).toString(), effort);
-    } else {
-        QVERIFY(received.front().body.contains(QStringLiteral("input")));
-        QVERIFY(!received.front().body.contains(QStringLiteral("messages")));
-        QCOMPARE(received.front().body.value(QStringLiteral("reasoning")).toObject()
-                     .value(QStringLiteral("effort")).toString(), effort);
-    }
+    QCOMPARE(received.front().path, QStringLiteral("/%1-profile/responses").arg(provider));
+    QVERIFY(received.front().body.contains(QStringLiteral("input")));
+    QVERIFY(!received.front().body.contains(QStringLiteral("messages")));
+    QCOMPARE(
+        received.front().body.value(QStringLiteral("reasoning")).toObject().value(QStringLiteral("effort")).toString(),
+        effort);
 }
 
 void AgentControllerTest::accountModelClientRoutesBySelectedModelAndFreshKey() {
     AccountRouteProbe glm;
     AccountRouteProbe deepseek;
-    QVERIFY(glm.port > 0 && deepseek.port > 0);
-    QVERIFY(glm.server.is_running() && deepseek.server.is_running());
+    AccountRouteProbe openrouter;
+    QVERIFY(glm.port > 0 && deepseek.port > 0 && openrouter.port > 0);
+    QVERIFY(glm.server.is_running() && deepseek.server.is_running() && openrouter.server.is_running());
     QHash<QString, QString> keys = {
         {QStringLiteral("glm"), QStringLiteral("glm-account-key")},
         {QStringLiteral("deepseek"), QStringLiteral("deepseek-account-key")}};
@@ -1063,6 +1087,7 @@ void AgentControllerTest::accountModelClientRoutesBySelectedModelAndFreshKey() {
     QStringList requestedProviders;
     config.glmBaseUrl = glm.baseUrl(QStringLiteral("glm-profile"));
     config.deepseekBaseUrl = deepseek.baseUrl(QStringLiteral("deepseek-profile"));
+    config.openrouterBaseUrl = openrouter.baseUrl(QStringLiteral("openrouter-profile"));
     config.keyProvider = [&](const QString& provider) {
         requestedProviders.push_back(provider);
         return keys.value(provider);
@@ -1110,6 +1135,20 @@ void AgentControllerTest::accountModelClientRoutesBySelectedModelAndFreshKey() {
     QCOMPARE(requestedProviders.size(), 6);
     QCOMPARE(glm.recordedRequests().size(), std::size_t(2));
     QCOMPARE(deepseek.recordedRequests().size(), std::size_t(2));
+    keys.insert(QStringLiteral("openrouter"), QStringLiteral("synthetic-openrouter-first"));
+    request.model = "anthropic/claude-fable-5.2";
+    QVERIFY(!client.stream(request, sink, cancel));
+    QCOMPARE(openrouter.recordedRequests().back().authorization, QStringLiteral("Bearer synthetic-openrouter-first"));
+    keys.insert(QStringLiteral("openrouter"), QStringLiteral("synthetic-openrouter-rotated"));
+    QVERIFY(!client.stream(request, sink, cancel));
+    QCOMPARE(openrouter.recordedRequests().back().authorization, QStringLiteral("Bearer synthetic-openrouter-rotated"));
+    keys.remove(QStringLiteral("openrouter"));
+    QCOMPARE(client.stream(request, sink, cancel).code(), MaiErrorCode::NotConfigured);
+    QCOMPARE(openrouter.recordedRequests().size(), std::size_t(2));
+    QCOMPARE(glm.recordedRequests().size(), std::size_t(2));
+    QCOMPARE(deepseek.recordedRequests().size(), std::size_t(2));
+    QCOMPARE(requestedProviders.mid(6),
+             (QStringList{QStringLiteral("openrouter"), QStringLiteral("openrouter"), QStringLiteral("openrouter")}));
 }
 
 
@@ -1173,10 +1212,10 @@ void AgentControllerTest::accountModelClientUsesResolvedProxy() {
     const std::atomic<bool> cancel{false};
     QVERIFY(!client.stream(request, sink, cancel));
     QCOMPARE(resolved.size(), std::size_t(1));
-    QCOMPARE(QString::fromStdString(resolved.front()), QStringLiteral("http://model.test/chat/completions"));
+    QCOMPARE(QString::fromStdString(resolved.front()), QStringLiteral("http://model.test/responses"));
     std::lock_guard<std::mutex> lock(proxy.mutex);
     QCOMPARE(proxy.count, 1);
-    QCOMPARE(QString::fromStdString(proxy.target), QStringLiteral("http://model.test/chat/completions"));
+    QCOMPARE(QString::fromStdString(proxy.target), QStringLiteral("http://model.test/responses"));
     QCOMPARE(QString::fromStdString(proxy.authorization), QStringLiteral("Bearer account-key"));
 }
 #endif

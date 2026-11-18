@@ -1783,8 +1783,8 @@ void AgentPanelSessionTest::mainModelChoicesStaySeparateFromReasoningEffort() {
     QVERIFY(high && high->isVisible() && high->isChecked());
     QTest::mouseClick(models, Qt::LeftButton);
     QVERIFY(!high->isVisible());
-    const QStringList ids{QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
-                          QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")};
+    const QStringList ids{QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
+                          QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2")};
     for (const QString& id : ids) {
         auto* option = actions->findChild<QPushButton*>(QStringLiteral("agentModelOption-") + id);
         QVERIFY2(option && option->isVisible(), qPrintable(id));
@@ -1797,19 +1797,18 @@ void AgentPanelSessionTest::mainModelChoicesStaySeparateFromReasoningEffort() {
     }
     QSignalSpy modelChanged(harness.panel.get(), &AgentChatPanel::modelChangeRequested);
     QSignalSpy effortChanged(harness.panel.get(), &AgentChatPanel::reasoningEffortChangeRequested);
-    auto* pro =
-        actions->findChild<QPushButton*>(QStringLiteral("agentModelOption-deepseek-v4-pro"));
+    auto* pro = actions->findChild<QPushButton*>(QStringLiteral("agentModelOption-anthropic/claude-fable-5.2"));
     QTest::mouseClick(pro, Qt::LeftButton);
     QCOMPARE(modelChanged.count(), 1);
-    QCOMPARE(modelChanged.first().first().toString(), QStringLiteral("deepseek-v4-pro"));
+    QCOMPARE(modelChanged.first().first().toString(), QStringLiteral("anthropic/claude-fable-5.2"));
     QCOMPARE(effortChanged.count(), 0);
     QVERIFY(!actions->isVisible());
     MaiSession session;
     QVERIFY(harness.controller->agent().getSession(harness.mine.toStdString(), session));
-    QCOMPARE(QString::fromStdString(session.model), QStringLiteral("deepseek-v4-pro"));
+    QCOMPARE(QString::fromStdString(session.model), QStringLiteral("anthropic/claude-fable-5.2"));
     auto* value = actions->findChild<QLabel*>(QStringLiteral("agentModelValue"));
     QVERIFY(value);
-    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    QCOMPARE(value->text(), QStringLiteral("anthropic/claude-fable-5.2"));
 }
 
 void AgentPanelSessionTest::mainModelValueFollowsTheSelectedSession() {

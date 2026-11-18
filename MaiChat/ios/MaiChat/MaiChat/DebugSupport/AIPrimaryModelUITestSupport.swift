@@ -10,7 +10,7 @@ enum AIPrimaryModelUITestSupport {
         guard let device = MTLCreateSystemDefaultDevice() else { return false }
         return device.supportsFamily(.apple7) || device.supportsFamily(.metal3)
     }()
-    // 独立会话配置验收使用正常 C ABI 和两种 wire 的 loopback 服务，不请求真实供应商。
+    // 独立会话配置验收使用正常 C ABI；三家云模型各走 Responses loopback 服务，不请求真实供应商。
     static var isSessionConfigurationRequested: Bool {
         let arguments = ProcessInfo.processInfo.arguments
         return arguments.contains("--ai-ui-test") && arguments.contains("--ai-session-model-ui-test")

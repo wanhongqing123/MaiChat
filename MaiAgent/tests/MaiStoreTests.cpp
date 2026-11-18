@@ -85,7 +85,81 @@ MaiMessagePart textPart(const std::string& id, const std::string& text) {
     return part;
 }
 
+MaiModelContinuationState syntheticContinuationState() {
+    return {
+        "responses.output.v1", "openrouter", "anthropic/claude-fable-5.2",
+        R"([{"type":"reasoning","id":"rs_synthetic","encrypted_content":"synthetic-only","signature":"fake-signature","unknown":{"nested":[1,"two"]}},{"type":"function_call","id":"fc_synthetic","call_id":"call_synthetic","name":"echo","arguments":"{\"text\":\"hello\"}"},{"type":"message","id":"msg_synthetic","content":[{"type":"output_text","text":"answer"}]}])"};
+}
+
+void checkContinuationState(const MaiMessage& message, std::size_t index,
+                            const MaiModelContinuationState& expected) {
+    CHECK(index < message.parts.size());
+    if (index >= message.parts.size()) return;
+    const auto* reasoning = std::get_if<MaiReasoningPart>(&message.parts[index].body);
+    CHECK(reasoning && reasoning->continuation.has_value());
+    if (!reasoning || !reasoning->continuation) return;
+    const auto& actual = *reasoning->continuation;
+    CHECK(actual.format == expected.format);
+    CHECK(actual.provider == expected.provider);
+    CHECK(actual.model == expected.model);
+    CHECK(actual.payload == expected.payload);
+}
+
 // ── 契约用例：对每个实现都必须成立 ─────────────────────────────
+
+void contract_continuation_state(MaiSessionStore& store, const char* which) {
+    std::printf("   [%s] continuation metadata updates retain independent response snapshots\n",
+                which);
+    const auto sessionId = MaiIdGenerator::newSessionId();
+    store.putSession(makeSession(sessionId, "continuation owner", 1));
+    auto message = makeMessage(MaiIdGenerator::newMessageId(), MaiRole::Assistant);
+    MaiMessagePart first;
+    first.id = MaiIdGenerator::newPartId();
+    first.created = 2000;
+    first.body = MaiReasoningPart{"Visible reasoning."};
+    message.parts.push_back(first);
+    store.putMessage(sessionId, message);
+
+    // 只补完整成功快照，没有显示文本 delta，也必须更新持久存储。
+    const auto firstState = syntheticContinuationState();
+    std::get<MaiReasoningPart>(message.parts[0].body).continuation = firstState;
+    auto secondState = firstState;
+    secondState.payload =
+        R"([{"type":"reasoning","id":"rs_second","encrypted_content":"second-synthetic-only"}])";
+    MaiMessagePart second;
+    second.id = MaiIdGenerator::newPartId();
+    second.created = 2001;
+    second.body = MaiReasoningPart{"", secondState};
+    message.parts.push_back(second);
+    store.putMessage(sessionId, message);
+    CHECK(!store.lastWriteError());
+
+    // 存储拥有值副本，调用方之后修改原快照不能改写已提交的响应。
+    std::get<MaiReasoningPart>(message.parts[0].body).continuation->payload = "caller-mutated";
+    MaiMessage loaded;
+    CHECK(store.getMessage(sessionId, message.id, loaded));
+    checkContinuationState(loaded, 0, firstState);
+    checkContinuationState(loaded, 1, secondState);
+    if (loaded.parts.size() == 2) {
+        CHECK(std::get<MaiReasoningPart>(loaded.parts[0].body).text == "Visible reasoning.");
+        CHECK(std::get<MaiReasoningPart>(loaded.parts[1].body).text.empty());
+    }
+    const auto history = store.listMessages(sessionId);
+    CHECK(history.size() == 1);
+    if (history.size() == 1) checkContinuationState(history[0], 0, firstState);
+    const auto page = store.listMessagesPage(sessionId, "", 1);
+    CHECK(page.size() == 1);
+    if (page.size() == 1) checkContinuationState(page[0], 1, secondState);
+
+    // 覆写为空状态时不能复活旧列；同消息的另一个成功响应仍然独立保存。
+    std::get<MaiReasoningPart>(message.parts[0].body).continuation.reset();
+    store.putMessage(sessionId, message);
+    CHECK(store.getMessage(sessionId, message.id, loaded));
+    if (!loaded.parts.empty())
+        CHECK(!std::get<MaiReasoningPart>(loaded.parts[0].body).continuation);
+    checkContinuationState(loaded, 1, secondState);
+    CHECK(store.removeSession(sessionId));
+}
 
 void contract_session_crud(MaiSessionStore& store, const char* which) {
     std::printf("   [%s] session create/read/update/delete\n", which);
@@ -840,6 +914,7 @@ void contract_partial_context_checkpoint(MaiSessionStore& store, const char* whi
 // 对内存和 SQLite 实现运行相同的会话、消息、工具与任务存储契约。
 // 每项断言只依赖公开接口和可读取的持久化结果。
 void runContract(MaiSessionStore& store, const char* which) {
+    contract_continuation_state(store, which);
     contract_partial_context_checkpoint(store, which);
     contract_context_checkpoint_atomicity(store, which);
     contract_session_crud(store, which);
@@ -897,6 +972,170 @@ void runContract(MaiSessionStore& store, const char* which) {
 }
 
 // ── 只有 SQLite 才有的性质 ─────────────────────────────────────
+
+void test_continuation_survives_reopen() {
+    std::printf("-> continuation output bytes survive close and reopen\n");
+    TempDir temp;
+    const auto path = temp.file("continuation.sqlite");
+    const auto sessionId = MaiIdGenerator::newSessionId();
+    const auto messageId = MaiIdGenerator::newMessageId();
+    auto firstState = syntheticContinuationState();
+    // 合成的长字段证明不会依赖 UI 文本长度截断续接数据。
+    firstState.payload = "[{\"type\":\"reasoning\",\"encrypted_content\":\"" +
+                         std::string(80 * 1024, 's') + "\",\"signature\":\"synthetic-only\"}]";
+    auto secondState = syntheticContinuationState();
+    secondState.provider = "glm";
+    secondState.model = "glm-5.3";
+    secondState.payload = "[ ]";
+    {
+        auto opened = makeMaiSqliteStore(path);
+        CHECK(opened);
+        if (!opened) return;
+        opened.value()->putSession(makeSession(sessionId, "continuation reopen", 1));
+        auto message = makeMessage(messageId, MaiRole::Assistant);
+        message.parts.push_back({MaiIdGenerator::newPartId(), MaiReasoningPart{"", firstState}, 1});
+        message.parts.push_back(
+            {MaiIdGenerator::newPartId(), MaiReasoningPart{"Visible only.", secondState}, 2});
+        opened.value()->putMessage(sessionId, message);
+        CHECK(!opened.value()->lastWriteError());
+    }
+    auto reopened = makeMaiSqliteStore(path);
+    CHECK(reopened);
+    if (!reopened) return;
+    MaiMessage loaded;
+    CHECK(reopened.value()->getMessage(sessionId, messageId, loaded));
+    checkContinuationState(loaded, 0, firstState);
+    checkContinuationState(loaded, 1, secondState);
+    if (loaded.parts.size() == 2) {
+        CHECK(std::get<MaiReasoningPart>(loaded.parts[0].body).text.empty());
+        CHECK(std::get<MaiReasoningPart>(loaded.parts[1].body).text == "Visible only.");
+    }
+}
+
+void test_continuation_v12_migration_preserves_history() {
+    std::printf("-> v12 reasoning rows migrate without inventing continuation state\n");
+    TempDir temp;
+    const auto path = temp.file("continuation-v12.sqlite");
+    const auto sessionId = MaiIdGenerator::newSessionId();
+    const auto messageId = MaiIdGenerator::newMessageId();
+    std::string originalFingerprint;
+    {
+        auto opened = makeMaiSqliteStore(path);
+        CHECK(opened);
+        if (!opened) return;
+        opened.value()->putSession(makeSession(sessionId, "legacy continuation", 1));
+        auto message = makeMessage(messageId, MaiRole::Assistant);
+        message.parts.push_back({"prt_legacy_01", MaiReasoningPart{"Legacy reasoning."}, 1});
+        message.parts.push_back({"prt_legacy_02", MaiReasoningPart{""}, 2});
+        opened.value()->putMessage(sessionId, message);
+        originalFingerprint = maiContextSourceFingerprint(sessionId, {message}, 1);
+    }
+    sqlite3* database = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+    if (!database) return;
+    sqlite3_stmt* columns = nullptr;
+    CHECK(sqlite3_prepare_v2(database, "PRAGMA table_info(parts)", -1, &columns, nullptr) ==
+          SQLITE_OK);
+    std::vector<std::string> continuationColumns;
+    if (columns) {
+        while (sqlite3_step(columns) == SQLITE_ROW) {
+            const auto* name = reinterpret_cast<const char*>(sqlite3_column_text(columns, 1));
+            if (name && std::string(name).find("continuation_") == 0)
+                continuationColumns.emplace_back(name);
+        }
+        sqlite3_finalize(columns);
+    }
+    // 真正删除新列再降回 v12，避免拿新库的默认字段冒充旧库升级。
+    for (const auto& column : continuationColumns) {
+        const auto sql = "ALTER TABLE parts DROP COLUMN " + column;
+        CHECK(sqlite3_exec(database, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    CHECK(sqlite3_exec(database, "PRAGMA user_version=12", nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(database);
+    {
+        auto migrated = makeMaiSqliteStore(path);
+        CHECK(migrated);
+        if (!migrated) return;
+        const auto history = migrated.value()->listMessages(sessionId);
+        CHECK(history.size() == 1);
+        CHECK(maiContextSourceFingerprint(sessionId, history, 1) == originalFingerprint);
+        if (history.size() == 1 && history[0].parts.size() == 2) {
+            CHECK(!std::get<MaiReasoningPart>(history[0].parts[0].body).continuation);
+            CHECK(!std::get<MaiReasoningPart>(history[0].parts[1].body).continuation);
+        }
+    }
+    database = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+    if (!database) return;
+    int count = 0;
+    const auto countColumn = [](void* result, int, char**, char**) -> int {
+        ++*static_cast<int*>(result);
+        return 0;
+    };
+    CHECK(sqlite3_exec(database,
+                       "SELECT name FROM pragma_table_info('parts') WHERE name IN "
+                       "('continuation_format','continuation_provider','continuation_model',"
+                       "'continuation_payload') AND type='TEXT'",
+                       countColumn, &count, nullptr) == SQLITE_OK);
+    CHECK(count == 4);
+    if (count == 4) {
+        CHECK(
+            sqlite3_exec(database,
+                         "UPDATE parts SET continuation_format=NULL,continuation_provider=NULL,"
+                         "continuation_model=NULL,continuation_payload=NULL;"
+                         "UPDATE parts SET continuation_format='',continuation_provider='',"
+                         "continuation_model='',continuation_payload='' WHERE id='prt_legacy_02';",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    sqlite3_close(database);
+    auto reopened = makeMaiSqliteStore(path);
+    CHECK(reopened);
+    if (!reopened) return;
+    MaiMessage loaded;
+    CHECK(reopened.value()->getMessage(sessionId, messageId, loaded));
+    CHECK(loaded.parts.size() == 2);
+    for (const auto& part : loaded.parts) {
+        const auto* reasoning = std::get_if<MaiReasoningPart>(&part.body);
+        CHECK(reasoning && !reasoning->continuation);
+    }
+}
+
+void test_continuation_fingerprint_preserves_legacy_hashes() {
+    std::printf("-> continuation fingerprints preserve old hashes and cover every state field\n");
+    const std::string sessionId = "ses_fingerprint_legacy";
+    auto message = makeMessage("msg_fingerprint_legacy", MaiRole::Assistant);
+    message.parts.push_back({"prt_fingerprint_reasoning", MaiReasoningPart{"thinking"}, 2000});
+    message.parts.push_back(textPart("prt_fingerprint_text", "answer"));
+    std::vector<MaiMessage> history{message};
+    const auto legacyFingerprint = maiContextSourceFingerprint(sessionId, history, 1);
+    // 由旧 v1 长度分隔字节序列独立计算，不能用新版函数自己生成预期值。
+    CHECK(legacyFingerprint == "6ba9c7b065b0fa5a632e0858d09b07d73ea6e84bda94fa71893b22a0333e1f45");
+    MaiContextCheckpoint partial;
+    partial.sessionId = sessionId;
+    partial.sourceFingerprint = "legacy-prefix-fingerprint";
+    partial.preservedUserMessageId = "msg_user_legacy";
+    partial.partialMessageId = message.id;
+    partial.partialPartCount = 1;
+    const auto legacyPartial = maiContextPartialSourceFingerprint(partial, history);
+    CHECK(legacyPartial == "4e4d396b0f133fc3502c79990b715dd605bcbf3c62bf38ee2a4aaec7b3d11502");
+    auto& continuation = std::get<MaiReasoningPart>(history[0].parts[0].body).continuation;
+    continuation = syntheticContinuationState();
+    const auto full = maiContextSourceFingerprint(sessionId, history, 1);
+    const auto coveredPart = maiContextPartialSourceFingerprint(partial, history);
+    CHECK(full != legacyFingerprint);
+    CHECK(coveredPart != legacyPartial);
+    for (const auto field :
+         {&MaiModelContinuationState::format, &MaiModelContinuationState::provider,
+          &MaiModelContinuationState::model, &MaiModelContinuationState::payload}) {
+        continuation = syntheticContinuationState();
+        ((*continuation).*field) += "-changed";
+        CHECK(maiContextSourceFingerprint(sessionId, history, 1) != full);
+        CHECK(maiContextPartialSourceFingerprint(partial, history) != coveredPart);
+    }
+    continuation.reset();
+    CHECK(maiContextSourceFingerprint(sessionId, history, 1) == legacyFingerprint);
+    CHECK(maiContextPartialSourceFingerprint(partial, history) == legacyPartial);
+}
 
 void test_survives_reopen() {
     std::printf("-> test_survives_reopen\n");
@@ -1326,6 +1565,7 @@ void test_session_effort_survives_reopen_and_v9_migration() {
 }  // namespace
 
 int main() {
+    test_continuation_fingerprint_preserves_legacy_hashes();
     std::printf("-> contract: memory store\n");
     {
         auto store = makeMaiMemoryStore();
@@ -1355,6 +1595,8 @@ int main() {
 
     test_v8_checkpoint_migrates_without_changing_original_source();
     test_session_effort_survives_reopen_and_v9_migration();
+    test_continuation_survives_reopen();
+    test_continuation_v12_migration_preserves_history();
     test_survives_reopen();
     test_specialist_reply_survives_reopen();
     test_migrates_unfinished_tool_index();

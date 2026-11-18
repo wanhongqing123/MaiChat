@@ -87,8 +87,8 @@ public final class AIAssistantController {
             this.selected = selected;
             this.model = AIAssistantSessionModels.model(data, remoteSession, selected,
                 remoteSession == null ? model : "");
-            this.baseUrl = this.model.startsWith("glm-") ? "https://open.bigmodel.cn/api/paas/v4"
-                : this.model.startsWith("deepseek-") ? DEEPSEEK_URL : baseUrl;
+            String modelBaseUrl = AIAssistantModelSettings.baseUrlForModel(this.model);
+            this.baseUrl = modelBaseUrl.isEmpty() ? baseUrl : modelBaseUrl;
             this.reasoningEffort = AIAssistantSessionModels.effort(data, remoteSession, selected,
                 remoteSession == null ? data.optString("defaultReasoningEffort", "high") : "");
             this.policy = policy;
@@ -305,8 +305,9 @@ public final class AIAssistantController {
     private final SessionReads sessionReads;
     private volatile Listener listener;
     private volatile HostToolHandler hostToolHandler;
-    static final String GLM_CHAT_URL = "https://open.bigmodel.cn/api/paas/v4";
+    static final String GLM_RESPONSES_URL = "https://open.bigmodel.cn/api/v1";
     static final String DEEPSEEK_URL = "https://api.deepseek.com";
+    static final String OPENROUTER_URL = "https://openrouter.ai/api/v1";
     static final String DEFAULT_MODEL = "deepseek-flash";
     volatile State state = new State(new JSONObject(), null, "", DEEPSEEK_URL,
         DEFAULT_MODEL, "on-request", "", "", "", 0, false, false);
@@ -323,6 +324,7 @@ public final class AIAssistantController {
     private JSONObject committedModelConfiguration;
     private volatile String deepseekApiKey = "";
     private volatile String glmApiKey = "";
+    private volatile String openrouterApiKey = "";
     private volatile String arkApiKey = "";
     private volatile long arkExpiresAt;
     private long nextArkRefreshAt;
@@ -1033,6 +1035,15 @@ public final class AIAssistantController {
                 return hostToolFailure("GLM key is unavailable", "not_configured");
             }
         }
+        if (tool.equals("openrouter_api_key")) {
+            try {
+                return new JSONObject().put("ok", true)
+                    .put("output", new JSONObject().put("key", testEndpoint == null ? openrouterApiKey : "test-key"))
+                    .toString().getBytes(StandardCharsets.UTF_8);
+            } catch (Exception failure) {
+                return hostToolFailure("OpenRouter key is unavailable", "not_configured");
+            }
+        }
         if (tool.equals("deepseek_api_key")) {
             try {
                 return new JSONObject().put("ok", true)
@@ -1413,8 +1424,9 @@ public final class AIAssistantController {
             "libonnxruntime.so");
         JSONObject request = settings.configuration(localFile, key);
         request.put("localModelName", AIAssistantSessionModels.LOCAL)
-            .put("glmBaseUrl", testEndpoint == null ? GLM_CHAT_URL : testEndpoint)
-            .put("deepseekBaseUrl", testEndpoint == null ? DEEPSEEK_URL : testEndpoint);
+            .put("glmBaseUrl", testEndpoint == null ? GLM_RESPONSES_URL : testEndpoint)
+            .put("deepseekBaseUrl", testEndpoint == null ? DEEPSEEK_URL : testEndpoint)
+            .put("openrouterBaseUrl", testEndpoint == null ? OPENROUTER_URL : testEndpoint);
         if (testEndpoint != null && !settings.isLocal()) {
             request.put("baseUrl", testEndpoint).put("model", "test-model")
                 .put("wire", "chat_completions").put("apiKey", "test-key");
@@ -1451,7 +1463,10 @@ public final class AIAssistantController {
 
     private String cloudKey(String model) {
         if (testEndpoint != null) return "test-key";
-        return model.startsWith("deepseek-") ? deepseekApiKey : glmApiKey;
+        if (AIAssistantModelSettings.OPENROUTER_MODEL.equals(model)) return openrouterApiKey;
+        if ("deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model)) return deepseekApiKey;
+        if ("glm-5.3".equals(model) || "glm-5.3-flash".equals(model)) return glmApiKey;
+        return "";
     }
 
     private void bindPrimarySettings(AIAssistantModelSettings settings, JSONObject configuration) {
@@ -3758,6 +3773,7 @@ public final class AIAssistantController {
         glmApiKey = keys.glm;
         deepseekApiKey = keys.deepseek;
         miniMaxApiKey = keys.minimax;
+        openrouterApiKey = keys.openrouter;
     }
 
     private void refreshSeedanceCredential(boolean force) {

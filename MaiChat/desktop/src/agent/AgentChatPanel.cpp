@@ -1865,8 +1865,8 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     modelOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
     modelOptionsLayout->setSpacing(0);
     for (const QString& model :
-         {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
-          QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")}) {
+         {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
+          QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2")}) {
         auto* option = new QPushButton(model, modelOptions);
         option->setObjectName(QStringLiteral("agentModelOption-") + model);
         option->setProperty("model", model);

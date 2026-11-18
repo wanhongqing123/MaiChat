@@ -1068,10 +1068,9 @@ void DesktopAuthClient::fetchAccountModelKeysImpl(AccountModelKeysCompletion com
             return;
         }
         const QJsonObject keys = result.body.value(QStringLiteral("api_keys")).toObject();
-        if (!keys.value(QStringLiteral("glm")).isString() ||
-            !keys.value(QStringLiteral("deepseek")).isString() ||
-            (keys.contains(QStringLiteral("minimax")) &&
-             !keys.value(QStringLiteral("minimax")).isString())) {
+        if (!keys.value(QStringLiteral("glm")).isString() || !keys.value(QStringLiteral("deepseek")).isString() ||
+            (keys.contains(QStringLiteral("minimax")) && !keys.value(QStringLiteral("minimax")).isString()) ||
+            (keys.contains(QStringLiteral("openrouter")) && !keys.value(QStringLiteral("openrouter")).isString())) {
             if (completion)
                 completion({}, QStringLiteral("账号服务返回的模型凭据无效"));
             return;
@@ -1079,10 +1078,11 @@ void DesktopAuthClient::fetchAccountModelKeysImpl(AccountModelKeysCompletion com
         const QString glm = keys.value(QStringLiteral("glm")).toString();
         const QString deepseek = keys.value(QStringLiteral("deepseek")).toString();
         const QString minimax = keys.value(QStringLiteral("minimax")).toString();
-        if ((!glm.isEmpty() && !validModelApiKey(glm)) ||
-            (!deepseek.isEmpty() && !validModelApiKey(deepseek)) ||
+        const QString openrouter = keys.value(QStringLiteral("openrouter")).toString();
+        if ((!glm.isEmpty() && !validModelApiKey(glm)) || (!deepseek.isEmpty() && !validModelApiKey(deepseek)) ||
             (!minimax.isEmpty() && !validModelApiKey(minimax)) ||
-            (glm.isEmpty() && deepseek.isEmpty() && minimax.isEmpty())) {
+            (!openrouter.isEmpty() && !validModelApiKey(openrouter)) ||
+            (glm.isEmpty() && deepseek.isEmpty() && minimax.isEmpty() && openrouter.isEmpty())) {
             if (completion)
                 completion({}, QStringLiteral("账号服务返回的模型凭据无效"));
             return;
@@ -1091,6 +1091,7 @@ void DesktopAuthClient::fetchAccountModelKeysImpl(AccountModelKeysCompletion com
         if (!glm.isEmpty()) available.insert(QStringLiteral("glm"), glm);
         if (!deepseek.isEmpty()) available.insert(QStringLiteral("deepseek"), deepseek);
         if (!minimax.isEmpty()) available.insert(QStringLiteral("minimax"), minimax);
+        if (!openrouter.isEmpty()) available.insert(QStringLiteral("openrouter"), openrouter);
         if (completion) completion(available, {});
     });
 }

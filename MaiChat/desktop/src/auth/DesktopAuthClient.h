@@ -97,7 +97,7 @@ public:
     void decideFriendRequest(const QString& requestId, bool accept, Completion completion);
     void removeFriend(const QString& account, Completion completion);
     void fetchImCredential(Completion completion);
-    // 账号鉴权 GET：仅把 GLM/DeepSeek Key 交给调用方内存，不写本机存储。
+    // 账号鉴权 GET：各供应商 Key 只交给调用方内存；可选 OpenRouter 缺省为空，不写本机存储。
     using AccountModelKeysCompletion =
         std::function<void(const QHash<QString, QString>&, const QString&)>;
     void fetchAccountModelKeys(AccountModelKeysCompletion completion);

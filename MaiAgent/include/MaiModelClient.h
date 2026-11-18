@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "MaiError.h"
+#include "MaiModelContinuationState.h"
 
 // ── 中立的模型抽象 ──────────────────────────────────────────────
 // 这里的结构**不是** OpenAI 的线格式，是我们自己的中间表示。
@@ -78,7 +79,7 @@ enum class MaiModelRole {
 // 这些差异就得靠"某些字段在某些场景下不填"来表达，很快就没人说得清了。
 //
 // 谁来填：MaiContextBuilder 把历史 MaiMessage 翻成这个。谁来读：
-// 各个 wire 实现（现在只有 MaiOpenAiClient）翻成自家的线格式。
+// Chat、Responses 与本地 wire 实现翻成各自的线格式。
 struct MaiModelImage {
     // 相对路径必须在工作目录内；绝对路径只允许宿主在用户明确选择附件后传入，
     // 或由已获批准的宿主工具创建。线格式实现负责读取并编码。
@@ -91,8 +92,8 @@ struct MaiModelMessage {
     // 正文。assistant 发起工具调用的那条可以是空的（那时候 invocations 非空），
     // 线格式里对应 content: null。
     std::string content;
-    // Responses 线协议可把同一轮原有的思考内容作为 reasoning item 回传。
-    // Chat Completions 忽略此字段，避免把草稿混入可见正文。
+    // 可见思考文本独立于正文。兼容 wire 按原供应商契约决定是否回传；
+    // 有原始 continuation 时必须优先它，不能从此文本伪造签名/加密 reasoning。
     std::string reasoning;
     std::vector<MaiModelImage> images;
     // ToolResult 时**必填**：这条结果对应哪次调用。Chat 线上字段名为 tool_call_id，
@@ -100,6 +101,9 @@ struct MaiModelMessage {
     std::string toolCallId;
     // Assistant 发起调用时填。一条消息可以同时发起多个调用。
     std::vector<MaiToolInvocation> invocations;
+    // 原成功 response 的续接状态。wire 匹配来源后使用它替代本消息的显示投影，
+    // 不能同时再次编码 content/invocations；不同 provider/model 不得收到该状态。
+    std::optional<MaiModelContinuationState> continuation;
 };
 
 // 一个工具对模型的完整声明。模型靠它决定什么时候调、怎么调。
@@ -231,6 +235,10 @@ struct MaiStreamSink {
     // 供应商实际返回的输入/输出 token。与其他流回调使用相同线程和引用生命周期。
     // 可缺省，失败或未返回 usage 时不得合成“实际用量”。追加在末尾保留已有聚合初始化。
     std::function<void(const MaiModelUsage&)> onUsage;
+    // 只在完整成功响应及全部工具调用校验完成后同步交付一次，然后才能交工具调用。
+    // 调用方在回调返回前复制并持久化；失败/取消/incomplete/缺终态不发布可重放状态。
+    // 快照可能只有加密字段、没有可见文本，仍需独立落库，不依赖文本字节增量触发保存。
+    std::function<void(const MaiModelContinuationState&)> onContinuationState;
 };
 
 using MaiModelImagePreparer =
@@ -246,7 +254,8 @@ struct MaiModelProxy {
 
 struct MaiModelConfig {
     // 不带末尾斜杠，也不带具体路径。客户端按 wire 拼接端点。例如：
-    //   https://open.bigmodel.cn/api/paas/v4   GLM
+    //   https://open.bigmodel.cn/api/v1        GLM Responses
+    //   https://openrouter.ai/api/v1           OpenRouter Responses
     //   http://127.0.0.1:11434/v1              Ollama
     std::string baseUrl;
     // 放进 Authorization: Bearer 头。

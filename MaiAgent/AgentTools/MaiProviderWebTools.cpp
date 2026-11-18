@@ -28,7 +28,7 @@ public:
         return mTools->deepseek.find(mName)->parametersSchema();
     }
     bool isAvailableForModel(const std::string& model) const override {
-        return model.empty() || maiCloudModelInfo(model).has_value();
+        return model.empty() || select(model) != nullptr;
     }
     MaiToolSpec specForModel(const std::string& model) const override {
         const auto* tool = select(model);
@@ -48,7 +48,11 @@ private:
     MaiTool* select(const std::string& model) const {
         const auto info = maiCloudModelInfo(model);
         if (!info) return nullptr;
-        return info->provider == "glm" ? mTools->glm.find(mName) : mTools->deepseek.find(mName);
+        // 主聊天目录可继续新增供应商；只有已实现原生网页合同的供应商能进入执行路径。
+        // 未接入的供应商不能借用 DeepSeek 的凭据或 HTTP 入口。
+        if (info->provider == "glm") return mTools->glm.find(mName);
+        if (info->provider == "deepseek") return mTools->deepseek.find(mName);
+        return nullptr;
     }
     std::shared_ptr<ProviderTools> mTools;
     std::string mName;

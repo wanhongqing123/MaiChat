@@ -22,7 +22,8 @@ public final class AIAssistantActionMenuTest {
     @Test public void mainModelMenuOffersExactCloudModelsAndKeepsEffortSeparate() {
         AIAssistantActionMenu menu = menu();
         click(menu, "主模型");
-        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
+        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+                "anthropic/claude-fable-5.2"})
             assertNotNull("Missing main-model choice: " + model, option(menu, model));
         assertNotNull(option(menu, "本地模型"));
         assertNull(option(menu, "简单"));
@@ -55,7 +56,8 @@ public final class AIAssistantActionMenuTest {
     @Test public void remoteModelMenuKeepsCloudAndEffortButNeverOffersLocalPathsOrAccountPolicy() {
         AIAssistantActionMenu menu = menu(true);
         click(menu, "主模型");
-        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
+        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+                "anthropic/claude-fable-5.2"})
             assertNotNull(option(menu, model));
         assertNull(option(menu, "本地模型"));
         assertNull(heading(menu, "操作权限"));

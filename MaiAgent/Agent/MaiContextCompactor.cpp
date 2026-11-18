@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <set>
 #include <string_view>
 #include <tuple>
@@ -248,17 +249,33 @@ MaiContextCheckpoint partialBoundary(const std::vector<MaiMessage>& history,
         }
         if (completedTools.empty()) return boundary;
         std::size_t keep = completedTools.back();
+        std::optional<std::size_t> latestContinuation;
+        for (std::size_t partIndex = 0; partIndex < message.parts.size(); ++partIndex) {
+            const auto* reasoning = std::get_if<MaiReasoningPart>(&message.parts[partIndex].body);
+            if (reasoning && reasoning->continuation) latestContinuation = partIndex;
+        }
+        if (latestContinuation) {
+            // 载体在 response 首部，其签名输出、所有调用和回执必须整组保留。
+            // 唯一大组不能靠切掉其中一次调用来腾预算；只能等更早的完整组可总结。
+            keep = *latestContinuation;
+            for (std::size_t partIndex = 0; partIndex < keep; ++partIndex) {
+                const auto* tool = std::get_if<MaiToolPart>(&message.parts[partIndex].body);
+                if (tool && (tool->state == MaiToolState::Pending ||
+                             tool->state == MaiToolState::Running))
+                    return boundary;
+            }
+        }
         // 一批工具的图片在全部回执之后追加，现有媒体字段不能反推各自调用。
         // 能保留最新组时仍整组保留；若唯一大组占满窗口，就在完整回执后、首图前封存。
         // Builder 随保留像素重纳真实组来源范围/索引，不伪造单图与某次调用的对应关系。
-        if (keep + 1 < message.parts.size() &&
+        if (!latestContinuation && keep + 1 < message.parts.size() &&
             std::holds_alternative<MaiImagePart>(message.parts[keep + 1].body)) {
             std::size_t groupStart = keep;
             while (groupStart > 0 &&
                    std::holds_alternative<MaiToolPart>(message.parts[groupStart - 1].body))
                 --groupStart;
             keep = archiveLatestImageGroup ? keep + 1 : groupStart;
-        } else if (completedTools.size() < 2)
+        } else if (!latestContinuation && completedTools.size() < 2)
             return boundary;
         if (keep == 0) return boundary;
         boundary.sourceMessageCount = index;

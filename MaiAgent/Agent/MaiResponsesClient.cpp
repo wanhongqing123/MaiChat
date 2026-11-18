@@ -1,7 +1,6 @@
 // 文件作用：实现 OpenAI Responses 协议的请求和流式解析。
 // 直接依赖：MaiFilePath.h、MaiFileSystem.h、MaiPathGuard.h；本文件在这些接口之间完成调用与结果转换。
 #include "MaiResponsesClient.h"
-#include "MaiCloudModelCatalog.h"
 
 #include <curl/curl.h>
 #include <json.hpp>
@@ -25,6 +24,7 @@
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiPathGuard.h"
+#include "MaiCloudModelCatalog.h"
 
 namespace {
 
@@ -177,11 +177,48 @@ const char* roleName(MaiModelRole role) {
     return "user";
 }
 
+// 仅检查会影响续接和工具执行的结构；厂商未知成员仍由原始快照原样保存。
+// 错误只描述字段契约，不把思考、签名、加密状态或工具参数写进诊断信息。
+MaiError validateOutput(const Json& output) {
+    if (!output.is_array()) return {MaiErrorCode::Protocol, "Responses output must be an array"};
+    std::set<std::string> callIds;
+    for (const Json& item : output) {
+        if (!item.is_object() || stringField(item, "type").empty())
+            return {MaiErrorCode::Protocol, "Responses output needs typed objects"};
+        const std::string type = stringField(item, "type");
+        if (type == "function_call") {
+            const std::string callId = stringField(item, "call_id");
+            if (callId.empty() || stringField(item, "name").empty() ||
+                !item.contains("arguments") || !item["arguments"].is_string() ||
+                !callIds.insert(callId).second)
+                return {MaiErrorCode::Protocol, "Responses returned an incomplete function call"};
+        } else if (type == "reasoning") {
+            for (const char* field : {"content", "summary"}) {
+                const auto parts = item.find(field);
+                if (parts == item.end() || parts->is_null()) continue;
+                if (!parts->is_array())
+                    return {MaiErrorCode::Protocol, "Responses reasoning parts must be arrays"};
+                for (const Json& part : *parts)
+                    if (!part.is_object() || (part.contains("text") && !part["text"].is_string()))
+                        return {MaiErrorCode::Protocol,
+                                "Responses reasoning text must be a string"};
+            }
+            for (const char* field : {"signature", "encrypted_content", "format"}) {
+                const auto value = item.find(field);
+                if (value != item.end() && !value->is_null() && !value->is_string())
+                    return {MaiErrorCode::Protocol, "Responses reasoning metadata must be strings"};
+            }
+        }
+    }
+    return {};
+}
+
 // 把模型消息、图片和工具定义组装为 Responses 请求体。
 // 工具结果引用原调用标识；图像准备失败时直接返回错误，不能发送缺媒体的请求。
 MaiResult<std::string> buildBody(const MaiModelRequest& request,
                                  const MaiModelImagePreparer& prepareImage) {
     Json input = Json::array();
+    const auto capability = maiCloudModelInfo(request.model);
     std::size_t latestUser = request.messages.size();
     for (std::size_t index = 0; index < request.messages.size(); ++index)
         if (request.messages[index].role == MaiModelRole::User) latestUser = index;
@@ -193,6 +230,19 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
             message.role != MaiModelRole::ToolResult)
             return {MaiErrorCode::InvalidInput,
                     "Responses accepts image parts only in user or tool-result input"};
+
+        if (message.role == MaiModelRole::Assistant && message.continuation && capability &&
+            message.continuation->provider == capability->provider &&
+            message.continuation->model == request.model) {
+            // 完整 output 是唯一续接来源；显示投影和工具投影不得再重建、重复或重排。
+            const auto& state = *message.continuation;
+            if (state.format != "responses.output.v1")
+                return {MaiErrorCode::Protocol, "Responses continuation format is unsupported"};
+            const Json output = Json::parse(state.payload, nullptr, false);
+            if (const MaiError error = validateOutput(output)) return error;
+            for (const Json& item : output) input.push_back(item);
+            continue;
+        }
 
         Json content;
         if (!message.images.empty()) {
@@ -223,7 +273,10 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
                                  {"output", std::move(content)}});
             continue;
         }
-        if (message.role == MaiModelRole::Assistant && !message.reasoning.empty()) {
+        // OpenRouter 的 signed/encrypted thinking 只能由原 output 回放，显示文本不能代替签名。
+        // 仅无续接状态的旧 GLM/DeepSeek 记录保留文本兼容；来源不匹配的现代状态只回放普通投影。
+        if (message.role == MaiModelRole::Assistant && !message.continuation &&
+            !message.reasoning.empty() && (!capability || capability->provider != "openrouter")) {
             input.push_back(Json{{"type", "reasoning"},
                                  {"content", Json::array({Json{{"type", "reasoning_text"},
                                                                {"text", message.reasoning}}})}});
@@ -242,11 +295,11 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
         }
     }
 
-    Json body{{"model", request.model}, {"input", std::move(input)}, {"stream", true}};
+    Json body{
+        {"model", request.model}, {"input", std::move(input)}, {"stream", true}, {"store", false}};
     if (request.maxOutputTokens != 0) body["max_output_tokens"] = request.maxOutputTokens;
-    if (maiCloudModelInfo(request.model).has_value() &&
-        (request.reasoningEffort == "low" || request.reasoningEffort == "high" ||
-         request.reasoningEffort == "max"))
+    if (capability && (request.reasoningEffort == "low" || request.reasoningEffort == "high" ||
+                       request.reasoningEffort == "max"))
         body["reasoning"] = Json{{"effort", request.reasoningEffort}};
     if (!request.baseInstructions.empty()) body["instructions"] = request.baseInstructions;
     if (request.temperature >= 0.0) body["temperature"] = request.temperature;
@@ -284,7 +337,12 @@ struct StreamContext {
         bool completed = false;
     };
     std::map<int, TextItem> textItems;
-    std::set<std::pair<int, int>> reasoningSeen;
+    // 显示累计和原始快照分开；done/terminal 可以补尾，不能靠“见过”标记丢弃完整尾部。
+    std::map<std::tuple<int, int, bool>, std::string> reasoningContent;
+    std::map<int, Json> completedOutput;
+    std::set<int> observedOutputIndices;
+    Json terminalOutput;
+    bool hasTerminalOutput = false;
     std::string rawBody;
     std::string terminalError;
     bool sawOutput = false;
@@ -391,6 +449,30 @@ void emitMessageSnapshot(StreamContext& context, int index, const Json& item) {
     }
 }
 
+// 原快照的字符串不能为显示而改写；这里只把未显示的后缀交给 reasoning 投影。
+void emitReasoningSnapshot(StreamContext& context, int outputIndex, int partIndex, bool summary,
+                           const std::string& text) {
+    std::string& delivered = context.reasoningContent[{outputIndex, partIndex, summary}];
+    if (text.size() <= delivered.size() || text.compare(0, delivered.size(), delivered) != 0)
+        return;
+    const std::string suffix = text.substr(delivered.size());
+    delivered = text;
+    context.sawOutput = true;
+    context.lastModelProgress = std::chrono::steady_clock::now();
+    if (context.sink->onReasoning) context.sink->onReasoning(suffix);
+}
+
+void emitReasoningItemSnapshot(StreamContext& context, int outputIndex, const Json& item) {
+    for (const char* field : {"content", "summary"}) {
+        const auto parts = item.find(field);
+        if (parts == item.end() || !parts->is_array()) continue;
+        for (std::size_t index = 0; index < parts->size(); ++index)
+            emitReasoningSnapshot(context, outputIndex, static_cast<int>(index),
+                                  std::strcmp(field, "summary") == 0,
+                                  stringField((*parts)[index], "text"));
+    }
+}
+
 void emitFullOutput(StreamContext& context, const Json& response) {
     if (!response.is_object() || !response.value("output", Json{}).is_array()) return;
     const Json& output = response["output"];
@@ -407,18 +489,7 @@ void emitFullOutput(StreamContext& context, const Json& response) {
             completeTextItem(context, static_cast<int>(index));
             continue;
         }
-        if ((type != "message" && type != "reasoning") || !item.value("content", Json{}).is_array())
-            continue;
-        const Json& parts = item["content"];
-        for (std::size_t partIndex = 0; partIndex < parts.size(); ++partIndex) {
-            const std::string text = stringField(parts[partIndex], "text");
-            if (text.empty()) continue;
-            const auto key = std::make_pair(static_cast<int>(index), static_cast<int>(partIndex));
-            if (type == "reasoning" && context.reasoningSeen.insert(key).second) {
-                context.sawOutput = true;
-                if (context.sink->onReasoning) context.sink->onReasoning(text);
-            }
-        }
+        if (type == "reasoning") emitReasoningItemSnapshot(context, static_cast<int>(index), item);
     }
 }
 
@@ -430,7 +501,16 @@ void handleEvent(StreamContext& context, const Json& event) {
     // 生命周期帧可以没有内容索引；缺失/空索引不能让异常越过 curl 的 C 回调边界。
     const int outputIndex = eventIndex(event, "output_index", -1);
     const int contentIndex = eventIndex(event, "content_index", 0);
-    const auto key = std::make_pair(outputIndex, contentIndex);
+    if (outputIndex >= 0) context.observedOutputIndices.insert(outputIndex);
+    if (type == "error" || type == "response.error") {
+        const Json error = event.value("error", Json{});
+        context.terminalError = stringField(error, "message");
+        if (context.terminalError.empty()) context.terminalError = stringField(event, "message");
+        if (context.terminalError.empty())
+            context.terminalError = "Responses stream returned an error";
+        context.done = true;
+        return;
+    }
     if (type == "response.created" || type == "response.in_progress") {
         // 生命周期属于协议进展，但不是助手文字或已交付输出；保留原重试/历史边界。
         noteProtocolProgress(context, type);
@@ -444,20 +524,19 @@ void handleEvent(StreamContext& context, const Json& event) {
                                  eventIndex(event, "summary_index", contentIndex));
         return;
     }
-    if (type == "response.reasoning_summary_text.delta" ||
-        type == "response.custom_tool_call_input.delta") {
-        // 当前工具协议不消费这些额外内容，仍承认非空协议增量；不伪装成思考或工具结果。
+    if (type == "response.custom_tool_call_input.delta") {
+        // 当前工具协议不消费自定义工具内容，仍承认非空协议增量，不伪装成工具结果。
         if (!stringField(event, "delta").empty())
             context.lastModelProgress = std::chrono::steady_clock::now();
         return;
     }
-    if (type == "response.reasoning_summary_text.done" ||
-        type == "response.custom_tool_call_input.done") {
+    if (type == "response.custom_tool_call_input.done") {
         noteProtocolProgress(context, type, outputIndex,
                              eventIndex(event, "summary_index", contentIndex));
         return;
     }
-    if (type == "response.output_text.delta" || type == "response.reasoning_text.delta") {
+    if (type == "response.output_text.delta" || type == "response.reasoning_text.delta" ||
+        type == "response.reasoning_summary_text.delta") {
         const std::string delta = stringField(event, "delta");
         if (delta.empty()) return;
         context.sawOutput = true;
@@ -472,20 +551,25 @@ void handleEvent(StreamContext& context, const Json& event) {
             else if (context.sink->onText)
                 context.sink->onText(delta);
         } else {
-            context.reasoningSeen.insert(key);
+            const bool summary = type == "response.reasoning_summary_text.delta";
+            context.reasoningContent[{
+                outputIndex, summary ? eventIndex(event, "summary_index", 0) : contentIndex,
+                summary}] += delta;
             if (context.sink->onReasoning) context.sink->onReasoning(delta);
         }
         return;
     }
-    if (type == "response.output_text.done" || type == "response.reasoning_text.done") {
+    if (type == "response.output_text.done" || type == "response.reasoning_text.done" ||
+        type == "response.reasoning_summary_text.done") {
         const std::string text = stringField(event, "text");
         if (text.empty()) return;
         if (type == "response.output_text.done") {
             emitTextSnapshot(context, outputIndex, contentIndex, text);
-        } else if (type == "response.reasoning_text.done" &&
-                   context.reasoningSeen.insert(key).second) {
-            context.sawOutput = true;
-            if (context.sink->onReasoning) context.sink->onReasoning(text);
+        } else {
+            const bool summary = type == "response.reasoning_summary_text.done";
+            emitReasoningSnapshot(context, outputIndex,
+                                  summary ? eventIndex(event, "summary_index", 0) : contentIndex,
+                                  summary, text);
         }
         noteProtocolProgress(context, type, outputIndex, contentIndex);
         return;
@@ -493,6 +577,10 @@ void handleEvent(StreamContext& context, const Json& event) {
     if (type == "response.output_item.added" || type == "response.output_item.done") {
         const Json item = event.value("item", Json::object());
         const std::string itemType = stringField(item, "type");
+        if (type == "response.output_item.done" && outputIndex >= 0) {
+            // 记录完整 item，包含晚于正文到达的签名。快照重复只替换同一槽位，不重复追加。
+            context.completedOutput[outputIndex] = item;
+        }
         if (outputIndex >= 0 && (itemType == "message" || itemType == "reasoning" ||
                                  itemType == "function_call" || itemType == "custom_tool_call" ||
                                  itemType == "web_search_call" || itemType == "tool_search_call"))
@@ -507,6 +595,9 @@ void handleEvent(StreamContext& context, const Json& event) {
             beginTextItem(context, outputIndex);
             emitMessageSnapshot(context, outputIndex, item);
             if (type == "response.output_item.done") completeTextItem(context, outputIndex);
+        } else if (itemType == "reasoning" && outputIndex >= 0 &&
+                   type == "response.output_item.done") {
+            emitReasoningItemSnapshot(context, outputIndex, item);
         }
         return;
     }
@@ -538,6 +629,20 @@ void handleEvent(StreamContext& context, const Json& event) {
     if (type == "response.completed" || type == "response.incomplete" ||
         type == "response.failed") {
         const Json response = event.value("response", Json::object());
+        if (!response.is_object()) {
+            context.terminalError = "Responses terminal snapshot must be an object";
+            context.done = true;
+            return;
+        }
+        if (response.contains("output")) {
+            context.terminalOutput = response["output"];
+            context.hasTerminalOutput = true;
+            if (const MaiError error = validateOutput(context.terminalOutput)) {
+                context.terminalError = error.message();
+                context.done = true;
+                return;
+            }
+        }
         const Json usage = response.value("usage", Json{});
         if (usage.is_object() && context.sink->onUsage) {
             const auto input = usage.value("input_tokens", Json{});
@@ -672,6 +777,8 @@ public:
     // 只在供应商确认完成后结束流，不从连接关闭推断模型已经完成。
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                     const std::atomic<bool>& cancel) override {
+        if (cancel.load(std::memory_order_relaxed))
+            return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
         MaiResult<std::string> built =
             buildBody(request, [this](const std::string& source, const std::string& workspace) {
                 return prepareImage(source, workspace);
@@ -859,10 +966,75 @@ public:
                                       "Responses stream ended without a terminal event");
             if (!context.terminalError.empty())
                 return MaiError::make(MaiErrorCode::Protocol, context.terminalError);
+
+            Json output = context.hasTerminalOutput ? context.terminalOutput : Json::array();
+            bool hasReplayableOutput = context.hasTerminalOutput;
+            if (!context.hasTerminalOutput && !context.completedOutput.empty()) {
+                // 一些兼容服务只在 item.done 提供完整项，终态不重复 output。
+                // 仅字段缺失才允许此回退，显式终态数组（包括空数组）始终权威。
+                // 完成前缀连续仍可能漏掉尾部，必须覆盖全部已观察索引才算完整快照。
+                for (const int index : context.observedOutputIndices)
+                    if (context.completedOutput.find(index) == context.completedOutput.end())
+                        return {MaiErrorCode::Protocol,
+                                "Responses output snapshot has unfinished items"};
+                output = Json::array();
+                int nextIndex = 0;
+                for (const auto& [index, item] : context.completedOutput) {
+                    if (index != nextIndex++)
+                        return {MaiErrorCode::Protocol,
+                                "Responses output snapshot has missing items"};
+                    output.push_back(item);
+                }
+                hasReplayableOutput = true;
+            }
+            if (hasReplayableOutput) {
+                if (const MaiError error = validateOutput(output)) return error;
+                if (output.empty() && context.sawOutput) {
+                    // 显式空终态不能复活此前已完成的 item 或工具；矛盾响应不发布状态或调用。
+                    if (!context.completedOutput.empty() || !context.calls.empty())
+                        return {MaiErrorCode::Protocol,
+                                "Responses terminal output conflicts with completed items"};
+                    // 仅有显示增量、没有原 item 的旧兼容响应仍可显示，不能让空快照替代真实历史。
+                    hasReplayableOutput = false;
+                }
+            }
             for (const auto& [_, call] : context.calls) {
-                if (call.id.empty() || call.name.empty())
+                if (!call.complete || call.id.empty() || call.name.empty())
                     return MaiError::make(MaiErrorCode::Protocol,
                                           "Responses returned an incomplete function call");
+            }
+            if (hasReplayableOutput) {
+                std::size_t callIndex = 0;
+                auto projected = context.calls.begin();
+                for (const Json& item : output) {
+                    if (stringField(item, "type") != "function_call") continue;
+                    if (projected == context.calls.end() ||
+                        projected->second.id != stringField(item, "call_id") ||
+                        projected->second.name != stringField(item, "name") ||
+                        projected->second.arguments != stringField(item, "arguments"))
+                        return {MaiErrorCode::Protocol,
+                                "Responses output does not match its function calls"};
+                    ++projected;
+                    ++callIndex;
+                }
+                if (callIndex != context.calls.size())
+                    return {MaiErrorCode::Protocol,
+                            "Responses output does not contain every function call"};
+            }
+            if (cancel.load(std::memory_order_relaxed))
+                return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
+            const auto capability = maiCloudModelInfo(request.model);
+            if (hasReplayableOutput && capability && sink.onContinuationState) {
+                const MaiModelContinuationState state{"responses.output.v1", capability->provider,
+                                                      request.model, output.dump()};
+                sink.onContinuationState(state);
+            }
+            // 持久化回调期间也可能取消，不能在它返回后继续交付任何可执行工具。
+            if (cancel.load(std::memory_order_relaxed))
+                return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
+            for (const auto& [_, call] : context.calls) {
+                if (cancel.load(std::memory_order_relaxed))
+                    return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
                 if (sink.onToolCall)
                     sink.onToolCall(MaiToolInvocation{call.id, call.name, call.arguments});
             }

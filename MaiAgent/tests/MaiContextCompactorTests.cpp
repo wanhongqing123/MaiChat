@@ -1905,6 +1905,61 @@ void test_legacy_invalid_utf8_tool_bytes_are_preserved() {
     }
 }
 
+void test_continuation_response_is_not_split_between_tool_results() {
+    auto store = makeMaiMemoryStore();
+    const auto sessionId = newSession(*store);
+    const auto user = message(MaiRole::User, "Continue the owned task.");
+    store->putMessage(sessionId, user);
+    auto assistant = message(MaiRole::Assistant, "Earlier response text.");
+    assistant.completed = 0;
+    const auto appendGroup = [&](int count, const std::string& prefix, std::size_t bytes) {
+        Json output = Json::array();
+        for (int index = 0; index < count; ++index) {
+            const auto call = prefix + std::to_string(index);
+            output.push_back({{"type", "function_call"},
+                              {"id", "item_" + call},
+                              {"call_id", call},
+                              {"name", "read"},
+                              {"arguments", "{}"}});
+        }
+        MaiModelContinuationState state{"responses.output.v1", "openrouter",
+                                        "anthropic/claude-fable-5.2", output.dump()};
+        assistant.parts.push_back({MaiIdGenerator::newPartId(), MaiReasoningPart{"", state}, 1});
+        for (int index = 0; index < count; ++index) {
+            MaiToolPart tool;
+            tool.tool = "read";
+            tool.callId = prefix + std::to_string(index);
+            tool.input = "{}";
+            tool.output = std::string(bytes, 'r');
+            tool.state = MaiToolState::Completed;
+            assistant.parts.push_back({MaiIdGenerator::newPartId(), tool, 1});
+        }
+        return state;
+    };
+    appendGroup(18, "older_", 2400);
+    const auto latestStart = assistant.parts.size();
+    const auto latestState = appendGroup(2, "latest_", 80);
+    store->putMessage(sessionId, assistant);
+    SummaryModel model;
+    model.limits = {8192, 1024};
+    const std::atomic<bool> cancel{false};
+    const auto compacted = MaiContextCompactor{}.prepare(
+        *store, model, MaiContextBuilder{}, sessionId, store->listMessages(sessionId),
+        request("anthropic/claude-fable-5.2"), cancel);
+    CHECK(compacted && compacted.value().advancedCheckpoint);
+    if (!compacted) return;
+    MaiContextCheckpoint checkpoint;
+    CHECK(store->getContextCheckpoint(sessionId, checkpoint));
+    CHECK(checkpoint.partialPartCount == latestStart);
+    bool keptGroup = false;
+    for (const auto& item : compacted.value().request.messages)
+        if (item.continuation && item.continuation->payload == latestState.payload) {
+            keptGroup = item.invocations.size() == 2 && item.invocations[0].id == "latest_0" &&
+                        item.invocations[1].id == "latest_1";
+        }
+    CHECK(keptGroup);
+}
+
 void test_active_turn_completed_tool_prefix_is_compactable() {
     std::puts("   v7: one current user and an ongoing assistant with 20 completed tool results");
     for (bool activeTail : {false, true}) {
@@ -2796,7 +2851,9 @@ void test_summary_format_through_real_wire() {
         const auto history = store->listMessages(id);
         const auto fingerprint = maiContextSourceFingerprint(id, history, history.size());
         const std::atomic<bool> cancel{false};
-        auto input = request("deepseek-flash");
+        // Chat 的 thinking/reasoning_effort 属于 GLM 扩展；不能让 DeepSeek
+        // 用例依赖旧的“目录中任何型号都加 GLM 参数”错误来验证重试保真。
+        auto input = request(chat ? "glm-5.3" : "deepseek-flash");
         input.reasoningEffort = "high";
         auto original = input;
         original.messages = MaiContextBuilder{}.build(history);
@@ -3164,6 +3221,10 @@ void test_oversized_summary_recovery_continues_the_same_runner() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--continuation-groups") {
+        test_continuation_response_is_not_split_between_tool_results();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--summary-budget-guards") {
         test_summary_format_and_size_share_one_retry_budget();
         test_metadata_history_index_is_bounded_by_the_assembled_request();
@@ -3232,6 +3293,7 @@ int main(int argc, char** argv) {
     test_partial_checkpoint_append_completion_reopen_and_promote();
     test_partial_tool_images_stay_with_recent_receipts();
     test_active_turn_completed_tool_prefix_is_compactable();
+    test_continuation_response_is_not_split_between_tool_results();
     test_invalid_continuation_bytes_have_exact_paging_progress();
     test_legacy_invalid_utf8_tool_bytes_are_preserved();
     test_model_specific_tokenizer_and_bounded_reference_index();

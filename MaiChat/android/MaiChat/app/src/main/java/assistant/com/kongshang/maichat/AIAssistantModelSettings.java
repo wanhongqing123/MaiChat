@@ -7,6 +7,7 @@ import org.json.JSONObject;
 
 final class AIAssistantModelSettings {
     static final String LOCAL_MODEL_ID = "builtin-qwen3.5-2b-q4_k_m";
+    static final String OPENROUTER_MODEL = "anthropic/claude-fable-5.2";
     final String cloudModel, policy, effort;
     private final boolean local;
 
@@ -40,10 +41,19 @@ final class AIAssistantModelSettings {
     }
     boolean isLocal() { return local; }
     String model() { return local ? "local:" + LOCAL_MODEL_ID : cloudModel; }
-    String baseUrl() { return local ? "" : cloudModel.startsWith("deepseek-")
-        ? "https://api.deepseek.com" : "https://open.bigmodel.cn/api/paas/v4"; }
-    String wire() { return local ? "local" : cloudModel.startsWith("glm-")
-        ? "chat_completions" : "responses"; }
+    String baseUrl() { return local ? "" : baseUrlForModel(cloudModel); }
+    String wire() { return local ? "local" : "responses"; }
+
+    // This is the host's endpoint projection only. Shared native routes own execution,
+    // capabilities and request serialization for the same exact cloud model identifiers.
+    static String baseUrlForModel(String model) {
+        if (OPENROUTER_MODEL.equals(model)) return "https://openrouter.ai/api/v1";
+        if ("deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model))
+            return "https://api.deepseek.com";
+        if ("glm-5.3".equals(model) || "glm-5.3-flash".equals(model))
+            return "https://open.bigmodel.cn/api/v1";
+        return "";
+    }
 
     AIAssistantModelSettings selectSource(boolean local) {
         return this.local == local ? this : new AIAssistantModelSettings(local, cloudModel, policy, effort);
@@ -77,7 +87,7 @@ final class AIAssistantModelSettings {
 
     static boolean supportedCloud(String model) {
         return "deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model)
-            || "glm-5.3".equals(model) || "glm-5.3-flash".equals(model);
+            || "glm-5.3".equals(model) || "glm-5.3-flash".equals(model) || OPENROUTER_MODEL.equals(model);
     }
     private static boolean supportedPolicy(String policy) {
         return "on-request".equals(policy) || "unless-trusted".equals(policy) || "never".equals(policy);

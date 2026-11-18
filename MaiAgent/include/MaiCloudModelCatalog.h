@@ -15,8 +15,8 @@ struct MaiCloudModelInfo {
     MaiModelContextLimits contextLimits;
 };
 
-// 仅返回已核的四个公开主聊天型号，不猜别名或前缀。未知返回 nullopt；不取密钥/访问网络。
-// GLM 使用 Chat Completions 兼容 Coding Plan，DeepSeek 使用 Responses。
+// 仅返回已核的公开主聊天型号，不猜别名或前缀。未知返回 nullopt；不取密钥/访问网络。
+// 产品云端 GLM、DeepSeek、OpenRouter 使用 Responses；账号权限仍按实际供应商响应判断。
 std::optional<MaiCloudModelInfo> maiCloudModelInfo(const std::string& model);
 
 // 空串表示继承宿主/供应商默认；显式值仅 low/high/max。纯校验，不修改输入或会话。
