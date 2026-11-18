@@ -11,14 +11,16 @@ Codex 使用本次检查时官方 main 的固定提交
 
 ## 先看结论
 
-建议先处理已有工具的正确性，再完善任务控制，最后按需求扩展生态。优先顺序：
+产品约束：**MaiChat 不接入 MCP；MCP 及依赖其连接的生态不计对齐缺口，也不进入后续候选。**
+本次修订替代前一稿中的 MCP 接入建议；源码差异不自动构成本产品的实现任务。
+建议先处理已有工具的正确性，再完善任务控制及现有工具的按需发现。优先顺序：
 
 1. **修正 `file_patch` 的定位及内容保留。** 当前接受部分 Codex 补丁语法，却有修改错误位置、改动未变上下文的风险。
 2. **完善子 Agent 运行中收消息、重定向和等待。** 已有基本多 Agent；现有 `send_input` 默认可能直接遇到 Busy。
 3. **统一图像能力检查。** 能力表与图像工具的型号判断不一致，需要先核实并统一；不能把静态风险报成已经复现的供应商错误。
 4. **完善现有进程工具的 PTY、shell/workdir 和等待预算。** 后台进程、增量输出和 stdin 已有，不再新增一套重复执行器。
 5. **补可被新输入唤醒的等待，按需补异步提问。** 问完以后可继续独立工作，等待时收到新指令可及时响应。
-6. **按需补工具发现与 MCP。** 先做好能力目录及按需 schema，再考虑外部 MCP/插件；不是把几个名字加到工具表就完成。
+6. **按需完善现有工具发现。** 基于已有普通工具的统一能力目录，按需提供 schema；独立于 MCP，不新增 MCP 接入。
 
 `file_read/glob/grep/edit`、基本子 Agent、同步 `question`、`todowrite`、`current_time`、
 网页搜索/抓取、图片查看及桌面后台进程都已有基础能力。名称不同不等于缺失。
@@ -67,13 +69,14 @@ Codex：[V1 排队/打断和 V2 消息/后续任务契约](https://github.com/op
 浏览器 screenshot 也有硬编码型号判断。用户直接附图入口反而读取统一能力目录，口径不同。
 
 MaiChat：`MaiAgent/Agent/MaiCloudModelCatalog.cpp:17`、`MaiAgent/AgentTools/MaiViewImageTool.cpp:55`、
-`MaiChat/desktop/src/MaiChatTools/DesktopBrowserTools.cpp:619`、`MaiChat/MobileAgentAdapter/MaiMobileHostTools.cpp:831`、
+`MaiChat/desktop/src/MaiChatTools/DesktopBrowserTools.cpp:619`、`MaiChat/MaiChatTools/MaiMobileHostTools.cpp:831`、
 `MaiChat/MobileAgentAdapter/MaiMobileAgent.cpp:1370`。
 Codex：[执行前检查模型图像输入能力](https://github.com/openai/codex/blob/ca21fe65d18a9b6326759fb4263c65dfbb645aa5/codex-rs/core/src/tools/handlers/view_image.rs#L103)。
 
 这是源码可见的内部契约不一致，尚未请求供应商复现。应先核实实际型号能力，
 再统一 schema 暴露、直接执行和图像结果的门禁。已有 JPEG 预览也有尺寸上限；
 原图/高细节查看可作为后续能力，不能把现有 `view_image` 整项算缺失。
+这里检查的是当前 AI 模型接收和理解图片的能力；给用户看的图片卡片、大图预览独立于该判断。
 
 ### 4. 进程执行：已有后台及 stdin，缺真实终端语义
 
@@ -106,24 +109,21 @@ Codex：[可提前唤醒的 sleep](https://github.com/openai/codex/blob/ca21fe65
 两者在上游仍有开关/模型/模式条件。应复用当前问题身份、回答队列和取消机制，
 不把 shell sleep 当成全平台实现，也不照搬上游最长 12 小时的范围。
 
-### 6. 工具发现及外部工具生态
+### 6. 现有工具的按需发现
 
 当前 `MaiToolRegistry::specs(model)` 过滤 internal/不可用项后，把所有公开 schema 交给请求。
-没有延迟 schema、工具搜索或通用 MCP 连接管理。工具多时可考虑按需发现，
-连接文档/数据库等第三方工具时才需要通用 MCP 动态导入。
+没有延迟 schema 或工具搜索。工具多时，可基于现有普通工具目录按需发现和提供 schema，
+减少每轮提示中无关工具定义的开销；这项能力不依赖 MCP。
 
 MaiChat：`MaiAgent/AgentTools/MaiTool.cpp:200`、`:211`、`MaiAgent/Agent/MaiTurnRunner.cpp:476`。
 Codex：[按条件启用工具搜索](https://github.com/openai/codex/blob/ca21fe65d18a9b6326759fb4263c65dfbb645aa5/codex-rs/core/src/tools/spec_plan.rs#L424)、
-[动态工具](https://github.com/openai/codex/blob/ca21fe65d18a9b6326759fb4263c65dfbb645aa5/codex-rs/core/src/tools/handlers/dynamic.rs#L34)、
-[MCP 工具适配](https://github.com/openai/codex/blob/ca21fe65d18a9b6326759fb4263c65dfbb645aa5/codex-rs/core/src/tools/handlers/mcp.rs#L56)。
+[动态工具](https://github.com/openai/codex/blob/ca21fe65d18a9b6326759fb4263c65dfbb645aa5/codex-rs/core/src/tools/handlers/dynamic.rs#L34)。
 
-MaiChat 不是没有扩展点：普通 C++ 工具注册、宿主 dispatcher 都已有。
-差异在于每线程外部 schema、来源/授权、延迟暴露和通用 MCP 生命周期。
-`list_mcp_resources/list_mcp_resource_templates/read_mcp_resource` 是同一 MCP 资源层，
-不宜拆成三个互不相关项目。iOS 也不能继承外部可执行 MCP server 的假设。
+普通 C++ 工具注册、宿主 dispatcher 都已有。后续如果需要动态提供普通工具，
+可复用这些入口并明确来源、授权及生命周期，不以 MCP 为基础，也不另外建立重复执行路径。
 
 Codex 自有的 ChatGPT Apps 目录、连接授权、web.run 后端及 imagegen 后端并不会因源码开放
-就变成 MaiChat 可直接使用的服务。先确定具体业务接入，再考虑市场/安装建议。
+就变成 MaiChat 可直接使用的服务；依赖 MCP 的连接与插件接入已按产品约束排除。
 任何新增第三方库仍须用户明确指定或确认，本轮没有接入依赖。
 
 ## 逐工具族核对清单
@@ -159,13 +159,11 @@ V1/V2 多 Agent 互斥，动态/MCP/扩展工具又取决于连接与策略，�
 - **close_agent / resume_agent / interrupt_agent：部分。** MaiChat 有关闭/取消；需明确可恢复中断、关闭后再派活和后代树清理语义。Codex V1/V2 并不同时提供同一组名称。
 - **CSV Agent jobs：不列当前 Codex 对齐要求。** 本次 Nov 快照的 Rust 注册/实现中没有 spawn_agents_on_csv/report_agent_job_result；不要从 7 月源码或旧清单沿用这个缺口。
 
-### 发现、资源、插件与媒体
+### 发现与媒体
 
 - **tool_search：条件缺口。** 上游需模型支持 search tool、策略允许和有 deferred 候选。MaiChat 目前全量 function schema；先建立统一能力目录，兼容不支持特殊协议的供应商。
 - **动态 function/namespace 工具：部分。** 已有 C++ 扩展点，缺运行时由外部宿主按线程提供 schema/来源/调用结果的通用合同。
-- **通用 MCP 工具：缺通用接入层。** 现有 curl/业务工具不等于 MCP inventory、授权、调用与结构化内容；按具体需求规划。
-- **list_mcp_resources / list_mcp_resource_templates / read_mcp_resource：缺通用资源层。** 依赖同一个 MCP 管理器；本地文件、云盘已有，不应一起算缺失。
-- **list_available_plugins_to_install / request_plugin_install：缺生态层、非直接移植。** Codex 的 Apps/Plugins/候选目录/账号授权门禁都需要满足；不代表模型可静默安装。MaiChat 应先有可连接能力目录再考虑市场。
+- **MCP 工具、资源及依赖其连接的插件生态：产品明确排除。** 不计缺口，不列新增任务。Codex 自有 Apps/Plugins 的目录、账号授权和安装建议也不直接移植。
 - **WebSearch / web.run：已有基础、专用能力部分差异。** 两端已有 web_search/web_fetch 和浏览器操作。上游 hosted 搜索与 standalone web.run 是不同注册路径；image query、PDF 截图、统一引用 ID、天气/金融等是另外的服务合同，不能把上游私有后端当可复制的本地工具。依据：上游 hosted_spec.rs:14、spec_plan.rs:724、codex-api/src/search.rs:32。
 - **view_image：已有，需统一能力检查，可选提高细节。** 当前有有界预览；原图细节和多执行环境选择是后续差异，多环境参数不适用于当前所有宿主。
 - **image_gen.imagegen：已有供应商实现但产品暂停。** 不列未实现，也不恢复图像/视频生成；上游有套餐/供应商/视觉模型/账号后端权限条件。依据：上游 spec_plan.rs:821；MaiCreativeMediaSupport.cpp:127。
