@@ -63,3 +63,19 @@ Windows 原已安装进程未停止、未替换；其公有 3.0.1 包不包含�
 本次没有修改公开 release/tag 或资产，也未触发真实模型 UI 任务。
 iOS 229 正常 Release、安装和独立启动由 Apple owner 在源码提交后执行，
 此记录不预先宣称手机更新完成。测试日志与精确源包保留于任务私有 cache。
+
+## 提交后的 Windows 候选
+
+实现提交 `70ee22f62251740bf53fd684a4aa6baef3409734` 已正常推送并独立核对远端 main。
+正常脚本生成私有候选 `MaiChat-win64-v3.0.1-20261119-70ee22f6.zip`：
+242,401,070 字节，SHA256
+`31d9e671fa8212399af8888a6ebc686b6f24acb4ba9fb0125c6addc968f4d2bb`。
+包内 exe SHA256 为
+`55f9c5eacc00f397c20fdeceedf8f94a5032c5ea8a04eb6723e98f4cde176dc0`。
+
+staging 和实际 ZIP 提取目录各运行一次 `--smoke`，退出均为 0
+（1.947 秒、3.890 秒）；两次 PATH 只有 Windows/System32，已清除 Qt 插件环境变量。
+三产物的 114 个 PE 导入和 Qt 插件检查通过。
+这是正常启动/依赖检查，不等于登录后真实供应商任务验收。
+现装 `D:\Program Files\MaiChat\maichat.exe` 的 PID 59396 保持运行，未用候选替换。
+候选留在 `.cache/openrouter-fable52-20261118/windows-candidate-70ee22f6/`，未上传发布。
