@@ -61,8 +61,13 @@ OpenRouter 两次真实工具往返没有返回 reasoning/encrypted item，
 
 Windows 原已安装进程未停止、未替换；其公有 3.0.1 包不包含本轮功能。
 本次没有修改公开 release/tag 或资产，也未触发真实模型 UI 任务。
-iOS 229 正常 Release、安装和独立启动由 Apple owner 在源码提交后执行，
-此记录不预先宣称手机更新完成。测试日志与精确源包保留于任务私有 cache。
+iOS 229 已由 Apple owner 从实现提交 `70ee22f6` 正常构建并安装：
+Release 0/156.067 秒、签名 deep/strict 0、安装 0/57.481 秒；
+独立 App 元数据为 3.0.1(229)，无参启动 0，独立进程 PID 76340 的路径匹配新 bundle。
+更新中数据容器正常迁移；没有卸载、清数据或恢复操作，也未比较数据字节或读回设备 exe hash。
+完整产物与验证边界见 `2026-11-19-openrouter-responses-ios229-delivery.md`。
+Mac v4 加小字体的最终消费者编译回执尚待补充，不能用之前 v2 的结果代替。
+测试日志与精确源包保留于任务私有 cache。
 
 ## 提交后的 Windows 候选
 
