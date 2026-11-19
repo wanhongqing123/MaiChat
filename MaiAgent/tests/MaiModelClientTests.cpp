@@ -603,7 +603,8 @@ void test_openrouter_402_retry_after_only_accepts_bounded_numeric_seconds() {
     }
 }
 
-// 完整 402 头之后的 RST 仍是已被拒绝的请求，不能把接收失败当作未收到 HTTP 的网络重试。
+// 完整 402 头之后的 RST 仍须保留已知状态和有界等待头；截断 metadata 不能推断预算来源。
+// 不能把接收失败降级成纯 Network、成功回复或自动重试，也不能回显任意头/半截正文。
 void test_openrouter_402_truncated_reset_response_is_not_retried() {
     class ResetServer final : public httplib::Server {
     public:
@@ -612,6 +613,7 @@ void test_openrouter_402_truncated_reset_response_is_not_retried() {
         std::atomic<int> socketFailures{0};
         std::thread listener;
         int port = 0;
+        std::string retryAfter;
 
         void start() {
             port = bind_to_any_port("127.0.0.1");
@@ -660,10 +662,16 @@ void test_openrouter_402_truncated_reset_response_is_not_retried() {
                 return false;
             }
             ++requests;
-            const std::string response =
+            std::string response =
                 "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\n"
-                "Content-Length: 4096\r\nConnection: close\r\nRetry-After: 7\r\n\r\n"
-                "{\"error\":{\"code\":402,\"message\":\"Synthetic truncated error";
+                "Content-Length: 4096\r\nConnection: close\r\n";
+            if (!retryAfter.empty()) response += "Retry-After: " + retryAfter + "\r\n";
+            // 即使字段文字恰好匹配已知预算类型，不完整 JSON 也不能用字符串搜索补出分类。
+            response +=
+                "\r\n{\"error\":{\"code\":402,\"message\":\"Synthetic truncated error\","
+                "\"metadata\":{\"reason\":\"in_flight_budget_exhausted\","
+                "\"limit_source\":\"openrouter_in_flight_budget\","
+                "\"debug\":\"synthetic-truncated-body-secret\"";
             std::size_t sent = 0;
             while (sent < response.size()) {
                 const auto written = httplib::detail::send_socket(socket, response.data() + sent,
@@ -683,31 +691,68 @@ void test_openrouter_402_truncated_reset_response_is_not_retried() {
             httplib::detail::close_socket(socket);
             return false;
         }
-    } server;
-    server.start();
-    CHECK(server.port > 0);
-    if (server.port <= 0) return;
-    MaiModelConfig config;
-    config.baseUrl = "http://127.0.0.1:" + std::to_string(server.port);
-    config.wire = MaiWireApi::Responses;
-    config.apiKey = "synthetic-reset-key";
-    config.totalTimeoutSeconds = 5;
-    config.maxRetries = 2;
-    config.retryInitialDelayMs = 1;
-    config.proxyResolver = [](const std::string&, MaiModelProxy& proxy) {
-        proxy.url.clear();
-        return true;
     };
-    MaiModelRequest request;
-    request.model = "anthropic/claude-fable-5.2";
-    const std::atomic<bool> cancel{false};
-    const MaiError error = makeMaiModelClient(config)->stream(request, {}, cancel);
-    CHECK(error.code() == MaiErrorCode::Network);
-    // 固定两份已入库 curl 的 CURLE_RECV_ERROR 文案，排除 FIN 导致 PARTIAL_FILE 的假绿。
-    CHECK(error.message() == "curl: Failure when receiving data from the peer");
-    CHECK(server.socketFailures.load() == 0);
-    CHECK(server.resets.load() >= 1);
-    CHECK(server.requests.load() == 1);
+    struct RetryCase {
+        const char* header;
+        const char* expected;
+    };
+    for (const RetryCase item :
+         {RetryCase{"7", "retry_after_seconds=7"}, RetryCase{"86400", "retry_after_seconds=86400"},
+          RetryCase{"86401", nullptr}, RetryCase{"synthetic-reset-header-secret", nullptr}}) {
+        ResetServer server;
+        server.retryAfter = item.header;
+        server.start();
+        CHECK(server.port > 0);
+        if (server.port <= 0) return;
+        MaiModelConfig config;
+        config.baseUrl = "http://127.0.0.1:" + std::to_string(server.port);
+        config.wire = MaiWireApi::Responses;
+        config.apiKey = "synthetic-reset-key";
+        config.totalTimeoutSeconds = 5;
+        config.maxRetries = 2;
+        config.retryInitialDelayMs = 1;
+        config.proxyResolver = [](const std::string&, MaiModelProxy& proxy) {
+            proxy.url.clear();
+            return true;
+        };
+        MaiModelRequest request;
+        request.model = "anthropic/claude-fable-5.2";
+        unsigned textEvents = 0, reasoningEvents = 0, toolEvents = 0, continuationEvents = 0;
+        MaiStreamSink sink;
+        sink.onText = [&](std::string_view) { ++textEvents; };
+        sink.onReasoning = [&](std::string_view) { ++reasoningEvents; };
+        sink.onToolCall = [&](const MaiToolInvocation&) { ++toolEvents; };
+        sink.onContinuationState = [&](const MaiModelContinuationState&) { ++continuationEvents; };
+        const std::atomic<bool> cancel{false};
+        const MaiError error = makeMaiModelClient(config)->stream(request, sink, cancel);
+        CHECK(error);
+        // 元数据不可解析时仍按未知的 HTTP 拒绝处理，不能标成已知 in-flight/RateLimited。
+        CHECK(error.code() == MaiErrorCode::Protocol);
+        CHECK(error.message().rfind("HTTP 402", 0) == 0);
+        CHECK(error.message().find("reason=") == std::string::npos);
+        CHECK(error.message().find("limit_source=") == std::string::npos);
+        CHECK(error.message().find("category=") == std::string::npos);
+        if (item.expected) {
+            const auto start = error.message().find("retry_after_seconds=");
+            CHECK(start != std::string::npos);
+            if (start != std::string::npos) {
+                const auto end = error.message().find_first_of(" \t\r\n])};,", start);
+                const auto field = error.message().substr(
+                    start, end == std::string::npos ? std::string::npos : end - start);
+                CHECK(field == item.expected);
+            }
+        } else {
+            CHECK(error.message().find("retry_after_seconds=") == std::string::npos);
+        }
+        CHECK(error.message().find("synthetic-reset-header-secret") == std::string::npos);
+        CHECK(error.message().find("synthetic-truncated-body-secret") == std::string::npos);
+        CHECK(error.message().find('\n') == std::string::npos);
+        CHECK(textEvents == 0 && reasoningEvents == 0 && toolEvents == 0 &&
+              continuationEvents == 0);
+        CHECK(server.socketFailures.load() == 0);
+        CHECK(server.resets.load() >= 1);
+        CHECK(server.requests.load() == 1);
+    }
 }
 
 void test_finish_reason_length_is_not_reported_as_success() {

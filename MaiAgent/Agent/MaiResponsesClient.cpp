@@ -1001,7 +1001,10 @@ public:
                 }
                 continue;
             }
-            if (transfer != CURLE_OK && !(context.done && transfer == CURLE_WRITE_ERROR))
+            // 已收到 402 就已知请求被 HTTP 拒绝；之后 RST 不能抹掉该事实。
+            // 其它传输错误保持原语义，也不能把不完整响应当作成功终态。
+            if (transfer != CURLE_OK && status != 402 &&
+                !(context.done && transfer == CURLE_WRITE_ERROR))
                 return MaiError::make(
                     MaiErrorCode::Network,
                     std::string("curl: ") +
@@ -1017,9 +1020,17 @@ public:
                                     : status >= 500                ? MaiErrorCode::Network
                                                                    : MaiErrorCode::Protocol;
                 const auto capability = maiCloudModelInfo(request.model);
-                if (status == 402 && capability && capability->provider == "openrouter")
-                    message += openRouterCreditDiagnostic(context.rawBody,
-                                                          context.retryAfterSeconds, code);
+                if (status == 402 && capability && capability->provider == "openrouter") {
+                    const std::string diagnostic = openRouterCreditDiagnostic(
+                        context.rawBody, context.retryAfterSeconds, code);
+                    message += diagnostic;
+                    // 截断 JSON 无法提供分类，但已校验的等待头是独立的 HTTP 事实。
+                    // 只保留数字秒，不能从半截正文猜预算来源或触发自动重试。
+                    if (transfer != CURLE_OK && diagnostic.empty() &&
+                        context.retryAfterSeconds >= 0)
+                        message += " [OpenRouter retry_after_seconds=" +
+                                   std::to_string(context.retryAfterSeconds) + "]";
+                }
                 return MaiError::make(code, message);
             }
             if (!context.done)
