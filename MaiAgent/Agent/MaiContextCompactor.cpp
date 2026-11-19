@@ -471,6 +471,8 @@ std::size_t utf8Prefix(const std::string& source, std::size_t first, std::size_t
 MaiModelRequest summaryRequest(const MaiModelRequest& original, const std::string& summary,
                                const Json& fragments, std::size_t outputTokens) {
     MaiModelRequest request;
+    // 摘要与主请求属于同一真实会话；后续格式重试复制此请求，不能切换路由身份。
+    request.sessionId = original.sessionId;
     request.model = original.model;
     // 当前轮已有显式 effort 时摘要沿用同一快照，不再暗中降级；未指定时保留原低开销默认。
     request.reasoningEffort = original.reasoningEffort.empty() ? "low" : original.reasoningEffort;
@@ -639,6 +641,13 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
     const std::atomic<bool>& cancel, const BuildContext& buildContext) const {
     if (cancel.load(std::memory_order_relaxed))
         return {MaiErrorCode::Canceled, "Context preparation was canceled."};
+    // 普通入口也有明确的目标会话；填补旧调用者的空元数据，拒绝两套不一致身份。
+    if (request.sessionId.empty()) {
+        request.sessionId = sessionId;
+    } else if (request.sessionId != sessionId) {
+        return {MaiErrorCode::InvalidInput,
+                "Model request session does not match context session."};
+    }
     if (mOptions.targetPercent == 0 || mOptions.targetPercent >= mOptions.triggerPercent ||
         mOptions.triggerPercent >= 100)
         return {MaiErrorCode::InvalidInput, "Invalid context compaction thresholds."};

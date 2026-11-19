@@ -221,6 +221,11 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
     // 显式档位按选中型号校验；不能静默丢弃不支持值，也不能把 Fable 的五档压回旧三档。
     if (!maiIsValidReasoningEffortForModel(request.model, request.reasoningEffort))
         return {MaiErrorCode::InvalidInput, "Unsupported reasoning effort for the selected model"};
+    // 路由身份只接受有界不透明标识，不回显非法值，也不以正文或路径生成替代身份。
+    if (request.sessionId.size() > 256 ||
+        std::any_of(request.sessionId.begin(), request.sessionId.end(),
+                    [](unsigned char value) { return value < 0x21 || value > 0x7e; }))
+        return {MaiErrorCode::InvalidInput, "Invalid model request session identifier"};
     Json input = Json::array();
     const auto capability = maiCloudModelInfo(request.model);
     std::size_t latestUser = request.messages.size();
@@ -301,6 +306,17 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
 
     Json body{
         {"model", request.model}, {"input", std::move(input)}, {"stream", true}, {"store", false}};
+    if (!request.sessionId.empty() && capability) {
+        // 仅映射型号目录明确声明的供应商字段；不把会话 ID 填进终端用户隔离字段。
+        // 空身份保留旧普通调用；自动缓存提示不改变原 input/instructions/tools 或输出预算。
+        if (capability->provider == "openrouter") {
+            body["session_id"] = request.sessionId;
+            body["cache_control"] = Json{{"type", "ephemeral"}};
+        } else if (capability->provider == "glm") {
+            body["prompt_cache_key"] = request.sessionId;
+        }
+        // DeepSeek 自动管理上下文缓存；不发送其明确不支持的缓存路由参数。
+    }
     if (request.maxOutputTokens != 0) body["max_output_tokens"] = request.maxOutputTokens;
     if (capability && !request.reasoningEffort.empty())
         body["reasoning"] = Json{{"effort", request.reasoningEffort}};

@@ -67,6 +67,8 @@ public:
 
     MaiContextCompactor();
     explicit MaiContextCompactor(Options options);
+    // sessionId 是本次上下文的权威会话；request.sessionId 为空时补齐，非空不一致时
+    // 返回 InvalidInput 且不调用模型。路由元数据不改变输入正文、工具或 token 估算。
     MaiResult<MaiContextPreparation> prepare(MaiSessionStore& store, MaiModelClient& model,
                                              const MaiContextBuilder& builder,
                                              const std::string& sessionId,

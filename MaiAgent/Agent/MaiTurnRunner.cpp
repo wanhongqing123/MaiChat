@@ -371,6 +371,8 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
                                                        const std::atomic<bool>& cancel,
                                                        const char* finalAnswerHint) {
     MaiModelRequest request;
+    // 沿用持久会话身份；每轮/工具跟进/补答不得创建新的缓存路由身份。
+    request.sessionId = mSessionId;
     request.model = modelName;
     const auto capability = maiCloudModelInfo(modelName);
     if (capability && capability->supportsReasoningEffort)

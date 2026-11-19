@@ -148,7 +148,8 @@ MaiResult<MaiContextPreparation> prepare(MaiSessionStore& store, SummaryModel& m
                                          store.listMessages(sessionId), request(), cancel);
 }
 
-// 比较整个普通请求，而不只比较可见正文：旧检查点的引用、工具配对和生成配置均须保持。
+// 比较普通请求的模型输入和生成策略，而不只比较可见正文：引用、工具配对和生成配置均须保持。
+// sessionId 是独立路由身份，由专门断言核对，不混入此模型输入快照。
 std::string requestSnapshot(const MaiModelRequest& request) {
     Json messages = Json::array(), tools = Json::array();
     for (const auto& message : request.messages) {
@@ -182,6 +183,132 @@ std::string requestSnapshot(const MaiModelRequest& request) {
 void populateSoftHistory(MaiSessionStore& store, const std::string& id) {
     appendRound(store, id, "Original source: " + std::string(16000, 's'));
     store.putMessage(id, message(MaiRole::User, "Continue the saved task."));
+}
+
+void test_cache_session_identity_is_bound_without_changing_the_request() {
+    auto store = makeMaiMemoryStore();
+    MaiContextCompactor compactor;
+    const std::atomic<bool> cancel{false};
+    for (int index = 0; index < 2; ++index) {
+        const auto authority = newSession(*store);
+        store->putMessage(authority, message(MaiRole::User, "Keep this synthetic instruction."));
+        const auto history = store->listMessages(authority);
+        for (bool supplied : {false, true}) {
+            SummaryModel model;
+            auto input = request("anthropic/claude-fable-5.2");
+            input.reasoningEffort = "xhigh";
+            input.workingDirectory = "/owned/cache-session-workspace";
+            input.temperature = 0.37;
+            input.maxOutputTokens = 777;
+            input.messages = MaiContextBuilder{}.build(history);
+            const auto before = requestSnapshot(input);
+            const auto estimate = model.estimateInputTokens(input);
+            input.sessionId = supplied ? authority : std::string{};
+            const auto prepared = compactor.prepare(*store, model, MaiContextBuilder{}, authority,
+                                                    history, input, cancel);
+            CHECK(prepared);
+            CHECK(model.requests().empty());
+            if (!prepared) continue;
+            CHECK(prepared.value().request.sessionId == authority);
+            CHECK(requestSnapshot(prepared.value().request) == before);
+            CHECK(prepared.value().inputEstimate.tokens == estimate.tokens);
+            CHECK(prepared.value().inputEstimate.exact == estimate.exact);
+            CHECK(maiContextSourceFingerprint(authority, store->listMessages(authority),
+                                              history.size()) ==
+                  maiContextSourceFingerprint(authority, history, history.size()));
+            auto changedIdentity = input;
+            changedIdentity.sessionId = std::string(8192, 'i');
+            CHECK(model.estimateInputTokens(changedIdentity).tokens == estimate.tokens);
+            CHECK(model.estimateInputTokens(changedIdentity).exact == estimate.exact);
+            CHECK(requestSnapshot(input) == before);
+        }
+    }
+}
+
+void test_cache_session_mismatch_is_rejected_before_any_summary_call() {
+    auto store = makeMaiMemoryStore();
+    const auto authority = newSession(*store);
+    const auto other = newSession(*store);
+    populate(*store, authority);
+    const auto history = store->listMessages(authority);
+    const auto fingerprint = maiContextSourceFingerprint(authority, history, history.size());
+    SummaryModel model;
+    auto input = request();
+    input.sessionId = other;
+    const std::atomic<bool> cancel{false};
+    const auto prepared = MaiContextCompactor{}.prepare(*store, model, MaiContextBuilder{},
+                                                        authority, history, input, cancel);
+    CHECK(!prepared);
+    if (!prepared) CHECK(prepared.error().code() == MaiErrorCode::InvalidInput);
+    CHECK(model.requests().empty());
+    MaiContextCheckpoint checkpoint;
+    CHECK(!store->getContextCheckpoint(authority, checkpoint));
+    CHECK(maiContextSourceFingerprint(authority, store->listMessages(authority), history.size()) ==
+          fingerprint);
+    CHECK(input.sessionId == other);
+}
+
+void test_cache_session_survives_summary_chunks_and_format_retry() {
+    const std::atomic<bool> cancel{false};
+    std::set<std::string> authorities;
+    MaiContextCompactor compactor;
+    for (bool supplied : {false, true}) {
+        auto store = makeMaiMemoryStore();
+        const auto authority = newSession(*store);
+        CHECK(authorities.insert(authority).second);
+        populate(*store, authority);
+        const auto history = store->listMessages(authority);
+        const auto fingerprint = maiContextSourceFingerprint(authority, history, history.size());
+        SummaryModel model;
+        // 第一批先失败一次格式校验，随后所有批次返回合法摘要；不触发网络重试。
+        model.interleave = [&](int index) {
+            model.response = index == 1 ? "not JSON" : summaryJson();
+        };
+        auto input = request("anthropic/claude-fable-5.2");
+        input.sessionId = supplied ? authority : std::string{};
+        input.reasoningEffort = "medium";
+        input.workingDirectory = "/owned/cache-session-workspace";
+        input.temperature = 0.31;
+        input.maxOutputTokens = 777;
+        const auto prepared = compactor.prepare(*store, model, MaiContextBuilder{}, authority,
+                                                history, input, cancel);
+        CHECK(prepared && prepared.value().advancedCheckpoint);
+        const auto attempts = model.requests();
+        // 两次以上表明除了首批格式补试，还真正处理了后续分块。
+        CHECK(attempts.size() > 2);
+        if (attempts.size() > 2) {
+            CHECK(attempts[0].messages.size() == 1 && attempts[1].messages.size() == 1 &&
+                  attempts[2].messages.size() == 1);
+            if (!attempts[0].messages.empty() && !attempts[1].messages.empty() &&
+                !attempts[2].messages.empty()) {
+                CHECK(attempts[0].messages[0].content == attempts[1].messages[0].content);
+                CHECK(attempts[2].messages[0].content != attempts[0].messages[0].content);
+            }
+        }
+        for (const auto& attempt : attempts) {
+            CHECK(attempt.sessionId == authority);
+            CHECK(attempt.model == input.model &&
+                  attempt.reasoningEffort == input.reasoningEffort &&
+                  attempt.workingDirectory == input.workingDirectory);
+            CHECK(attempt.tools.empty());
+            CHECK(attempt.maxOutputTokens == 1024);
+            CHECK(requestSnapshot(attempt).find(authority) == std::string::npos);
+        }
+        if (prepared) {
+            const auto& output = prepared.value().request;
+            CHECK(output.sessionId == authority);
+            CHECK(output.model == input.model && output.reasoningEffort == input.reasoningEffort &&
+                  output.baseInstructions == input.baseInstructions &&
+                  output.workingDirectory == input.workingDirectory &&
+                  output.temperature == input.temperature &&
+                  output.maxOutputTokens == input.maxOutputTokens);
+            auto restoredMessages = output;
+            restoredMessages.messages = input.messages;
+            CHECK(requestSnapshot(restoredMessages) == requestSnapshot(input));
+        }
+        CHECK(maiContextSourceFingerprint(authority, store->listMessages(authority),
+                                          history.size()) == fingerprint);
+    }
 }
 
 // 只有写错误边界可注入；实际消息与检查点仍由普通 MemoryStore 保存和核对。
@@ -3221,6 +3348,13 @@ void test_oversized_summary_recovery_continues_the_same_runner() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--cache-session") {
+        test_cache_session_identity_is_bound_without_changing_the_request();
+        test_cache_session_mismatch_is_rejected_before_any_summary_call();
+        test_cache_session_survives_summary_chunks_and_format_retry();
+        std::printf("cache session compactor checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--continuation-groups") {
         test_continuation_response_is_not_split_between_tool_results();
         return failures == 0 ? 0 : 1;
@@ -3269,6 +3403,9 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     std::puts("MaiContextCompactorTests");
+    test_cache_session_identity_is_bound_without_changing_the_request();
+    test_cache_session_mismatch_is_rejected_before_any_summary_call();
+    test_cache_session_survives_summary_chunks_and_format_retry();
     for (int mode = 0; mode < 5; ++mode)
         test_hard_summary_failure_continues_with_original_history(mode);
     test_history_index_preserves_old_summary_users_and_source_identity();

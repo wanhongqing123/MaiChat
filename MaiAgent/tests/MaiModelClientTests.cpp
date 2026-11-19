@@ -2362,6 +2362,154 @@ void test_glm_responses_completes_without_done_and_keeps_metadata_only_state() {
     }
 }
 
+// 会话提示只增加已核供应商的顶层字段；工具 schema 本身含同名字段，不能对原始 JSON 搜索判定。
+void test_responses_cache_session_hints_preserve_the_original_request() {
+    struct ProviderCase {
+        const char* model;
+        int hints;  // 0: 无提示；1: OpenRouter；2: GLM。
+    };
+    const ProviderCase cases[] = {
+        {"anthropic/claude-fable-5.2", 1},
+        {"glm-5.3", 2},
+        {"glm-5.3-flash", 2},
+        {"deepseek-flash", 0},
+        {"deepseek-v4-pro", 0},
+        {"unknown-fixture", 0},
+        {"local:synthetic", 0},
+    };
+    const auto withoutHints = [](json body) {
+        body.erase("session_id");
+        body.erase("cache_control");
+        body.erase("prompt_cache_key");
+        return body;
+    };
+    for (const auto& item : cases) {
+        FakeServer fake;
+        fake.script = sse(json{{"type", "response.completed"},
+                               {"response", {{"status", "completed"}, {"output", json::array()}}}});
+        fake.start();
+        const auto body = [&] {
+            std::lock_guard<std::mutex> lock(fake.mutex);
+            return json::parse(fake.lastBody, nullptr, false);
+        };
+        MaiModelRequest request;
+        request.model = item.model;
+        request.reasoningEffort = "high";
+        request.maxOutputTokens = 273;
+        request.baseInstructions = "Preserve these stable instructions.";
+        request.messages = {{MaiModelRole::User, "First input"},
+                            {MaiModelRole::Assistant, "Earlier answer"},
+                            {MaiModelRole::User, "Current input"}};
+        const std::string parameters =
+            R"({"type":"object","properties":{"session_id":{"type":"string"},"cache_control":{"type":"string"},"prompt_cache_key":{"type":"string"}}})";
+        // 刻意逆字典序，缓存元数据不能顺带重排原工具声明。
+        request.tools = {{"z_lookup", "Read retained data", parameters},
+                         {"a_lookup", "Read another retained source", parameters}};
+        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        const json original = body();
+        CHECK(original.is_object());
+        if (!original.is_object()) continue;
+        CHECK(!original.contains("session_id"));
+        CHECK(!original.contains("cache_control"));
+        CHECK(!original.contains("prompt_cache_key"));
+        CHECK(wireValue(original, "/store") == false);
+        CHECK(wireValue(original, "/max_output_tokens") == 273);
+        CHECK(wireValue(original, "/instructions") == request.baseInstructions);
+        const json expectedInput = json::array({
+            json{{"type", "message"}, {"role", "user"}, {"content", "First input"}},
+            json{{"type", "message"}, {"role", "assistant"}, {"content", "Earlier answer"}},
+            json{{"type", "message"}, {"role", "user"}, {"content", "Current input"}},
+        });
+        CHECK(wireValue(original, "/input") == expectedInput);
+        CHECK(wireValue(original, "/tools/0/parameters") == json::parse(parameters));
+        json sameSession;
+        const std::vector<std::string> sessions{"session_alpha", "session_alpha", "session_beta",
+                                                std::string(256, 'x'), "!~\"\\/#"};
+        for (std::size_t index = 0; index < sessions.size(); ++index) {
+            request.sessionId = sessions[index];
+            CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+            const json actual = body();
+            CHECK(actual.is_object());
+            if (!actual.is_object()) continue;
+            CHECK(withoutHints(actual) == original);
+            CHECK(wireValue(actual, "/input") == expectedInput);
+            CHECK(wireValue(actual, "/tools") == wireValue(original, "/tools"));
+            CHECK(wireValue(actual, "/instructions") == request.baseInstructions);
+            if (item.hints == 1) {
+                CHECK(wireValue(actual, "/session_id") == sessions[index]);
+                CHECK(wireValue(actual, "/cache_control") == json({{"type", "ephemeral"}}));
+                CHECK(!actual.contains("prompt_cache_key"));
+            } else if (item.hints == 2) {
+                CHECK(wireValue(actual, "/prompt_cache_key") == sessions[index]);
+                CHECK(!actual.contains("session_id"));
+                CHECK(!actual.contains("cache_control"));
+            } else {
+                CHECK(!actual.contains("session_id"));
+                CHECK(!actual.contains("cache_control"));
+                CHECK(!actual.contains("prompt_cache_key"));
+                CHECK(actual == original);
+            }
+            if (index == 0) sameSession = actual;
+            if (index == 1) CHECK(actual == sameSession);
+            if (index == 2 && item.hints != 0) CHECK(actual != sameSession);
+        }
+        request.sessionId.clear();
+        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        CHECK(body() == original);
+        // 默认输出/推理设置不受会话提示影响，非零显式值和原始默认值都需保持。
+        request.maxOutputTokens = 0;
+        request.reasoningEffort.clear();
+        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        const json defaults = body();
+        CHECK(defaults.is_object());
+        if (!defaults.is_object()) continue;
+        CHECK(!defaults.contains("session_id") && !defaults.contains("cache_control") &&
+              !defaults.contains("prompt_cache_key"));
+        CHECK(!defaults.contains("max_output_tokens") && !defaults.contains("reasoning"));
+        request.sessionId = "session_alpha";
+        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        CHECK(withoutHints(body()) == defaults);
+    }
+}
+
+// 所有模型先验证同一输入契约，即使供应商不使用 sessionId 也不能把坏 ID 带入 HTTP 或错误文本。
+void test_responses_cache_session_rejects_bad_ids_before_http() {
+    const std::string marker = "synthetic-session-id-secret";
+    const std::vector<std::string> badIds{
+        marker + std::string(257 - marker.size(), 'x'),
+        " " + marker,
+        marker + " ",
+        marker + "\t",
+        marker + "\n",
+        marker + "\r",
+        marker + std::string(1, '\0'),
+        marker + std::string(1, '\x1f'),
+        marker + std::string(1, '\x7f'),
+        marker + "\xC3\xA9",
+        marker + "\xE7\x95\x8C",
+    };
+    for (const char* model :
+         {"anthropic/claude-fable-5.2", "glm-5.3", "glm-5.3-flash", "deepseek-flash",
+          "deepseek-v4-pro", "unknown-fixture", "local:synthetic"}) {
+        FakeServer fake;
+        fake.script = sse(json{{"type", "response.completed"},
+                               {"response", {{"status", "completed"}, {"output", json::array()}}}});
+        fake.start();
+        for (const auto& id : badIds) {
+            MaiModelRequest request;
+            request.model = model;
+            request.sessionId = id;
+            const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+            CHECK(!answer.done);
+            CHECK(answer.code == MaiErrorCode::InvalidInput);
+            CHECK(fake.requestCount.load() == 0);
+            CHECK(answer.error.find(marker) == std::string::npos);
+            CHECK(answer.text.empty() && answer.reasoning.empty());
+            CHECK(answer.calls.empty() && answer.continuations.empty());
+        }
+    }
+}
+
 // Fable 五档是模型能力，不能用旧全局三档列表把 medium/xhigh 静默省略或映射成其它值。
 void test_fable_responses_preserves_all_five_reasoning_efforts() {
     FakeServer fake;
@@ -3118,6 +3266,11 @@ void test_context_limits_output_budget_and_actual_usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--cache-session") {
+        test_responses_cache_session_hints_preserve_the_original_request();
+        test_responses_cache_session_rejects_bad_ids_before_http();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--openrouter-402") {
         test_openrouter_402_classifies_in_flight_budget_without_retry();
         test_openrouter_402_limits_do_not_infer_missing_or_foreign_metadata();
@@ -3246,6 +3399,8 @@ int main(int argc, char** argv) {
     test_responses_foreign_continuation_uses_only_ordinary_history();
     test_glm_responses_completes_without_done_and_keeps_metadata_only_state();
     test_fable_responses_preserves_all_five_reasoning_efforts();
+    test_responses_cache_session_hints_preserve_the_original_request();
+    test_responses_cache_session_rejects_bad_ids_before_http();
     test_responses_rejects_unsupported_model_efforts_before_http();
     test_cloud_effort_levels_reach_the_selected_wire();
     test_routed_models_keep_wire_key_and_failure_isolation();

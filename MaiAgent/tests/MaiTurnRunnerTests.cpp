@@ -716,6 +716,157 @@ void test_multi_turn_history() {
     CHECK(agent->listMessages(sessionId).size() == 4);
 }
 
+// 会话身份只用于请求路由；工具后继、下一轮及无工具补答都不能重新生成或丢掉它。
+void test_runner_session_identity_survives_tools_and_final_answer_recovery() {
+    class IdentityTool final : public MaiTool {
+    public:
+        std::vector<std::string> sessions;
+        std::string name() const override {
+            return "identity_probe";
+        }
+        std::string description() const override {
+            return "Observe the current owned session without side effects.";
+        }
+        std::string parametersSchema() const override {
+            return R"({"type":"object","properties":{},"additionalProperties":false})";
+        }
+        bool requiresWorkingDirectory(const std::string&) const override {
+            return false;
+        }
+        MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
+            sessions.push_back(context.sessionId);
+            return MaiToolResult::success("Observed the owned session.");
+        }
+    };
+    MaiFakeModelClient::Turn call;
+    call.invocations = {{"call_identity", "identity_probe", "{}"}};
+    MaiFakeModelClient::Turn answered;
+    answered.textChunks = {"First owned answer."};
+    MaiFakeModelClient::Turn empty;
+    MaiFakeModelClient::Turn final;
+    final.textChunks = {"Recovered owned answer."};
+    auto model = std::make_unique<MaiFakeModelClient>(
+        std::vector<MaiFakeModelClient::Turn>{call, answered, empty, final});
+    auto* observedModel = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    auto tool = std::make_unique<IdentityTool>();
+    auto* observedTool = tool.get();
+    tools->add(std::move(tool));
+    MaiAgent::Options options;
+    options.defaultModel = "anthropic/claude-fable-5.2";
+    options.reasoningEffort = "medium";
+    options.baseInstructions = "Keep the original instructions and reference order.";
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools), options);
+    const auto created = agent.submit(MaiCreateSession{"/tmp", "Owned routing session", ""});
+    CHECK(created);
+    if (!created) return;
+    const auto& sessionId = created.value();
+    CHECK(agent.submit(MaiSendPrompt{sessionId, "First owned request."}));
+    agent.waitIdle();
+    CHECK(agent.submit(MaiSendPrompt{sessionId, "Second owned request."}));
+    agent.waitIdle();
+    CHECK(observedTool->sessions == std::vector<std::string>{sessionId});
+    CHECK(observedModel->requestCount() == 4);
+    for (std::size_t index = 0; index < observedModel->requestCount(); ++index) {
+        const auto request = observedModel->request(index);
+        CHECK(request.sessionId == sessionId);
+        CHECK(request.model == options.defaultModel);
+        CHECK(request.reasoningEffort == options.reasoningEffort);
+        CHECK(request.baseInstructions == options.baseInstructions);
+        CHECK(request.maxOutputTokens == 0);
+        CHECK(!request.messages.empty());
+        if (!request.messages.empty()) {
+            CHECK(request.messages.front().role == MaiModelRole::User);
+            CHECK(request.messages.front().content == "First owned request.");
+        }
+        if (index < 3) {
+            CHECK(request.tools.size() == 1);
+            if (request.tools.size() == 1) {
+                CHECK(request.tools.front().name == "identity_probe");
+                CHECK(request.tools.front().parametersJson == observedTool->parametersSchema());
+            }
+        } else {
+            CHECK(request.tools.empty());
+        }
+        // 新身份字段不是提示词；本地估算不能因有无路由 ID 而改变。
+        auto withoutIdentity = request;
+        withoutIdentity.sessionId.clear();
+        const auto withEstimate = maiEstimateModelInputTokens(request);
+        const auto withoutEstimate = maiEstimateModelInputTokens(withoutIdentity);
+        CHECK(withEstimate.tokens == withoutEstimate.tokens);
+        CHECK(withEstimate.exact == withoutEstimate.exact);
+    }
+    if (observedModel->requestCount() == 4) {
+        const auto afterTool = observedModel->request(1);
+        bool hasOriginalToolResult = false;
+        for (const auto& message : afterTool.messages)
+            if (message.role == MaiModelRole::ToolResult && message.toolCallId == "call_identity") {
+                CHECK(message.content == "Observed the owned session.");
+                hasOriginalToolResult = true;
+            }
+        CHECK(hasOriginalToolResult);
+        bool hasSecondPrompt = false;
+        for (const auto& message : observedModel->request(3).messages)
+            if (message.role == MaiModelRole::User && message.content == "Second owned request.")
+                hasSecondPrompt = true;
+        CHECK(hasSecondPrompt);
+    }
+}
+
+// 根会话与真实子会话共享客户端，但每个请求必须使用其所属的既有会话 ID。
+void test_runner_session_identity_keeps_root_and_child_sessions_separate() {
+    auto model = std::make_unique<MaiFakeModelClient>();
+    model->setRepeatingTurn(defaultTurn());
+    auto* observedModel = model.get();
+    MaiAgent::Options options;
+    options.defaultModel = "deepseek-flash";
+    options.reasoningEffort = "high";
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), nullptr, options);
+    const auto rootA = agent.submit(MaiCreateSession{"/tmp", "Owned root A", "glm-5.3", "low"});
+    const auto rootB =
+        agent.submit(MaiCreateSession{"/tmp", "Owned root B", "deepseek-v4-pro", "max"});
+    CHECK(rootA && rootB);
+    if (!rootA || !rootB) return;
+    CHECK(rootA.value() != rootB.value());
+    CHECK(agent.submit(MaiSendPrompt{rootA.value(), "Owned root A request."}));
+    CHECK(agent.submit(MaiSendPrompt{rootB.value(), "Owned root B request."}));
+    const auto child = agent.spawnSubAgent(rootA.value(), "Owned child", "Owned child request.");
+    CHECK(child);
+    if (!child) {
+        agent.waitIdle();
+        return;
+    }
+    agent.waitIdle();
+    CHECK(child.value() != rootA.value() && child.value() != rootB.value());
+    MaiSession childSession;
+    CHECK(agent.getSession(child.value(), childSession));
+    CHECK(childSession.parentId == rootA.value());
+    CHECK(agent.submit(MaiSendPrompt{rootA.value(), "Owned root A after child."}));
+    agent.waitIdle();
+    const std::map<std::string, std::pair<std::string, std::string>> expected{
+        {"Owned root A request.", {rootA.value(), "glm-5.3"}},
+        {"Owned root B request.", {rootB.value(), "deepseek-v4-pro"}},
+        {"Owned child request.", {child.value(), "glm-5.3"}},
+        {"Owned root A after child.", {rootA.value(), "glm-5.3"}}};
+    std::set<std::string> observedPrompts;
+    CHECK(observedModel->requestCount() == expected.size());
+    for (std::size_t index = 0; index < observedModel->requestCount(); ++index) {
+        const auto request = observedModel->request(index);
+        std::string lastOwnedPrompt;
+        for (const auto& message : request.messages)
+            if (message.role == MaiModelRole::User && expected.count(message.content))
+                lastOwnedPrompt = message.content;
+        CHECK(!lastOwnedPrompt.empty());
+        if (lastOwnedPrompt.empty()) continue;
+        observedPrompts.insert(lastOwnedPrompt);
+        const auto& identity = expected.at(lastOwnedPrompt);
+        CHECK(request.sessionId == identity.first);
+        CHECK(request.model == identity.second);
+        CHECK(request.reasoningEffort == (identity.second == "deepseek-v4-pro" ? "max" : "low"));
+    }
+    CHECK(observedPrompts.size() == expected.size());
+}
+
 void test_reasoning_goes_to_its_own_part() {
     MaiFakeModelClient::Turn turn = defaultTurn();
     turn.reasoning = "let me think";
@@ -1465,6 +1616,7 @@ void test_specialist_text_reply_reaches_parent_without_a_file() {
     agent.waitIdle();
     CHECK(modelObserver->requestCount() == 2);
     const auto request = modelObserver->request(0);
+    CHECK(request.sessionId == session.id);
     CHECK(request.messages.size() == 2);
     if (request.messages.size() == 2) {
         CHECK(request.messages[0].role == MaiModelRole::System);
@@ -1472,6 +1624,7 @@ void test_specialist_text_reply_reaches_parent_without_a_file() {
         CHECK(request.messages[1].content.find("Summarize the result") != std::string::npos);
     }
     const auto afterTool = modelObserver->request(1);
+    CHECK(afterTool.sessionId == session.id);
     CHECK(afterTool.messages.size() == 5);
     if (afterTool.messages.size() == 5) {
         CHECK(afterTool.messages[1].content.find("child answer") != std::string::npos);
@@ -2618,6 +2771,13 @@ void test_untrusted_tool_output_cannot_claim_accepted_task_identity() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--cache-session") {
+        test_runner_session_identity_survives_tools_and_final_answer_recovery();
+        test_runner_session_identity_keeps_root_and_child_sessions_separate();
+        test_specialist_text_reply_reaches_parent_without_a_file();
+        std::printf("runner cache session checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--model-efforts") {
         test_runner_efforts_follow_the_actual_model_and_preserve_invalid_errors();
         std::printf("model effort runner checks: %d failure(s)\n", failures);
@@ -2677,6 +2837,8 @@ int main(int argc, char** argv) {
     }
     test_active_turn_compaction_uses_sqlite_stored_bytes();
     test_compacted_turn_reads_original_link_without_user_resend();
+    test_runner_session_identity_survives_tools_and_final_answer_recovery();
+    test_runner_session_identity_keeps_root_and_child_sessions_separate();
     test_full_turn();
     test_prompt_images_reach_the_current_user_message();
     test_request_is_assembled_correctly();
