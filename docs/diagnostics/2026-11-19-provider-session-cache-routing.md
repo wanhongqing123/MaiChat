@@ -38,3 +38,17 @@ Mac 普通消费者共 230 个产品对象全部新编译，旧产品对象复�
 Windows 标准 own-target clean 后新 ABI 产品构建及三 binary/114 PE/plugin 门禁为 0，普通 Controller28/Panel3/Remote4/Window4 用例均通过。Android 两 ARM ABI 的正常 native 新 Header 重编/链接 0/42 秒，未安装设备。
 
 这些只验证本端的请求参数和身份链路，不是供应商真实缓存命中或节省金额证明。候选 231 版本只改 app build number，尚未据此声称手机已更新；旧横屏及其他 UI 场景未重复运行，不计入本轮通过。
+
+## 已推送实现与 Windows 候选
+
+实现提交 `2dd34dc0f218eccb26154792ae1c558a2abcac54` 已正常推送并独立核对远端 main。
+同源新 ABI 私有候选 `MaiChat-win64-v3.0.1-20261119-2dd34dc0.zip` 为 242393512 字节，
+SHA256 `bb6b193bd519b6421e8bb6d0b9e732cd7b41b6ffdb4ff4f40f3671ef0728d892`；
+exe SHA256 为 `88bba07f9cb522857f6b171021b04439730d9aed89e180fe6033fe9f2cc7e425`。
+staging 和实际 ZIP 提取目录各运行一次 `--smoke`，退出均为 0（1.793/4.272 秒）；
+PATH 只有 Windows/System32，Qt 环境已清除。这是启动与依赖验证，不是供应商命中实测。
+用户现装 PID 59396 的 `D:\Program Files\MaiChat\maichat.exe` 未停止或替换，候选未发布上传。
+
+iOS 同源正常签名 Release 231 已就绪；安装前可信连接检查返回 CoreDevice 4016，
+未派发安装或启动，最新独立已装版本仍是 230。连接与解锁请求已在 Apple 端等待用户回复，
+具体构建和阻塞边界见 `2026-11-19-ios231-cache-package-delivery.md`。
