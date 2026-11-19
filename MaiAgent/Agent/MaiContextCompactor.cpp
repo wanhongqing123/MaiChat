@@ -132,6 +132,12 @@ std::size_t scaledTokens(MaiModelTokenEstimate count, double multiplier) {
                : static_cast<std::size_t>(scaled);
 }
 
+// 百分比均以原始窗口为基数，保持 floor(window * percent / 100) 的精度；
+// 分开商与余数避免乘法溢出。调用方只传入经过校验的不超过 100 的百分比。
+std::size_t windowPercent(std::size_t window, unsigned int percent) {
+    return window / 100 * percent + window % 100 * percent / 100;
+}
+
 std::vector<MaiModelMessage> summaryMessages(const MaiContextCheckpoint& checkpoint,
                                              MaiModelClient& model, const std::string& currentModel,
                                              std::size_t referenceTokens) {
@@ -260,8 +266,8 @@ MaiContextCheckpoint partialBoundary(const std::vector<MaiMessage>& history,
             keep = *latestContinuation;
             for (std::size_t partIndex = 0; partIndex < keep; ++partIndex) {
                 const auto* tool = std::get_if<MaiToolPart>(&message.parts[partIndex].body);
-                if (tool && (tool->state == MaiToolState::Pending ||
-                             tool->state == MaiToolState::Running))
+                if (tool &&
+                    (tool->state == MaiToolState::Pending || tool->state == MaiToolState::Running))
                     return boundary;
             }
         }
@@ -687,27 +693,32 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
         prepared.request = std::move(request);
         return prepared;
     }
+    // 对齐 Codex 的窗口余量策略：默认可用输入为原窗口的 95%，触发阈值单独
+    // 按原窗口计算，不把供应商允许的最长回答当作每次必需输出。工具声明已参与
+    // 输入估计，不能再固定扣除一份工具余量。显式请求或宿主预留可以进一步收紧。
+    // https://github.com/openai/codex/blob/6271f35f527bf7709b9af5e4e752e9f122706a17/
+    // codex-rs/protocol/src/openai_models.rs
+    const std::size_t effectiveWindow = windowPercent(limits.contextWindowTokens, 95);
     const std::size_t outputReserve =
-        std::min(request.maxOutputTokens != 0             ? request.maxOutputTokens
-                 : limits.defaultOutputReserveTokens != 0 ? limits.defaultOutputReserveTokens
-                                                          : limits.maxOutputTokens,
-                 limits.maxOutputTokens);
-    const std::size_t toolReserve =
-        request.tools.empty() ? 0 : std::min(std::size_t{8192}, limits.contextWindowTokens / 16);
-    if (outputReserve == 0 || outputReserve >= limits.contextWindowTokens ||
-        toolReserve >= limits.contextWindowTokens - outputReserve)
+        request.maxOutputTokens != 0 ? request.maxOutputTokens : limits.defaultOutputReserveTokens;
+    if (effectiveWindow == 0 || outputReserve >= limits.contextWindowTokens)
         return {MaiErrorCode::InvalidInput,
                 "The selected model has no input capacity after generation reserves."};
-    // 预算预留不改变主请求的生成策略：原 0 必须继续省略 wire 上限，显式值保持原样。
-    // 摘要子请求单独设置输出限额；不能以压缩为由把用户原本的长回答静默封顶到 32K。
-    const std::size_t inputBudget = limits.contextWindowTokens - outputReserve - toolReserve;
-    const std::size_t trigger = inputBudget / 100 * mOptions.triggerPercent;
-    const std::size_t target = inputBudget / 100 * mOptions.targetPercent;
+    // 预留必须按实际显式值计算，不能夹小预算却把更大的 cap 发给供应商。
+    // 此处只计算输入预算，原 0 继续省略 wire 上限，显式值和真实生成策略均保持不变。
+    const std::size_t inputBudget =
+        std::min(effectiveWindow, limits.contextWindowTokens - outputReserve);
+    const std::size_t trigger =
+        std::min(windowPercent(limits.contextWindowTokens, mOptions.triggerPercent), inputBudget);
+    const std::size_t target =
+        std::min(windowPercent(limits.contextWindowTokens, mOptions.targetPercent), inputBudget);
+    if (trigger == 0 || target == 0)
+        return {MaiErrorCode::InvalidInput, "The selected model has no usable context budget."};
     const auto estimate = [&](const MaiModelRequest& value) {
         return scaledTokens(model.estimateInputTokens(value), mOptions.estimateMultiplier);
     };
     prepared.inputEstimate = model.estimateInputTokens(request);
-    if (estimate(request) <= trigger) {
+    if (estimate(request) < trigger) {
         prepared.request = std::move(request);
         return prepared;
     }
@@ -781,8 +792,13 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
     // 摘要请求本身同样受实际窗口约束；历史块过长时按 UTF-8 边界分块，标明精确来源偏移。
     const std::size_t summaryOutput =
         std::min({limits.maxOutputTokens, std::size_t{16384}, limits.contextWindowTokens / 8});
-    const std::size_t summaryInput = limits.contextWindowTokens - summaryOutput;
+    const std::size_t summaryInput =
+        std::min(effectiveWindow, limits.contextWindowTokens - summaryOutput);
     const std::size_t summaryLimit = std::min(std::size_t{8192}, limits.contextWindowTokens / 16);
+    // 极小窗口不能把摘要输出 0 发送为供应商默认无限额，也不能产生零摘要预算。
+    if (summaryOutput == 0 || summaryLimit == 0)
+        return {MaiErrorCode::InvalidInput,
+                "The selected model has no usable context summarization budget."};
     const auto sourceFingerprint = maiContextSourceFingerprint(sessionId, history, history.size());
     // Runner 可有意过滤尚未消费的 steering；保存当时完整 store 前缀，既允许这些
     // 已知排除项存在，也不漏掉摘要过程中对它们或真实来源/尾部的并发修改。

@@ -161,7 +161,8 @@ struct MaiModelContextLimits {
     std::size_t contextWindowTokens = 0;
     std::size_t maxOutputTokens = 0;
     // 仅用于输入预算的可选生成预留，不写入 wire、不会限制实际生成长度。
-    // 0 保守预留目录中的 maxOutputTokens；本地 automatic 模式可指定运行时余量策略，
+    // 0 使用压缩器的窗口比例余量，不按目录最大输出全额预留；本地 automatic 模式
+    // 可指定更保守的运行时余量策略，
     // 因为其真实输出上限由“窗口减实际输入”动态决定，不能预留整个窗口而拒绝所有输入。
     std::size_t defaultOutputReserveTokens = 0;
 };

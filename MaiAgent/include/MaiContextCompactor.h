@@ -39,8 +39,9 @@ struct MaiContextPreparation {
 class MaiContextCompactor {
 public:
     struct Options {
-        // 触发/目标占扣除生成和工具余量后的输入容量百分比，须 0 < target < trigger < 100。
-        unsigned int triggerPercent = 80;
+        // 触发/目标按原始窗口分别计算，须 0 < target < trigger < 100；默认在 90%
+        // 尝试整理，输入硬预算为窗口的 95%。明确的生成预留可进一步收紧三个预算。
+        unsigned int triggerPercent = 90;
         unsigned int targetPercent = 60;
         // 最近的完整用户轮次（包含当前轮）保持原文，至少 1；从不拆开工具调用与回执。
         std::size_t retainRecentTurns = 2;
