@@ -26,3 +26,33 @@ Builder 默认没有固定字节预算裁剪历史文字；非零预算属于显
 与已安装 230 对应的产品源码 `f785e2c2` 比较，Compactor/Runner 后继改动仅是会话路由身份透传和一致性校验；Builder 和原史读取在该区间无改动。这里说明现有实现，不代替设备当前进程、特定会话检查点或摘要质量的实测。未修改产品策略，也未进行付费重现。
 
 结论：聊天记录可追溯，但模型当前窗口不是旧对话的无损副本；应明确承认摘要遗漏和未主动回查导致忘记细节的风险。
+
+## 当前压缩阈值及官方容量
+
+后续问题要求核对各型号约 1M 窗口与何时开始压缩。已重新核对 [DeepSeek](https://api-docs.deepseek.com/quick_start/pricing/)、[GLM-5.3](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3)、[GLM-5.3-Flash](https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash) 和 [Fable 5.2](https://openrouter.ai/anthropic/claude-fable-5.2) 当前官方页面：约 1M 容量与现目录一致。
+
+App 云端请求的 `maxOutputTokens` 默认为 0，未覆写目录的 `defaultOutputReserveTokens`，因此本地预算采用官方最大输出作预留；这不会将该数字发成生成上限，也不表示每次实际生成或收取这么多输出。默认带工具时另预留 8192 token，开始整理的门槛是 `floor((window-outputReserve-toolReserve)/100)*80`。
+
+| 型号 | 目录窗口 | 本地输出预留 | 开始尝试整理的输入估计阈值 |
+| --- | ---: | ---: | ---: |
+| DeepSeek Flash / V4 Pro | 1,048,576 | 393,216 | 超过 517,680 |
+| GLM-5.3 / Flash | 1,048,576 | 131,072 | 超过 727,440 |
+| Fable 5.2 | 1,000,000 | 128,000 | 超过 691,040 |
+| Particle-1 Free | 1,048,576 | 131,072 | 超过 727,440 |
+
+这些是一次请求的上下文输入估计，包括固定指令、工具声明、历史、回传状态及图片余量，不是字符数或多次账单用量之和。默认估算并非各厂商 tokenizer 精确值；同一 Runner 若真实 input usage 高于估算，会提高倍率并更早触发。软区延期等情形另有边界，越过阈值不代表摘要一定已成功。
+
+## Codex 官方源码对照
+
+先检查已有本地 Codex，发现它是 `wanhongqing123/codex` fork，HEAD `ac71f246`，不能直接视为官方现状。随后经 GitHub 插件读取 `openai/codex` 当前 main，固定在 `6271f35f527bf7709b9af5e4e752e9f122706a17`；七份相关原文件已按官方 blob 逐等核对，研究材料留在仓库外。本次没有改动该本地 fork 或引入其源码作为产品依赖。
+
+- [ModelInfo 的通用阈值](https://github.com/openai/codex/blob/6271f35f527bf7709b9af5e4e752e9f122706a17/codex-rs/protocol/src/openai_models.rs#L577)：自动压缩默认直接取原窗口 90%，有显式型号阈值时取更小者；可用窗口默认 95% 是另一项计算，不能相乘成 85.5%。没有 MaiChat 的“先扣最大输出再乘 80%”链。具体型号/配置仍可能更早，不能把 90% 承诺给所有现装会话。
+- [上下文计数](https://github.com/openai/codex/blob/6271f35f527bf7709b9af5e4e752e9f122706a17/codex-rs/core/src/context_manager/history.rs#L1201)：优先使用上次供应商 usage，再补新加入内容和必要的旧推理估计。无精确计数时仍需估算；不是整场会话累计消费。
+- [调用时机](https://github.com/openai/codex/blob/6271f35f527bf7709b9af5e4e752e9f122706a17/codex-rs/core/src/session/turn.rs#L1669)：回合前检查，并可在需要继续调用时于回合中压缩；回合前源码仍标有新输入预估的 TODO。本次未取官方完整配置，未把 fork 的后置/后台默认参数冒充官方默认。
+- [本地摘要后的窗口](https://github.com/openai/codex/blob/6271f35f527bf7709b9af5e4e752e9f122706a17/codex-rs/core/src/compact.rs#L745)：近期 user 文本有 20,000 token 预算，另保留显式要求保留的客户端内容；该独立保留路径也有 64,000 token 预算。超限边界可以截断并标记来源不完整，普通旧 assistant/tool 不会全部原样保留。
+- [远端 V2](https://github.com/openai/codex/blob/6271f35f527bf7709b9af5e4e752e9f122706a17/codex-rs/core/src/compact_remote_v2.rs#L558)：客户端选择有界保留项并拼接服务端返回的 compaction 项。源码不能证明不透明服务端状态在语义上无损。显式保留、特定客户端工具观察与所有原始工具结果并非同一承诺。
+- [采纳保护](https://github.com/openai/codex/blob/6271f35f527bf7709b9af5e4e752e9f122706a17/codex-rs/core/src/compact_remote_v2_installation.rs#L92)：型号与 compaction hash 不匹配时拒绝候选，使用前缀专用采纳入口，并在采纳后重新检查预算。真正会话状态 primitive 未包含于本次七文件取证，不从 fork 泛化原子落盘顺序。
+
+[官方配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)也将自动阈值、计数范围及供应商远端压缩能力列为独立配置。Responses 兼容并不自动证明某厂商支持 Codex 的远端压缩协议。
+
+可借鉴点是按型号设定合理触发余量、优先采用真实 usage 校正、显式保留关键原文及安全采纳边界。MaiChat 当前最大输出预留使默认策略尤其在 DeepSeek 上偏保守；不能只把比例改成 90% 而省略生成余量和工具组完整性验证。本轮仍为代码与公开文档核查，产品阈值及摘要策略均未修改，模型调用为 0。
