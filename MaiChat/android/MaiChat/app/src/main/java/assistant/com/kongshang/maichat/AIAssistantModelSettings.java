@@ -8,6 +8,7 @@ import org.json.JSONObject;
 final class AIAssistantModelSettings {
     static final String LOCAL_MODEL_ID = "builtin-qwen3.5-2b-q4_k_m";
     static final String OPENROUTER_MODEL = "anthropic/claude-fable-5.2";
+    static final String PARTICLE_FREE_MODEL = "particle-ai/particle-1:free";
     final String cloudModel, policy, effort;
     private final boolean local;
 
@@ -49,7 +50,7 @@ final class AIAssistantModelSettings {
     // This is the host's endpoint projection only. Shared native routes own execution,
     // capabilities and request serialization for the same exact cloud model identifiers.
     static String baseUrlForModel(String model) {
-        if (OPENROUTER_MODEL.equals(model)) return "https://openrouter.ai/api/v1";
+        if (isOpenRouterModel(model)) return "https://openrouter.ai/api/v1";
         if ("deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model))
             return "https://api.deepseek.com";
         if ("glm-5.3".equals(model) || "glm-5.3-flash".equals(model))
@@ -91,7 +92,12 @@ final class AIAssistantModelSettings {
 
     static boolean supportedCloud(String model) {
         return "deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model)
-            || "glm-5.3".equals(model) || "glm-5.3-flash".equals(model) || OPENROUTER_MODEL.equals(model);
+            || "glm-5.3".equals(model) || "glm-5.3-flash".equals(model) || isOpenRouterModel(model);
+    }
+    // Both exact product identifiers use the current account's OpenRouter route;
+    // aliases or the paid Particle endpoint must not borrow this credential.
+    static boolean isOpenRouterModel(String model) {
+        return OPENROUTER_MODEL.equals(model) || PARTICLE_FREE_MODEL.equals(model);
     }
     private static boolean supportedPolicy(String policy) {
         return "on-request".equals(policy) || "unless-trusted".equals(policy) || "never".equals(policy);

@@ -64,6 +64,9 @@ MaiModelContextLimits maiOfficialModelContextLimits(const std::string& baseUrl,
         return {1048576, 393216};
     if (endpoint == "https://openrouter.ai/api/v1" && model == "anthropic/claude-fable-5.2")
         return {1000000, 128000};
+    // https://docs.particle.ai/models；不把收费同名或其它代理地址视为此免费目录容量。
+    if (endpoint == "https://openrouter.ai/api/v1" && model == "particle-ai/particle-1:free")
+        return {1048576, 131072};
     return {};
 }
 

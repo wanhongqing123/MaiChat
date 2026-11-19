@@ -1866,18 +1866,22 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     modelOptionsLayout->setSpacing(0);
     for (const QString& model :
          {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
-          QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2")}) {
-        auto* option = new QPushButton(model, modelOptions);
+          QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2"),
+          QStringLiteral("particle-ai/particle-1:free")}) {
+        const QString title =
+            model == QStringLiteral("particle-ai/particle-1:free") ? QStringLiteral("Particle-1（免费）") : model;
+        auto* option = new QPushButton(title, modelOptions);
+        if (model == QStringLiteral("particle-ai/particle-1:free"))
+            option->setToolTip(QStringLiteral("免费主模型有额度限制；外部工具按各自规则计费。"));
         option->setObjectName(QStringLiteral("agentModelOption-") + model);
         option->setProperty("model", model);
         option->setCheckable(true);
         option->setAutoExclusive(true);
         option->setFixedHeight(UiZoom::s(38));
-        UiZoom::setStyle(
-            option, QStringLiteral(
-                        "QPushButton{padding-left:20px;text-align:left;background:#f5f8fc;}"
-                        "QPushButton:hover{background:#e8f2fc;}"
-                        "QPushButton:checked{background:#e6f2ff;color:#0a65ad;font-weight:600;}"));
+        UiZoom::setStyle(option,
+                         QStringLiteral("QPushButton{padding-left:20px;text-align:left;background:#f5f8fc;}"
+                                        "QPushButton:hover{background:#e8f2fc;}"
+                                        "QPushButton:checked{background:#e6f2ff;color:#0a65ad;font-weight:600;}"));
         modelOptionsLayout->addWidget(option);
         runtime_->modelOptionButtons.append(option);
         connect(option, &QPushButton::clicked, this, [this, actionPanel, model] {
@@ -2350,12 +2354,15 @@ QString AgentChatPanel::sessionId() const {
 }
 
 void AgentChatPanel::setModelLabel(const QString& label, bool configured) {
+    const QString displayLabel =
+        label == QStringLiteral("particle-ai/particle-1:free") ? QStringLiteral("Particle-1（免费）") : label;
+    // The raw identifier remains the capability/selection source; only its visible label changes.
     runtime_->modelChip->setText(label);
     runtime_->modelConfigured = configured && label != QStringLiteral("未配置模型") && !label.trimmed().isEmpty();
     runtime_->modelChip->setEnabled(runtime_->modelConfigured && !runtime_->running);
-    if (runtime_->modelSectionValue) runtime_->modelSectionValue->setText(label);
+    if (runtime_->modelSectionValue) runtime_->modelSectionValue->setText(displayLabel);
     if (runtime_->modelSection)
-        runtime_->modelSection->setAccessibleName(QStringLiteral("主模型：%1").arg(label));
+        runtime_->modelSection->setAccessibleName(QStringLiteral("主模型：%1").arg(displayLabel));
     for (QPushButton* option : runtime_->modelOptionButtons) {
         // 自定义/本地型号不属于云选项时，旧云选中状态也必须清掉。
         option->setAutoExclusive(false);

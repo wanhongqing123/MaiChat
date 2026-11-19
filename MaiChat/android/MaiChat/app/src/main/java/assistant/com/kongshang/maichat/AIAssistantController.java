@@ -1464,7 +1464,7 @@ public final class AIAssistantController {
 
     private String cloudKey(String model) {
         if (testEndpoint != null) return "test-key";
-        if (AIAssistantModelSettings.OPENROUTER_MODEL.equals(model)) return openrouterApiKey;
+        if (AIAssistantModelSettings.isOpenRouterModel(model)) return openrouterApiKey;
         if ("deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model)) return deepseekApiKey;
         if ("glm-5.3".equals(model) || "glm-5.3-flash".equals(model)) return glmApiKey;
         return "";

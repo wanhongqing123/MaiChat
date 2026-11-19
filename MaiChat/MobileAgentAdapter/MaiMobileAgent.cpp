@@ -735,7 +735,7 @@ struct MaiMobileAgent {
             else if (providerName == "deepseek")
                 route.modelNames = {"deepseek-flash", "deepseek-v4-pro"};
             else
-                route.modelNames = {"anthropic/claude-fable-5.2"};
+                route.modelNames = {"anthropic/claude-fable-5.2", "particle-ai/particle-1:free"};
             route.config = config;
             route.config.apiKey.clear();
             route.config.wire = MaiWireApi::Responses;
@@ -755,7 +755,7 @@ struct MaiMobileAgent {
         if (nextLocalRoute) nextRoutes.routes.push_back(*nextLocalRoute);
         if (!isLocal && !defaultCapability) {
             // 普通 C ABI 仍可显式配置自有端点/型号（含合成测试），只允许该精确型号。
-            // 产品五型号始终走以上账号提供器；这不是账号缺失时的另一条业务兜底。
+            // 产品六型号始终走以上账号提供器；这不是账号缺失时的另一条业务兜底。
             MaiModelRoute route;
             route.modelNames = {requestedModel};
             route.config = config;

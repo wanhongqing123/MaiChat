@@ -311,11 +311,22 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
         // 空身份保留旧普通调用；自动缓存提示不改变原 input/instructions/tools 或输出预算。
         if (capability->provider == "openrouter") {
             body["session_id"] = request.sessionId;
-            body["cache_control"] = Json{{"type", "ephemeral"}};
+            // 此显式自动断点是已核 Claude 合同，不能仅凭同为 OpenRouter 推给免费模型。
+            if (request.model == "anthropic/claude-fable-5.2")
+                body["cache_control"] = Json{{"type", "ephemeral"}};
         } else if (capability->provider == "glm") {
             body["prompt_cache_key"] = request.sessionId;
         }
         // DeepSeek 自动管理上下文缓存；不发送其明确不支持的缓存路由参数。
+    }
+    if (request.model == "particle-ai/particle-1:free") {
+        // 免费是明确的请求约束，即使普通调用没有 sessionId 也不能省略价格守卫。
+        // 不启用付费插件或替代型号；没有零价供应商时直接失败，不接受收费回退。
+        // https://openrouter.ai/docs/guides/routing/provider-selection#max-price
+        body["provider"] = Json{
+            {"max_price", Json{{"prompt", 0}, {"completion", 0}, {"request", 0}, {"image", 0}}},
+            {"allow_fallbacks", false}};
+        body["plugins"] = Json::array();
     }
     if (request.maxOutputTokens != 0) body["max_output_tokens"] = request.maxOutputTokens;
     if (capability && !request.reasoningEffort.empty())

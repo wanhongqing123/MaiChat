@@ -112,9 +112,12 @@ QString sessionKey(const QJsonObject& value) {
 }
 
 const QStringList& sessionModelChoices() {
-    static const QStringList models{QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
-                                    QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro"),
-                                    QStringLiteral("anthropic/claude-fable-5.2")};
+    static const QStringList models{QStringLiteral("glm-5.3"),
+                                    QStringLiteral("glm-5.3-flash"),
+                                    QStringLiteral("deepseek-flash"),
+                                    QStringLiteral("deepseek-v4-pro"),
+                                    QStringLiteral("anthropic/claude-fable-5.2"),
+                                    QStringLiteral("particle-ai/particle-1:free")};
     return models;
 }
 
@@ -829,7 +832,11 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
     modelOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
     modelOptionsLayout->setSpacing(0);
     for (const auto& model : sessionModelChoices()) {
-        auto* option = new QPushButton(model, runtime_->modelOptions);
+        const QString title =
+            model == QStringLiteral("particle-ai/particle-1:free") ? QStringLiteral("Particle-1（免费）") : model;
+        auto* option = new QPushButton(title, runtime_->modelOptions);
+        if (model == QStringLiteral("particle-ai/particle-1:free"))
+            option->setToolTip(QStringLiteral("免费主模型有额度限制；外部工具按各自规则计费。"));
         option->setObjectName(QStringLiteral("remoteAgentModelOption-") + model);
         option->setProperty("model", model);
         option->setCheckable(true);
@@ -1414,9 +1421,10 @@ void RemoteAgentPanel::updateSessionModelControls() {
     // not implement provider effort. Use the shared capability, not a UI guess.
     const auto capability = maiCloudModelInfo(model.toUtf8().toStdString());
     const bool effortAvailable = available && capability && capability->supportsReasoningEffort;
-    runtime_->modelValue->setText(model.isEmpty()
-                                     ? pending ? QStringLiteral("正在读取") : QStringLiteral("未确认")
-                                     : model);
+    runtime_->modelValue->setText(model.isEmpty() ? pending ? QStringLiteral("正在读取") : QStringLiteral("未确认")
+                                  : model == QStringLiteral("particle-ai/particle-1:free")
+                                      ? QStringLiteral("Particle-1（免费）")
+                                      : model);
     runtime_->effortValue->setText(sessionEffortTitle(effort));
     runtime_->modelSection->setAccessibleName(QStringLiteral("主模型：") + runtime_->modelValue->text());
     runtime_->effortSection->setAccessibleName(QStringLiteral("思考强度：") + runtime_->effortValue->text());

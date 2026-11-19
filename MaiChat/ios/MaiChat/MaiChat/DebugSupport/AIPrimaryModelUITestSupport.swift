@@ -27,6 +27,7 @@ enum AIPrimaryModelUITestSupport {
 /// 只观察真实配置和已持久化消息，绝不安装 handler 或生成测试回复。
 struct AIPrimaryModelUITestStatus: View {
     @ObservedObject private var model = AIAssistantModel.shared
+    @ObservedObject private var support = AIAssistantModel.shared.uiTestSupport
 
     var body: some View {
         let count = model.messages.filter { message in
@@ -37,6 +38,14 @@ struct AIPrimaryModelUITestStatus: View {
         let latest = model.messages.last(where: { $0.role == "assistant" })?.parts
             .filter { $0.kind == "text" }.compactMap(\.text).joined(separator: "\n") ?? ""
         VStack(spacing: 0) {
+            if ProcessInfo.processInfo.arguments.contains("--ai-particle-owned-vision-ui-test") {
+                Button("导入自有图片") { Task { await model.importParticleOwnedVisionFixture() } }
+                    .accessibilityIdentifier("particle-import-owned-image")
+                Button("验自有图文队列") { Task { await model.sendParticleOwnedVisionFixture() } }
+                    .accessibilityIdentifier("particle-send-owned-image-queue")
+                Text("自有图片状态").accessibilityIdentifier("particle-owned-vision-status")
+                    .accessibilityValue(support.particleOwnedVisionStatus)
+            }
             Text("实际主模型状态")
                 .font(.caption2)
                 .accessibilityIdentifier("primary-ui-model-state")
@@ -44,7 +53,7 @@ struct AIPrimaryModelUITestStatus: View {
             Text("会话模型配置")
                 .font(.caption2)
                 .accessibilityIdentifier("primary-ui-session-configuration")
-                .accessibilityValue("session:\(model.selected);model:\(model.settings.model);effort:\(model.settings.effectiveReasoningEffort);wire:\(model.actualWire);remote:\(model.selectedRemote != nil);stored-effort:\(model.settings.reasoningEffort ?? "");supported:\(model.availableReasoningEfforts.joined(separator: ","))")
+                .accessibilityValue("session:\(model.selected);model:\(model.settings.model);effort:\(model.settings.effectiveReasoningEffort);wire:\(model.actualWire);remote:\(model.selectedRemote != nil);stored-effort:\(model.settings.reasoningEffort ?? "");supported:\(model.availableReasoningEfforts.joined(separator: ","));catalog-provider:\(AIModelSettings.cloudProvider(for: model.settings.model) ?? (model.settings.isLocalModel ? "llama" : "unavailable"))")
             if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") {
                 AISessionModelRemoteUITestStatus()
             }

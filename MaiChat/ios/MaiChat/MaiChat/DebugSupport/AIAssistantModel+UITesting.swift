@@ -45,6 +45,7 @@ final class AIAssistantModelUITestSupport: ObservableObject {
     @Published var toolDetailCapacityObservation = ""
 
     @Published var sessionModelPolicyResult = "未执行"
+    @Published var particleOwnedVisionStatus = "not imported"
     #endif
 }
 
@@ -553,6 +554,56 @@ extension AIAssistantModel {
                     "missing/null owner B default inherited owner A medium")
         }
         uiTestSupport.sessionModelCommandHandler = savedOwnerHandler
+        // A new free model reuses only the OpenRouter account route. These are
+        // host/owner boundaries; native support waits for the same-source Core packet.
+        await selectRemoteConversation(a)
+        for previous in ["medium", "xhigh"] {
+            await selectPrimaryModel(AIModelSettings.fableModel, reasoningEffort: previous)
+            guard let fableChoice = commands.last else { return }
+            await deliverSessionModelUITestReceipt(owner: a, id: fableChoice.1,
+                result: capableResult(model: AIModelSettings.fableModel, effort: previous))
+            await selectPrimaryModel(AIModelSettings.particleFreeModel)
+            guard let freeChoice = commands.last else { return }
+            require(freeChoice.2["model"] as? String == AIModelSettings.particleFreeModel &&
+                    freeChoice.2["reasoningEffort"] as? String == "high",
+                    "Fable-only override was sent to the free model without normalization")
+            require(settings.model == AIModelSettings.fableModel && settings.reasoningEffort == previous,
+                    "free model selection committed before owner acceptance")
+            await deliverSessionModelUITestReceipt(owner: a, id: freeChoice.1,
+                result: capableResult(model: AIModelSettings.particleFreeModel, effort: "xhigh"))
+            require(settings.model == AIModelSettings.fableModel, "free model accepted an unsupported xhigh ACK")
+            var invalidCapabilities = capableResult(model: AIModelSettings.particleFreeModel, effort: "high")
+            invalidCapabilities["supportedReasoningEfforts"] = AIModelSettings.fableReasoningEfforts
+            await deliverSessionModelUITestReceipt(owner: a, id: freeChoice.1, result: invalidCapabilities)
+            require(settings.model == AIModelSettings.fableModel, "free model borrowed Fable-only capabilities")
+            await deliverSessionModelUITestReceipt(owner: a, id: freeChoice.1,
+                result: capableResult(model: AIModelSettings.particleFreeModel, effort: "high"))
+            require(settings.model == AIModelSettings.particleFreeModel &&
+                    settings.displayName == "Particle-1（免费）" && settings.baseUrl == AIModelSettings.openRouterUrl &&
+                    AIModelSettings.cloudProvider(for: settings.model) == "openrouter" &&
+                    availableReasoningEfforts == AIModelSettings.ordinaryReasoningEfforts,
+                    "free model owner choice used another provider or effort set")
+            let beforeInvalid = commands.count
+            await selectPrimaryModel(AIModelSettings.particleFreeModel, reasoningEffort: "xhigh")
+            await selectPrimaryModel(AIModelSettings.particleFreeModel, reasoningEffort: "medium")
+            require(commands.count == beforeInvalid && settings.reasoningEffort == "high",
+                    "explicit free-only invalid effort was remapped or dispatched")
+        }
+        for effort in AIModelSettings.ordinaryReasoningEfforts {
+            await selectReasoningEffort(effort)
+            guard let choice = commands.last else { return }
+            await deliverSessionModelUITestReceipt(owner: a, id: choice.1,
+                result: capableResult(model: AIModelSettings.particleFreeModel, effort: effort))
+            require(settings.model == AIModelSettings.particleFreeModel && settings.reasoningEffort == effort,
+                    "free model valid three-level choice was lost")
+        }
+        var ordinaryFree = AIModelSettings()
+        ordinaryFree.selectModel(AIModelSettings.fableModel); ordinaryFree.reasoningEffort = "xhigh"
+        ordinaryFree.selectModel(AIModelSettings.particleFreeModel)
+        require(ordinaryFree.model == AIModelSettings.particleFreeModel && ordinaryFree.reasoningEffort == "high" &&
+                ordinaryFree.baseUrl == AIModelSettings.openRouterUrl &&
+                AIModelSettings.cloudProvider(for: "particle-ai/particle-1") == nil,
+                "ordinary free settings guessed a provider alias or kept Fable-only effort")
         let offline = owner("offline", online: false)
         applyUITestMutation(.remoteSessions([a, b, local, offline]))
         let beforeOffline = commands.count
@@ -560,6 +611,48 @@ extension AIAssistantModel {
         require(commands.count == beforeOffline && !canChangeSessionModel, "offline owner accepted model mutation")
         await selectRemoteConversation(b)
         uiTestSupport.sessionModelPolicyResult = failures.isEmpty ? "PASS \(checks) owner protocol checks" : "FAIL " + failures.joined(separator: " | ")
+    }
+
+    /// An owned image exercises the ordinary import/admission/composer pipeline;
+    /// no Photos, camera or user file is opened by this explicit Simulator fixture.
+    func importParticleOwnedVisionFixture() async {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-particle-owned-vision-ui-test"),
+              AIPrimaryModelUITestSupport.isSessionConfigurationRequested,
+              selectedRemote == nil, !selected.isEmpty else { return }
+        // The ordinary attachment picker dismisses the composer before import.
+        // Preserve that boundary so changing allowsEmptySubmit does not reload
+        // an actively composing keyboard inside this explicit test hook.
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+            to: nil, from: nil, for: nil)
+        uiTestSupport.particleOwnedVisionStatus = "importing"
+        let target = importTarget()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("owned-particle-image-" + UUID().uuidString, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("particle-owned-blue.png")
+            let image = UIGraphicsImageRenderer(size: CGSize(width: 24, height: 16)).image { context in
+                UIColor.systemBlue.setFill(); context.fill(CGRect(x: 0, y: 0, width: 24, height: 16))
+            }
+            guard let data = image.pngData() else { throw CancellationError() }
+            try data.write(to: url)
+            guard let imported = await importFile(url), addAttachments([imported], to: target) == 1 else {
+                throw CancellationError()
+            }
+            uiTestSupport.particleOwnedVisionStatus = "ready"
+        } catch { uiTestSupport.particleOwnedVisionStatus = "failed: " + error.localizedDescription }
+    }
+
+    /// This explicit test control verifies the same public queue entry after
+    /// ordinary import; it does not represent keyboard-send acceptance.
+    func sendParticleOwnedVisionFixture() async {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-particle-owned-vision-ui-test"),
+              AIPrimaryModelUITestSupport.isSessionConfigurationRequested,
+              selectedRemote == nil, settings.model == AIModelSettings.particleFreeModel,
+              !selected.isEmpty, !(pendingAttachments[selected] ?? []).isEmpty else { return }
+        let session = selected
+        let accepted = await sendMessage("Owned free image reply", expectedSession: session)
+        uiTestSupport.particleOwnedVisionStatus = accepted ? "queued" : "refused"
     }
 
     /// Use the real wire decoder/projection. The remote path is deliberately

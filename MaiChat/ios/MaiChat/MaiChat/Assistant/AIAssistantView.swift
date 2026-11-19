@@ -1403,6 +1403,17 @@ private struct AIActionPanel: View {
                             selectModel(AIModelSettings.fableModel)
                         }
                         .accessibilityIdentifier("ai-primary-model-" + AIModelSettings.fableModel)
+                        // Keep free-tier limits beside the explicit free model choice.
+                        option("Particle-1（免费）", selected: selectedModelID == AIModelSettings.particleFreeModel) {
+                            selectModel(AIModelSettings.particleFreeModel)
+                        }
+                        .accessibilityIdentifier("ai-primary-model-" + AIModelSettings.particleFreeModel)
+                        Text("免费额度有限，可能限流；不会自动改用付费线路。")
+                            .font(AppTypography.metadata)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 6)
                         if allowLocalModel {
                             option("本地模型", selected: isLocalModel) { selectModel("local:" + AILocalModelStore.bundledPrimaryID) }
                                 .accessibilityIdentifier("ai-primary-model-local")

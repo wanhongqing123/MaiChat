@@ -18,6 +18,13 @@ std::optional<MaiCloudModelInfo> maiCloudModelInfo(const std::string& model) {
     if (model == "anthropic/claude-fable-5.2")
         return MaiCloudModelInfo{model, "openrouter", MaiWireApi::Responses,
                                  true,  true,         {1000000, 128000}};
+    // 免费端点必须保留精确后缀，不能用同名收费型号替代。能力及实际三档由一手文档核对。
+    // https://openrouter.ai/particle-ai/particle-1:free
+    // https://docs.particle.ai/models
+    // https://docs.particle.ai/reasoning
+    if (model == "particle-ai/particle-1:free")
+        return MaiCloudModelInfo{model, "openrouter", MaiWireApi::Responses,
+                                 true,  true,         {1048576, 131072}};
     return std::nullopt;
 }
 

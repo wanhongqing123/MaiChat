@@ -77,7 +77,11 @@ private final class SessionModelHTTPFixture: @unchecked Sendable {
         // boundary, not the provider's ordinary modern continuation contract.
         let messageID = "msg_owned_" + UUID().uuidString.lowercased()
         let requestedEffort = (object["reasoning"] as? [String: Any])?["effort"] as? String ?? "inherited"
-        let replyText = provider == .openrouter ? provider.reply + " (" + requestedEffort + ")" : provider.reply
+        let hasImage = (object["input"] as? [[String: Any]] ?? []).contains { item in
+            (item["content"] as? [[String: Any]] ?? []).contains { $0["type"] as? String == "input_image" }
+        }
+        let replyText = provider == .openrouter
+            ? provider.reply + " (" + (hasImage ? "image" : requestedEffort) + ")" : provider.reply
         let content: [String: Any] = ["type": "output_text", "text": replyText, "annotations": []]
         let message: [String: Any] = ["id": messageID, "type": "message", "role": "assistant",
                                       "status": "completed", "content": [content]]
@@ -123,6 +127,178 @@ final class SessionModelsUITests: XCTestCase {
 
     /// A normal model selection must expose the model's actual effort menu.
     /// This first checks availability only; no unsupported old-Core selection is faked.
+    /// Merely opening the new free choice must not replace an existing session's
+    /// model or claim a successful selection before the native/owner receipt.
+    @MainActor
+    func testParticleFreeEntryPreservesExistingSessionSelection() throws {
+        continueAfterFailure = false
+        let glm = try SessionModelHTTPFixture(provider: .glm)
+        let deepseek = try SessionModelHTTPFixture(provider: .deepseek)
+        let openrouter = try SessionModelHTTPFixture(provider: .openrouter)
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test", "--ai-session-model-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_GLM_PORT"] = String(glm.port)
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_DEEPSEEK_PORT"] = String(deepseek.port)
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_OPENROUTER_PORT"] = String(openrouter.port)
+        app.launch(); defer { app.terminate() }
+        let config = app.staticTexts["primary-ui-session-configuration"]
+        XCTAssertTrue(config.waitForExistence(timeout: 30))
+        XCTAssertTrue((config.value as? String ?? "").contains("model:deepseek-flash;"))
+        app.buttons["更多"].tap(); app.buttons["ai-primary-model-settings"].tap()
+        let menu = app.descendants(matching: .any)["ai-action-panel"]
+        let entry = app.buttons["ai-primary-model-particle-ai/particle-1:free"]
+        if entry.exists && !entry.isHittable { menu.swipeUp() }
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "particle-free-main-model-entry"; screenshot.lifetime = .keepAlways; add(screenshot)
+        XCTAssertTrue(entry.waitForExistence(timeout: 5), "The normal main-model menu lacks the free Particle entry")
+        XCTAssertEqual(entry.label, "Particle-1（免费）")
+        XCTAssertTrue((config.value as? String ?? "").contains("model:deepseek-flash;"),
+            "Opening the menu must preserve the current ordinary session")
+        XCTAssertTrue(openrouter.requests().isEmpty, "Listing a model must not issue a provider request")
+    }
+
+    /// Normal selection, ordinary imported image admission and real native
+    /// Responses requests use the free route; no live provider or Photos is used.
+    /// Image submission uses the explicit owned queue control. The real keyboard's
+    /// disabled Send observation is retained separately, not claimed fixed here.
+    @MainActor
+    func testParticleFreeNormalSelectionVisionAndRelaunch() throws {
+        continueAfterFailure = false
+        let glm = try SessionModelHTTPFixture(provider: .glm)
+        let deepseek = try SessionModelHTTPFixture(provider: .deepseek)
+        let openrouter = try SessionModelHTTPFixture(provider: .openrouter)
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test", "--ai-session-model-ui-test",
+            "--ai-particle-owned-vision-ui-test", "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_GLM_PORT"] = String(glm.port)
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_DEEPSEEK_PORT"] = String(deepseek.port)
+        app.launchEnvironment["MAICHAT_SESSION_MODELS_OPENROUTER_PORT"] = String(openrouter.port)
+        app.launchEnvironment["NO_PROXY"] = "*"; app.launchEnvironment["no_proxy"] = "*"
+        app.launch(); defer { app.terminate() }
+        let config = app.staticTexts["primary-ui-session-configuration"]
+        XCTAssertTrue(config.waitForExistence(timeout: 30))
+        let composer = app.textViews["ai-composer"]
+        let free = "particle-ai/particle-1:free"
+        defer {
+            let shapes = openrouter.requests().map { body in
+                ["model": body["model"] as? String ?? "", "effort":
+                    (body["reasoning"] as? [String: Any])?["effort"] as? String ?? "",
+                 "hasImage": (body["input"] as? [[String: Any]] ?? []).contains { item in
+                    (item["content"] as? [[String: Any]] ?? []).contains { $0["type"] as? String == "input_image" }
+                 }] as [String: Any]
+            }
+            let data = try! JSONSerialization.data(withJSONObject: shapes, options: .prettyPrinted)
+            let capture = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+            capture.name = "particle-owned-request-shapes"; capture.lifetime = .keepAlways; add(capture)
+        }
+        func require(_ model: String, _ effort: String) {
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format:
+                "value CONTAINS %@ AND value CONTAINS %@ AND value CONTAINS %@",
+                "model:" + model + ";", "effort:" + effort + ";", "wire:responses;"), object: config)],
+                timeout: 12), .completed)
+        }
+        func closePanel() {
+            let panel = app.descendants(matching: .any)["ai-action-panel"]
+            if panel.exists { app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: 8, dy: panel.frame.midY)).tap() }
+        }
+        func chooseModel(_ model: String) {
+            if !app.descendants(matching: .any)["ai-action-panel"].exists { app.buttons["更多"].tap() }
+            let item = app.buttons["ai-primary-model-" + model]
+            if !item.exists { app.buttons["ai-primary-model-settings"].tap() }
+            let panel = app.descendants(matching: .any)["ai-action-panel"]
+            // SwiftUI may report an offscreen row's frame as zero. Start at
+            // the visible top and use short, low-velocity drags without inertia.
+            panel.swipeDown()
+            for _ in 0..<16 where !item.isHittable {
+                let start = panel.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.65))
+                let end = panel.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.48))
+                start.press(forDuration: 0.05, thenDragTo: end,
+                    withVelocity: XCUIGestureVelocity(rawValue: 100), thenHoldForDuration: 0.2)
+            }
+            let screenshot = XCTAttachment(screenshot: app.screenshot())
+            screenshot.name = "particle-model-target-" + model.replacingOccurrences(of: "/", with: "-")
+            screenshot.lifetime = .keepAlways; add(screenshot)
+            XCTAssertTrue(item.isHittable); item.tap()
+        }
+        func chooseEffort(_ label: String) {
+            if !app.descendants(matching: .any)["ai-action-panel"].exists { app.buttons["更多"].tap() }
+            let control = app.buttons["思考强度"]
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "enabled == true"), object: control)], timeout: 10), .completed)
+            control.tap(); let option = app.buttons[label]
+            let screenshot = XCTAttachment(screenshot: app.screenshot())
+            screenshot.name = "particle-effort-menu-" + label
+            screenshot.lifetime = .keepAlways; add(screenshot)
+            XCTAssertTrue(option.waitForExistence(timeout: 5)); option.tap()
+        }
+        func sessionID() throws -> String {
+            let value = try XCTUnwrap(config.value as? String)
+            return try XCTUnwrap(value.split(separator: ";").first { $0.hasPrefix("session:") }).dropFirst(8).description
+        }
+        func selectSession(_ id: String) {
+            closePanel(); app.buttons["对话列表"].tap()
+            let row = app.buttons["ai-conversation-" + id]
+            XCTAssertTrue(row.waitForExistence(timeout: 8)); row.tap()
+        }
+        require("deepseek-flash", "high")
+        chooseModel("anthropic/claude-fable-5.2")
+        require("anthropic/claude-fable-5.2", "high")
+        chooseEffort("超高"); require("anthropic/claude-fable-5.2", "xhigh")
+        chooseModel(free); require(free, "high")
+        XCTAssertTrue((config.value as? String ?? "").contains("stored-effort:high;"))
+        XCTAssertTrue((config.value as? String ?? "").contains("catalog-provider:openrouter"))
+        let a = try sessionID()
+        for (effort, label) in [("low", "低"), ("high", "高"), ("max", "最高")] {
+            chooseEffort(label); require(free, effort); closePanel()
+            composer.tap(); composer.typeText("Owned free reply " + effort + "\n")
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format:
+                "value CONTAINS %@", "Fixture OpenRouter reply (" + effort + ")"),
+                object: app.staticTexts["primary-ui-model-output"])], timeout: 15), .completed)
+        }
+        closePanel(); app.buttons["particle-import-owned-image"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate:
+            NSPredicate(format: "value == %@", "ready"), object: app.staticTexts["particle-owned-vision-status"])],
+            timeout: 10), .completed)
+        composer.tap(); composer.typeText("Owned free image reply")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format:
+            "value CONTAINS %@", "Owned free image reply"), object: composer)], timeout: 5), .completed)
+        // R7 preserves the real keyboard's disabled Send observation. This
+        // explicit owned control now verifies import -> ordinary queue -> wire;
+        // it must not be reported as a successful keyboard image send.
+        app.buttons["particle-send-owned-image-queue"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format:
+            "value CONTAINS %@", "Fixture OpenRouter reply (image)"),
+            object: app.staticTexts["primary-ui-model-output"])], timeout: 15), .completed)
+        let visual = XCTAttachment(screenshot: app.screenshot())
+        visual.name = "particle-free-owned-image-reply"; visual.lifetime = .keepAlways; add(visual)
+        closePanel(); app.buttons["对话列表"].tap()
+        let create = app.buttons.matching(identifier: "ai-session-drawer")
+            .matching(NSPredicate(format: "label == %@", "新对话")).firstMatch
+        XCTAssertTrue(create.waitForExistence(timeout: 5)); create.tap()
+        require("deepseek-flash", "high")
+        selectSession(a); require(free, "max")
+        app.terminate(); app.launch()
+        XCTAssertTrue(config.waitForExistence(timeout: 30)); selectSession(a); require(free, "max")
+        let restored = XCTAttachment(screenshot: app.screenshot())
+        restored.name = "particle-free-model-after-relaunch"; restored.lifetime = .keepAlways; add(restored)
+        let requests = openrouter.requests()
+        XCTAssertEqual(requests.count, 4)
+        XCTAssertTrue(requests.allSatisfy { $0["model"] as? String == free &&
+            $0["session_id"] as? String == a && $0["cache_control"] == nil })
+        XCTAssertTrue(requests.contains { body in
+            (body["input"] as? [[String: Any]] ?? []).contains { item in
+                (item["content"] as? [[String: Any]] ?? []).contains { $0["type"] as? String == "input_image" }
+            }
+        })
+        XCTAssertTrue(requests.allSatisfy { !($0["tools"] as? [Any] ?? []).isEmpty })
+        XCTAssertTrue(glm.requests().isEmpty && deepseek.requests().isEmpty,
+            "Free model requests must not fall back to another provider")
+    }
+
     @MainActor
     func testFableOffersFiveReasoningLevelsAndOtherModelsKeepThree() throws {
         continueAfterFailure = false

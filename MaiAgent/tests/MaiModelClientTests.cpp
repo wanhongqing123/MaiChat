@@ -2510,6 +2510,193 @@ void test_responses_cache_session_rejects_bad_ids_before_http() {
     }
 }
 
+// 免费主模型只使用精确免费 ID；目录能力不能靠前缀猜测或沿用付费 Fable 五档。
+void test_particle_free_primary_catalog_uses_the_exact_free_model() {
+    const std::string model = "particle-ai/particle-1:free";
+    const auto info = maiCloudModelInfo(model);
+    CHECK(info.has_value());
+    if (info) {
+        CHECK(info->model == model);
+        CHECK(info->provider == "openrouter");
+        CHECK(info->wire == MaiWireApi::Responses);
+        CHECK(info->supportsImages);
+        CHECK(info->supportsReasoningEffort);
+        CHECK(info->contextLimits.contextWindowTokens == 1048576);
+        CHECK(info->contextLimits.maxOutputTokens == 131072);
+    }
+    CHECK(!maiCloudModelInfo("particle-ai/particle-1"));
+    CHECK(!maiCloudModelInfo("particle-ai/particle-1:free-extra"));
+    const auto limits = maiOfficialModelContextLimits("https://openrouter.ai/api/v1", model);
+    CHECK(limits.contextWindowTokens == 1048576);
+    CHECK(limits.maxOutputTokens == 131072);
+    const auto custom = maiOfficialModelContextLimits("https://synthetic.invalid/v1", model);
+    CHECK(custom.contextWindowTokens == 0 && custom.maxOutputTokens == 0);
+    CHECK(maiReasoningEffortsForModel(model) == std::vector<std::string>({"low", "high", "max"}));
+    for (const char* effort : {"", "low", "high", "max"})
+        CHECK(maiIsValidReasoningEffortForModel(model, effort));
+    for (const char* effort : {"medium", "xhigh", "none", "invalid"})
+        CHECK(!maiIsValidReasoningEffortForModel(model, effort));
+}
+
+// 即使普通调用没有 sessionId，免费请求仍须带完整零价约束并显式关闭增值插件。
+// 缓存路由只携带现有 ID；Claude 专用断点不能顺带发给另一供应商的模型。
+void test_particle_free_primary_wire_keeps_zero_price_guards_without_a_session() {
+    FakeServer fake;
+    fake.script = sse(json{{"type", "response.completed"},
+                           {"response", {{"status", "completed"}, {"output", json::array()}}}});
+    fake.start();
+    MaiModelRequest request;
+    request.model = "particle-ai/particle-1:free";
+    request.reasoningEffort = "low";
+    request.maxOutputTokens = 321;
+    request.baseInstructions = "Retain the ordinary primary model request.";
+    MaiModelMessage user;
+    user.role = MaiModelRole::User;
+    user.content = "Owned free primary check";
+    request.messages.push_back(std::move(user));
+    request.tools = {{"z_owned", "Owned no-effect tool", R"({"type":"object"})"},
+                     {"a_owned", "Another owned no-effect tool", R"({"type":"object"})"}};
+    const json expectedProvider{
+        {"max_price", {{"prompt", 0}, {"completion", 0}, {"request", 0}, {"image", 0}}},
+        {"allow_fallbacks", false}};
+    json first;
+    for (const std::string& id : {std::string{}, std::string{"owned_free_session"}}) {
+        request.sessionId = id;
+        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        CHECK(answer.done);
+        json body;
+        {
+            std::lock_guard<std::mutex> lock(fake.mutex);
+            body = json::parse(fake.lastBody, nullptr, false);
+        }
+        CHECK(body.is_object());
+        if (!body.is_object()) continue;
+        CHECK(wireValue(body, "/model") == request.model);
+        CHECK(wireValue(body, "/provider") == expectedProvider);
+        for (const char* name : {"prompt", "completion", "request", "image"}) {
+            const std::string path = std::string{"/provider/max_price/"} + name;
+            const auto value = wireValue(body, path.c_str());
+            CHECK(value.is_number());
+            CHECK(value == 0);
+        }
+        CHECK(wireValue(body, "/plugins") == json::array());
+        CHECK(!body.contains("cache_control"));
+        CHECK(!body.contains("prompt_cache_key"));
+        CHECK(wireValue(body, "/reasoning/effort") == "low");
+        CHECK(wireValue(body, "/max_output_tokens") == 321);
+        CHECK(wireValue(body, "/store") == false);
+        CHECK(wireValue(body, "/instructions") == request.baseInstructions);
+        CHECK(wireValue(body, "/tools/0/name") == "z_owned");
+        CHECK(wireValue(body, "/tools/1/name") == "a_owned");
+        if (id.empty()) {
+            CHECK(!body.contains("session_id"));
+            first = body;
+        } else {
+            CHECK(wireValue(body, "/session_id") == id);
+            body.erase("session_id");
+            CHECK(body == first);
+        }
+    }
+    CHECK(fake.requestCount.load() == 2);
+}
+
+// 增加免费型号不能改变旧供应商字段；Fable 的 Claude 缓存规则仍按原空/非空身份工作。
+void test_particle_free_primary_does_not_change_existing_provider_fields() {
+    for (const char* model :
+         {"anthropic/claude-fable-5.2", "glm-5.3", "deepseek-flash", "unknown-fixture"}) {
+        FakeServer fake;
+        fake.script = sse(json{{"type", "response.completed"},
+                               {"response", {{"status", "completed"}, {"output", json::array()}}}});
+        fake.start();
+        MaiModelRequest request;
+        request.model = model;
+        for (const std::string& id : {std::string{}, std::string{"owned_legacy_session"}}) {
+            request.sessionId = id;
+            CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+            std::lock_guard<std::mutex> lock(fake.mutex);
+            const json body = json::parse(fake.lastBody, nullptr, false);
+            CHECK(body.is_object());
+            if (!body.is_object()) continue;
+            CHECK(!body.contains("provider"));
+            CHECK(!body.contains("plugins"));
+            if (std::string(model) == "anthropic/claude-fable-5.2" && !id.empty()) {
+                CHECK(wireValue(body, "/session_id") == id);
+                CHECK(wireValue(body, "/cache_control") == json({{"type", "ephemeral"}}));
+                CHECK(!body.contains("prompt_cache_key"));
+            } else if (std::string(model) == "glm-5.3" && !id.empty()) {
+                CHECK(wireValue(body, "/prompt_cache_key") == id);
+                CHECK(!body.contains("session_id"));
+                CHECK(!body.contains("cache_control"));
+            } else {
+                CHECK(!body.contains("session_id"));
+                CHECK(!body.contains("cache_control"));
+                CHECK(!body.contains("prompt_cache_key"));
+            }
+        }
+    }
+}
+
+// 免费额度或鉴权额度失败必须原样结束，不切换到付费型号或读取另一条路由的凭据。
+void test_particle_free_primary_quota_errors_never_fall_back_to_paid_routes() {
+    const std::string freeModel = "particle-ai/particle-1:free";
+    for (const int status : {429, 402}) {
+        FakeServer free, paid;
+        free.status = status;
+        free.script =
+            json{{"error", {{"code", status}, {"message", "Synthetic free quota rejection."}}}}
+                .dump();
+        paid.script = sse(json{{"type", "response.completed"},
+                               {"response", {{"status", "completed"}, {"output", json::array()}}}});
+        free.start();
+        paid.start();
+        unsigned freeKeyReads = 0, paidKeyReads = 0;
+        MaiModelRoute freeRoute;
+        freeRoute.modelNames = {freeModel};
+        freeRoute.config.baseUrl = free.base();
+        freeRoute.config.wire = MaiWireApi::Responses;
+        freeRoute.config.maxRetries = 2;
+        freeRoute.config.retryInitialDelayMs = 1;
+        freeRoute.apiKeyProvider = [&] {
+            ++freeKeyReads;
+            return std::string{"synthetic-free-route-key"};
+        };
+        MaiModelRoute paidRoute;
+        paidRoute.modelNames = {"anthropic/claude-fable-5.2"};
+        paidRoute.config.baseUrl = paid.base();
+        paidRoute.config.wire = MaiWireApi::Responses;
+        paidRoute.apiKeyProvider = [&] {
+            ++paidKeyReads;
+            return std::string{"synthetic-paid-route-key"};
+        };
+        MaiRoutedModelConfig routes;
+        routes.routes = {freeRoute, paidRoute};
+        auto client = makeMaiRoutedModelClient(std::move(routes));
+        MaiModelRequest request;
+        request.model = freeModel;
+        request.reasoningEffort = "low";
+        request.sessionId = "owned_free_failure_session";
+        unsigned textEvents = 0, reasoningEvents = 0, toolEvents = 0, stateEvents = 0;
+        MaiStreamSink sink;
+        sink.onText = [&](std::string_view) { ++textEvents; };
+        sink.onReasoning = [&](std::string_view) { ++reasoningEvents; };
+        sink.onToolCall = [&](const MaiToolInvocation&) { ++toolEvents; };
+        sink.onContinuationState = [&](const MaiModelContinuationState&) { ++stateEvents; };
+        const std::atomic<bool> cancel{false};
+        const MaiError error = client->stream(request, sink, cancel);
+        CHECK(error.code() == (status == 429 ? MaiErrorCode::RateLimited : MaiErrorCode::Protocol));
+        CHECK(error.message().rfind("HTTP " + std::to_string(status), 0) == 0);
+        CHECK(free.requestCount.load() == 1);
+        CHECK(paid.requestCount.load() == 0);
+        CHECK(freeKeyReads == 1);
+        CHECK(paidKeyReads == 0);
+        CHECK(textEvents == 0 && reasoningEvents == 0 && toolEvents == 0 && stateEvents == 0);
+        std::lock_guard<std::mutex> lock(free.mutex);
+        const auto body = json::parse(free.lastBody, nullptr, false);
+        CHECK(wireValue(body, "/model") == freeModel);
+        CHECK(free.lastAuthorization == "Bearer synthetic-free-route-key");
+    }
+}
+
 // Fable 五档是模型能力，不能用旧全局三档列表把 medium/xhigh 静默省略或映射成其它值。
 void test_fable_responses_preserves_all_five_reasoning_efforts() {
     FakeServer fake;
@@ -3266,6 +3453,13 @@ void test_context_limits_output_budget_and_actual_usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--free-primary") {
+        test_particle_free_primary_catalog_uses_the_exact_free_model();
+        test_particle_free_primary_wire_keeps_zero_price_guards_without_a_session();
+        test_particle_free_primary_does_not_change_existing_provider_fields();
+        test_particle_free_primary_quota_errors_never_fall_back_to_paid_routes();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--cache-session") {
         test_responses_cache_session_hints_preserve_the_original_request();
         test_responses_cache_session_rejects_bad_ids_before_http();
@@ -3350,6 +3544,10 @@ int main(int argc, char** argv) {
     }
 #endif
     test_context_limits_output_budget_and_actual_usage();
+    test_particle_free_primary_catalog_uses_the_exact_free_model();
+    test_particle_free_primary_wire_keeps_zero_price_guards_without_a_session();
+    test_particle_free_primary_does_not_change_existing_provider_fields();
+    test_particle_free_primary_quota_errors_never_fall_back_to_paid_routes();
     test_text_stream_one_byte_at_a_time();
     test_text_stream_all_at_once();
     test_tool_call_fragments();

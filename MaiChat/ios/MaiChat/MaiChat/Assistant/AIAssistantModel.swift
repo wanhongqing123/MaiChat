@@ -50,7 +50,9 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     static let glmResponsesUrl = "https://open.bigmodel.cn/api/v1"
     static let openRouterUrl = "https://openrouter.ai/api/v1"
     static let fableModel = "anthropic/claude-fable-5.2"
-    static let cloudModels = ["deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash", fableModel]
+    static let particleFreeModel = "particle-ai/particle-1:free"
+    static let cloudModels = ["deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash",
+                              fableModel, particleFreeModel]
     static let deepSeekUrl = "https://api.deepseek.com"
     static let ordinaryReasoningEfforts = ["low", "high", "max"]
     static let fableReasoningEfforts = ["low", "medium", "high", "xhigh", "max"]
@@ -114,7 +116,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
         switch model {
         case "deepseek-flash", "deepseek-v4-pro": return "deepseek"
         case "glm-5.3", "glm-5.3-flash": return "glm"
-        case fableModel: return "openrouter"
+        case fableModel, particleFreeModel: return "openrouter"
         default: return nil
         }
     }
@@ -146,6 +148,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
         case "glm-5.3-flash": return "GLM-5.3-Flash"
         case "deepseek-v4-pro": return "DeepSeek V4 Pro"
         case Self.fableModel: return "Claude Fable 5.2"
+        case Self.particleFreeModel: return "Particle-1（免费）"
         default: return "DeepSeek Flash"
         }
     }
@@ -203,7 +206,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.deepSeekUrl
         } else if ["glm-5.3", "glm-5.3-flash"].contains(selected) {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.glmResponsesUrl
-        } else if selected == Self.fableModel {
+        } else if [Self.fableModel, Self.particleFreeModel].contains(selected) {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.openRouterUrl
         }
     }
