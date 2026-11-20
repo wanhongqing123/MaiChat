@@ -1724,9 +1724,13 @@ private:
         if (const auto* textBody = std::get_if<MaiTextPart>(&part.body)) {
             kind = kText;
             text = textBody->text;
+            // 非工具的 state 原来固定为 0；仅对正文/推理保存模型草稿位。
+            // 工具的枚举值和 kind=2 恢复查询保持原契约，无需重写已有表。
+            state = part.modelDraft ? 1 : 0;
         } else if (const auto* reasoningBody = std::get_if<MaiReasoningPart>(&part.body)) {
             kind = kReasoning;
             text = reasoningBody->text;
+            state = part.modelDraft ? 1 : 0;
             if (reasoningBody->continuation) continuation = &*reasoningBody->continuation;
         } else if (const auto* imageBody = std::get_if<MaiImagePart>(&part.body)) {
             kind = kImage;
@@ -1792,6 +1796,8 @@ private:
             part.id = textColumn(statement, 0);
             const int kind = sqlite3_column_int(statement, 1);
             part.created = sqlite3_column_int64(statement, 2);
+            part.modelDraft =
+                (kind == kText || kind == kReasoning) && sqlite3_column_int(statement, 9) == 1;
             if (kind == kReasoning) {
                 MaiReasoningPart reasoning{textColumn(statement, 3)};
                 MaiModelContinuationState continuation{

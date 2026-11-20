@@ -37,6 +37,9 @@ enum class MaiEventType {
     MessageTextCommitted,
     // 补充已在安全点消费，新 assistant 已落库；先于其 MessageUpdated 广播。
     TurnSteeringApplied,
+    // 同一轮次内的模型采样正在恢复，不代表新轮次开始、完成或失败。
+    // detail 为宿主进度文案，不可回灌模型或当作助手正文提交。
+    ModelRequestRetrying,
 };
 
 // 转成 "message.part.delta" 这类线上字符串。

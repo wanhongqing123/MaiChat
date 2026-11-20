@@ -44,6 +44,8 @@ void appendPart(SourceDigest& digest, const MaiMessagePart& part) {
     digest.append(part.id);
     digest.append(std::to_string(part.created));
     digest.append(std::to_string(part.body.index()));
+    // false 不改变旧检查点指纹；草稿的确认状态变化必须使已捕获来源失效。
+    if (part.modelDraft) digest.append("MaiModelDraft/v1");
     std::visit(
         [&](const auto& body) {
             using Body = std::decay_t<decltype(body)>;

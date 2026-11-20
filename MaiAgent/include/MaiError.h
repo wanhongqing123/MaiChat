@@ -2,6 +2,7 @@
 // 对外类型：MaiErrorCode、MaiError、MaiResult；线程、失败和生命周期以类型附近注释为准。
 #pragma once
 
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -44,9 +45,18 @@ enum class MaiErrorCode {
 // 而不是去匹配 message 的文字（文案会改，码不会）。
 const char* maiErrorCodeToString(MaiErrorCode code);
 
-// 一个错误，或者"没有错误"。
-//
-// 默认构造出来是**没有错误**的状态，所以函数里 `return {};` 就表示成功。
+// 实现方已确认可重试时附带的结构化建议，不通过错误文案猜测。
+// 只描述同一操作的恢复预算和等待，不授权重新执行工具或切换供应商。
+// maxRetries 不含首次尝试；retryAfterMs 为 -1 时没有服务方的等待建议。
+struct MaiRetryAdvice {
+    int maxRetries = 0;
+    long initialDelayMs = 250;
+    long retryAfterMs = -1;
+    bool sawOutput = false;
+};
+
+// 一个错误，或者“没有错误”。默认构造无错误，所以 return {} 表示成功。
+// 恢复建议随错误值复制；仅有错误码/人类消息而无建议时不会自动重新采样。
 class MaiError {
 public:
     MaiError() = default;
@@ -59,6 +69,9 @@ public:
     // 给人看的。不要拿它做逻辑判断——文案会改，判断要用 code()。
     const std::string& message() const;
     bool hasError() const;
+    const std::optional<MaiRetryAdvice>& retryAdvice() const;
+    // 建议随值复制保留；没有建议的鉴权、内容拒绝、取消等错误不得自动恢复。
+    MaiError& withRetryAdvice(MaiRetryAdvice advice);
 
     // 方便写 `if (error) { ... }`。
     //
@@ -69,6 +82,7 @@ public:
 private:
     MaiErrorCode mCode = MaiErrorCode::Ok;
     std::string mMessage;
+    std::optional<MaiRetryAdvice> mRetryAdvice;
 };
 
 // 轻量 Result：要么有值，要么有错。

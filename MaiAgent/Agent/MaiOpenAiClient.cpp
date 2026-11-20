@@ -14,12 +14,12 @@
 #include <cstring>
 #include <map>
 #include <mutex>
-#include <thread>
 #include <unordered_map>
 
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiPathGuard.h"
+#include "MaiModelRetry.h"
 #include "MaiResponsesClient.h"
 
 namespace {
@@ -344,6 +344,8 @@ struct StreamCtx {
     std::string rawBody;
     std::string finishReason;
     bool sawOutput = false;
+    bool transientStreamError = false;
+    long retryAfterSeconds = -1;
     bool done = false;
     bool manualRedirects = false;
     bool redirectStatus = false;
@@ -396,6 +398,14 @@ void handleSseLine(StreamCtx& context, const std::string& line) {
     if (parsed.contains("error")) {
         context.error = parsed["error"].is_string() ? parsed["error"].get<std::string>()
                                                     : parsed["error"].dump();
+        // 正常 HTTP 流内的 typed 服务错误也能恢复；字符串文案不作为分类依据。
+        const auto& error = parsed["error"];
+        if (error.is_object()) {
+            auto code = error.value("code", json{});
+            if (code.is_null()) code = error.value("type", json{});
+            context.transientStreamError =
+                code.is_string() && MaiModelRetry::isTransientProviderCode(code.get<std::string>());
+        }
         return;
     }
 
@@ -458,12 +468,15 @@ std::size_t headerCallback(char* bytes, std::size_t size, std::size_t count, voi
     auto& context = *static_cast<StreamCtx*>(user);
     if (count != 0 && size > SIZE_MAX / count) return 0;
     const auto length = size * count;
-    if (context.manualRedirects && length >= 5 && std::memcmp(bytes, "HTTP/", 5) == 0) {
-        const std::string line(bytes, length);
-        const auto space = line.find(' ');
-        const int status = space == std::string::npos ? 0 : std::atoi(line.c_str() + space + 1);
-        context.redirectStatus = status >= 300 && status < 400;
-        context.redirectResponse = false;
+    if (length >= 5 && std::memcmp(bytes, "HTTP/", 5) == 0) {
+        context.retryAfterSeconds = -1;
+        if (context.manualRedirects) {
+            const std::string line(bytes, length);
+            const auto space = line.find(' ');
+            const int status = space == std::string::npos ? 0 : std::atoi(line.c_str() + space + 1);
+            context.redirectStatus = status >= 300 && status < 400;
+            context.redirectResponse = false;
+        }
     } else if (context.manualRedirects && context.redirectStatus && !context.redirectResponse &&
                length > 9) {
         const std::string name(bytes, 9);
@@ -474,6 +487,14 @@ std::size_t headerCallback(char* bytes, std::size_t size, std::size_t count, voi
             const std::string value(bytes + 9, length - 9);
             context.redirectResponse = value.find_first_not_of(" \t\r\n") != std::string::npos;
         }
+    }
+    constexpr std::size_t retryAfterNameLength = 12;
+    if (length >= retryAfterNameLength &&
+        std::equal(bytes, bytes + retryAfterNameLength, "retry-after:",
+                   [](unsigned char a, unsigned char b) { return std::tolower(a) == b; })) {
+        const long delay = MaiModelRetry::parseDelayMilliseconds(
+            std::string_view(bytes + retryAfterNameLength, length - retryAfterNameLength));
+        context.retryAfterSeconds = delay < 0 ? -1 : delay / 1000;
     }
     // 响应头到达也是真实通信；只记时间，不保存可能带凭据的头字段。
     if (length > 0) context.lastStreamActivity = std::chrono::steady_clock::now();
@@ -533,18 +554,6 @@ bool isRetryableCurlError(CURLcode code) {
     return code == CURLE_COULDNT_CONNECT || code == CURLE_COULDNT_RESOLVE_HOST ||
            code == CURLE_OPERATION_TIMEDOUT || code == CURLE_RECV_ERROR ||
            code == CURLE_SEND_ERROR || code == CURLE_GOT_NOTHING;
-}
-
-bool waitBeforeRetry(long delayMs, const std::atomic<bool>& cancel) {
-    constexpr long kSliceMs = 25;
-    long waited = 0;
-    while (waited < delayMs) {
-        if (cancel.load(std::memory_order_relaxed)) return false;
-        const long slice = std::min(kSliceMs, delayMs - waited);
-        std::this_thread::sleep_for(std::chrono::milliseconds(slice));
-        waited += slice;
-    }
-    return !cancel.load(std::memory_order_relaxed);
 }
 
 // Chat Completions 的实现。Responses 在独立的 wire 文件里，
@@ -710,67 +719,97 @@ public:
                 if (status == 301 || status == 302 || status == 303) post = false;
                 currentUrl = nextUrl;
             }
-            if (cancel.load(std::memory_order_relaxed))
-                return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
-            if (context.inactive)
-                return MaiError::make(
-                    MaiErrorCode::Network,
-                    "model stream transport inactive for " +
-                        std::to_string(mConfig.inactivityTimeoutSeconds) + " seconds (request " +
-                        std::to_string(body.size()) + " bytes, " + std::to_string(imageCount) +
-                        " images; received " + std::to_string(context.responseBytes) +
-                        " bytes). No response bytes or upload progress were received during this "
-                        "interval; retry later or choose another available model.");
-            if (context.progressTimedOut)
-                return MaiError::make(
-                    MaiErrorCode::Network,
-                    "model stream made no progress for " +
-                        std::to_string(mConfig.progressTimeoutSeconds) + " seconds (request " +
-                        std::to_string(body.size()) + " bytes, " + std::to_string(imageCount) +
-                        " images; received " + std::to_string(context.responseBytes) +
-                        " bytes). The provider sent no text, reasoning, or tool arguments during "
-                        "this interval; retry later or choose another available model.");
-
-            const bool transient = transfer != CURLE_OK ? isRetryableCurlError(transfer)
-                                                        : status == 408 || status >= 500;
-            if (transient && !context.sawOutput && attempt < mConfig.maxRetries) {
-                const long delay = mConfig.retryInitialDelayMs * (1L << attempt);
-                if (!waitBeforeRetry(delay, cancel))
+            const bool canRetry = MaiModelRetry::isTransient(
+                status, transfer != CURLE_OK && isRetryableCurlError(transfer), context.rawBody);
+            const auto advise = [&](MaiError error, bool retryable) {
+                return retryable
+                           ? MaiModelRetry::advise(std::move(error), mConfig, context.sawOutput,
+                                                   context.retryAfterSeconds < 0
+                                                       ? -1
+                                                       : context.retryAfterSeconds * 1000)
+                           : error;
+            };
+            const MaiError failure = [&]() -> MaiError {
+                if (cancel.load(std::memory_order_relaxed))
                     return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
-                continue;
-            }
+                if (context.inactive)
+                    return advise(
+                        MaiError::make(
+                            MaiErrorCode::Network,
+                            "model stream transport inactive for " +
+                                std::to_string(mConfig.inactivityTimeoutSeconds) +
+                                " seconds (request " + std::to_string(body.size()) + " bytes, " +
+                                std::to_string(imageCount) + " images; received " +
+                                std::to_string(context.responseBytes) +
+                                " bytes). No response bytes or upload progress were received "
+                                "during this "
+                                "interval; retry later or choose another available model."),
+                        true);
+                if (context.progressTimedOut)
+                    return advise(
+                        MaiError::make(
+                            MaiErrorCode::Network,
+                            "model stream made no progress for " +
+                                std::to_string(mConfig.progressTimeoutSeconds) +
+                                " seconds (request " + std::to_string(body.size()) + " bytes, " +
+                                std::to_string(imageCount) + " images; received " +
+                                std::to_string(context.responseBytes) +
+                                " bytes). The provider sent no text, reasoning, or tool arguments "
+                                "during "
+                                "this interval; retry later or choose another available model."),
+                        true);
 
-            if (transfer != CURLE_OK && !(context.done && transfer == CURLE_WRITE_ERROR))
-                return MaiError::make(
-                    MaiErrorCode::Network,
-                    std::string("curl: ") +
-                        (transfer == CURLE_PEER_FAILED_VERIFICATION && transportError[0]
-                             ? transportError
-                             : curl_easy_strerror(transfer)));
-            if (status >= 400) {
-                const std::string provider = providerErrorMessage(context.rawBody);
-                std::string message = "HTTP " + std::to_string(status);
-                if (!provider.empty()) message += ": " + provider;
-                const MaiErrorCode code = status == 401 || status == 403
-                                              ? MaiErrorCode::NotConfigured
-                                          : status == 429 ? MaiErrorCode::RateLimited
-                                          : status >= 500 ? MaiErrorCode::Network
-                                                          : MaiErrorCode::Protocol;
-                return MaiError::make(code, std::move(message));
-            }
-            if (!context.error.empty())
-                return MaiError::make(MaiErrorCode::Protocol, context.error);
-            if (!context.done)
-                return MaiError::make(
-                    MaiErrorCode::Protocol,
-                    "Chat Completions stream ended without a terminal [DONE] event");
-            if (context.finishReason == "length")
-                return MaiError::make(MaiErrorCode::Protocol,
-                                      "模型输出达到长度上限，回答可能不完整。");
-            if (context.finishReason == "content_filter")
-                return MaiError::make(MaiErrorCode::Protocol,
-                                      "模型供应商拦截了这次输出（content_filter）。");
+                if (transfer != CURLE_OK && !(context.done && transfer == CURLE_WRITE_ERROR))
+                    return advise(MaiError::make(MaiErrorCode::Network,
+                                                 std::string("curl: ") +
+                                                     (transfer == CURLE_PEER_FAILED_VERIFICATION &&
+                                                              transportError[0]
+                                                          ? transportError
+                                                          : curl_easy_strerror(transfer))),
+                                  canRetry);
+                if (status >= 400) {
+                    const std::string provider = providerErrorMessage(context.rawBody);
+                    std::string message = "HTTP " + std::to_string(status);
+                    if (!provider.empty()) message += ": " + provider;
+                    const MaiErrorCode code = status == 401 || status == 403
+                                                  ? MaiErrorCode::NotConfigured
+                                              : status == 429 ? MaiErrorCode::RateLimited
+                                              : status >= 500 ? MaiErrorCode::Network
+                                                              : MaiErrorCode::Protocol;
+                    return advise(MaiError::make(code, std::move(message)), canRetry);
+                }
+                if (!context.error.empty())
+                    return advise(MaiError::make(MaiErrorCode::Protocol, context.error),
+                                  context.transientStreamError);
+                if (!context.done)
+                    return advise(
+                        MaiError::make(
+                            MaiErrorCode::Protocol,
+                            "Chat Completions stream ended without a terminal [DONE] event"),
+                        true);
+                if (context.finishReason == "length")
+                    return MaiError::make(
+                        MaiErrorCode::Protocol,
+                        "The model output reached its length limit; the answer may be incomplete.");
+                if (context.finishReason == "content_filter")
+                    return MaiError::make(
+                        MaiErrorCode::Protocol,
+                        "The model provider filtered this output (content_filter).");
 
+                return {};
+            }();
+            if (failure) {
+                const auto& advice = failure.retryAdvice();
+                // 直接调用只恢复无输出尝试；Agent 请求由 TurnRunner 重建上下文后恢复。
+                if (!request.callerManagesRetries && advice && !advice->sawOutput &&
+                    attempt < advice->maxRetries) {
+                    if (MaiModelRetry::wait(MaiModelRetry::delayMilliseconds(*advice, attempt),
+                                            cancel) == MaiRetryWaitResult::Canceled)
+                        return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
+                    continue;
+                }
+                return failure;
+            }
             if (sink.onToolCall) {
                 for (const auto& choice : context.tools.take()) sink.onToolCall(choice);
             }

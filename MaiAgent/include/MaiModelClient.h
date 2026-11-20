@@ -153,6 +153,10 @@ struct MaiModelRequest {
     // 该值不进入提示正文、工具声明或 token 估算；未知供应商/本地模型不发送此元数据。
     // 追加末尾保留旧聚合初始化；字段增加后所有 C++ 消费者须按同一布局重新编译。
     std::string sessionId;
+    // Agent 在失败后会隔离草稿并重建历史，由它唯一持有重试计数。
+    // 为 true 时适配器只执行一次并通过 MaiError 携带建议，禁止两层重试相乘。
+    // 普通直接 stream 调用默认保留仅在无输出时恢复的契约；不序列化到模型请求。
+    bool callerManagesRetries = false;
 };
 
 // 模型目录的真实容量，不是历史字节上限。0 表示未知，不能擅自套用其他模型的窗口。
@@ -276,7 +280,8 @@ struct MaiModelConfig {
     // 在此时长内没有接收字节或实际上传增长就中止流式请求。
     // SSE 保活与尚未拼完的事件能证明链路活跃；curl 自身的周期回调不能。0 表示关闭。
     long inactivityTimeoutSeconds = 120;
-    // 只在还没有向调用方交付任何正文/思考/工具调用时重试，避免流式内容重复。
+    // 首次请求之外的恢复次数。Agent 统一恢复并隔离失败草稿；直接 stream 调用
+    // 仅在未交付内容时自行重试。callerManagesRetries 决定唯一持有预算的一层。
     int maxRetries = 2;
     long retryInitialDelayMs = 250;
     // 空时使用平台默认根证书；Android 宿主可传系统信任库导出的 PEM 文件。

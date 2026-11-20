@@ -42,6 +42,15 @@ bool MaiError::hasError() const {
     return mCode != MaiErrorCode::Ok;
 }
 
+const std::optional<MaiRetryAdvice>& MaiError::retryAdvice() const {
+    return mRetryAdvice;
+}
+
+MaiError& MaiError::withRetryAdvice(MaiRetryAdvice advice) {
+    mRetryAdvice = advice;
+    return *this;
+}
+
 MaiError::operator bool() const {
     return hasError();
 }

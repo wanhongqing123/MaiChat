@@ -186,6 +186,84 @@ void populateSoftHistory(MaiSessionStore& store, const std::string& id) {
     store.putMessage(id, message(MaiRole::User, "Continue the saved task."));
 }
 
+// 摘要断流也返回同一 TurnRunner 预算，不能被 Protocol 容量降级吞掉。
+void test_turn_recovers_summary_stream_before_sampling_main_response() {
+    class InterruptedSummary final : public SummaryModel {
+    public:
+        int attempts = 0;
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                        const std::atomic<bool>& cancel) override {
+            CHECK(request.callerManagesRetries);
+            for (const auto& item : request.messages)
+                CHECK(item.content.find("FAILED_SUMMARY_DRAFT") == std::string::npos);
+            if (++attempts == 1) {
+                sink.onText("FAILED_SUMMARY_DRAFT");
+                return MaiError{MaiErrorCode::Protocol, "missing terminal event"}.withRetryAdvice(
+                    {1, 0, -1, true});
+            }
+            return SummaryModel::stream(request, sink, cancel);
+        }
+    } model;
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    populateSoftHistory(*store, id);
+    auto assistant = message(MaiRole::Assistant, {});
+    assistant.parts.clear();
+    assistant.completed = 0;
+    store->putMessage(id, assistant);
+    MaiContextBuilder builder;
+    MaiEventBus bus;
+    MaiEventEmitter emitter(bus);
+    int retries = 0, errors = 0;
+    const auto token = bus.subscribe([&](const MaiEvent& event) {
+        if (event.type == MaiEventType::ModelRequestRetrying) ++retries;
+        if (event.type == MaiEventType::SessionError) ++errors;
+    });
+    MaiTurnRunner::Dependencies dependencies;
+    dependencies.store = store.get();
+    dependencies.model = &model;
+    dependencies.context = &builder;
+    dependencies.emitter = &emitter;
+    dependencies.defaultModel = "fixture";
+    MaiTurnRunner runner(dependencies, id, assistant);
+    const std::atomic<bool> cancel{false};
+    runner.run(cancel);
+    CHECK(runner.succeeded());
+    CHECK(retries == 1 && errors == 0);
+    CHECK(model.attempts >= 3);
+    MaiContextCheckpoint checkpoint;
+    CHECK(store->getContextCheckpoint(id, checkpoint));
+    CHECK(checkpoint.summary.find("FAILED_SUMMARY_DRAFT") == std::string::npos);
+    bus.unsubscribe(token);
+}
+
+void test_failed_model_draft_is_excluded_from_summary_sources() {
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    auto user = message(MaiRole::User, "Saved goal: " + std::string(22000, 's'));
+    store->putMessage(id, user);
+    auto assistant = message(MaiRole::Assistant, "PRIVATE_INCOMPLETE_SUMMARY_SOURCE");
+    assistant.parts[0].modelDraft = true;
+    assistant.parts.push_back(
+        {MaiIdGenerator::newPartId(), MaiTextPart{"Valid committed response"}, 1});
+    store->putMessage(id, assistant);
+    store->putMessage(id, message(MaiRole::User, "Continue task"));
+    SummaryModel model;
+    auto original = request();
+    original.callerManagesRetries = true;
+    const std::atomic<bool> cancel{false};
+    const auto prepared = MaiContextCompactor{}.prepare(*store, model, MaiContextBuilder{}, id,
+                                                        store->listMessages(id), original, cancel);
+    CHECK(prepared);
+    CHECK(!model.requests().empty());
+    for (const auto& sent : model.requests()) {
+        CHECK(sent.callerManagesRetries);
+        for (const auto& item : sent.messages)
+            CHECK(item.content.find("PRIVATE_INCOMPLETE_SUMMARY_SOURCE") == std::string::npos);
+    }
+    CHECK(store->listMessages(id)[1].parts[0].modelDraft);
+}
+
 void test_cache_session_identity_is_bound_without_changing_the_request() {
     auto store = makeMaiMemoryStore();
     MaiContextCompactor compactor;
@@ -3693,6 +3771,8 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     std::puts("MaiContextCompactorTests");
+    test_turn_recovers_summary_stream_before_sampling_main_response();
+    test_failed_model_draft_is_excluded_from_summary_sources();
     test_codex_window_defaults_do_not_reserve_the_catalog_maximum_output();
     test_codex_window_trigger_starts_at_ninety_percent();
     test_codex_window_hard_limit_counts_tools_and_images_once();

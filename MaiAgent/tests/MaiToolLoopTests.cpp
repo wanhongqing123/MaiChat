@@ -25,6 +25,7 @@
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiMemoryStore.h"
+#include "MaiModelRetry.h"
 #include "MaiFileTools.h"
 #include "MaiFakeModelClient.h"
 #include "MaiIdGenerator.h"
@@ -1314,6 +1315,210 @@ void test_committed_text_covers_complete_response_items_without_early_or_duplica
     agent.eventBus().unsubscribe(subscription);
 }
 
+// 独立模拟“已发过增量再失败”，避免普通 Fake 的输出前 error 路径掩盖恢复边界。
+class RecoveryModel final : public MaiModelClient {
+public:
+    std::function<MaiError(const MaiModelRequest&, const MaiStreamSink&, int)> respond;
+    std::vector<MaiModelRequest> requests;
+    MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                    const std::atomic<bool>&) override {
+        requests.push_back(request);
+        return respond(request, sink, static_cast<int>(requests.size()));
+    }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
+};
+
+void test_stream_recovery_preserves_completed_tools_and_discards_failed_calls() {
+    Workspace workspace;
+    auto model = std::make_unique<RecoveryModel>();
+    auto* observed = model.get();
+    model->respond = [](const MaiModelRequest& request, const MaiStreamSink& sink, int attempt) {
+        CHECK(request.callerManagesRetries);
+        if (attempt == 1) {
+            sink.onToolCall({"executed_once", "mobile_preview_image", "{}"});
+            return MaiError{};
+        }
+        if (attempt == 2) {
+            sink.onText("PRIVATE_FAILED_DRAFT");
+            sink.onToolCall({"unconfirmed_call", "mobile_preview_image", "{}"});
+            return MaiError{MaiErrorCode::Network, "truncated model response"}.withRetryAdvice(
+                {2, 0, -1, true});
+        }
+        bool sawCall = false, sawResult = false;
+        for (const auto& message : request.messages) {
+            CHECK(message.content.find("PRIVATE_FAILED_DRAFT") == std::string::npos);
+            for (const auto& call : message.invocations) {
+                CHECK(call.id != "unconfirmed_call");
+                if (call.id == "executed_once") sawCall = true;
+            }
+            if (message.role == MaiModelRole::ToolResult && message.toolCallId == "executed_once")
+                sawResult = true;
+        }
+        CHECK(sawCall && sawResult);
+        sink.onText("Recovered final answer");
+        return MaiError{};
+    };
+    std::atomic<int> executions{0};
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(std::make_unique<UserImagePreviewTool>(executions));
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+    Recorder recorder;
+    recorder.attach(agent);
+    const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    const auto turn = agent.submit(MaiSendPrompt{session, "Show image then answer"});
+    CHECK(turn);
+    agent.waitIdle();
+    CHECK(observed->requests.size() == 3);
+    CHECK(executions.load() == 1);
+    int running = 0, idle = 0, retry = 0, commits = 0;
+    for (const auto& event : recorder.all()) {
+        CHECK(event.type != MaiEventType::SessionError);
+        if (event.type == MaiEventType::SessionStatus && event.detail == "running") ++running;
+        if (event.type == MaiEventType::SessionIdle) ++idle;
+        if (event.type == MaiEventType::MessageTextCommitted) ++commits;
+        if (event.type == MaiEventType::ModelRequestRetrying) {
+            ++retry;
+            CHECK(event.turnId == turn.value());
+            CHECK(std::string(maiEventTypeToString(event.type)) == "model.request.retrying");
+        }
+    }
+    CHECK(running == 1 && idle == 1 && retry == 1 && commits == 1);
+}
+
+void test_stream_recovery_exhaustion_keeps_drafts_without_commit_receipts() {
+    Workspace workspace;
+    auto model = std::make_unique<RecoveryModel>();
+    auto* observed = model.get();
+    model->respond = [](const MaiModelRequest&, const MaiStreamSink& sink, int) {
+        sink.onText("Incomplete response");
+        return MaiError{MaiErrorCode::Network, "disconnected"}.withRetryAdvice({2, 0, -1, true});
+    };
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model));
+    Recorder recorder;
+    recorder.attach(agent);
+    const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    CHECK(agent.submit(MaiSendPrompt{session, "Finish response"}));
+    agent.waitIdle();
+    CHECK(observed->requests.size() == 3);
+    int errors = 0, retries = 0;
+    for (const auto& event : recorder.all()) {
+        if (event.type == MaiEventType::SessionError) ++errors;
+        if (event.type == MaiEventType::ModelRequestRetrying) ++retries;
+        CHECK(event.type != MaiEventType::MessageTextCommitted);
+    }
+    CHECK(errors == 1 && retries == 2);
+    const auto messages = agent.listMessages(session);
+    CHECK(messages.back().parts.size() == 3);
+    for (const auto& part : messages.back().parts) CHECK(part.modelDraft);
+}
+
+void test_steering_during_recovery_resets_old_tool_repetition_guard() {
+    Workspace workspace;
+    auto model = std::make_unique<RecoveryModel>();
+    auto* observed = model.get();
+    model->respond = [](const MaiModelRequest& request, const MaiStreamSink& sink, int attempt) {
+        if (attempt == 3)
+            return MaiError{MaiErrorCode::Network, "retry before replan"}.withRetryAdvice(
+                {1, 150, -1, false});
+        if (attempt < 5) {
+            sink.onToolCall(
+                {"owned_repeat_" + std::to_string(attempt), "mobile_preview_image", "{}"});
+            return MaiError{};
+        }
+        // 新指令已切换计划，不能因旧结果累计三次而被迫进入禁用工具的收尾。
+        CHECK(!request.tools.empty());
+        sink.onText("Completed the new plan");
+        return MaiError{};
+    };
+    std::atomic<int> executions{0};
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(std::make_unique<UserImagePreviewTool>(executions));
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool retrying = false;
+    const auto token = agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type != MaiEventType::ModelRequestRetrying) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        retrying = true;
+        cv.notify_all();
+    });
+    const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    const auto turn = agent.submit(MaiSendPrompt{session, "Inspect initial state"});
+    CHECK(turn);
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        CHECK(cv.wait_for(lock, std::chrono::seconds(3), [&] { return retrying; }));
+    }
+    CHECK(agent.submit(MaiSteerPrompt{session, turn.value(), "recovery-new-plan",
+                                      "Inspect once more for the new plan"}));
+    agent.waitIdle();
+    CHECK(observed->requests.size() == 5 && executions.load() == 3);
+    agent.eventBus().unsubscribe(token);
+}
+
+void test_stream_recovery_wait_accepts_steering_and_cancel() {
+    Workspace workspace;
+    for (const bool cancel : {false, true}) {
+        auto model = std::make_unique<RecoveryModel>();
+        auto* observed = model.get();
+        const auto startedAt = std::chrono::steady_clock::now();
+        model->respond = [&](const MaiModelRequest& request, const MaiStreamSink& sink,
+                             int attempt) {
+            if (attempt == 1)
+                return MaiError{MaiErrorCode::Network, "try again"}.withRetryAdvice(
+                    {2, 0, cancel ? 30000L : 150L, false});
+            bool sawSteering = false;
+            for (const auto& message : request.messages)
+                if (message.content.find("Use the newer instruction") != std::string::npos)
+                    sawSteering = true;
+            CHECK(sawSteering);
+            // 新输入不能绕过 Retry-After，也不能让等待无界重新开始。
+            CHECK(std::chrono::steady_clock::now() - startedAt >= std::chrono::milliseconds(140));
+            sink.onText("Followed newer instruction");
+            return MaiError{};
+        };
+        MaiAgent agent(makeMaiMemoryStore(), std::move(model));
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool retrying = false;
+        const auto token = agent.eventBus().subscribe([&](const MaiEvent& event) {
+            if (event.type != MaiEventType::ModelRequestRetrying) return;
+            std::lock_guard<std::mutex> lock(mutex);
+            retrying = true;
+            cv.notify_all();
+        });
+        const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+        const auto turn = agent.submit(MaiSendPrompt{session, "Initial instruction"});
+        CHECK(turn);
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            CHECK(cv.wait_for(lock, std::chrono::seconds(3), [&] { return retrying; }));
+        }
+        const auto controlAt = std::chrono::steady_clock::now();
+        if (cancel)
+            CHECK(agent.submit(MaiInterrupt{session}));
+        else
+            CHECK(agent.submit(MaiSteerPrompt{session, turn.value(), "retry-steering",
+                                              "Use the newer instruction"}));
+        agent.waitIdle();
+        CHECK(std::chrono::steady_clock::now() - controlAt < std::chrono::seconds(3));
+        CHECK(observed->requests.size() == (cancel ? 1 : 2));
+        agent.eventBus().unsubscribe(token);
+    }
+    std::atomic<bool> canceled{true};
+    CHECK(MaiModelRetry::wait(60000, canceled) == MaiRetryWaitResult::Canceled);
+    CHECK(MaiModelRetry::parseDelayMilliseconds(" 2 ") == 2000);
+    CHECK(MaiModelRetry::parseDelayMilliseconds("-1") == -1);
+    CHECK(MaiModelRetry::parseDelayMilliseconds("1.5") == -1);
+    CHECK(MaiModelRetry::parseDelayMilliseconds("999999999999999999") == -1);
+    CHECK(MaiModelRetry::parseDelayMilliseconds("Wed, 21 Oct 2015 07:28:00 GMT") == 0);
+    CHECK(MaiModelRetry::delayMilliseconds({2, 250, -1, false}, 20) == 60000);
+    CHECK(MaiModelRetry::delayMilliseconds({2, 250, 120000, false}, 0) == 120000);
+}
+
 void test_failed_or_canceled_partial_text_does_not_produce_a_commit_receipt() {
     class PartialFailureModel final : public MaiModelClient {
     public:
@@ -1994,6 +2199,10 @@ void test_specialist_reply_keeps_existing_history_and_new_steering_in_order() {
 }  // namespace
 
 int main() {
+    test_stream_recovery_preserves_completed_tools_and_discards_failed_calls();
+    test_stream_recovery_exhaustion_keeps_drafts_without_commit_receipts();
+    test_stream_recovery_wait_accepts_steering_and_cancel();
+    test_steering_during_recovery_resets_old_tool_repetition_guard();
     test_tool_loop_closes();
     test_screenshot_stop_without_workspace_keeps_file_tools_blocked();
     test_balance_error_routes_back_to_main_model();

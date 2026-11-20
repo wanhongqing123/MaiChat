@@ -368,6 +368,9 @@ std::string MaiConsoleRenderer::format(const MaiEvent& event) {
             return atLineStart(mAtLineStart, "\n> ");
         case MaiEventType::SessionError:
             return atLineStart(mAtLineStart, "[error] " + event.detail + "\n");
+        case MaiEventType::ModelRequestRetrying:
+            // 恢复进度属于宿主状态，不写成模型正文，也不结束当前输入/取消生命周期。
+            return atLineStart(mAtLineStart, "[model] " + event.detail + "\n");
         case MaiEventType::SessionUpdated:
             if (event.detail.empty()) return {};
             return atLineStart(mAtLineStart, "[session] titled \"" + event.detail + "\"\n");

@@ -23,6 +23,7 @@
 #include <sqlite3.h>
 
 #include "MaiIdGenerator.h"
+#include "MaiContextBuilder.h"
 #include "MaiSessionStore.h"
 #include "MaiMemoryStore.h"
 #include "MaiSqliteStore.h"
@@ -1197,6 +1198,55 @@ void test_survives_reopen() {
     }
 }
 
+// 失败草稿可见且持久化，但重启后仍不能被当作已完成的模型上下文。
+void test_model_draft_survives_reopen_without_becoming_model_history() {
+    TempDir temp;
+    const auto path = temp.file("draft.db");
+    std::string session;
+    {
+        auto opened = makeMaiSqliteStore(path);
+        CHECK(opened);
+        if (!opened) return;
+        auto store = std::move(opened.value());
+        session = MaiIdGenerator::newSessionId();
+        store->putSession(makeSession(session, "draft isolation", 42));
+        auto message = makeMessage(MaiIdGenerator::newMessageId(), MaiRole::Assistant);
+        auto failed = textPart(MaiIdGenerator::newPartId(), "FAILED_PRIVATE_DRAFT");
+        failed.modelDraft = true;
+        message.parts.push_back(failed);
+        MaiMessagePart reasoning{MaiIdGenerator::newPartId(), MaiReasoningPart{"FAILED_REASONING"},
+                                 42};
+        reasoning.modelDraft = true;
+        message.parts.push_back(reasoning);
+        message.parts.push_back(textPart(MaiIdGenerator::newPartId(), "COMMITTED_ANSWER"));
+        const auto before = maiContextSourceFingerprint(session, {message}, 1);
+        message.parts[0].modelDraft = false;
+        CHECK(before != maiContextSourceFingerprint(session, {message}, 1));
+        message.parts[0].modelDraft = true;
+        store->putMessage(session, message);
+        CHECK(!store->lastWriteError());
+    }
+    auto reopened = makeMaiSqliteStore(path);
+    CHECK(reopened);
+    if (!reopened) return;
+    auto store = std::move(reopened.value());
+    const auto history = store->listMessages(session);
+    CHECK(history.size() == 1);
+    if (history.empty() || history[0].parts.size() != 3) {
+        CHECK(false);
+        return;
+    }
+    CHECK(history[0].parts[0].modelDraft && history[0].parts[1].modelDraft);
+    CHECK(!history[0].parts[2].modelDraft);
+    CHECK(history[0].text().find("FAILED_PRIVATE_DRAFT") != std::string::npos);
+    const auto context = MaiContextBuilder{}.build(history, 0, 0, {}, true);
+    CHECK(context.size() == 1);
+    if (!context.empty()) {
+        CHECK(context[0].content == "COMMITTED_ANSWER");
+        CHECK(context[0].reasoning.empty());
+    }
+}
+
 void test_specialist_reply_survives_reopen() {
     std::printf("-> test_specialist_reply_survives_reopen\n");
     TempDir temp;
@@ -1565,6 +1615,7 @@ void test_session_effort_survives_reopen_and_v9_migration() {
 }  // namespace
 
 int main() {
+    test_model_draft_survives_reopen_without_becoming_model_history();
     test_continuation_fingerprint_preserves_legacy_hashes();
     std::printf("-> contract: memory store\n");
     {

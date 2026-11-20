@@ -82,6 +82,12 @@ public:
     bool hasVisibleText() const;
 
 private:
+    // 每次失败都重新构造当前会话输入；同一采样的重试不占工具迭代额度。
+    // 传输层只执行一次，恢复等待可被取消或新输入打断。
+    // 已执行工具结果随历史回传，重试层不重新派发其旧调用。
+    std::vector<MaiToolInvocation> requestWithRecovery(bool includeTools,
+                                                       const std::atomic<bool>& cancel,
+                                                       const char* finalAnswerHint = nullptr);
     // run() 的实际工作。外层 run() 负责把任何未预期异常收敛成会话错误，不能让异常逃出
     // std::thread 后触发 std::terminate，带着整个宿主进程一起退出。
     void runUnchecked(const std::atomic<bool>& cancel);

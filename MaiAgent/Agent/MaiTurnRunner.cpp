@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <chrono>
 #include <exception>
 #include <map>
 #include <tuple>
@@ -17,6 +18,7 @@
 
 #include "MaiIdGenerator.h"
 #include "MaiContextCompactor.h"
+#include "MaiModelRetry.h"
 
 namespace {
 
@@ -281,13 +283,7 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         if (mDependencies.closeSteering) mDependencies.closeSteering();
         advanceSteering(false);
         if (mError || cancel.load(std::memory_order_relaxed)) return;
-        auto built = buildRequest(mModelName, false, false, cancel, hint);
-        if (!built) {
-            mError = built.error();
-            return;
-        }
-        MaiModelRequest finalRequest = std::move(built.value());
-        const auto finalCalls = requestCompletion(finalRequest, cancel);
+        const auto finalCalls = requestWithRecovery(false, cancel, hint);
         const bool hasFinalText = mResponseHasVisibleText;
         commitStreamedParts();
         if (!mError && !cancel.load(std::memory_order_relaxed) &&
@@ -302,12 +298,10 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         }
         if (mError) break;
 
-        auto built = buildRequest(mModelName, false, true, cancel);
-        if (!built) {
-            mError = built.error();
-            break;
-        }
-        const auto calls = requestCompletion(built.value(), cancel);
+        const auto inputsBeforeRequest = mCurrentUserMessageIds;
+        const auto calls = requestWithRecovery(true, cancel);
+        // 恢复等待内部也会消费补充；新指令不能继承旧计划的“重复无进展”计数。
+        if (inputsBeforeRequest != mCurrentUserMessageIds) observedBatches.clear();
         const bool producedVisibleText = mResponseHasVisibleText;
         commitStreamedParts();
         announceCommittedTextParts(cancel);
@@ -371,6 +365,8 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
                                                        const std::atomic<bool>& cancel,
                                                        const char* finalAnswerHint) {
     MaiModelRequest request;
+    // 上下文压缩也属于本次采样；摘要失败必须回到同一恢复预算，避免适配器叠加重试。
+    request.callerManagesRetries = true;
     // 沿用持久会话身份；每轮/工具跟进/补答不得创建新的缓存路由身份。
     request.sessionId = mSessionId;
     request.model = modelName;
@@ -507,6 +503,59 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
     return prepared.value().request;
 }
 
+std::vector<MaiToolInvocation> MaiTurnRunner::requestWithRecovery(bool includeTools,
+                                                                  const std::atomic<bool>& cancel,
+                                                                  const char* finalAnswerHint) {
+    int retries = 0;
+    int retryLimit = -1;
+    for (;;) {
+        if (cancel.load(std::memory_order_relaxed)) {
+            mError = {MaiErrorCode::Canceled, "canceled by user"};
+            return {};
+        }
+        // 重连期间接受的补充必须先消费，不能继续发送第一次捕获的旧请求体。
+        advanceSteering(false);
+        if (mError) return {};
+        auto built = buildRequest(mModelName, false, includeTools, cancel, finalAnswerHint);
+        std::vector<MaiToolInvocation> calls;
+        if (!built)
+            mError = built.error();
+        else
+            calls = requestCompletion(built.value(), cancel);
+        if (!mError) return calls;
+        const auto advice = mError.retryAdvice();
+        if (!advice || cancel.load(std::memory_order_relaxed)) return {};
+        if (retryLimit < 0) retryLimit = advice->maxRetries;
+        retryLimit = std::min(retryLimit, advice->maxRetries);
+        if (retries >= retryLimit) return {};
+        const long delay = MaiModelRetry::delayMilliseconds(*advice, retries);
+        ++retries;
+        mDependencies.emitter->emitModelRetry(mSessionId, mInitialAssistantId, retries, retryLimit,
+                                              delay);
+        const auto retryAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay);
+        for (;;) {
+            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+                                       retryAt - std::chrono::steady_clock::now())
+                                       .count();
+            const auto waited =
+                MaiModelRetry::wait(std::max(0L, static_cast<long>(remaining)), cancel, [this] {
+                    return mDependencies.pendingSteering &&
+                           !mDependencies.pendingSteering().empty();
+                });
+            if (waited == MaiRetryWaitResult::Canceled) {
+                mError = {MaiErrorCode::Canceled, "canceled by user"};
+                return {};
+            }
+            if (waited == MaiRetryWaitResult::Ready) break;
+            // 消费新输入后等待同一个截止时间，不重复完整等待，也不提前绕过 Retry-After。
+            mError = {};
+            advanceSteering(false);
+            if (mError) return {};
+        }
+        mError = {};
+    }
+}
+
 std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRequest& request,
                                                                 const std::atomic<bool>& cancel) {
     // 每一圈的文本是独立的 part：模型在调工具前后说的话是两段发言，
@@ -594,7 +643,8 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     sink.onContinuationState = [&](const MaiModelContinuationState& state) {
         if (continuationError) return;
         if (continuationPublished) {
-            continuationError = {MaiErrorCode::Protocol, "multiple continuation states for one response"};
+            continuationError = {MaiErrorCode::Protocol,
+                                 "multiple continuation states for one response"};
             return;
         }
         continuationPublished = true;
@@ -602,9 +652,9 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
         carrier.id = continuationPartId;
         carrier.created = MaiTime::getCurrentTime();
         carrier.body = MaiReasoningPart{"", state};
-        mAssistant.parts.insert(mAssistant.parts.begin() +
-                                    static_cast<std::ptrdiff_t>(mResponseFirstPart),
-                                std::move(carrier));
+        mAssistant.parts.insert(
+            mAssistant.parts.begin() + static_cast<std::ptrdiff_t>(mResponseFirstPart),
+            std::move(carrier));
         // 状态可能没有一个显示字节，不能等待文本 checkpoint 才持久化。
         mDependencies.store->putMessage(mSessionId, mAssistant);
         continuationError = mDependencies.store->lastWriteError();
@@ -618,18 +668,34 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
 
     const auto streamError = mDependencies.model->stream(request, sink, cancel);
     mError = continuationError ? continuationError : streamError;
+    // 尾部先写入同一 part。只有完整成功尝试才转成可供模型/摘要使用的历史。
+    commitStreamedParts();
+    // 持久化失败不是模型网络故障，不能沿用断流恢复建议而继续采样。
+    if (const auto error = mDependencies.store->lastWriteError()) mError = error;
+    if (!mError && !cancel.load(std::memory_order_relaxed)) {
+        for (std::size_t index = mResponseFirstPart; index < mAssistant.parts.size(); ++index)
+            mAssistant.parts[index].modelDraft = false;
+        mDependencies.store->putMessage(mSessionId, mAssistant);
+        if (const auto error = mDependencies.store->lastWriteError()) {
+            mError = error;
+            for (std::size_t index = mResponseFirstPart; index < mAssistant.parts.size(); ++index)
+                mAssistant.parts[index].modelDraft = true;
+        }
+    }
     if (mError && continuationPublished) {
         // state 回调期间也可能 Stop，此时 wire 可拒绝交付后续调用元数据。
         // 没有任何工具进入执行，撤下本次载体而保留可见草稿，避免回放无结果的调用。
-        mAssistant.parts.erase(
-            std::remove_if(mAssistant.parts.begin(), mAssistant.parts.end(),
-                           [&](const MaiMessagePart& part) { return part.id == continuationPartId; }),
-            mAssistant.parts.end());
+        mAssistant.parts.erase(std::remove_if(mAssistant.parts.begin(), mAssistant.parts.end(),
+                                              [&](const MaiMessagePart& part) {
+                                                  return part.id == continuationPartId;
+                                              }),
+                               mAssistant.parts.end());
         mDependencies.store->putMessage(mSessionId, mAssistant);
         if (const auto writeError = mDependencies.store->lastWriteError())
             mError = writeError;
         else
-            mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mSessionId, mAssistant.id);
+            mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mSessionId,
+                                               mAssistant.id);
         calls.clear();
     }
     return calls;
@@ -986,6 +1052,7 @@ void MaiTurnRunner::beginStreamedPart(const std::string& partId, MaiMessagePartB
     part.id = partId;
     part.body = std::move(body);  // 先空着，内容在 commitStreamedParts 里填
     part.created = MaiTime::getCurrentTime();
+    part.modelDraft = true;
     mAssistant.parts.push_back(std::move(part));
 
     // 先落库，再广播。理由见头文件里这个函数的注释——这里错了的话，界面分不出正文和思考过程，
@@ -1013,7 +1080,7 @@ void MaiTurnRunner::announceCommittedTextParts(const std::atomic<bool>& cancel) 
     for (std::size_t index = mResponseFirstPart; index < mAssistant.parts.size(); ++index) {
         const auto& part = mAssistant.parts[index];
         const auto* text = std::get_if<MaiTextPart>(&part.body);
-        if (!text || text->text.empty()) continue;
+        if (!text || text->text.empty() || part.modelDraft) continue;
         mDependencies.emitter->emitTextCommitted(mSessionId, mInitialAssistantId, mAssistant.id,
                                                  part.id);
     }

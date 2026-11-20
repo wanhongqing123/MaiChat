@@ -49,6 +49,15 @@ void MaiEventEmitter::emitTurnIdle(const std::string& sessionId, const std::stri
     mBus.publish(event);
 }
 
+void MaiEventEmitter::emitModelRetry(const std::string& sessionId, const std::string& turnId,
+                                     int retry, int limit, long delayMs) {
+    MaiEvent event = makeEvent(MaiEventType::ModelRequestRetrying, sessionId);
+    event.turnId = turnId;
+    event.detail = "Reconnecting to model " + std::to_string(retry) + "/" + std::to_string(limit) +
+                   " (waiting " + std::to_string(delayMs) + " ms)";
+    mBus.publish(event);
+}
+
 void MaiEventEmitter::emitTurnError(const std::string& sessionId, const std::string& turnId,
                                     const std::string& detail) {
     MaiEvent event = makeEvent(MaiEventType::SessionError, sessionId);

@@ -319,6 +319,8 @@ std::vector<SourceField> sourceFields(const std::vector<MaiMessage>& history,
                 (previous && hasCoveredPart(*previous, message, index, partIndex)))
                 continue;
             const auto& part = message.parts[partIndex];
+            // 摘要和直接推理使用同一成功边界，避免把失败采样通过摘要重新引入。
+            if (message.role == MaiRole::Assistant && part.modelDraft) continue;
             Json source{{"message_id", message.id},
                         {"role", maiRoleToString(message.role)},
                         {"part_id", part.id}};
@@ -479,6 +481,8 @@ MaiModelRequest summaryRequest(const MaiModelRequest& original, const std::strin
     MaiModelRequest request;
     // 摘要与主请求属于同一真实会话；后续格式重试复制此请求，不能切换路由身份。
     request.sessionId = original.sessionId;
+    // 摘要本身不持有另一份网络恢复预算；由原请求的调用方统一决定是否重建。
+    request.callerManagesRetries = original.callerManagesRetries;
     request.model = original.model;
     // 当前轮已有显式 effort 时摘要沿用同一快照，不再暗中降级；未指定时保留原低开销默认。
     request.reasoningEffort = original.reasoningEffort.empty() ? "low" : original.reasoningEffort;
@@ -586,7 +590,7 @@ MaiResult<std::string> summarize(MaiModelClient& model, const MaiModelRequest& r
     MaiModelRequest attempt = request;
     for (unsigned int index = 0; index < 2; ++index) {
         auto text = collectSummaryText(model, attempt, cancel);
-        // 工具/截断/歧义正文、取消和网络等流错误保持原失败，不扩大重试范围。
+        // 流错误保持原失败（含 typed 恢复建议），不挪用摘要格式重试预算。
         if (!text) return text.error();
         const auto validated = validateSummary(text.value());
         bool oversized = false;
@@ -898,7 +902,8 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
     const auto deferOrFail = [&](const MaiError& error) -> MaiResult<MaiContextPreparation> {
         if (cancel.load(std::memory_order_relaxed))
             return {MaiErrorCode::Canceled, "Context summarization was canceled."};
-        if (error.code() != MaiErrorCode::Protocol) return error;
+        // 缺终止事件虽然属于 Protocol，仍是可恢复传输失败；不能先走容量降级吞掉它。
+        if (error.retryAdvice() || error.code() != MaiErrorCode::Protocol) return error;
         if (const MaiError sourceError = verifySource()) return sourceError;
         if (estimate(request) > inputBudget) {
             if (!mOptions.allowHistoryIndexRecovery) return error;

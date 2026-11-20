@@ -18,13 +18,13 @@
 #include <tuple>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiPathGuard.h"
+#include "MaiModelRetry.h"
 #include "MaiCloudModelCatalog.h"
 
 namespace {
@@ -375,8 +375,11 @@ struct StreamContext {
     bool hasTerminalOutput = false;
     std::string rawBody;
     std::string terminalError;
+    bool transientStreamError = false;
     // 仅保存已校验的数字秒，-1 表示缺失/无效；原响应头可能带凭据，不能保留或写入诊断。
+    // 402 诊断仅接受数字秒；恢复等待另保留支持 HTTP 日期的毫秒值。
     long retryAfterSeconds = -1;
+    long retryAfterDelayMs = -1;
     bool sawOutput = false;
     bool done = false;
     bool inactive = false;
@@ -536,6 +539,11 @@ void handleEvent(StreamContext& context, const Json& event) {
     if (outputIndex >= 0) context.observedOutputIndices.insert(outputIndex);
     if (type == "error" || type == "response.error") {
         const Json error = event.value("error", Json{});
+        // 仅认结构化错误码；未知类型不能通过错误文案触发自动重新采样。
+        auto code = stringField(error, "code");
+        if (code.empty()) code = stringField(event, "code");
+        if (code.empty()) code = stringField(error, "type");
+        context.transientStreamError = MaiModelRetry::isTransientProviderCode(code);
         context.terminalError = stringField(error, "message");
         if (context.terminalError.empty()) context.terminalError = stringField(event, "message");
         if (context.terminalError.empty())
@@ -689,6 +697,10 @@ void handleEvent(StreamContext& context, const Json& event) {
         if (type != "response.completed") {
             const Json error = response.value("error", Json::object());
             const Json details = response.value("incomplete_details", Json::object());
+            // max_output_tokens/content_filter 等 incomplete 是语义失败，不能当断流。
+            if (type == "response.failed")
+                context.transientStreamError =
+                    MaiModelRetry::isTransientProviderCode(stringField(error, "code"));
             context.terminalError = stringField(error, "message");
             if (context.terminalError.empty())
                 context.terminalError = stringField(details, "reason");
@@ -707,18 +719,15 @@ void handleLine(StreamContext& context, const std::string& line) {
     if (event.is_object()) handleEvent(context, event);
 }
 
-// Retry-After 本轮只支持 0..86400 的数字秒；HTTP-date、符号、小数和溢出均不推断。
+// 402 的既有诊断契约只记录已校验的数字秒，不扩大付费错误元数据。
 long parseRetryAfterSeconds(std::string_view value) {
     const auto first = value.find_first_not_of(" \t\r\n");
     if (first == std::string_view::npos) return -1;
-    const auto last = value.find_last_not_of(" \t\r\n");
-    value = value.substr(first, last - first + 1);
-    long seconds = 0;
-    for (const char digit : value) {
-        if (digit < '0' || digit > '9' || seconds > (86400 - (digit - '0')) / 10) return -1;
-        seconds = seconds * 10 + (digit - '0');
-    }
-    return seconds;
+    value = value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+    if (!std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return -1;
+    const long delay = MaiModelRetry::parseDelayMilliseconds(value);
+    return delay < 0 ? -1 : delay / 1000;
 }
 
 std::size_t headerCallback(char* bytes, std::size_t size, std::size_t count, void* user) {
@@ -728,6 +737,7 @@ std::size_t headerCallback(char* bytes, std::size_t size, std::size_t count, voi
     if (length >= 5 && std::memcmp(bytes, "HTTP/", 5) == 0) {
         // 100 Continue、代理与重定向都可带来多个响应；后续响应不能继承前一个 Retry-After。
         context.retryAfterSeconds = -1;
+        context.retryAfterDelayMs = -1;
         if (context.manualRedirects) {
             const std::string line(bytes, length);
             const auto space = line.find(' ');
@@ -751,9 +761,11 @@ std::size_t headerCallback(char* bytes, std::size_t size, std::size_t count, voi
         std::equal(bytes, bytes + retryAfterNameLength,
                    "retry-after:", [](unsigned char left, unsigned char right) {
                        return std::tolower(left) == right;
-                   }))
-        context.retryAfterSeconds = parseRetryAfterSeconds(
-            std::string_view(bytes + retryAfterNameLength, length - retryAfterNameLength));
+                   })) {
+        const std::string_view value(bytes + retryAfterNameLength, length - retryAfterNameLength);
+        context.retryAfterSeconds = parseRetryAfterSeconds(value);
+        context.retryAfterDelayMs = MaiModelRetry::parseDelayMilliseconds(value);
+    }
     // 响应头到达也是真实通信；除已校验秒数外只记时间，不保存可能带凭据的原头字段。
     if (length > 0) context.lastStreamActivity = std::chrono::steady_clock::now();
     return context.cancel->load(std::memory_order_relaxed) ? 0 : length;
@@ -1003,69 +1015,84 @@ public:
                 currentUrl = nextUrl;
             }
 
-            if (cancel.load(std::memory_order_relaxed))
-                return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
-            if (context.inactive)
-                return MaiError::make(MaiErrorCode::Network,
-                                      "model stream transport inactive: no data or keepalive for " +
-                                          std::to_string(mConfig.inactivityTimeoutSeconds) +
-                                          " seconds");
-            if (context.progressTimedOut)
-                return MaiError::make(MaiErrorCode::Network,
-                                      "model stream made no progress for " +
-                                          std::to_string(mConfig.progressTimeoutSeconds) +
-                                          " seconds");
-            const bool transient =
-                transfer != CURLE_OK ? isRetryable(transfer) : status == 408 || status >= 500;
-            // 已收到的 402 拒绝不能因错误正文截断/RST 被降级成自动传输重试。
-            if (status != 402 && transient && !context.sawOutput && attempt < mConfig.maxRetries) {
-                const long delay = mConfig.retryInitialDelayMs * (1L << attempt);
-                for (long waited = 0; waited < delay; waited += 25) {
-                    if (cancel.load(std::memory_order_relaxed))
-                        return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(std::min(25L, delay - waited)));
+            const bool canRetry = MaiModelRetry::isTransient(
+                status, transfer != CURLE_OK && isRetryable(transfer), context.rawBody);
+            const auto advise = [&](MaiError error, bool retryable) {
+                return retryable
+                           ? MaiModelRetry::advise(std::move(error), mConfig, context.sawOutput,
+                                                   context.retryAfterDelayMs)
+                           : error;
+            };
+            const MaiError failure = [&]() -> MaiError {
+                if (cancel.load(std::memory_order_relaxed))
+                    return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
+                if (context.inactive)
+                    return advise(
+                        MaiError::make(
+                            MaiErrorCode::Network,
+                            "model stream transport inactive: no data or keepalive for " +
+                                std::to_string(mConfig.inactivityTimeoutSeconds) + " seconds"),
+                        true);
+                if (context.progressTimedOut)
+                    return advise(
+                        MaiError::make(MaiErrorCode::Network,
+                                       "model stream made no progress for " +
+                                           std::to_string(mConfig.progressTimeoutSeconds) +
+                                           " seconds"),
+                        true);
+                if (transfer != CURLE_OK && status != 402 &&
+                    !(context.done && transfer == CURLE_WRITE_ERROR))
+                    return advise(MaiError::make(MaiErrorCode::Network,
+                                                 std::string("curl: ") +
+                                                     (transfer == CURLE_PEER_FAILED_VERIFICATION &&
+                                                              transportError[0]
+                                                          ? transportError
+                                                          : curl_easy_strerror(transfer))),
+                                  canRetry);
+                if (status >= 400) {
+                    const std::string detail = providerError(context.rawBody);
+                    std::string message =
+                        "HTTP " + std::to_string(status) + (detail.empty() ? "" : ": " + detail);
+                    MaiErrorCode code = status == 401 || status == 403 ? MaiErrorCode::NotConfigured
+                                        : status == 429                ? MaiErrorCode::RateLimited
+                                        : status >= 500                ? MaiErrorCode::Network
+                                                                       : MaiErrorCode::Protocol;
+                    const auto capability = maiCloudModelInfo(request.model);
+                    if (status == 402 && capability && capability->provider == "openrouter") {
+                        const std::string diagnostic = openRouterCreditDiagnostic(
+                            context.rawBody, context.retryAfterSeconds, code);
+                        message += diagnostic;
+                        // 截断 JSON 无法提供分类，但已校验的等待头是独立的 HTTP 事实。
+                        // 只保留数字秒，不能从半截正文猜预算来源或触发自动重试。
+                        if (transfer != CURLE_OK && diagnostic.empty() &&
+                            context.retryAfterSeconds >= 0)
+                            message += " [OpenRouter retry_after_seconds=" +
+                                       std::to_string(context.retryAfterSeconds) + "]";
+                    }
+                    return advise(MaiError::make(code, message), canRetry);
                 }
-                continue;
-            }
-            // 已收到 402 就已知请求被 HTTP 拒绝；之后 RST 不能抹掉该事实。
-            // 其它传输错误保持原语义，也不能把不完整响应当作成功终态。
-            if (transfer != CURLE_OK && status != 402 &&
-                !(context.done && transfer == CURLE_WRITE_ERROR))
-                return MaiError::make(
-                    MaiErrorCode::Network,
-                    std::string("curl: ") +
-                        (transfer == CURLE_PEER_FAILED_VERIFICATION && transportError[0]
-                             ? transportError
-                             : curl_easy_strerror(transfer)));
-            if (status >= 400) {
-                const std::string detail = providerError(context.rawBody);
-                std::string message =
-                    "HTTP " + std::to_string(status) + (detail.empty() ? "" : ": " + detail);
-                MaiErrorCode code = status == 401 || status == 403 ? MaiErrorCode::NotConfigured
-                                    : status == 429                ? MaiErrorCode::RateLimited
-                                    : status >= 500                ? MaiErrorCode::Network
-                                                                   : MaiErrorCode::Protocol;
-                const auto capability = maiCloudModelInfo(request.model);
-                if (status == 402 && capability && capability->provider == "openrouter") {
-                    const std::string diagnostic = openRouterCreditDiagnostic(
-                        context.rawBody, context.retryAfterSeconds, code);
-                    message += diagnostic;
-                    // 截断 JSON 无法提供分类，但已校验的等待头是独立的 HTTP 事实。
-                    // 只保留数字秒，不能从半截正文猜预算来源或触发自动重试。
-                    if (transfer != CURLE_OK && diagnostic.empty() &&
-                        context.retryAfterSeconds >= 0)
-                        message += " [OpenRouter retry_after_seconds=" +
-                                   std::to_string(context.retryAfterSeconds) + "]";
-                }
-                return MaiError::make(code, message);
-            }
-            if (!context.done)
-                return MaiError::make(MaiErrorCode::Protocol,
-                                      "Responses stream ended without a terminal event");
-            if (!context.terminalError.empty())
-                return MaiError::make(MaiErrorCode::Protocol, context.terminalError);
+                if (!context.done)
+                    return advise(MaiError::make(MaiErrorCode::Protocol,
+                                                 "Responses stream ended without a terminal event"),
+                                  true);
+                if (!context.terminalError.empty())
+                    return advise(MaiError::make(MaiErrorCode::Protocol, context.terminalError),
+                                  context.transientStreamError);
 
+                return {};
+            }();
+            if (failure) {
+                const auto& advice = failure.retryAdvice();
+                // 直接调用只恢复无输出尝试；Agent 请求由 TurnRunner 重建上下文后恢复。
+                if (!request.callerManagesRetries && advice && !advice->sawOutput &&
+                    attempt < advice->maxRetries) {
+                    if (MaiModelRetry::wait(MaiModelRetry::delayMilliseconds(*advice, attempt),
+                                            cancel) == MaiRetryWaitResult::Canceled)
+                        return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
+                    continue;
+                }
+                return failure;
+            }
             Json output = context.hasTerminalOutput ? context.terminalOutput : Json::array();
             bool hasReplayableOutput = context.hasTerminalOutput;
             if (!context.hasTerminalOutput && !context.completedOutput.empty()) {

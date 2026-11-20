@@ -115,7 +115,8 @@ class ModelHandler(BaseHTTPRequestHandler):
             "function": {"name": tool, "arguments": args},
         }]}) if tool else b""
         text_frames = [frame({"content": piece}) for piece in text]
-        done = b"data: [DONE]\n\n"
+        # 第五项仅供断流用例：以合法 HTTP EOF 结束，却不给模型协议终止帧。
+        done = b"" if len(entry) > 4 and entry[4] else b"data: [DONE]\n\n"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         # HTTP/1.0 默认靠关闭连接界定正文；本地 Windows 定点复现会在首字后报告接收错误。
@@ -459,6 +460,28 @@ with_reasoning = subprocess.run(
 shown = with_reasoning.stdout.decode("utf-8", "replace")
 check("--reasoning shows the draft", DRAFT in shown, repr(shown[-200:]))
 check("--reasoning still shows the answer", ANSWER in shown)
+
+# ── 同一进程/同一 turn 的断流恢复 ────────────────────────────
+# 直接驱动当前构建的 CLI；不允许把失败草稿作为助手历史再发给假模型。
+FAILED_DRAFT = "UNCONFIRMED_LOCAL_DRAFT_E2E"
+RECOVERED = "Completed after the interrupted model response."
+with served_lock:
+    served["n"] = 0
+    body_mark = len(ModelHandler.bodies)
+SCRIPTS[:] = [(FAILED_DRAFT, "", "", "", True), (RECOVERED, "", "")]
+mark = len(text())
+turns = prompts_seen()
+send("Recover an interrupted response")
+check("partial draft remains visible", wait_after(FAILED_DRAFT, mark))
+check("host reports model recovery", wait_after("[model] Reconnecting to model 1/2", mark))
+check("the same turn completes after reconnecting", wait_after(RECOVERED, mark))
+check("recovered turn returns to idle", wait_prompts(turns + 1))
+check("recovery is not exposed as a terminal error", "[error]" not in text()[mark:])
+with served_lock:
+    recovery_requests = ModelHandler.bodies[body_mark:]
+check("exactly two HTTP attempts", len(recovery_requests) == 2)
+check("retry excludes the unconfirmed assistant draft",
+      len(recovery_requests) == 2 and FAILED_DRAFT.encode("utf-8") not in recovery_requests[1])
 
 # ── 查询类命令 ────────────────────────────────────────────
 mark = len(text())

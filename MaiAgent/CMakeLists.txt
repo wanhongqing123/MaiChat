@@ -451,6 +451,7 @@ add_library(maiagent STATIC
   Agent/MaiTurnRunner.cpp
   Agent/MaiContextBuilder.cpp
   Agent/MaiModelClient.cpp
+  Agent/MaiModelRetry.cpp
   Agent/MaiRoutedModelClient.cpp
   Agent/MaiCloudModelCatalog.cpp
   Agent/MaiContextCheckpoint.cpp

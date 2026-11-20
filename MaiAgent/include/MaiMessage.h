@@ -125,6 +125,10 @@ struct MaiMessagePart {
     std::string id;
     MaiMessagePartBody body;
     MaiMillis created = 0;
+    // 未成功确认的模型采样草稿。正文/推理仍可显示，但不得用于后续推理或摘要。
+    // 新流在首次落库时即置 true，完整响应成功且持久化后清除；失败/取消保留。
+    // 旧数据默认为 false；工具与用户附件不使用该位，不能据此推断工具是否执行。
+    bool modelDraft = false;
 };
 
 // ── 消息 ────────────────────────────────────────────────────────

@@ -58,11 +58,14 @@ struct FakeServer {
     int status = 200;
     std::string retryAfter;
     int transientFailures = 0;
+    int transientStatus = 503;
+    std::string transientBody = R"({"error":{"message":"temporarily unavailable"}})";
     bool stallWithoutBytes = false;
     bool sendOnlyHeartbeats = false;
     // 重复有效但不推进的协议事件，用于证明服务端状态/空 delta 不会无限续期。
     std::string repeatedEvent;
     bool keepOpenAfterDone = false;
+    int stallRequests = 0;
     std::vector<std::string> delayedChunks;
     int delayedChunkMs = 0;
     std::atomic<bool> releaseStall{false};
@@ -86,9 +89,9 @@ struct FakeServer {
                 requestBodies.push_back(request.body);
             }
             if (requestNumber <= transientFailures) {
-                response.status = 503;
-                response.set_content(R"({"error":{"message":"temporarily unavailable"}})",
-                                     "application/json");
+                response.status = transientStatus;
+                if (!retryAfter.empty()) response.set_header("Retry-After", retryAfter);
+                response.set_content(transientBody, "application/json");
                 return;
             }
             if (status != 200) {
@@ -97,7 +100,7 @@ struct FakeServer {
                 response.set_content(script, "application/json");
                 return;
             }
-            if (keepOpenAfterDone) {
+            if (keepOpenAfterDone || requestNumber <= stallRequests) {
                 auto sent = std::make_shared<bool>(false);
                 response.set_chunked_content_provider(
                     "text/event-stream", [this, sent](std::size_t, httplib::DataSink& sink) {
@@ -761,7 +764,7 @@ void test_finish_reason_length_is_not_reported_as_success() {
     choice["finish_reason"] = "length";
     const Collected result = run(sse(json{{"choices", json::array({choice})}}) + kDone, 3);
     CHECK(result.code == MaiErrorCode::Protocol);
-    CHECK(result.error.find("长度上限") != std::string::npos);
+    CHECK(result.error.find("length limit") != std::string::npos);
 }
 
 void test_final_unterminated_sse_line_is_processed() {
@@ -889,7 +892,7 @@ void test_protocol_liveness_and_progress_are_distinct() {
         CHECK(!client->stream(request, sink, cancel));
         CHECK(output == "ready");
     }
-    // 同一状态重复发送只说明链路活跃；无实质推进仍按独立期限结束，且不重试旧请求。
+    // 同一状态重复只说明链路活跃；无实质推进仍超时，并遵守显式的一次恢复预算。
     FakeServer fake;
     fake.repeatedEvent =
         response_event({{"type", "response.in_progress"}, {"output_index", nullptr}}) +
@@ -903,6 +906,8 @@ void test_protocol_liveness_and_progress_are_distinct() {
     config.inactivityTimeoutSeconds = 1;
     config.progressTimeoutSeconds = 2;
     config.totalTimeoutSeconds = 6;
+    config.maxRetries = 1;
+    config.retryInitialDelayMs = 0;
     auto client = makeMaiModelClient(config);
     MaiModelRequest request;
     request.model = "test-model";
@@ -911,7 +916,7 @@ void test_protocol_liveness_and_progress_are_distinct() {
     const auto result = client->stream(request, sink, cancel);
     CHECK(result.code() == MaiErrorCode::Network);
     CHECK(result.message().find("made no progress") != std::string::npos);
-    CHECK(fake.requestCount.load() == 1);
+    CHECK(fake.requestCount.load() == 2);
 }
 
 void test_responses_lifecycle_advances_without_synthetic_output() {
@@ -962,6 +967,9 @@ void test_silent_transport_still_times_out() {
         config.inactivityTimeoutSeconds = 1;
         config.progressTimeoutSeconds = 5;
         config.totalTimeoutSeconds = 7;
+        // 单次超时之外最多再连一次，不能把无输出超时漏在恢复分支之外。
+        config.maxRetries = 1;
+        config.retryInitialDelayMs = 0;
         auto client = makeMaiModelClient(config);
         MaiModelRequest request;
         request.model = "test-model";
@@ -970,7 +978,7 @@ void test_silent_transport_still_times_out() {
         const auto result = client->stream(request, sink, cancel);
         CHECK(result.code() == MaiErrorCode::Network);
         CHECK(result.message().find("transport inactive") != std::string::npos);
-        CHECK(fake.requestCount.load() == 1);
+        CHECK(fake.requestCount.load() == 2);
     }
 }
 
@@ -2636,7 +2644,7 @@ void test_particle_free_primary_does_not_change_existing_provider_fields() {
     }
 }
 
-// 免费额度或鉴权额度失败必须原样结束，不切换到付费型号或读取另一条路由的凭据。
+// 免费路由的临时限流可按预算重试同一型号；不得切付费型号或读取另一条路由凭据。
 void test_particle_free_primary_quota_errors_never_fall_back_to_paid_routes() {
     const std::string freeModel = "particle-ai/particle-1:free";
     for (const int status : {429, 402}) {
@@ -2685,7 +2693,7 @@ void test_particle_free_primary_quota_errors_never_fall_back_to_paid_routes() {
         const MaiError error = client->stream(request, sink, cancel);
         CHECK(error.code() == (status == 429 ? MaiErrorCode::RateLimited : MaiErrorCode::Protocol));
         CHECK(error.message().rfind("HTTP " + std::to_string(status), 0) == 0);
-        CHECK(free.requestCount.load() == 1);
+        CHECK(free.requestCount.load() == (status == 429 ? 3 : 1));
         CHECK(paid.requestCount.load() == 0);
         CHECK(freeKeyReads == 1);
         CHECK(paidKeyReads == 0);
@@ -3452,7 +3460,136 @@ void test_context_limits_output_budget_and_actual_usage() {
 
 }  // namespace
 
+// 走真实 HTTP 和 Agent：半截正文后正常 EOF 也必须恢复，失败草稿不能进入重试请求。
+void test_agent_recovers_partial_stream_without_replaying_draft(MaiWireApi wire, bool stalled,
+                                                                bool serverError = false) {
+    FakeServer fake;
+    const json finalItem{
+        {"type", "message"},
+        {"id", "msg_recovered"},
+        {"role", "assistant"},
+        {"content", json::array({json{{"type", "output_text"}, {"text", "RECOVERED_FINAL"}}})}};
+    fake.scripts = {sse(json{{"type", "response.output_text.delta"},
+                             {"output_index", 0},
+                             {"delta", "FAILED_ATTEMPT_PRIVATE_DRAFT"}}),
+                    sse(json{{"type", "response.completed"},
+                             {"response", {{"output", json::array({finalItem})}}}})};
+    if (wire == MaiWireApi::ChatCompletions)
+        fake.scripts = {text_delta("FAILED_ATTEMPT_PRIVATE_DRAFT"),
+                        text_delta("RECOVERED_FINAL") + kDone};
+    if (serverError) {
+        // HTTP 200 中的明确 server_error 与 EOF 共用同一恢复所有者。
+        fake.scripts[0] +=
+            wire == MaiWireApi::ChatCompletions
+                ? sse(json{{"error", {{"code", "server_error"}, {"message", "try again"}}}})
+                : sse(json{{"type", "response.failed"},
+                           {"response",
+                            {{"error", {{"code", "server_error"}, {"message", "try again"}}}}}});
+    }
+    if (stalled) {
+        fake.stallRequests = 1;
+        fake.script = fake.scripts.front();
+    }
+    fake.start();
+    MaiModelConfig config;
+    config.baseUrl = fake.base();
+    config.apiKey = "test-key";
+    config.wire = wire;
+    config.inactivityTimeoutSeconds = 1;
+    config.progressTimeoutSeconds = 2;
+    config.maxRetries = 2;
+    config.retryInitialDelayMs = 1;
+    MaiAgent agent(makeMaiMemoryStore(), makeMaiModelClient(config));
+    std::atomic<int> errors{0}, commits{0};
+    const auto token = agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type == MaiEventType::SessionError) ++errors;
+        if (event.type == MaiEventType::MessageTextCommitted) ++commits;
+    });
+    const auto session = agent.submit(
+        MaiCreateSession{MaiFileSystem::temporaryDirectory().toUtf8(), "", "deepseek-flash", ""});
+    CHECK(session);
+    if (!session) return;
+    CHECK(agent.submit(MaiSendPrompt{session.value(), "Recover this response"}));
+    agent.waitIdle();
+    CHECK(fake.requestCount.load() == 2);
+    CHECK(errors.load() == 0);
+    CHECK(commits.load() == 1);
+    const auto messages = agent.listMessages(session.value());
+    CHECK(messages.size() == 2);
+    if (messages.size() == 2) {
+        // 本地仍保留失败时已经显示的草稿，成功尝试使用独立 part。
+        CHECK(messages.back().text().find("FAILED_ATTEMPT_PRIVATE_DRAFT") != std::string::npos);
+        CHECK(messages.back().text().find("RECOVERED_FINAL") != std::string::npos);
+        CHECK(messages.back().parts.front().modelDraft);
+        CHECK(!messages.back().parts.back().modelDraft);
+    }
+    {
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        if (fake.requestBodies.size() >= 2)
+            CHECK(fake.requestBodies[1].find("FAILED_ATTEMPT_PRIVATE_DRAFT") == std::string::npos);
+    }
+    agent.eventBus().unsubscribe(token);
+}
+
+// 两层均有重试能力时，真实 HTTP 次数仍严格受同一预算约束；永久拒绝不重试。
+void test_agent_transport_retry_budget_and_permanent_rejections(MaiWireApi wire) {
+    for (const int status : {503, 429, 401, 402, 403}) {
+        for (const bool hardQuota : {false, true}) {
+            if (hardQuota && status != 429) continue;
+            FakeServer fake;
+            fake.transientFailures = status == 429 && !hardQuota ? 1 : 100;
+            fake.transientStatus = status;
+            fake.retryAfter = "0";
+            if (hardQuota)
+                fake.transientBody =
+                    R"({"error":{"code":"insufficient_quota","message":"no credit"}})";
+            fake.script = wire == MaiWireApi::ChatCompletions
+                              ? text_delta("Recovered after rate limit") + kDone
+                              : sse(json{{"type", "response.output_text.delta"},
+                                         {"output_index", 0},
+                                         {"delta", "Recovered after rate limit"}}) +
+                                    sse(json{{"type", "response.completed"}});
+            fake.start();
+            MaiModelConfig config;
+            config.baseUrl = fake.base();
+            config.wire = wire;
+            config.maxRetries = 2;
+            config.retryInitialDelayMs = 0;
+            MaiAgent agent(makeMaiMemoryStore(), makeMaiModelClient(config));
+            std::atomic<int> errors{0}, commits{0};
+            const auto token = agent.eventBus().subscribe([&](const MaiEvent& event) {
+                if (event.type == MaiEventType::SessionError) ++errors;
+                if (event.type == MaiEventType::MessageTextCommitted) ++commits;
+            });
+            const auto session = agent.submit(MaiCreateSession{
+                MaiFileSystem::temporaryDirectory().toUtf8(), "", "deepseek-flash", ""});
+            CHECK(session);
+            if (!session) continue;
+            CHECK(agent.submit(MaiSendPrompt{session.value(), "Retry within budget"}));
+            agent.waitIdle();
+            const bool succeeds = status == 429 && !hardQuota;
+            CHECK(fake.requestCount.load() == (status == 503 ? 3 : succeeds ? 2 : 1));
+            CHECK(errors.load() == (succeeds ? 0 : 1));
+            CHECK(commits.load() == (succeeds ? 1 : 0));
+            agent.eventBus().unsubscribe(token);
+        }
+    }
+}
+
+void test_stream_recovery() {
+    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
+        test_agent_recovers_partial_stream_without_replaying_draft(wire, false);
+        test_agent_recovers_partial_stream_without_replaying_draft(wire, true);
+        test_agent_recovers_partial_stream_without_replaying_draft(wire, false, true);
+        test_agent_transport_retry_budget_and_permanent_rejections(wire);
+    }
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--stream-recovery") {
+        test_stream_recovery();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--free-primary") {
         test_particle_free_primary_catalog_uses_the_exact_free_model();
         test_particle_free_primary_wire_keeps_zero_price_guards_without_a_session();
@@ -3548,6 +3685,7 @@ int main(int argc, char** argv) {
     test_particle_free_primary_wire_keeps_zero_price_guards_without_a_session();
     test_particle_free_primary_does_not_change_existing_provider_fields();
     test_particle_free_primary_quota_errors_never_fall_back_to_paid_routes();
+    test_stream_recovery();
     test_text_stream_one_byte_at_a_time();
     test_text_stream_all_at_once();
     test_tool_call_fragments();

@@ -346,6 +346,8 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
         for (std::size_t partIndex = messageIndex == firstMessage ? firstPart : 0;
              partIndex < message.parts.size(); ++partIndex) {
             const auto& part = message.parts[partIndex];
+            // 保留本地可见的断流草稿，但不能把它冒充完整 assistant 响应再提交。
+            if (message.role == MaiRole::Assistant && part.modelDraft) continue;
             if (const auto* text = std::get_if<MaiTextPart>(&part.body)) {
                 // 工具调用之后又开口说话了，说明上一批已经结束，先结算。
                 flush_batch();
