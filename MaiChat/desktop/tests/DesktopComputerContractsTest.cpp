@@ -86,6 +86,8 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ++inputCalls_;
+            scope_ = request;
+            scope_.isCanceled = {};
             if (request.kind == DesktopNativeInputKind::KeyDown) add(held_.keysDown, request.key);
             if (request.kind == DesktopNativeInputKind::KeyUp) erase(held_.keysDown, request.key);
             if (request.kind == DesktopNativeInputKind::MouseDown) add(held_.buttonsDown, buttonName(request.button));
@@ -252,6 +254,7 @@ public:
     std::function<void()> onCapture;
     std::function<void()> onDisplayCapture;
     std::function<void()> onInput;
+    std::function<void()> onNativeInput;
     std::function<MaiError(const CaptureOptions&)> onDisplayCaptureOptions;
 
     std::shared_ptr<DesktopNativeInputSession> createInputSession() override {
@@ -259,6 +262,7 @@ public:
         RecordingInputSession::OneShot oneShot;
         if (!statefulInput) oneShot = [this](const DesktopNativeInput& input) { return this->input(input); };
         lastInputSession = std::make_shared<RecordingInputSession>(statefulInput, std::move(oneShot));
+        lastInputSession->beforeInput = [this] { if (onNativeInput) onNativeInput(); };
         if (composeInputSession)
             return makeDesktopComputerInputSession(lastInputSession,
                 [](const DesktopNativeInput&) { return MaiError{}; });
@@ -1311,6 +1315,418 @@ struct DisplayToolFixture {
         CHECK(tool);
     }
 };
+
+// Receiver selection is independent of the display coordinate port. These are
+// fixture-owned windows, including a negative-origin display, never OS targets.
+struct ExecutionWindowScene {
+    DesktopNativeDisplay display;
+    DesktopNativeWindow window;
+    double outsideX;
+    double outsideY;
+};
+
+std::vector<ExecutionWindowScene> executionWindowScenes() {
+    return {
+        {{11, 0, 0, 1920, 1080, true},
+         {101, 5001, "Owned document", "Contract fixture", 320, 115, 1454, 800},
+         .568,
+         .8712},
+        {{22, -1280, -120, 1280, 1024, false},
+         {202, 5002, "Owned palette", "Contract fixture", -1000, 80, 600, 500},
+         .1,
+         .9},
+        {{33, 0, 0, 1600, 900, false}, {303, 5003, "Owned console", "Contract fixture", 900, 350, 600, 500}, .1, .1}};
+}
+
+void useExecutionWindowScene(RecordingBackend& backend, const ExecutionWindowScene& scene) {
+    backend.visible = {scene.window};
+    backend.availableDisplays = {scene.display};
+}
+
+DesktopComputerAction observeExecutionWindow(Fixture& fixture, const std::string& kind, std::uint64_t receiver) {
+    DesktopComputerAction action;
+    action.action = kind;
+    action.desktopScope = true;
+    action.displayId = fixture.backend->availableDisplays.front().id;
+    action.workspace = fixture.workspace.path().toUtf8().toStdString();
+    action.turnId = "execution-window-turn";
+    const auto& display = fixture.backend->availableDisplays.front();
+    const auto& window = fixture.backend->visible.front();
+    action.xRatio = (window.x + window.width / 2 - display.x) / (display.width - 1);
+    action.yRatio = (window.y + window.height / 2 - display.y) / (display.height - 1);
+    action.toXRatio = action.xRatio;
+    action.toYRatio = action.yRatio;
+    const auto observed = fixture.controller.observeDisplay("owner", action.workspace, action.displayId, {}, 0, 0, 0,
+                                                            action.turnId, 0, receiver);
+    CHECK(observed);
+    if (observed) action.snapshotId = Json::parse(observed.value().json).value("snapshot_id", std::string());
+    CHECK(!action.snapshotId.empty());
+    // The ordinary request deliberately leaves executionWindowId empty. The
+    // controller must enforce the receiver bound to its observation, not trust it.
+    return action;
+}
+
+void checkPointOutsideExecutionWindow(const MaiError& error) {
+    CHECK(error.code() == MaiErrorCode::InvalidInput);
+    CHECK(error.message().find("point_outside_target") != std::string::npos);
+    CHECK(error.message().find("bounds") != std::string::npos);
+    CHECK(error.message().find("requested") != std::string::npos);
+}
+
+void verifyDisplayExecutionWindowBoundsAndCompatibility() {
+    for (const auto& scene : executionWindowScenes()) {
+        for (const char* kind : {"click", "move", "scroll", "drag"}) {
+            for (const bool constrained : {false, true}) {
+                Fixture fixture;
+                useExecutionWindowScene(*fixture.backend, scene);
+                auto action = observeExecutionWindow(fixture, kind, constrained ? scene.window.id : 0);
+                if (action.snapshotId.empty()) continue;
+                action.scrollLines = 1;
+                if (std::string(kind) == "drag") {
+                    action.toXRatio = scene.outsideX;
+                    action.toYRatio = scene.outsideY;
+                } else {
+                    action.xRatio = scene.outsideX;
+                    action.yRatio = scene.outsideY;
+                }
+                const auto result = fixture.controller.perform("owner", action);
+                if (constrained) {
+                    CHECK(!result);
+                    if (!result) checkPointOutsideExecutionWindow(result.error());
+                    CHECK(fixture.backend->inputs.empty());
+                    if (fixture.backend->lastInputSession) {
+                        CHECK(fixture.backend->lastInputSession->inputCalls() == 0);
+                        CHECK(fixture.backend->lastInputSession->batchCalls() == 0);
+                    }
+                } else {
+                    CHECK(result && result.value().dispatched);
+                    CHECK(fixture.backend->inputs.size() == 1);
+                    if (!fixture.backend->inputs.empty()) {
+                        const auto& input = fixture.backend->inputs.back();
+                        CHECK(input.desktopScope && !input.executionWindow);
+                        const double x = std::string(kind) == "drag" ? input.toX : input.x;
+                        const double y = std::string(kind) == "drag" ? input.toY : input.y;
+                        CHECK(std::abs(x - (scene.display.x + scene.outsideX * (scene.display.width - 1))) < .001);
+                        CHECK(std::abs(y - (scene.display.y + scene.outsideY * (scene.display.height - 1))) < .001);
+                    }
+                }
+                CHECK(fixture.backend->activationCount == 0);
+            }
+        }
+        Fixture fixture;
+        useExecutionWindowScene(*fixture.backend, scene);
+        fixture.backend->statefulInput = true;
+        auto batch = observeExecutionWindow(fixture, "input_events", scene.window.id);
+        if (batch.snapshotId.empty()) continue;
+        DesktopInputEvent move;
+        move.kind = DesktopInputEventKind::AbsoluteMove;
+        move.x = scene.outsideX;
+        move.y = scene.outsideY;
+        batch.events = {move};
+        const auto outside = fixture.controller.perform("owner", batch);
+        CHECK(!outside);
+        if (!outside) checkPointOutsideExecutionWindow(outside.error());
+        if (fixture.backend->lastInputSession) CHECK(fixture.backend->lastInputSession->batchCalls() == 0);
+        CHECK(fixture.backend->activationCount == 0);
+
+        auto inside = observeExecutionWindow(fixture, "input_events", scene.window.id);
+        move.x = inside.xRatio;
+        move.y = inside.yRatio;
+        inside.events = {move};
+        const auto accepted = fixture.controller.perform("owner", inside);
+        CHECK(accepted && accepted.value().dispatched);
+        const auto native = fixture.backend->lastInputSession;
+        CHECK(native && native->scope().executionWindow);
+        if (native) {
+            if (native->scope().executionWindow) CHECK(native->scope().executionWindow->id == scene.window.id);
+            CHECK(native->port().x == scene.display.x && native->port().y == scene.display.y);
+            CHECK(native->port().width == scene.display.width && native->port().height == scene.display.height);
+        }
+    }
+}
+
+void verifyDisplayExecutionWindowBindingAndSuccessor() {
+    for (const char* kind : {"click", "key", "type", "replace_text"}) {
+        Fixture fixture;
+        const auto scene = executionWindowScenes().front();
+        useExecutionWindowScene(*fixture.backend, scene);
+        auto action = observeExecutionWindow(fixture, kind, scene.window.id);
+        if (action.snapshotId.empty()) continue;
+        action.key = "Ctrl+V";
+        action.text = "Owned receiver text";
+        action.executionWindowId = 999;  // Cannot override the snapshot-owned receiver.
+        action.executionWindowProcessId = 999;
+        const auto acted = fixture.controller.perform("owner", action);
+        CHECK(acted && acted.value().dispatched);
+        CHECK(fixture.backend->activationCount == 0);
+        CHECK(fixture.backend->inputs.size() == 1);
+        if (!fixture.backend->inputs.empty()) {
+            const auto& input = fixture.backend->inputs.back();
+            CHECK(input.desktopScope && input.executionWindow);
+            if (input.executionWindow) {
+                CHECK(input.executionWindow->id == scene.window.id);
+                CHECK(input.executionWindow->processId == scene.window.processId);
+                CHECK(input.executionWindow->x == scene.window.x && input.executionWindow->y == scene.window.y);
+            }
+        }
+        if (!acted || acted.value().observation.json.empty()) continue;
+        const auto next = Json::parse(acted.value().observation.json);
+        auto successor = action;
+        successor.action = "click";
+        successor.snapshotId = next.value("snapshot_id", std::string());
+        successor.xRatio = scene.outsideX;
+        successor.yRatio = scene.outsideY;
+        CHECK(!successor.snapshotId.empty() && successor.snapshotId != action.snapshotId);
+        const auto rejected = fixture.controller.perform("owner", successor);
+        CHECK(!rejected);
+        if (!rejected) checkPointOutsideExecutionWindow(rejected.error());
+        CHECK(fixture.backend->inputs.size() == 1);
+    }
+    for (int change = 0; change < 9; ++change) {
+        Fixture fixture;
+        const auto scene = executionWindowScenes().front();
+        useExecutionWindowScene(*fixture.backend, scene);
+        auto action = observeExecutionWindow(fixture, "click", scene.window.id);
+        if (action.snapshotId.empty()) continue;
+        auto& window = fixture.backend->visible.front();
+        if (change == 0) ++window.processId;
+        if (change == 1) ++window.id;
+        if (change == 2) window.x += 10;
+        if (change == 3) window.height += 10;
+        if (change == 4) window.title += " changed";
+        if (change == 5) window.minimized = true;
+        if (change == 6) window.cloaked = true;
+        if (change == 7) window.boundsAvailable = false;
+        if (change == 8) fixture.backend->visible.clear();
+        CHECK(!fixture.controller.perform("owner", action));
+        CHECK(fixture.backend->inputs.empty() && fixture.backend->activationCount == 0);
+    }
+    for (const char* kind : {"key", "key_down", "type", "replace_text", "input_events"}) {
+        Fixture fixture;
+        const auto scene = executionWindowScenes().front();
+        useExecutionWindowScene(*fixture.backend, scene);
+        fixture.backend->statefulInput = true;
+        fixture.backend->focused = false;
+        auto action = observeExecutionWindow(fixture, kind, scene.window.id);
+        action.key = std::string(kind) == "key_down" ? "Ctrl" : "Ctrl+V";
+        action.text = "Do not inject into another receiver";
+        if (std::string(kind) == "input_events") {
+            DesktopInputEvent text;
+            text.kind = DesktopInputEventKind::UnicodeText;
+            text.text = "Owned text";
+            action.events = {text};
+        }
+        const auto rejected = fixture.controller.perform("owner", action);
+        CHECK(!rejected);
+        if (!rejected) CHECK(rejected.error().code() == MaiErrorCode::Busy);
+        CHECK(fixture.backend->activationCount == 0);
+        if (fixture.backend->lastInputSession) {
+            CHECK(fixture.backend->lastInputSession->inputCalls() == 0);
+            CHECK(fixture.backend->lastInputSession->batchCalls() == 0);
+        }
+    }
+}
+
+void verifyDisplayExecutionWindowHeldTargetAndRelease() {
+    for (const std::uint64_t nextReceiver : {std::uint64_t(0), std::uint64_t(202), std::uint64_t(101)}) {
+        Fixture fixture;
+        const auto scene = executionWindowScenes().front();
+        useExecutionWindowScene(*fixture.backend, scene);
+        fixture.backend->visible.push_back({202, 6002, "Owned alternate", "Contract fixture", 600, 180, 900, 700});
+        fixture.backend->statefulInput = true;
+        auto down = observeExecutionWindow(fixture, "key_down", scene.window.id);
+        down.key = "Ctrl";
+        CHECK(fixture.controller.perform("owner", down));
+        const auto native = fixture.backend->lastInputSession;
+        CHECK(native && native->state().keysDown == std::vector<std::string>{"Ctrl"});
+        if (!native) continue;
+        if (nextReceiver == 101) ++fixture.backend->visible.front().processId;
+        auto changed = observeExecutionWindow(fixture, "key", nextReceiver);
+        changed.key = "Ctrl+V";
+        const auto before = native->inputCalls();
+        const auto rejected = fixture.controller.perform("owner", changed);
+        CHECK(!rejected);
+        if (!rejected) CHECK(rejected.error().code() == MaiErrorCode::Busy);
+        CHECK(native->inputCalls() == before);
+        DesktopComputerAction up;
+        up.action = "key_up";
+        up.key = "Ctrl";
+        up.turnId = down.turnId;
+        CHECK(fixture.controller.perform("owner", up));
+        CHECK(fixture.controller.inputState("owner").empty());
+    }
+    for (const bool pointer : {false, true}) {
+        Fixture fixture;
+        const auto scene = executionWindowScenes().front();
+        useExecutionWindowScene(*fixture.backend, scene);
+        fixture.backend->statefulInput = true;
+        auto down = observeExecutionWindow(fixture, pointer ? "mouse_down" : "key_down", scene.window.id);
+        down.key = "Ctrl";
+        CHECK(fixture.controller.perform("owner", down));
+        const auto native = fixture.backend->lastInputSession;
+        CHECK(native && !native->state().empty());
+        fixture.backend->visible.clear();
+        fixture.backend->focused = false;
+        DesktopComputerAction up;
+        up.action = pointer ? "mouse_up" : "key_up";
+        up.key = "Ctrl";
+        up.turnId = down.turnId;
+        CHECK(fixture.controller.perform("owner", up));
+        CHECK(fixture.controller.inputState("owner").empty());
+        CHECK(fixture.backend->activationCount == 0);
+    }
+}
+
+void verifySuccessorCannotAdoptRecycledExecutionWindow() {
+    for (const char* kind : {"click", "key_down"}) {
+        for (int change = 0; change < 4; ++change) {
+            Fixture fixture;
+            const auto scene = executionWindowScenes().front();
+            useExecutionWindowScene(*fixture.backend, scene);
+            fixture.backend->statefulInput = true;
+            auto action = observeExecutionWindow(fixture, kind, scene.window.id);
+            action.key = "Ctrl";
+            fixture.backend->onNativeInput = [&] {
+                auto& receiver = fixture.backend->visible.front();
+                if (change == 0) ++receiver.processId;
+                if (change == 1) receiver.ownerId = 808;
+                if (change == 2) receiver.className += " replacement";
+                if (change == 3) receiver.application += " replacement";
+            };
+            const auto result = fixture.controller.perform("owner", action);
+            CHECK(result && result.value().dispatched);
+            if (result) {
+                CHECK(result.value().state == "dispatched_observation_failed");
+                CHECK(result.value().observation.json.empty() && result.value().observation.imagePath.empty());
+                CHECK(result.value().observationError.find("execution window") != std::string::npos);
+                CHECK(result.value().inputState.empty());
+            }
+            CHECK(fixture.controller.inputState("owner").empty());
+            CHECK(fixture.backend->lastInputSession && fixture.backend->lastInputSession->inputCalls() == 1);
+        }
+    }
+}
+
+void verifyRevokedObservationCannotBeResurrectedBySuccessor() {
+    Fixture fixture;
+    const auto scene = executionWindowScenes().front();
+    useExecutionWindowScene(*fixture.backend, scene);
+    auto action = observeExecutionWindow(fixture, "click", scene.window.id);
+    // The ordinary caller can revoke a Session without owning a cancel flag.
+    // No key/button is held, so revocation need not change input generation.
+    CHECK(!action.isCanceled);
+    fixture.backend->onDisplayCapture = [&] {
+        CHECK(!fixture.controller.releaseInput("owner", action.turnId));
+    };
+    const auto result = fixture.controller.perform("owner", action);
+    CHECK(result && result.value().dispatched);
+    if (result) {
+        CHECK(result.value().state == "dispatched_observation_failed");
+        CHECK(result.value().observation.json.empty() && result.value().observation.imagePath.empty());
+        CHECK(!result.value().observationError.empty());
+    }
+    CHECK(fixture.controller.inputState("owner").empty());
+    CHECK(fixture.backend->inputs.size() == 1);
+}
+
+void verifyDisplayExecutionWindowToolContract() {
+    DisplayToolFixture fixture;
+    if (!fixture.tool) return;
+    const auto scene = executionWindowScenes().front();
+    useExecutionWindowScene(*fixture.backend, scene);
+    const Json observe{
+        {"action", "observe"}, {"target", "display"}, {"display_id", "11"}, {"execution_window_id", "101"}};
+    const auto observed = fixture.tool->execute(observe.dump(), fixture.context);
+    CHECK(!observed.hasError());
+    if (observed.hasError()) return;
+    const auto output = Json::parse(observed.output());
+    Json click{{"action", "click"},         {"target", "display"},
+               {"display_id", "11"},        {"snapshot_id", output["snapshot_id"]},
+               {"x_ratio", scene.outsideX}, {"y_ratio", scene.outsideY}};
+    auto overrideReceiver = click;
+    overrideReceiver["execution_window_id"] = "202";
+    CHECK(fixture.tool->execute(overrideReceiver.dump(), fixture.context).error().code() == MaiErrorCode::InvalidInput);
+    overrideReceiver = click;
+    overrideReceiver["execution_window_process_id"] = "5001";
+    CHECK(fixture.tool->execute(overrideReceiver.dump(), fixture.context).error().code() == MaiErrorCode::InvalidInput);
+    const auto rejected = fixture.tool->execute(click.dump(), fixture.context);
+    CHECK(rejected.hasError());
+    if (rejected.hasError()) {
+        CHECK(rejected.error().code() == MaiErrorCode::InvalidInput);
+        const auto detail = Json::parse(rejected.error().message(), nullptr, false);
+        CHECK(detail.is_object());
+        if (detail.is_object()) {
+            CHECK(detail.value("reason", std::string()) == "point_outside_target");
+            CHECK(detail.contains("target_bounds") && detail.contains("requested_px"));
+            CHECK(detail.contains("execution_window_id"));
+        }
+        CHECK(rejected.error().message().find("point_outside_target") != std::string::npos);
+        CHECK(rejected.error().message().find("bounds") != std::string::npos);
+        CHECK(rejected.error().message().find("requested") != std::string::npos);
+    }
+    CHECK(fixture.backend->inputs.empty() && fixture.backend->activationCount == 0);
+    auto mixed = observe;
+    mixed["target"] = "window";
+    mixed["window_id"] = "101";
+    mixed.erase("display_id");
+    CHECK(fixture.tool->execute(mixed.dump(), fixture.context).error().code() == MaiErrorCode::InvalidInput);
+}
+
+void verifyWindowObservationImageOption() {
+    DisplayToolFixture fixture;
+    if (!fixture.tool) return;
+    const Json metadata{{"action", "observe"}, {"target", "window"}, {"window_id", "101"}};
+    for (const bool explicitFalse : {false, true}) {
+        auto request = metadata;
+        if (explicitFalse) request["include_image"] = false;
+        const auto observed = fixture.tool->execute(request.dump(), fixture.context);
+        CHECK(!observed.hasError());
+        CHECK(observed.images().empty());
+        if (!observed.hasError()) {
+            const auto output = Json::parse(observed.output());
+            CHECK(output["has_image"] == false && output["image_width"] == 0 && output["image_height"] == 0);
+        }
+    }
+    CHECK(fixture.backend->captureCount == 0);
+    auto image = metadata;
+    image["include_image"] = true;
+    const auto captured = fixture.tool->execute(image.dump(), fixture.context);
+    CHECK(!captured.hasError());
+    CHECK(captured.images().size() == 1);
+        if (!captured.hasError()) {
+            const auto picture = Json::parse(captured.output());
+#if defined(Q_OS_WIN)
+            CHECK(picture.value("image_coordinates_usable_for_input", false));
+#else
+            CHECK(!picture.value("image_coordinates_usable_for_input", true));
+#endif
+        }
+    if (!captured.hasError()) {
+        const auto output = Json::parse(captured.output());
+        CHECK(output["has_image"] == true && output["image_width"] == 20 && output["image_height"] == 20);
+        CHECK(output.value("snapshot_id", std::string()).size() > 0);
+        CHECK(!output.value("image_path", std::string()).empty());
+    }
+    CHECK(fixture.backend->captureCount == 1 && fixture.backend->activationCount == 0);
+    CHECK(fixture.backend->inputs.empty());
+    for (const char* model : {"glm-5.3", "deepseek-v4-pro", "local:owned-text-model"}) {
+        fixture.context.model = model;
+        const auto textOnly = fixture.tool->execute(image.dump(), fixture.context);
+        CHECK(textOnly.hasError() && textOnly.error().code() == MaiErrorCode::NotSupported);
+        CHECK(textOnly.images().empty());
+        CHECK(fixture.backend->captureCount == 1);
+    }
+}
+
+void verifyExecutionWindowContracts() {
+    verifyRevokedObservationCannotBeResurrectedBySuccessor();
+    verifySuccessorCannotAdoptRecycledExecutionWindow();
+    verifyDisplayExecutionWindowBoundsAndCompatibility();
+    verifyDisplayExecutionWindowBindingAndSuccessor();
+    verifyDisplayExecutionWindowHeldTargetAndRelease();
+    verifyDisplayExecutionWindowToolContract();
+    verifyWindowObservationImageOption();
+}
 
 void verifyDisplayToolWaitAndCancel() {
     {
@@ -2820,12 +3236,14 @@ void verifyObservationWithoutImage() {
     }
     for (const std::string model : {"deepseek-flash", "glm-5.3", "local:qa"}) {
         context.model = model;
-        for (const Json includeImage : {Json(true), Json(false), Json(nullptr), Json("false")}) {
+        const auto explicitMetadata =
+            tool->execute(Json{{"action", "observe"}, {"window_id", "101"}, {"include_image", false}}.dump(), context);
+        CHECK(!explicitMetadata.hasError() && explicitMetadata.images().empty());
+        for (const Json includeImage : {Json(nullptr), Json("false")}) {
             const auto unsupportedImage = tool->execute(
                 Json{{"action", "observe"}, {"window_id", "101"}, {"include_image", includeImage}}.dump(), context);
             CHECK(unsupportedImage.hasError());
             CHECK(unsupportedImage.error().code() == MaiErrorCode::InvalidInput);
-            CHECK(unsupportedImage.error().message().find("screenshot") != std::string::npos);
             CHECK(unsupportedImage.images().empty());
         }
     }
@@ -3656,7 +4074,8 @@ void verifyPublicContract() {
     CHECK(schema.is_object());
     if (!schema.is_object()) return;
     const Json properties = schema.value("properties", Json::object());
-    CHECK(!properties.contains("include_image"));
+    CHECK(properties.value("include_image", Json::object()).value("type", std::string()) == "boolean");
+    CHECK(properties.value("execution_window_id", Json::object()).value("type", std::string()) == "string");
     const Json actions = properties.value("action", Json::object()).value("enum", Json{});
     // The public contract exposes routine desktop operations without needing a
     // native session. Native dispatch belongs to the separate fixture test.
@@ -3700,6 +4119,12 @@ void verifyPublicContract() {
 
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
+    if (argc == 2 && std::string(argv[1]) == "--execution-window") {
+        verifyExecutionWindowContracts();
+        std::fprintf(stderr, "execution-window contract failures: %d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    verifyExecutionWindowContracts();
     verifyDisplayObservation();
     verifyDisplayDispatchAndNextObservation();
     verifyDisplayIdentityAndGeometry();

@@ -1,4 +1,5 @@
 #include "MaiChatTools/DesktopComputerWindowsPenInternal.h"
+#include "MaiChatTools/DesktopComputerWindowsPointerScope.h"
 
 #if defined(_WIN32) && !defined(MAI_DESKTOP_PEN_NO_NATIVE)
 #ifndef NOMINMAX
@@ -130,8 +131,9 @@ private:
 };
 class Pen final : public DesktopComputerWindowsPen {
 public:
-    Pen(std::shared_ptr<DesktopWindowsPenTransport> transport, std::chrono::milliseconds refresh)
-        : transport_(std::move(transport)), refresh_(refresh) {}
+    Pen(std::shared_ptr<DesktopWindowsPenTransport> transport, std::chrono::milliseconds refresh,
+        DesktopWindowsPenReceiverValidator validator)
+        : transport_(std::move(transport)), refresh_(refresh), validator_(std::move(validator)) {}
     ~Pen() override {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -143,6 +145,18 @@ public:
     }
     MaiError dispatch(const DesktopInputPen& input, const DesktopInputPort& port,
                       std::function<bool()> isCanceled) override {
+        return dispatchCommand(input, port, {}, std::move(isCanceled));
+    }
+    MaiError dispatchGuarded(const DesktopInputPen& input, const DesktopInputPort& port,
+                            const DesktopNativeInput& receiverScope, std::function<bool()> isCanceled) override {
+        auto owned = receiverScope;
+        owned.isCanceled = {};
+        owned.key.clear();
+        owned.text.clear();
+        return dispatchCommand(input, port, std::move(owned), std::move(isCanceled));
+    }
+    MaiError dispatchCommand(const DesktopInputPen& input, const DesktopInputPort& port,
+                             std::optional<DesktopNativeInput> receiverScope, std::function<bool()> isCanceled) {
         const auto generation = epoch_.load();  // Stop cannot become this request's new generation.
         Admission admission(active_);
         if (!admission.acquired()) return busy();
@@ -151,11 +165,15 @@ public:
         event.kind = DesktopInputEventKind::Pen;
         event.pen = input;
         if (const auto error = maiDesktopValidateInputEvents({event})) return error;
+        if (receiverScope && !validator_ && !maiDesktopInputEventsOnlyRelease({event}))
+            return {MaiErrorCode::NotSupported, "pen receiver validation is unavailable"};
         auto command = std::make_shared<Command>();
         command->input = input;
         command->port = port;
         command->cancel = std::move(isCanceled);
+        command->receiverScope = std::move(receiverScope);
         command->epoch = generation;
+        command->onlyRelease = maiDesktopInputEventsOnlyRelease({event});
         return execute(std::move(command));
     }
     DesktopNativeInputState state() const override {
@@ -184,9 +202,10 @@ private:
         DesktopInputPen input;
         DesktopInputPort port;
         std::function<bool()> cancel;
+        std::optional<DesktopNativeInput> receiverScope;
         std::promise<MaiError> result;
         std::uint64_t epoch = 0;
-        bool cleanup = false;
+        bool cleanup = false, receiverRejected = false, onlyRelease = false;
     };
     MaiError execute(std::shared_ptr<Command> command) {
         auto result = command->result.get_future();
@@ -200,8 +219,14 @@ private:
     }
     bool revoked(const Command& command) const {
         if (epoch_.load() != command.epoch) return true;
+        if (command.onlyRelease) return false;  // A surviving report still needs a receiver, never caller permission.
         const bool requested = command.cancel && command.cancel();
         return requested || epoch_.load() != command.epoch;
+    }
+    MaiError validateReceiver(const DesktopWindowsPenPoint& point) const {
+        if (!receiverScope_) return {};
+        if (!validator_) return {MaiErrorCode::NotSupported, "pen receiver validation is unavailable"};
+        return validator_(*receiverScope_, point.x, point.y);
     }
     void publish() {
         auto published = std::make_shared<Published>();
@@ -213,11 +238,22 @@ private:
         }
         std::atomic_store(&snapshot_, std::shared_ptr<const Published>(std::move(published)));
     }
-    MaiError send(const DesktopWindowsPenPoint& point, const Command* command,
+    MaiError send(const DesktopWindowsPenPoint& point, Command* command,
                   std::optional<std::uint64_t> generation = {}) {
         for (unsigned attempt = 0; attempt < 3; ++attempt) {
             if (generation && epoch_.load() != *generation) return canceled();
             if (command && revoked(*command)) return canceled();
+            // Cleanup has neither a command nor a generation. Every new
+            // command effect and autonomous report rechecks its exact point,
+            // including retries after a native ERROR_NOT_READY result.
+            if (command || generation) {
+                if (const auto error = validateReceiver(point)) {
+                    if (command) command->receiverRejected = true;
+                    return error;
+                }
+                if (generation && epoch_.load() != *generation) return canceled();
+                if (command && revoked(*command)) return canceled();
+            }
             DesktopWindowsPenSubmission result;
             try {
                 result = transport_->inject(point);
@@ -271,6 +307,7 @@ private:
                 if (!error) {
                     created_ = uncertain_ = false;
                     model_ = {};
+                    receiverScope_.reset();
                 }
                 if (!first) first = error;
             }
@@ -312,6 +349,8 @@ private:
         }
         if (fault_) return fault_;
         if (phase == Phase::Up && (!created_ || !model_.inRange)) return {};
+        if (!release && created_ && !maiDesktopWindowsPointerScopeMatches(receiverScope_, command.receiverScope))
+            return {MaiErrorCode::Busy, "release the owned pen source before changing its receiver scope"};
         Model candidate = model_;
         std::uint32_t action = kDesktopPenUpdate;
         if (phase == Phase::Up) {
@@ -350,6 +389,25 @@ private:
             return released ? MaiError{MaiErrorCode::Canceled, "pen canceled; cleanup failed: " + released.message()}
                             : canceled();
         }
+        if (!release) {
+            // Only a new effect may bind a new receiver. A paired UP keeps
+            // the old receiver for the hover reports that can follow it.
+            receiverScope_ = std::move(command.receiverScope);
+            if (const auto error = validateReceiver(candidate.point)) {
+                const auto released = cleanup();
+                return released ? MaiError{error.code(), error.message() + "; cleanup failed: " + released.message()}
+                                : error;
+            }
+        } else if (candidate.inRange && action == kDesktopPenUpdate) {
+            // A barrel-only release may keep contact/hover alive in UPDATE.
+            // Retire the complete source if that surviving report loses its
+            // receiver, while cached UP/leave remain independent cleanup.
+            if (const auto error = validateReceiver(candidate.point)) {
+                const auto released = cleanup();
+                return released ? MaiError{error.code(), error.message() + "; cleanup failed: " + released.message()}
+                                : error;
+            }
+        }
         const bool changedTool = candidate.tool != model_.tool;
         if (!release && created_ && model_.inRange && changedTool) {
             // A physical tool-role change crosses out-of-range. End an owned
@@ -381,7 +439,7 @@ private:
             // These are consecutive calls: no target ACK, timer or fixed wait.
             const auto error = send(packet(intent, kDesktopPenUpdate), &command);
             if (error) {
-                if (error.code() != MaiErrorCode::Canceled) {
+                if (error.code() != MaiErrorCode::Canceled && !command.receiverRejected) {
                     model_ = intent;
                     uncertain_ = false;  // A legal hover has no contact switch.
                 }
@@ -394,11 +452,12 @@ private:
         }
         action = candidate.contact ? (model_.contact ? kDesktopPenUpdate : kDesktopPenDown)
                                    : (model_.contact ? kDesktopPenUp : kDesktopPenUpdate);
-        const auto error = send(packet(candidate, action), release ? nullptr : &command);
+        const bool survivingReport = release && candidate.inRange && action == kDesktopPenUpdate;
+        const auto error = send(packet(candidate, action), !release || survivingReport ? &command : nullptr);
         if (error) {
             // A failed system call is not an accepted new state. Retain its
             // attempted geometry conservatively only for owned cleanup/retry.
-            if (error.code() != MaiErrorCode::Canceled) {
+            if (error.code() != MaiErrorCode::Canceled && !command.receiverRejected) {
                 model_ = candidate;
                 uncertain_ = true;
             }
@@ -493,6 +552,8 @@ private:
     }
     std::shared_ptr<DesktopWindowsPenTransport> transport_;
     const std::chrono::milliseconds refresh_;
+    const DesktopWindowsPenReceiverValidator validator_;
+    std::optional<DesktopNativeInput> receiverScope_;
     std::atomic<bool> active_{false}, cleanupRequested_{false};
     std::atomic<std::uint64_t> epoch_{0};
     mutable std::shared_ptr<const Published> snapshot_ = std::make_shared<const Published>();
@@ -606,13 +667,22 @@ public:
 
 std::shared_ptr<DesktopComputerWindowsPen> makeDesktopComputerWindowsPenWithTransport(
     std::shared_ptr<DesktopWindowsPenTransport> transport, std::chrono::milliseconds refreshInterval) {
+    return makeDesktopComputerWindowsPenWithTransport(std::move(transport), refreshInterval, {});
+}
+std::shared_ptr<DesktopComputerWindowsPen> makeDesktopComputerWindowsPenWithTransport(
+    std::shared_ptr<DesktopWindowsPenTransport> transport, std::chrono::milliseconds refreshInterval,
+    DesktopWindowsPenReceiverValidator validator) {
     return transport && refreshInterval.count() >= 0 &&
                    refreshInterval.count() <= std::numeric_limits<std::int32_t>::max()
-               ? std::make_shared<Pen>(std::move(transport), refreshInterval)
+               ? std::make_shared<Pen>(std::move(transport), refreshInterval, std::move(validator))
                : nullptr;
 }
 std::shared_ptr<DesktopComputerWindowsPen> makeDesktopComputerWindowsPen() {
     return makeDesktopComputerWindowsPenWithTransport(std::make_shared<NativeTransport>());
+}
+std::shared_ptr<DesktopComputerWindowsPen> makeDesktopComputerWindowsPen(DesktopWindowsPenReceiverValidator validator) {
+    return makeDesktopComputerWindowsPenWithTransport(std::make_shared<NativeTransport>(), std::chrono::milliseconds(16),
+                                                      std::move(validator));
 }
 MaiResult<DesktopWindowsPenApiPosition> maiDesktopWindowsPenApiPosition(
     const DesktopWindowsPenPoint& point, const DesktopWindowsPenDesktop& currentDesktop) {

@@ -21,12 +21,23 @@ public:
             input_.isCanceled = {};
             return {};
         }
+        if (input.executionWindow && !input.desktopScope)
+            return {MaiErrorCode::InvalidInput, "execution window restriction requires display coordinates"};
         const bool owned = !std::atomic_load(&snapshot_->state)->empty() || (pen_ && !pen_->state().empty()) ||
                            (touch_ && !touch_->state().empty());
         auto selected = input.desktopScope ? nullptr : input.expectedWindowId
             ? reinterpret_cast<HWND>(std::uintptr_t(input.expectedWindowId)) : GetForegroundWindow();
         if (owned) {
             bool changed = input.desktopScope != input_.desktopScope;
+            // A display may retain its identity while its permitted receiver
+            // changes. Never move held native controls across that boundary.
+            changed = changed || input.executionWindow.has_value() != input_.executionWindow.has_value();
+            if (input.executionWindow && input_.executionWindow) {
+                const auto& a = *input.executionWindow;
+                const auto& b = *input_.executionWindow;
+                changed = changed || a.id != b.id || a.processId != b.processId || a.x != b.x || a.y != b.y ||
+                    a.width != b.width || a.height != b.height;
+            }
             if (input.desktopScope) {
                 const auto& a = input.display;
                 const auto& b = input_.display;
@@ -142,7 +153,12 @@ public:
     }
     MaiError validate() const {
         if (input_.isCanceled && input_.isCanceled()) return {MaiErrorCode::Canceled, "computer input canceled"};
-        if (hooks_.validate) return hooks_.validate(input_);
+        if (hooks_.validate) {
+            if (const auto error = hooks_.validate(input_)) return error;
+            // Test seams may replace OS state, but a receiver still requires
+            // its actual native identity unless the test supplies no receiver.
+            if (!input_.executionWindow) return {};
+        }
         if (input_.desktopScope) {
             if (!interactiveDesktop()) return {MaiErrorCode::NotConfigured, "Windows input requires the active interactive desktop"};
             MONITORINFO information{};
@@ -151,6 +167,22 @@ public:
             if (input_.display.x != bounds.left || input_.display.y != bounds.top ||
                 input_.display.width != bounds.right - bounds.left || input_.display.height != bounds.bottom - bounds.top)
                 return {MaiErrorCode::Busy, "observed display geometry changed before input"};
+            if (input_.executionWindow) {
+                const auto& receiver = *input_.executionWindow;
+                if (!receiver.id || !receiver.processId || receiver.minimized || receiver.cloaked ||
+                    !receiver.boundsAvailable || !windowMatchesProcess(receiver) || !IsWindowVisible(handle(receiver)) ||
+                    IsIconic(handle(receiver)))
+                    return {MaiErrorCode::Busy, "execution window identity or visibility changed before input"};
+                DWORD cloaked = 0;
+                if (FAILED(DwmGetWindowAttribute(handle(receiver), DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) || cloaked)
+                    return {MaiErrorCode::Busy, "execution window state is unavailable or cloaked"};
+                const auto actual = visibleBounds(handle(receiver));
+                if (receiver.x != actual.left || receiver.y != actual.top ||
+                    receiver.width != actual.right - actual.left || receiver.height != actual.bottom - actual.top)
+                    return {MaiErrorCode::Busy, "execution window geometry changed before input"};
+                if (!belongsToSelected(GetForegroundWindow(), handle(receiver)))
+                    return {MaiErrorCode::Busy, "foreground no longer belongs to the execution window"};
+            }
             return {};
         }
         if (!foreground_ || !belongsToSelected(GetForegroundWindow(), foreground_))
@@ -162,6 +194,12 @@ public:
     }
     MaiError validatePoint(POINT point) const {
         if (const auto error = validate()) return error;
+        if (input_.executionWindow) {
+            const auto& receiver = *input_.executionWindow;
+            if (const auto outside = maiDesktopValidateExecutionPoint(receiver, point.x, point.y)) return outside;
+            if (!belongsToSelected(WindowFromPhysicalPoint(point), handle(receiver)))
+                return {MaiErrorCode::Busy, "pointer hit does not belong to the execution window"};
+        }
         if (hooks_.hitTest) return hooks_.hitTest(input_, point);
         if (input_.desktopScope) {
             const auto& bounds = input_.display;
@@ -182,7 +220,7 @@ public:
     MaiError validatePointerTarget() const {
         if (const auto ready = validate()) return ready;
         if (const auto modifiers = pointerModifiers()) return modifiers;
-        if (input_.desktopScope) return {}; // The display scope permits normal cross-window input.
+        if (input_.desktopScope && !input_.executionWindow) return {}; // Unrestricted display input may cross windows.
         const auto point = cursor();
         return point ? validatePoint(point.value()) : point.error();
     }
@@ -260,6 +298,9 @@ public:
     }
     MaiError moveRelative(std::int32_t x, std::int32_t y) const {
         if (const auto ready = validate()) return ready;
+        if (input_.executionWindow && (x || y))
+            return {MaiErrorCode::NotSupported,
+                    "window-restricted input requires absolute motion; relative motion is subject to OS acceleration"};
         if (const auto modifiers = pointerModifiers()) return modifiers;
         if (const auto foreign = noForeignMouseButtons()) return foreign;
         INPUT input{};

@@ -34,6 +34,8 @@ private:
         std::string turn;
         bool display = false;
         std::uint64_t target = 0;
+        std::uint64_t executionWindowId = 0;
+        std::uint64_t executionWindowProcessId = 0;
         std::chrono::steady_clock::time_point deadline;
         bool expired = false;
     };

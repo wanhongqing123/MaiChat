@@ -315,6 +315,31 @@ if(WIN32 OR APPLE)
   endif()
 endif()
 
+# OCR 普通核心只依赖已有 ORT C API 和 OpenCV 几何，不借用 Qt 或模型工具协议。
+if(MAICHAT_ENABLE_OPENCV)
+  add_library(maichat_ocr STATIC ../Media/MaiOcr.cpp)
+  target_include_directories(maichat_ocr PUBLIC ../Media PRIVATE
+    ../../MaiAgent/third_party/onnxruntime/include/onnxruntime/core/session)
+  target_include_directories(maichat_ocr PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${MAICHAT_OPENCV_SOURCE}/modules/core/include"
+    "${MAICHAT_OPENCV_SOURCE}/modules/imgproc/include"
+    "${CMAKE_CURRENT_BINARY_DIR}/opencv")
+  target_link_libraries(maichat_ocr PUBLIC maiagent opencv_core opencv_imgproc)
+  if(WIN32)
+    add_executable(mai_ocr_test ../Media/tests/MaiOcrTest.cpp)
+    target_include_directories(mai_ocr_test PRIVATE
+      "${CMAKE_CURRENT_BINARY_DIR}"
+      "${MAICHAT_OPENCV_SOURCE}/modules/core/include"
+      "${MAICHAT_OPENCV_SOURCE}/modules/imgproc/include"
+      "${CMAKE_CURRENT_BINARY_DIR}/opencv")
+    target_link_libraries(mai_ocr_test PRIVATE maichat_ocr gdi32 user32)
+    add_test(NAME mai_ocr_test COMMAND mai_ocr_test
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/build/vendor/onnxruntime-windows-x64/onnxruntime.dll"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../Media/data/ocr")
+  endif()
+endif()
+
 # 人像核心和 ORT/四个感知模型与 RVM、FFmpeg 独立启用和打包。
 option(MAICHAT_ENABLE_PORTRAIT "Build local desktop portrait service" ${MAICHAT_ENABLE_OPENCV})
 if(MAICHAT_ENABLE_PORTRAIT)
@@ -1006,6 +1031,34 @@ if(WIN32 AND MAICHAT_ENABLE_OPENCV)
   target_compile_definitions(maichat_agent PRIVATE MAICHAT_DESKTOP_VISION=1)
   target_link_libraries(maichat_agent PRIVATE maichat_image_vision)
 endif()
+if(TARGET maichat_ocr)
+  target_sources(maichat_agent PRIVATE
+    src/MaiChatTools/DesktopOcrTools.h src/MaiChatTools/DesktopOcrTools.cpp)
+  target_compile_definitions(maichat_agent PRIVATE MAICHAT_DESKTOP_OCR=1)
+  target_link_libraries(maichat_agent PRIVATE maichat_ocr)
+  # 模型嵌在资源中；运行时和许可仍须独立随 App/ZIP 交付，不能借 RVM 的启用条件。
+  set(_maichat_ocr_assets "${CMAKE_CURRENT_SOURCE_DIR}/../Media/data/ocr")
+  if(WIN32)
+    set(_maichat_ocr_runtime "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/build/vendor/onnxruntime-windows-x64/onnxruntime.dll")
+    set(_maichat_ocr_destination "$<TARGET_FILE_DIR:maichat>")
+    set(_maichat_ocr_runtime_destination "${_maichat_ocr_destination}/onnxruntime.dll")
+  elseif(APPLE)
+    set(_maichat_ocr_runtime "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/build/vendor/onnxruntime-macos/libonnxruntime.1.26.0.dylib")
+    set(_maichat_ocr_destination "$<TARGET_BUNDLE_DIR:maichat>/Contents/Resources")
+    set(_maichat_ocr_runtime_destination "$<TARGET_BUNDLE_DIR:maichat>/Contents/Frameworks/libonnxruntime.1.26.0.dylib")
+  endif()
+  if(EXISTS "${_maichat_ocr_runtime}")
+    add_custom_command(TARGET maichat POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${_maichat_ocr_destination}/OcrModels"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_maichat_ocr_runtime}" "${_maichat_ocr_runtime_destination}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_maichat_ocr_assets}/LICENSE" "${_maichat_ocr_destination}/OcrModels/PP-OCRv5_LICENSE.txt"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_maichat_ocr_assets}/PROVENANCE.md" "${_maichat_ocr_destination}/OcrModels/PROVENANCE.md"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/onnxruntime/LICENSE" "${_maichat_ocr_destination}/OcrModels/ONNXRUNTIME_LICENSE.txt"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/onnxruntime/ThirdPartyNotices.txt" "${_maichat_ocr_destination}/OcrModels/ONNXRUNTIME_ThirdPartyNotices.txt")
+  else()
+    message(STATUS "Local OCR runtime absent; ordinary/tool initialization will report NotConfigured")
+  endif()
+endif()
 if(MAICHAT_ENABLE_PORTRAIT)
   add_library(maichat_desktop_portrait STATIC
     src/MaiChatTools/DesktopPortraitService.cpp
@@ -1362,6 +1415,12 @@ if(WIN32)
   set_tests_properties(desktop_computer_actions_native PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180
     ENVIRONMENT "QT_QPA_PLATFORM=windows")
   add_test(NAME desktop_computer_actions_native_state COMMAND desktop_computer_actions_native_test --native-state-only)
+  add_executable(desktop_computer_window_image_test tests/DesktopComputerWindowImageTest.cpp)
+  target_link_libraries(desktop_computer_window_image_test PRIVATE maichat_agent Qt6::Widgets Qt6::Test user32 dwmapi)
+  target_include_directories(desktop_computer_window_image_test PRIVATE ../../MaiAgent/third_party/nlohmann)
+  add_test(NAME desktop_computer_window_image COMMAND desktop_computer_window_image_test)
+  set_tests_properties(desktop_computer_window_image PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "QT_QPA_PLATFORM=windows")
   set_tests_properties(desktop_computer_actions_native_state PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90
     ENVIRONMENT "QT_QPA_PLATFORM=windows")
   add_executable(desktop_computer_windows_touch_test tests/DesktopComputerWindowsTouchTest.cpp)
@@ -1781,6 +1840,10 @@ if(WIN32 AND MAICHAT_ENABLE_OPENCV)
     MAICHAT_LENA_PATH="${MAICHAT_OPENCV_SOURCE}/samples/data/lena.jpg")
   target_link_libraries(desktop_vision_tools_test PRIVATE
     maichat_agent Qt6::Widgets Qt6::Test)
+  add_executable(desktop_ocr_tools_test
+    tests/DesktopOcrToolsTest.cpp resources/resources.qrc)
+  target_link_libraries(desktop_ocr_tools_test PRIVATE
+    maichat_agent Qt6::Widgets Qt6::Test)
 endif()
 
 add_executable(remote_diagnostics_controller_test tests/RemoteDiagnosticsControllerTest.cpp)
@@ -2134,6 +2197,7 @@ if(WIN32 AND MAICHAT_ENABLE_OPENCV)
     "${MAICHAT_FACE_MODEL}" "${MAICHAT_PERSON_MODEL}"
     "${MAICHAT_OPENCV_SOURCE}/samples/data/lena.jpg")
   add_test(NAME desktop_vision_tools_test COMMAND desktop_vision_tools_test)
+  add_test(NAME desktop_ocr_tools_test COMMAND desktop_ocr_tools_test)
 endif()
 add_test(NAME performance_log_test COMMAND performance_log_test)
 add_test(NAME remote_diagnostics_controller_test COMMAND remote_diagnostics_controller_test)

@@ -844,9 +844,164 @@ void stopDoesNotWaitForPeriodicIo() {
     CHECK(births == 1);
     CHECK(transport->destroys == 1 && transport->injectAfterDestroy == 0);
 }
+
+DesktopNativeInput receiverScope() {
+    DesktopNativeInput result;
+    result.desktopScope = true;
+    result.display.id = 17;
+    DesktopNativeWindow receiver;
+    receiver.id = 23;
+    receiver.processId = 29;
+    result.executionWindow = receiver;
+    return result;
+}
+
+void receiverIsCheckedBetweenSourceEffects() {
+    for (int mode = 0; mode < 2; ++mode) {
+        auto transport = std::make_shared<Transport>();
+        auto valid = std::make_shared<std::atomic<bool>>(true);
+        transport->duringInject = [valid] { *valid = false; };
+        if (mode == 1) transport->results.push_back({DesktopWindowsTouchSubmitKind::Retry, {}});
+        auto touch = makeDesktopComputerWindowsTouchWithTransport(
+            transport, std::chrono::milliseconds(0),
+            [valid](const DesktopNativeInput&, std::int32_t, std::int32_t) -> MaiError {
+                return valid->load() ? MaiError{} : MaiError{MaiErrorCode::Busy, "fixture receiver changed"};
+            });
+        const auto result = touch->dispatchGuarded({contact(1), contact(2, Phase::Down, .75F)}, port(), receiverScope());
+        CHECK(result.code() == MaiErrorCode::Busy);
+        const auto frames = transport->snapshot();
+        unsigned births = 0;
+        for (const auto& frame : frames)
+            for (const auto& point : frame.points) births += (point.flags & kDesktopTouchDown) != 0;
+        CHECK(births == 1); // A seed/expansion or ERROR_NOT_READY retry needs fresh receiver authority.
+        CHECK(touch->state().empty() && transport->destroys == 1);
+        CHECK(!touch->releaseAll());
+    }
+    auto transport = std::make_shared<Transport>();
+    auto touch = backend(transport);
+    CHECK(touch->dispatchGuarded({contact(1)}, port(), receiverScope()).code() == MaiErrorCode::NotSupported);
+    CHECK(transport->creates == 0 && transport->snapshot().empty());
+    CHECK(!touch->releaseAll());
+}
+
+void periodicReportsUseOwnedReceiverScope() {
+    auto transport = std::make_shared<Transport>();
+    auto valid = std::make_shared<std::atomic<bool>>(true);
+    auto armed = std::make_shared<std::atomic<bool>>(false);
+    auto calls = std::make_shared<std::atomic<unsigned>>(0);
+    auto invalidationFrame = std::make_shared<std::atomic<unsigned>>(0);
+    transport->duringInject = [valid, armed, calls, invalidationFrame] {
+        const auto count = ++*calls;
+        if (armed->exchange(false)) {
+            *valid = false;
+            *invalidationFrame = count;
+        }
+    };
+    auto badScope = std::make_shared<std::atomic<bool>>(false);
+    auto touch = makeDesktopComputerWindowsTouchWithTransport(
+        transport, std::chrono::milliseconds(3),
+        [valid, badScope](const DesktopNativeInput& scope, std::int32_t x, std::int32_t y) -> MaiError {
+            if (scope.isCanceled || !scope.key.empty() || !scope.text.empty() || !scope.executionWindow ||
+                scope.executionWindow->id != 23 || scope.executionWindow->processId != 29 ||
+                scope.display.id != 17 || x != 600 || y != 450)
+                *badScope = true;
+            return valid->load() ? MaiError{} : MaiError{MaiErrorCode::Busy, "fixture receiver changed"};
+        });
+    auto scope = receiverScope();
+    auto payload = std::make_shared<int>(7);
+    std::weak_ptr<int> weak = payload;
+    scope.isCanceled = [payload] { return false; };
+    auto cancel = [payload] { return false; };
+    payload.reset();
+    scope.key = "borrowed key";
+    scope.text = "borrowed text";
+    CHECK(!touch->dispatchGuarded({contact(1)}, port(), scope, std::move(cancel)));
+    scope = {}; // The resident writer must own only sanitized receiver values.
+    CHECK(weak.expired());
+    CHECK(transport->waitForFrames(3)); // An unchanged receiver keeps normal reports active.
+    *armed = true;
+    CHECK(eventually([&] { return invalidationFrame->load() != 0; }));
+    CHECK(eventually([&] { return touch->state().empty(); }));
+    CHECK(!badScope->load());
+    const auto frames = transport->snapshot();
+    CHECK(frames.size() == invalidationFrame->load() + 1); // Only cached cleanup follows receiver loss.
+    if (!frames.empty()) {
+        CHECK(frames.back().points.size() == 1);
+        if (!frames.back().points.empty()) CHECK(frames.back().points[0].flags & kDesktopTouchUp);
+    }
+    CHECK(touch->validate().code() == MaiErrorCode::Busy);
+    CHECK(!touch->releaseAll());
+}
+
+void partialReleaseCannotReportSurvivorsToAnInvalidReceiver() {
+    auto transport = std::make_shared<Transport>();
+    auto valid = std::make_shared<std::atomic<bool>>(true);
+    auto touch = makeDesktopComputerWindowsTouchWithTransport(
+        transport, std::chrono::milliseconds(0),
+        [valid](const DesktopNativeInput&, std::int32_t, std::int32_t) -> MaiError {
+            return valid->load() ? MaiError{} : MaiError{MaiErrorCode::Busy, "fixture receiver changed"};
+        });
+    CHECK(!touch->dispatchGuarded({contact(1), contact(2, Phase::Down, .75F)}, port(), receiverScope()));
+    const auto before = transport->snapshot().size();
+    *valid = false;
+    const auto result = touch->dispatchGuarded({contact(1, Phase::Up)}, {}, receiverScope(), [] { return true; });
+    CHECK(result.code() == MaiErrorCode::Busy);
+    CHECK(touch->state().empty());
+    const auto frames = transport->snapshot();
+    unsigned ups = 0;
+    for (std::size_t index = before; index < frames.size(); ++index)
+        for (const auto& point : frames[index].points) {
+            CHECK(!(point.flags & (kDesktopTouchInRange | kDesktopTouchInContact)));
+            ups += (point.flags & kDesktopTouchUp) != 0;
+        }
+    CHECK(ups == 2); // Receiver rejection cannot block either cached paired UP.
+    CHECK(!touch->releaseAll());
+}
+
+void liveReceiverBindingCannotBeReplacedOrRemoved() {
+    for (int mode = 0; mode < 7; ++mode) {
+        auto transport = std::make_shared<Transport>();
+        auto touch = makeDesktopComputerWindowsTouchWithTransport(
+            transport, std::chrono::milliseconds(0),
+            [](const DesktopNativeInput&, std::int32_t, std::int32_t) -> MaiError { return {}; });
+        const auto original = receiverScope();
+        if (mode == 6)
+            CHECK(!touch->dispatch({contact(1)}, port()));
+        else
+            CHECK(!touch->dispatchGuarded({contact(1)}, port(), original));
+        const auto before = transport->snapshot().size();
+        auto changed = original;
+        if (mode == 1) ++changed.executionWindow->id;
+        if (mode == 2) ++changed.executionWindow->processId;
+        if (mode == 3) ++changed.display.id;
+        if (mode == 4) ++changed.display.width;
+        if (mode == 5) ++changed.executionWindow->x;
+        const auto result = mode == 0 ? touch->dispatch({contact(1, Phase::Move, .75F)}, port())
+                                      : touch->dispatchGuarded({contact(1, Phase::Move, .75F)}, port(), changed);
+        CHECK(result.code() == MaiErrorCode::Busy);
+        CHECK(transport->snapshot().size() == before);
+        CHECK(!touch->state().empty());
+        CHECK(!touch->releaseAll());
+        // Once the previous native source is retired, the requested binding is
+        // admitted normally; no second ownership ledger survives releaseAll.
+        if (mode == 0)
+            CHECK(!touch->dispatch({contact(1)}, port()));
+        else
+            CHECK(!touch->dispatchGuarded({contact(1)}, port(), changed));
+        CHECK(!touch->releaseAll());
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--receiver-guard") {
+        receiverIsCheckedBetweenSourceEffects();
+        periodicReportsUseOwnedReceiverScope();
+        partialReleaseCannotReportSurvivorsToAnInvalidReceiver();
+        liveReceiverBindingCannotBeReplacedOrRemoved();
+        std::printf("touch receiver guard: %d checks, %d failures\n", checks, failures);
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--parameter-semantics") {
         physicalAnglesAndEllipseBounds();
         nonuniformViewportAndOptionalEllipseAxes();
@@ -884,6 +1039,10 @@ int main(int argc, char** argv) {
     stopDoesNotWaitForPeriodicIo();
     layoutChangeRetiresPhysicalBinding();
     opaqueIdsKeepNativeOrder();
+    receiverIsCheckedBetweenSourceEffects();
+    periodicReportsUseOwnedReceiverScope();
+    partialReleaseCannotReportSurvivorsToAnInvalidReceiver();
+    liveReceiverBindingCannotBeReplacedOrRemoved();
     std::printf("DesktopComputerWindowsTouchTest: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

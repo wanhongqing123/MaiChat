@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <future>
 #include <mutex>
@@ -13,6 +14,8 @@
 #include <set>
 #include <thread>
 #include <utility>
+#include <string>
+#include <dwmapi.h>
 
 namespace {
 int checks = 0, failures = 0;
@@ -1578,8 +1581,395 @@ void revocationDuringPendingCleanup() {
     check(fake.session->state().empty() && !fake.send(raw('D')) && fake.session->state().rawKeys.size() == 1,
           "drained binding is empty and the next fresh admission can hold normally");
 }
+// This explicit mode creates only its own Win32 windows. Real foreground,
+// identity, geometry and hit predicates run; input and pointer effects are
+// recorded, never sent to Windows, and neither clipboard nor files are used.
+class OwnedExecutionWindows {
+public:
+    HWND receiver = nullptr;
+    HWND sibling = nullptr;
+    HWND popup = nullptr;
+    HWND edit = nullptr;
+    DesktopNativeDisplay display;
+    const char* unavailableStage = "not_started";
+    DWORD unavailableError = 0;
+
+    OwnedExecutionWindows() : previousForeground_(GetForegroundWindow()) {
+        setDpi_ =
+            reinterpret_cast<SetDpi>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext"));
+        if (setDpi_) previousDpi_ = setDpi_(reinterpret_cast<HANDLE>(std::intptr_t(-4)));
+    }
+    ~OwnedExecutionWindows() {
+        if (previousForeground_ && IsWindow(previousForeground_)) SetForegroundWindow(previousForeground_);
+        if (popup) DestroyWindow(popup);
+        if (sibling) DestroyWindow(sibling);
+        if (receiver) DestroyWindow(receiver);
+        pump();
+        if (setDpi_ && previousDpi_) setDpi_(previousDpi_);
+    }
+    bool open() {
+        unavailableStage = "input_desktop";
+        HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+        if (!input) { unavailableError = GetLastError(); return false; }
+        CloseDesktop(input);
+        unavailableStage = "active_monitor";
+        HMONITOR monitor = nullptr;
+        EnumDisplayMonitors(
+            nullptr, nullptr,
+            [](HMONITOR value, HDC, LPRECT, LPARAM context) -> BOOL {
+                *reinterpret_cast<HMONITOR*>(context) = value;
+                return FALSE;
+            },
+            reinterpret_cast<LPARAM>(&monitor));
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (!monitor || !GetMonitorInfoW(monitor, &info)) return false;
+        const auto& work = info.rcWork;
+        if (work.right - work.left < 720 || work.bottom - work.top < 520) return false;
+        // A real top-level default procedure owns activation. The predefined
+        // STATIC control class is not a reliable foreground-window fixture.
+        unavailableStage = "owned_window_class";
+        const wchar_t* className = L"MaiChatOwnedExecutionScopeTestWindow";
+        WNDCLASSW windowClass{};
+        windowClass.lpfnWndProc = DefWindowProcW;
+        windowClass.hInstance = GetModuleHandleW(nullptr);
+        windowClass.lpszClassName = className;
+        if (!RegisterClassW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            unavailableError = GetLastError();
+            return false;
+        }
+        display = {std::uint64_t(reinterpret_cast<std::uintptr_t>(monitor)),
+                   double(info.rcMonitor.left),
+                   double(info.rcMonitor.top),
+                   double(info.rcMonitor.right - info.rcMonitor.left),
+                   double(info.rcMonitor.bottom - info.rcMonitor.top),
+                   (info.dwFlags & MONITORINFOF_PRIMARY) != 0};
+        receiver =
+            CreateWindowExW(0, className, L"Owned execution receiver", WS_OVERLAPPEDWINDOW | WS_VISIBLE, work.left + 40,
+                            work.top + 40, 500, 340, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        sibling =
+            CreateWindowExW(0, className, L"Owned unrelated sibling", WS_OVERLAPPEDWINDOW | WS_VISIBLE, work.left + 80,
+                            work.top + 80, 420, 280, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        unavailableStage = "owned_window_creation";
+        if (!receiver || !sibling) { unavailableError = GetLastError(); return false; }
+        edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_LEFT, 20, 40, 300, 100, receiver,
+                               nullptr, GetModuleHandleW(nullptr), nullptr);
+        popup = CreateWindowExW(0, className, L"Owned receiver popup", WS_POPUP | WS_BORDER, work.left + 130,
+                                work.top + 140, 180, 100, receiver, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!edit || !popup) { unavailableError = GetLastError(); return false; }
+        unavailableStage = "owned_foreground";
+        return focus(receiver);
+    }
+    bool focus(HWND target) {
+        ShowWindow(target, SW_SHOWNORMAL);
+        SetForegroundWindow(target);
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            pump();
+            if (GetForegroundWindow() == target) {
+                if (target == receiver) SetFocus(edit);
+                return true;
+            }
+            Sleep(5);
+        }
+        return false;
+    }
+    static void pump() {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    static DesktopNativeWindow describe(HWND window) {
+        DesktopNativeWindow result;
+        result.id = std::uint64_t(reinterpret_cast<std::uintptr_t>(window));
+        DWORD process = 0;
+        GetWindowThreadProcessId(window, &process);
+        result.processId = process;
+        wchar_t text[512]{};
+        int count = GetWindowTextW(window, text, int(std::size(text)));
+        result.title = utf8(text, count);
+        count = GetClassNameW(window, text, int(std::size(text)));
+        result.className = utf8(text, count);
+        result.ownerId = std::uint64_t(reinterpret_cast<std::uintptr_t>(GetWindow(window, GW_OWNER)));
+        result.toolWindow = (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0;
+        result.minimized = IsIconic(window) != FALSE;
+        DWORD cloaked = 0;
+        if (DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked)) == S_OK)
+            result.cloaked = cloaked != 0;
+        RECT rectangle{};
+        result.boundsAvailable =
+            (DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &rectangle, sizeof(rectangle)) == S_OK &&
+             rectangle.right > rectangle.left && rectangle.bottom > rectangle.top) ||
+            GetWindowRect(window, &rectangle);
+        result.x = rectangle.left;
+        result.y = rectangle.top;
+        result.width = rectangle.right - rectangle.left;
+        result.height = rectangle.bottom - rectangle.top;
+        wchar_t path[32768]{};
+        DWORD length = DWORD(std::size(path));
+        if (QueryFullProcessImageNameW(GetCurrentProcess(), 0, path, &length))
+            result.application = utf8(path, int(length));
+        return result;
+    }
+
+private:
+    static std::string utf8(const wchar_t* text, int length) {
+        if (length <= 0) return {};
+        const int bytes =
+            WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, length, nullptr, 0, nullptr, nullptr);
+        std::string output(std::size_t(bytes), '\0');
+        if (bytes)
+            WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, length, &output[0], bytes, nullptr, nullptr);
+        return output;
+    }
+    using SetDpi = HANDLE(WINAPI*)(HANDLE);
+    SetDpi setDpi_ = nullptr;
+    HANDLE previousDpi_ = nullptr;
+    HWND previousForeground_ = nullptr;
+};
+
+int executionWindowReceiverGuardsNewInputAndAllowsRelease() {
+    OwnedExecutionWindows windows;
+    if (!windows.open()) {
+        std::printf("SKIP execution-window native predicates: %s unavailable, Win32 error %lu\n",
+                    windows.unavailableStage, static_cast<unsigned long>(windows.unavailableError));
+        return 77;
+    }
+    std::vector<INPUT> emitted;
+    std::vector<POINT> moved;
+    std::function<void(const INPUT&)> onEmit;
+    POINT cursor{};
+    DesktopWindowsInputHooks hooks;
+    hooks.emitInput = [&](const INPUT& input) {
+        emitted.push_back(input);
+        if (onEmit) onEmit(input);
+        return UINT(1);
+    };
+    hooks.move = [&](POINT point) {
+        cursor = point;
+        moved.push_back(point);
+        return MaiError{};
+    };
+    hooks.cursor = [&] { return MaiResult<POINT>(cursor); };
+    hooks.keyState = [](int) { return SHORT(0); };
+    hooks.secureInput = [] { return MaiResult<bool>(false); };
+    // No validate/hitTest override: the production Win32 receiver predicate is
+    // the subject of this test. Move/cursor hooks prevent actual pointer motion.
+    auto native = makeDesktopWindowsInputSessionForTesting(std::move(hooks));
+    DesktopNativeInput scope;
+    scope.desktopScope = true;
+    scope.display = windows.display;
+    scope.executionWindow = windows.describe(windows.receiver);
+    scope.x = scope.executionWindow->x + scope.executionWindow->width / 2;
+    scope.y = scope.executionWindow->y + scope.executionWindow->height / 2;
+    scope.toX = scope.x;
+    scope.toY = scope.y;
+    cursor = {LONG(std::lround(scope.x)), LONG(std::lround(scope.y))};
+    scope.kind = DesktopNativeInputKind::Move;
+    auto outside = scope;
+    outside.x = scope.executionWindow->x + scope.executionWindow->width + 12;
+    check(native->input(outside).code() == MaiErrorCode::InvalidInput && emitted.empty() && moved.empty(),
+          "real receiver bounds reject screen-valid outside point before pointer or input effects");
+
+    scope.kind = DesktopNativeInputKind::Key;
+    scope.key = "Ctrl+V";
+    check(windows.focus(windows.sibling), "owned foreign sibling foreground precondition");
+    emitted.clear();
+    moved.clear();
+    check(native->input(scope).code() == MaiErrorCode::Busy && emitted.empty() && moved.empty(),
+          "same-PID unowned sibling cannot receive a constrained display chord");
+    check(windows.focus(windows.receiver), "owned receiver foreground precondition");
+    const auto beforeMove = *scope.executionWindow;
+    MoveWindow(windows.receiver, int(beforeMove.x) + 20, int(beforeMove.y) + 15, int(beforeMove.width),
+               int(beforeMove.height), TRUE);
+    DwmFlush();
+    windows.pump();
+    const auto movedReceiver = windows.describe(windows.receiver);
+    check(movedReceiver.x != beforeMove.x || movedReceiver.y != beforeMove.y,
+          "owned receiver geometry changed before testing the stale native snapshot");
+    emitted.clear();
+    moved.clear();
+    check(bool(native->input(scope)) && emitted.empty() && moved.empty(),
+          "real moved receiver invalidates a geometry-bound native scope before emission");
+    scope.executionWindow = windows.describe(windows.receiver);
+    scope.x = scope.executionWindow->x + scope.executionWindow->width / 2;
+    scope.y = scope.executionWindow->y + scope.executionWindow->height / 2;
+    cursor = {LONG(std::lround(scope.x)), LONG(std::lround(scope.y))};
+    for (const auto kind : {DesktopNativeInputKind::Key, DesktopNativeInputKind::Type,
+                            DesktopNativeInputKind::ReplaceFocusedText, DesktopNativeInputKind::Click}) {
+        scope.kind = kind;
+        scope.text = "Owned synthetic receiver text";
+        auto request = scope;
+        if (kind != DesktopNativeInputKind::Click) {
+            // Keyboard/text actions have no pointer locator. Unused zero-port
+            // coordinates must not turn receiver focus into a pointer test.
+            request.x = windows.display.x;
+            request.y = windows.display.y;
+        }
+        emitted.clear();
+        moved.clear();
+        check(!native->input(request) && !emitted.empty(), "focused real receiver permits recorded new input");
+    }
+
+    check(windows.focus(windows.popup), "owned popup foreground precondition");
+    scope.kind = DesktopNativeInputKind::Key;
+    emitted.clear();
+    moved.clear();
+    check(!native->input(scope) && !emitted.empty(), "real owner-chain popup permits constrained display key input");
+
+    SetWindowPos(windows.popup, HWND_TOP, int(scope.executionWindow->x + scope.executionWindow->width) + 20,
+                 int(scope.executionWindow->y) + 50, 180, 100, SWP_SHOWWINDOW);
+    check(windows.focus(windows.popup), "outside owned popup foreground precondition");
+    DwmFlush();
+    const auto popup = windows.describe(windows.popup);
+    check(popup.x >= scope.executionWindow->x + scope.executionWindow->width,
+          "owned popup is physically outside the receiver pointer rectangle");
+    auto popupPointer = scope;
+    popupPointer.kind = DesktopNativeInputKind::Click;
+    popupPointer.x = popup.x + popup.width / 2;
+    popupPointer.y = popup.y + popup.height / 2;
+    emitted.clear();
+    moved.clear();
+    check(native->input(popupPointer).code() == MaiErrorCode::InvalidInput && emitted.empty() && moved.empty(),
+          "owner-chain popup outside the receiver rectangle cannot widen constrained display pointer bounds");
+    emitted.clear();
+    check(!native->input(scope) && !emitted.empty(),
+          "keyboard permits the full owner-chain popup even outside the receiver pointer rectangle");
+    ShowWindow(windows.popup, SW_HIDE);
+
+    check(windows.focus(windows.receiver), "receiver focus before bounded drag");
+    auto drag = scope;
+    drag.kind = DesktopNativeInputKind::Drag;
+    drag.toX = drag.executionWindow->x + drag.executionWindow->width + 12;
+    drag.toY = drag.y;
+    drag.durationMs = 1;
+    emitted.clear();
+    moved.clear();
+    check(bool(native->input(drag)), "native drag cannot finish outside its receiver rectangle");
+    bool everyMoveInside = true;
+    for (const auto& point : moved)
+        everyMoveInside = everyMoveInside && point.x >= drag.executionWindow->x && point.y >= drag.executionWindow->y &&
+                          point.x < drag.executionWindow->x + drag.executionWindow->width &&
+                          point.y < drag.executionWindow->y + drag.executionWindow->height;
+    check(everyMoveInside && native->state().empty(),
+          "rejected drag never warps outside and pairs any already-owned mouse down");
+
+    DesktopInputPort port;
+    port.x = port.environmentX = windows.display.x;
+    port.y = port.environmentY = windows.display.y;
+    port.width = port.environmentWidth = windows.display.width;
+    port.height = port.environmentHeight = windows.display.height;
+    DesktopInputEvent absolute;
+    absolute.kind = DesktopInputEventKind::AbsoluteMove;
+    absolute.x = (scope.executionWindow->x + scope.executionWindow->width + 12 - windows.display.x) /
+                 (windows.display.width - 1);
+    absolute.y = (scope.y - windows.display.y) / (windows.display.height - 1);
+    DesktopInputEvent button;
+    button.kind = DesktopInputEventKind::MouseButton;
+    button.button = 1;
+    emitted.clear();
+    moved.clear();
+    check(native->inputEvents({absolute, button}, scope, port, {}).code() == MaiErrorCode::InvalidInput &&
+              emitted.empty() && moved.empty(),
+          "typed display batch rejects its first outside receiver move before a later button down");
+
+    for (const bool rawPrefix : {false, true}) {
+        check(windows.focus(windows.receiver), "receiver focus before prefix handoff");
+        emitted.clear();
+        moved.clear();
+        bool changedFocus = false;
+        bool acquiredSibling = false;
+        onEmit = [&](const INPUT& input) {
+            if (!changedFocus && input.type == INPUT_KEYBOARD && !(input.ki.dwFlags & KEYEVENTF_KEYUP)) {
+                changedFocus = true;
+                acquiredSibling = windows.focus(windows.sibling);
+            }
+        };
+        const auto stopped =
+            rawPrefix ? native->inputEvents({raw('A', false, 0, 0x01)}, scope, port, {}) : native->input(scope);
+        onEmit = {};
+        std::size_t downs = 0;
+        for (const auto& input : emitted)
+            if (input.type == INPUT_KEYBOARD && !(input.ki.dwFlags & KEYEVENTF_KEYUP)) ++downs;
+        check(changedFocus && acquiredSibling && stopped.code() == MaiErrorCode::Busy && downs == 1,
+              "legacy/raw terminal down rechecks the actual receiver after a recorded modifier prefix changes "
+              "foreground");
+        check(native->state().empty() && !emitted.empty() && (emitted.back().ki.dwFlags & KEYEVENTF_KEYUP),
+              "prefix focus loss releases its own modifier without sending the terminal key");
+    }
+
+    check(windows.focus(windows.receiver), "receiver focus before explicit raw repeat");
+    check(!native->inputEvents({raw('A')}, scope, port, {}), "recorded raw source before receiver-loss repeat");
+    check(windows.focus(windows.sibling), "foreign sibling focus before explicit raw repeat");
+    auto repeated = raw('A');
+    repeated.key.repeat = true;
+    const auto repeatStart = emitted.size();
+    check(native->inputEvents({repeated}, scope, port, {}).code() == MaiErrorCode::Busy,
+          "raw repeat cannot continue after its observed receiver loses foreground");
+    bool repeatedDown = false;
+    for (std::size_t index = repeatStart; index < emitted.size(); ++index)
+        repeatedDown = repeatedDown || !(emitted[index].ki.dwFlags & KEYEVENTF_KEYUP);
+    check(!repeatedDown && !native->releaseAll() && native->state().empty(),
+          "rejected repeat emits no new down and remains releasable");
+    for (int releaseKind = 0; releaseKind < 3; ++releaseKind) {
+        check(windows.focus(windows.receiver), "receiver focus before owned hold");
+        scope.executionWindow = windows.describe(windows.receiver);
+        scope.kind = DesktopNativeInputKind::KeyDown;
+        scope.key = "Ctrl";
+        if (releaseKind == 1)
+            check(!native->inputEvents({raw('A')}, scope, {}, {}), "owned raw down before focus-loss release");
+        else
+            check(!native->input(scope), "owned Ctrl down before focus-loss release");
+        check(!native->state().empty(), "receiver-bound native hold is recorded");
+        check(windows.focus(windows.sibling), "foreign focus before owned release");
+        check(native->validate().code() == MaiErrorCode::Busy,
+              "watchdog validation retains and checks the real receiver while a key is held");
+        const auto before = emitted.size();
+        MaiError released;
+        if (releaseKind == 0) {
+            auto up = scope;
+            up.kind = DesktopNativeInputKind::KeyUp;
+            released = native->input(up);
+        } else if (releaseKind == 1)
+            released = native->inputEvents({raw('A', true)}, scope, {}, {});
+        else
+            released = native->releaseAll();
+        check(!released && native->state().empty() && emitted.size() > before &&
+                  emitted.back().type == INPUT_KEYBOARD && (emitted.back().ki.dwFlags & KEYEVENTF_KEYUP),
+              "receiver focus loss cannot block original owned key_up/raw_up/releaseAll");
+    }
+    for (const bool clear : {false, true}) {
+        check(windows.focus(windows.receiver), "receiver focus before target-change hold");
+        scope.executionWindow = windows.describe(windows.receiver);
+        scope.kind = DesktopNativeInputKind::KeyDown;
+        scope.key = "Ctrl";
+        check(!native->input(scope), "Ctrl is held against its original receiver");
+        check(windows.focus(windows.sibling), "owned sibling focus before receiver replacement");
+        auto changed = scope;
+        if (clear)
+            changed.executionWindow.reset();
+        else
+            changed.executionWindow = windows.describe(windows.sibling);
+        changed.key = "A";
+        const auto before = emitted.size();
+        const auto rejected = native->input(changed);
+        bool newDown = false;
+        for (std::size_t index = before; index < emitted.size(); ++index)
+            if (emitted[index].type == INPUT_KEYBOARD && !(emitted[index].ki.dwFlags & KEYEVENTF_KEYUP)) newDown = true;
+        check(rejected.code() == MaiErrorCode::Busy && !newDown,
+              "a held receiver cannot be replaced or removed on the same display");
+        check(!native->releaseAll() && native->state().empty(), "target-change rejection still permits owned cleanup");
+    }
+    native->releaseAll();
+    std::printf("execution-window native predicates: %d checks, %d failures; input effects recorded only\n", checks,
+                failures);
+    return failures ? 1 : 0;
 }
-int main() {
+}  // namespace
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--execution-window-native")
+        return executionWindowReceiverGuardsNewInputAndAllowsRelease();
     rawIdentityAndBinding();
     aliasesAndMixedEntry();
     canonicalRawSourceAliases();

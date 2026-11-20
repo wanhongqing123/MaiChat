@@ -202,6 +202,24 @@ if ((Get-FileHash -LiteralPath $codeFontLicenseTarget -Algorithm SHA256).Hash -n
 $rvmSourceModel = Join-Path $repositoryRoot 'MaiAgent\models\rvm_mobilenetv3_fp32.onnx'
 $ortSourceRuntime = Join-Path $repositoryRoot 'MaiAgent\build\vendor\onnxruntime-windows-x64\onnxruntime.dll'
 $ortSourceProvider = Join-Path $repositoryRoot 'MaiAgent\build\vendor\onnxruntime-windows-x64\onnxruntime_providers_shared.dll'
+# OCR 模型和字典已固定嵌入资源；运行时与许可独立交付，不依赖 RVM/人像开关。
+if ($opencvEnabled) {
+    foreach ($asset in @(
+        'onnxruntime.dll',
+        'OcrModels\PP-OCRv5_LICENSE.txt',
+        'OcrModels\PROVENANCE.md',
+        'OcrModels\ONNXRUNTIME_LICENSE.txt',
+        'OcrModels\ONNXRUNTIME_ThirdPartyNotices.txt'
+    )) {
+        $source = Join-Path $exeDir $asset
+        if (-not (Test-Path -LiteralPath $source)) { throw "Local OCR runtime/license missing: $source" }
+        $target = Join-Path $staging $asset
+        New-Item -ItemType Directory -Force (Split-Path -Parent $target) | Out-Null
+        Copy-Item -LiteralPath $source -Destination $target -Force
+        if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash) { throw "Local OCR asset hash mismatch: $asset" }
+    }
+}
 if ($ffmpegEnabled -and $opencvEnabled -and
     (Test-Path -LiteralPath $rvmSourceModel) -and
     (Test-Path -LiteralPath $ortSourceRuntime)) {

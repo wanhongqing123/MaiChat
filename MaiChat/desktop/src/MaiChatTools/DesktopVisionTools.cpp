@@ -1,6 +1,7 @@
 // 文件作用：桌面端 Agent 工具；DesktopVisionTools 负责 Agent 工具注册、调用与结果返回，本文件给出其实现。
-// 直接依赖：MaiFilePath.h、MaiFileSystem.h、MaiIdGenerator.h、MaiImageVision.h；实现与这些接口协作。
+// 直接依赖：MaiFilePath.h、MaiFileSystem.h、MaiIdGenerator.h、MaiImageVision.h；同时注册共用普通入口的本地 OCR。
 #include "MaiChatTools/DesktopVisionTools.h"
+#include "MaiChatTools/DesktopOcrTools.h"
 #include "ui/DesktopRasterImage.h"
 
 #include <QByteArray>
@@ -251,4 +252,5 @@ void registerDesktopVisionTools(MaiToolRegistry& registry) {
     auto service = std::make_shared<DesktopVisionService>();
     registry.add(std::make_unique<DesktopVisionTool>(VisionAction::DetectFaces, service));
     registry.add(std::make_unique<DesktopVisionTool>(VisionAction::SegmentPerson, service));
+    registerDesktopOcrTools(registry);
 }

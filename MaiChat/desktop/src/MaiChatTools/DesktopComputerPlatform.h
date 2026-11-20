@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -139,12 +140,22 @@ struct DesktopNativeInput {
     // keeps the older free function wrappers scoped to their initial foreground.
     std::uint64_t expectedWindowId = 0;
     std::uint64_t expectedProcessId = 0;
-    // Explicit display scope permits intentional foreground changes; the legacy
-    // window scope continues checking the selected window identity.
+    // Unrestricted display scope permits intentional foreground changes; the
+    // optional executionWindow narrows it while preserving display coordinates.
+    // The legacy window scope continues checking the selected window identity.
     bool desktopScope = false;
     DesktopNativeDisplay display;
     std::function<bool()> isCanceled;
+    // Optional receiver restriction for display coordinates. Native validation
+    // checks this exact window before every new input; its owned release events
+    // remain legal after focus loss. It does not alter the display/image port.
+    std::optional<DesktopNativeWindow> executionWindow;
 };
+
+// Shared ordinary bounds predicate. A rejected point includes structured
+// native-coordinate facts in MaiError::message for thin tool adapters; it
+// neither activates a window nor grants permission to dispatch input.
+MaiError maiDesktopValidateExecutionPoint(const DesktopNativeWindow& window, double x, double y);
 
 // Ordinary native sessions pair only their own downs with ups. Implementations
 // serialize these methods and preserve native source/held state across input()

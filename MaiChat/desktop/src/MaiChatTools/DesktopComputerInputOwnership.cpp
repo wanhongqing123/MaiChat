@@ -67,12 +67,15 @@ MaiResult<std::shared_ptr<DesktopNativeInputSession>> DesktopComputerInputOwners
     if (const auto owner = desktopOwner.lock(); owner && owner != local && !owner->state().empty())
         return {MaiErrorCode::Busy, "another input session owns held desktop buttons or keys"};
     const auto target = action.desktopScope ? action.displayId : action.windowId;
+    const bool changedReceiver = !releasing && found != entries_.end() &&
+        (found->second.executionWindowId != action.executionWindowId ||
+         found->second.executionWindowProcessId != action.executionWindowProcessId);
     if (found != entries_.end() && !local->state().empty() &&
         ((target != 0 && (found->second.display != action.desktopScope || found->second.target != target)) ||
-         found->second.turn != action.turnId))
+         found->second.turn != action.turnId || changedReceiver))
         return {MaiErrorCode::Busy, "release owned inputs before changing input target or task"};
     const bool changedContext = found != entries_.end() &&
-        (found->second.turn != action.turnId ||
+        (found->second.turn != action.turnId || changedReceiver ||
          (target != 0 && (found->second.display != action.desktopScope || found->second.target != target)));
     if (!create && (found == entries_.end() || changedContext))
         return std::shared_ptr<DesktopNativeInputSession>{};
@@ -87,6 +90,7 @@ MaiResult<std::shared_ptr<DesktopNativeInputSession>> DesktopComputerInputOwners
         if (!native) return {MaiErrorCode::NotSupported, "independent input is unavailable in this backend"};
         found = entries_
                     .insert_or_assign(session, Entry{native, action.turnId, action.desktopScope, target,
+                                                     action.executionWindowId, action.executionWindowProcessId,
                                                      std::chrono::steady_clock::now() + timeout_, false})
                     .first;
         if (!watchdog_.joinable()) watchdog_ = std::thread([this] { watch(); });

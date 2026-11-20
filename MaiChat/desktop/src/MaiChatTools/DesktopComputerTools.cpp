@@ -37,6 +37,7 @@
 namespace {
 
 using Json = nlohmann::json;
+const char* nativeScreenUnit();
 
 struct ObservedWindow {
     DesktopNativeWindow window;
@@ -48,6 +49,7 @@ struct ObservedWindow {
     std::string token;
     std::string turnId;
     std::optional<DesktopNativeWindow> elementWindow;
+    std::optional<DesktopNativeWindow> executionWindow;
     std::uint64_t elementWindowId = 0;
     std::map<std::string, DesktopNativeElement> elements;
     std::atomic<bool> invalidated{false};
@@ -74,6 +76,45 @@ bool observationWindowMatches(const DesktopNativeWindow& before, const DesktopNa
     if (before.minimized != now.minimized || before.cloaked != now.cloaked ||
         before.boundsAvailable != now.boundsAvailable || !windowIdentityMatches(before, now)) return false;
     return (before.minimized || before.cloaked) ? true : currentWindowMatches(before, now);
+}
+
+bool executionWindowMatches(const DesktopNativeWindow& before, const DesktopNativeWindow& now) {
+    // A screenshot's receiver is an exact spatial restriction. Even a small
+    // move requires fresh evidence; the legacy window tolerance is unchanged.
+    return currentWindowMatches(before, now) && before.x == now.x && before.y == now.y &&
+           before.width == now.width && before.height == now.height;
+}
+
+bool executionIdentityMatches(const DesktopNativeWindow& before, const DesktopNativeWindow& now) {
+    // Post-input observation may refresh a document title or geometry, but an
+    // automatic handoff must never adopt a recycled handle or another owner.
+    return before.id == now.id && before.processId == now.processId && before.ownerId == now.ownerId &&
+           before.className == now.className && before.application == now.application;
+}
+
+bool validWindowBounds(const DesktopNativeWindow& window) {
+    return window.id && window.processId && !window.minimized && !window.cloaked && window.boundsAvailable &&
+           std::isfinite(window.x) && std::isfinite(window.y) && std::isfinite(window.width) &&
+           std::isfinite(window.height) && window.width > 0 && window.height > 0 &&
+           std::isfinite(window.x + window.width) && std::isfinite(window.y + window.height);
+}
+
+MaiError executionPointError(const DesktopNativeWindow& window, double x, double y) {
+    // Match the native integer pointer location on Windows. macOS dispatch
+    // retains screen points; PNG pixels are never substituted for native units.
+#if defined(Q_OS_WIN)
+    x = std::round(x);
+    y = std::round(y);
+#endif
+    if (x >= window.x && y >= window.y && x < window.x + window.width && y < window.y + window.height) return {};
+    Json details{{"reason", "point_outside_target"}, {"execution_window_id", std::to_string(window.id)},
+                 {"target_bounds", {{"x", window.x}, {"y", window.y}, {"width", window.width}, {"height", window.height}}},
+                 {"requested_point", {{"x", x}, {"y", y}, {"unit", nativeScreenUnit()}}},
+                 {"native_screen_bounds_unit", nativeScreenUnit()}};
+#if defined(Q_OS_WIN)
+    details["requested_px"] = {{"x", x}, {"y", y}};
+#endif
+    return {MaiErrorCode::InvalidInput, details.dump()};
 }
 
 bool ratio(double value) {
@@ -419,6 +460,12 @@ DesktopInputPort inputPort(double x, double y, double width, double height,
 
 }  // namespace
 
+MaiError maiDesktopValidateExecutionPoint(const DesktopNativeWindow& window, double x, double y) {
+    if (!validWindowBounds(window) || !std::isfinite(x) || !std::isfinite(y))
+        return {MaiErrorCode::InvalidInput, "execution window and pointer need finite visible native bounds"};
+    return executionPointError(window, x, y);
+}
+
 MaiError DesktopComputerBackend::activateForInput(const DesktopNativeWindow& window) {
     return activate(window);
 }
@@ -457,13 +504,15 @@ struct DesktopComputerController::Impl {
         const auto found = sessions.find(sessionId);
         return found == sessions.end() ? nullptr : found->second;
     }
-    void invalidate(const std::string& session, const std::string& turn, bool allowLegacy = false) {
+    void invalidate(const std::string& session, const std::string& turn, bool allowLegacy = false,
+                    const std::shared_ptr<ObservedWindow>& expected = {}) {
         std::shared_ptr<ObservedWindow> revoked;
         {
             std::lock_guard<std::mutex> lock(mutex);
             const auto found = sessions.find(session);
             if (found == sessions.end()) return;
             const auto& selected = found->second;
+            if (expected && selected != expected) return;
             if (!turn.empty() && selected->turnId != turn && !(allowLegacy && selected->turnId.empty())) return;
             // Never wait for a worker's state mutex: platform work may await
             // this GUI thread. Its local shared_ptr keeps state alive while
@@ -591,7 +640,7 @@ MaiResult<std::vector<DesktopNativeDisplay>> DesktopComputerController::displays
 MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
     const std::string& sessionId, const std::string& workspace, std::uint64_t displayId,
     std::function<bool()> isCanceled, std::uint64_t afterFrameSequence, std::int64_t afterFrameReceivedAtMs, int waitMs,
-    const std::string& turnId, std::uint64_t elementWindowId) {
+    const std::string& turnId, std::uint64_t elementWindowId, std::uint64_t executionWindowId) {
     impl_->inputOwnership->touch(sessionId, turnId);
     const auto canceled = [&] { return isCanceled && isCanceled(); };
     const auto cleanupOnCancel = qScopeGuard([&] {
@@ -628,6 +677,24 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
     if (count != 1 || !validDisplay(selected))
         return {MaiErrorCode::InvalidInput, "selected display is ambiguous or invalid"};
 
+    std::optional<DesktopNativeWindow> executionWindow;
+    if (executionWindowId) {
+        const auto windows = impl_->backend->windows();
+        if (!windows) return windows.error();
+        for (const auto& window : windows.value()) {
+            if (window.id != executionWindowId) continue;
+            if (executionWindow)
+                return {MaiErrorCode::InvalidInput, "execution window is ambiguous; observe again"};
+            executionWindow = window;
+        }
+        if (!executionWindow) return {MaiErrorCode::NotFound, "execution window is not available"};
+        const auto& window = *executionWindow;
+        if (!validWindowBounds(window) || window.x >= selected.x + selected.width ||
+            window.y >= selected.y + selected.height || window.x + window.width <= selected.x ||
+            window.y + window.height <= selected.y)
+            return {MaiErrorCode::InvalidInput, "execution window needs visible bounds on the selected display"};
+    }
+
     const std::string directory = maiResolvePathWithinRoot(workspace, "computer");
     if (directory.empty()) return {MaiErrorCode::InvalidInput, "display image directory leaves the workspace"};
     const std::string relative = "computer/" + MaiIdGenerator::generate("display_") + ".png";
@@ -662,6 +729,14 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
     if (std::count_if(afterCapture.value().begin(), afterCapture.value().end(),
                       [&](const auto& display) { return displayMatches(selected, display); }) != 1)
         return {MaiErrorCode::InvalidInput, "display geometry changed while observing; observe again"};
+    if (executionWindow) {
+        const auto windows = impl_->backend->windows();
+        if (!windows) return windows.error();
+        if (std::count_if(windows.value().begin(), windows.value().end(), [&](const auto& window) {
+                return executionWindowMatches(*executionWindow, window);
+            }) != 1)
+            return {MaiErrorCode::InvalidInput, "execution window changed while observing; observe again"};
+    }
     if (screenshot.pngBytes.empty() || screenshot.pngBytes.size() > 20 * 1024 * 1024 || screenshot.width <= 0 ||
         screenshot.height <= 0)
         return {MaiErrorCode::Protocol, "display capture returned an empty or oversized image"};
@@ -687,6 +762,7 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
     state->token = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
     state->turnId = turnId;
     state->elementWindowId = elementWindowId;
+    state->executionWindow = executionWindow;
     state->observedAt = std::chrono::steady_clock::now();
     Json output = displayJson(selected);
     output["target"] = "display";
@@ -700,6 +776,13 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
     output["frame_received_at_ms"] = screenshot.frameReceivedAtMs;
     output["coordinate_space"] = "relative fractions 0..1 within the captured display";
     output["native_screen_bounds_unit"] = nativeScreenUnit();
+    output["input_coordinate_space"] = {{"space", "display"}, {"space_id", std::to_string(selected.id)},
+                                         {"unit", "ratio"}};
+    output["image_coordinate_space"] = {{"space", "image"}, {"space_id", relative}, {"unit", "pixel"}};
+    if (executionWindow) {
+        output["execution_window_id"] = std::to_string(executionWindow->id);
+        output["execution_window"] = windowJson(*executionWindow);
+    }
     if (elementWindowId) {
         output["element_window_id"] = std::to_string(elementWindowId);
         const auto sources = impl_->backend->windows();
@@ -738,10 +821,16 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
             }
         }
     }
-    if (canceled() || desktopInputGeneration.load() != inputGeneration) {
+    bool receiverChanged = false;
+    if (executionWindow) {
+        const auto windows = impl_->backend->windows();
+        receiverChanged = !windows || std::count_if(windows.value().begin(), windows.value().end(),
+            [&](const auto& now) { return executionWindowMatches(*executionWindow, now); }) != 1;
+    }
+    if (canceled() || desktopInputGeneration.load() != inputGeneration || receiverChanged) {
         MaiFileSystem::removeFile(MaiFilePath::fromUtf8(destination));
         return {canceled() ? MaiErrorCode::Canceled : MaiErrorCode::Busy,
-                "desktop observation changed during element inspection; observe again"};
+                "desktop observation or execution window changed during inspection; observe again"};
     }
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -857,6 +946,17 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(
     if (includeImage) {
         output["image_path"] = relativeImagePath;
         output["mime_type"] = "image/png";
+        // A picture is not proof of a native input transform. Windows WGC's
+        // DWM-frame correspondence is independently measured; the current Mac
+        // capture API does not publish its surface/content origin transform.
+#if defined(Q_OS_WIN)
+        output["image_coordinates_usable_for_input"] = true;
+#else
+        output["image_coordinates_usable_for_input"] = false;
+        output["image_coordinate_mapping_note"] =
+            "Window-image/native-frame alignment is unverified. Use display observe with execution_window_id "
+            "for image-derived positions, or use native accessibility element geometry.";
+#endif
     }
     auto state = std::make_shared<ObservedWindow>();
     state->window = selected;
@@ -886,6 +986,10 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(
         impl_->sessions[sessionId] = state;
     }
     output["snapshot_id"] = state->token;
+    output["input_coordinate_space"] = {{"space", "window"}, {"space_id", std::to_string(selected.id)},
+                                         {"unit", "ratio"}};
+    if (includeImage)
+        output["image_coordinate_space"] = {{"space", "image"}, {"space_id", relativeImagePath}, {"unit", "pixel"}};
     return DesktopComputerObservation{output.dump(), imagePath};
 }
 
@@ -907,9 +1011,12 @@ MaiError DesktopComputerController::act(const std::string& sessionId, const std:
 }
 
 MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const std::string& sessionId,
-                                                                          const DesktopComputerAction& request,
+                                                                          const DesktopComputerAction& originalRequest,
                                                                           DesktopComputerActionProgress* progress) {
     if (progress) *progress = {};
+    // Receiver identity comes from the snapshot, not from an action that could
+    // accidentally omit or override it. Keep the caller's ordinary DTO intact.
+    DesktopComputerAction request = originalRequest;
     // Keep validation and failure cleanup in the same serialized operation.
     // A reset cannot slip between unlocking input and an older failure guard.
     std::unique_lock<std::mutex> desktopLock(desktopOperationMutex, std::try_to_lock);
@@ -1086,6 +1193,8 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     // native layer also checks target identity between multi-event inputs.
 
     if (state->invalidated.load()) return {MaiErrorCode::Canceled, "input observation was revoked"};
+    request.executionWindowId = state->executionWindow ? state->executionWindow->id : 0;
+    request.executionWindowProcessId = state->executionWindow ? state->executionWindow->processId : 0;
     const auto inputCanceled = [&request, state] {
         return state->invalidated.load() || (request.isCanceled && request.isCanceled());
     };
@@ -1161,8 +1270,61 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         if (std::count_if(current.value().begin(), current.value().end(),
                           [&](const auto& display) { return displayMatches(state->display, display); }) != 1)
             return evidenceFailure("display geometry changed; observe again");
+        if (state->executionWindow) {
+            const auto windows = impl_->backend->windows();
+            if (!windows) return windows.error();
+            if (std::count_if(windows.value().begin(), windows.value().end(), [&](const auto& now) {
+                    return executionWindowMatches(*state->executionWindow, now);
+                }) != 1)
+                return evidenceFailure("execution window changed; observe again");
+        }
         const auto resolved = resolveElementPoint();
         if (resolved) return resolved;
+        if (state->executionWindow) {
+            const auto& receiver = *state->executionWindow;
+            const auto point = [&](double x, double y) {
+                return executionPointError(receiver,
+                    state->display.x + x * (std::max)(1.0, state->display.width - 1),
+                    state->display.y + y * (std::max)(1.0, state->display.height - 1));
+            };
+            const bool positioned = action == "move" || action == "click" || action == "double_click" ||
+                action == "right_click" || action == "drag" || action == "scroll" || action == "mouse_down";
+            if (positioned) {
+                const auto error = elementPoint ? executionPointError(receiver, elementPoint->first, elementPoint->second)
+                                                : point(request.xRatio, request.yRatio);
+                if (error) return error;
+                if (action == "drag") {
+                    const auto error = point(request.toXRatio, request.toYRatio);
+                    if (error) return error;
+                }
+            }
+            for (const auto& event : request.events) {
+                if (event.kind == DesktopInputEventKind::AbsoluteMove) {
+                    if (const auto error = point(event.x, event.y)) return error;
+                } else if (event.kind == DesktopInputEventKind::RelativeMove && (event.deltaX || event.deltaY)) {
+                    // Native relative deltas are subject to OS acceleration;
+                    // predicting their destination would manufacture evidence.
+                    return {MaiErrorCode::NotSupported,
+                            "window-restricted input requires absolute motion; native relative motion is not bounded"};
+                } else if (event.kind == DesktopInputEventKind::Touch) {
+                    for (const auto& contact : event.contacts) {
+                        if (contact.phase == DesktopInputPhase::Up || contact.phase == DesktopInputPhase::Cancel ||
+                            contact.phase == DesktopInputPhase::CancelAll) continue;
+                        if (const auto error = point(contact.x, contact.y)) return error;
+                    }
+                } else if (event.kind == DesktopInputEventKind::Pen &&
+                           event.pen.phase != DesktopInputPhase::Up && event.pen.phase != DesktopInputPhase::Cancel &&
+                           event.pen.phase != DesktopInputPhase::CancelAll &&
+                           event.pen.phase != DesktopInputPhase::HoverLeave &&
+                           event.pen.phase != DesktopInputPhase::ButtonOnly) {
+                    if (const auto error = point(event.pen.x, event.pen.y)) return error;
+                }
+            }
+            const auto focused = impl_->backend->inputFocused(receiver);
+            if (!focused) return focused.error();
+            if (!focused.value())
+                return {MaiErrorCode::Busy, "execution window is not focused; observe and focus it explicitly"};
+        }
         DesktopComputerActionResult receipt;
         if (request.dryRun) {
             receipt.state = "validated";
@@ -1178,6 +1340,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         DesktopNativeInput input;
         input.desktopScope = true;
         input.display = state->display;
+        input.executionWindow = state->executionWindow;
         input.text = request.text;
         input.key = request.key;
         input.lines = request.scrollLines;
@@ -1221,14 +1384,48 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         receipt.dispatched = true;
         if (eventBatch) receipt.acceptedEvents = request.events.size();
         receipt.inputState = inputState(sessionId);
-        const auto next = observeDisplay(sessionId, state->workspace, state->display.id, request.isCanceled,
-                                         state->frameSequence, MaiTime::getCurrentTime(), 0, request.turnId,
-                                         state->elementWindowId);
+        const auto next = [&]() -> MaiResult<DesktopComputerObservation> {
+            if (inputCanceled())
+                return {MaiErrorCode::Canceled, "execution observation was revoked after input"};
+            if (state->executionWindow) {
+                const auto windows = impl_->backend->windows();
+                if (!windows) return windows.error();
+                if (std::count_if(windows.value().begin(), windows.value().end(), [&](const auto& now) {
+                        return executionIdentityMatches(*state->executionWindow, now);
+                    }) != 1)
+                    return {MaiErrorCode::InvalidInput,
+                            "execution window identity changed after input; observe explicitly before further input"};
+            }
+            auto observed = observeDisplay(sessionId, state->workspace, state->display.id, inputCanceled,
+                                          state->frameSequence, MaiTime::getCurrentTime(), 0, request.turnId,
+                                          state->elementWindowId, state->executionWindow ? state->executionWindow->id : 0);
+            if (!observed || !state->executionWindow) return observed;
+            const auto successor = impl_->get(sessionId);
+            const auto metadata = Json::parse(observed.value().json, nullptr, false);
+            const bool sameSnapshot = successor && metadata.is_object() && metadata.contains("snapshot_id") &&
+                                      metadata["snapshot_id"] == successor->token;
+            if (!sameSnapshot || inputCanceled() || successor->invalidated.load() || !successor->executionWindow ||
+                !executionIdentityMatches(*state->executionWindow, *successor->executionWindow)) {
+                // Revoke only this handoff, never a concurrently selected new
+                // receiver. The newly captured frame is not published to tools.
+                if (sameSnapshot) impl_->invalidate(sessionId, request.turnId, false, successor);
+                if (!observed.value().imagePath.empty())
+                    MaiFileSystem::removeFile(MaiFilePath::fromUtf8(observed.value().imagePath));
+                return {MaiErrorCode::InvalidInput, "execution window identity changed during successor observation"};
+            }
+            return observed;
+        }();
         if (next)
             receipt.observation = next.value();
         else {
             receipt.state = "dispatched_observation_failed";
             receipt.observationError = next.error().message();
+            if (state->executionWindow) {
+                // Holds belong to the original receiver even when the input
+                // itself succeeded. A failed handoff cannot transfer them.
+                const auto released = impl_->inputOwnership->release(sessionId, request.turnId);
+                if (released) receipt.observationError += "; owned cleanup: " + released.message();
+            }
         }
         if (canceled()) impl_->inputOwnership->release(sessionId, request.turnId);
         return success(std::move(receipt));
@@ -1419,12 +1616,26 @@ public:
                "minimized/cloaked windows can be observed as metadata, but need available bounds for ordinary input. "
                "Use window_id to select an untitled window. target=display observe provides a whole-screen image and "
                "native "
-               "bounds; target=window observe provides window bounds and Accessibility/UIA elements "
-               "without a window image. Prefer display scope for visual/cross-application work. "
+               "bounds; target=window observe provides window bounds and Accessibility/UIA elements; "
+               "include_image=true also captures that window. "
+#if defined(Q_OS_WIN)
+               "Prefer window images for one-window visual work. "
+#else
+               "Window images are for reading; their native-frame alignment is unverified. Do not derive input "
+               "positions from them: use display observe with execution_window_id or native element_id. "
+#endif
                "Specify target explicitly on observe/input; omitted target means window. Click, "
                "double_click and drag accept a mouse button; right_click is a fixed right-button alias. "
                "move positions the pointer, scroll supports either axis, key taps a key/chord, and type "
                "inserts Unicode text. These actions may be selected independently as needed.\n"
+               "RECEIVER: display observe accepts execution_window_id to retain display coordinates while "
+               "restricting every new input to that observed window. The restriction persists in successor "
+               "snapshots; actions cannot override it. Its window must already be focused (including owned "
+               "popups); no implicit focus is performed. Mouse/touch/pen points must be inside its main bounds "
+               "and hit that window family. Select an outside popup explicitly before pointing outside those "
+               "bounds. Changed identity/geometry requires a new observation; foreign focus rejects input. "
+               "Restricted native relative motion is unsupported; use absolute motion. Omit the receiver only "
+               "for intentional whole-display/cross-application work.\n"
                "WINDOW STATE: minimize/restore require target=window and its current snapshot_id. Results include "
                "before_window, after_window and actual focused when readable; observe again afterwards. Cloaked "
                "windows are never moved across virtual desktops. ELEMENTS: click/double_click/right_click can use "
@@ -1515,13 +1726,15 @@ public:
           "action":{"type":"string","enum":["list","list_displays","list_keys","observe","focus","minimize","restore","move","click","double_click","right_click","drag","mouse_down","mouse_up","type","replace_text","key","key_down","key_up","scroll","input_state","reset_inputs","release_all","verify","clear"]},
           "button":{"type":"string","enum":["left","right","middle","back","forward"],"description":"Button for click/double_click/drag/mouse_down/mouse_up; default left. right_click always means right."},
           "axis":{"type":"string","enum":["vertical","horizontal"],"description":"Scroll axis, default vertical. Positive lines mean up vertically or right horizontally."},
-          "target":{"type":"string","enum":["window","display"],"description":"Set explicitly on observe/input. display: selected whole screen and its bound image (preferred for visual work). window: selected window bounds/UIA, no window image. Omitted means window."},
+          "target":{"type":"string","enum":["window","display"],"description":"Set explicitly on observe/input. display: selected whole screen and its bound image. window: selected window bounds/UIA and optional include_image. Omitted means window."},
           "display_id":{"type":"string","description":"Exact ID from list_displays; required for display observe/input. Keep the image, display_id and snapshot_id from the same observation."},
           "element_window_id":{"type":"string","description":"Display observe only: inspect this one discovered window for UIA/AX elements (including separate popup/taskbar). Accessibility source only; input stays scoped to display_id."},
+          "execution_window_id":{"type":"string","description":"Display observe only: bind a visible discovered window as receiver for all subsequent inputs. Coordinates remain display-relative; main bounds, identity and foreground window family are checked. Actions cannot override or clear it."},
           "element_id":{"type":"string","minLength":1,"description":"Opaque ID from the current snapshot for click/double_click/right_click. Supply element_id OR both x_ratio/y_ratio, never both; changed native evidence requires observing again."},
           "window_title":{"type":"string","maxLength":500,"description":"Exact title for window observe; supply this OR window_id, not both."},
           "window_id":{"type":"string","description":"ID from list/window observe. Required for window input; coordinates refer to this window's full observed bounds."},
           "include_elements":{"type":"boolean","description":"Window observe only: include Accessibility/UIA elements. Their center_x_ratio/center_y_ratio can be used directly for window input."},
+          "include_image":{"type":"boolean","description":"Window observe only: capture the selected window with actual image dimensions. Default false preserves metadata-only observation; requires an image-capable primary model."},
           "snapshot_id":{"type":"string","description":"Fresh token for this session and target. Observe returns snapshot_id; display input returns the next token at observation.snapshot_id. Mutations consume it; owned up/release actions need no token. Standalone screenshot never renews it."},
           "wait_ms":{"type":"integer","minimum":0,"maximum":5000,"description":"Display observe only: wait before acquiring a fresh frame, e.g. for application paint/loading."},
           "x_ratio":{"type":"number","minimum":0,"maximum":1,"description":"Horizontal fraction of selected display/window bounds: 0 left, 1 right. For the bound full-display image use px/(inspected image width-1), never raw pixels or browser-viewport ratios."},
@@ -1581,14 +1794,15 @@ public:
         for (auto field = args.begin(); field != args.end(); ++field) {
             const auto& name = field.key();
             const bool known = name == "action" || name == "target" || name == "window_title" ||
-                name == "window_id" || name == "display_id" || name == "element_window_id" || name == "element_id" ||
+                name == "window_id" || name == "display_id" || name == "element_window_id" ||
+                name == "execution_window_id" || name == "element_id" ||
                 name == "include_elements" || name == "include_image" || name == "snapshot_id" || name == "wait_ms" ||
                 name == "x_ratio" || name == "y_ratio" || name == "to_x_ratio" || name == "to_y_ratio" ||
                 name == "duration_ms" || name == "text" || name == "key" || name == "lines" || name == "expected_text" ||
                 name == "dry_run" || name == "button" || name == "axis" || name == "events" || name == "input_options";
             if (!known) return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                                       "unexpected desktop_computer parameter: " + name);
-            if ((name == "window_id" || name == "display_id" || name == "element_window_id") &&
+            if ((name == "window_id" || name == "display_id" || name == "element_window_id" || name == "execution_window_id") &&
                 !field.value().is_string())
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, name + " must be a decimal string");
             if ((name == "target" || name == "window_title" || name == "snapshot_id" || name == "element_id" ||
@@ -1727,14 +1941,20 @@ public:
             return MaiToolResult::success(output.dump());
         }
         if (action == "observe") {
-            if (args.contains("include_image"))
-                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                              "observe returns metadata only; use screenshot for screen images");
             for (auto field = args.begin(); field != args.end(); ++field)
                 if (field.key() != "action" && field.key() != "window_title" && field.key() != "window_id" &&
-                    field.key() != "include_elements")
+                    field.key() != "include_elements" && field.key() != "include_image")
                     return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                                   "unexpected window observe parameter: " + field.key());
+            if ((args.contains("include_image") && !args["include_image"].is_boolean()) ||
+                (args.contains("include_elements") && !args["include_elements"].is_boolean()))
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "observe image/element flags must be boolean");
+            const bool includeImage = args.value("include_image", false);
+            const auto modelInfo = maiCloudModelInfo(context.model);
+            if (includeImage && ((modelInfo && !modelInfo->supportsImages) ||
+                                context.model.compare(0, 6, "local:") == 0))
+                return MaiToolResult::failure(MaiErrorCode::NotSupported,
+                                              "Window images require an image-capable primary model");
             if (args.contains("window_title") == args.contains("window_id"))
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                               "window observe needs exactly one of window_title or window_id");
@@ -1749,9 +1969,12 @@ public:
             }
             const auto observed = controller_->observe(
                 context.sessionId, args.value("window_title", std::string()), context.root,
-                args.value("include_elements", true), id, false, [&context] { return context.isCanceled(); },
+                args.value("include_elements", true), id, includeImage, [&context] { return context.isCanceled(); },
                 context.turnId);
             if (!observed) return failure(observed.error());
+            if (includeImage)
+                return MaiToolResult::successWithImages(observed.value().json,
+                                                        {MaiToolImage{observed.value().imagePath, "image/png"}});
             return MaiToolResult::success(observed.value().json);
         }
         if (action == "clear") {
@@ -1884,6 +2107,13 @@ private:
                     {"window_operation_attempted", progress.windowOperationAttempted},
                     {"needs_observation", progress.needsObservation},
                     {"input_state", inputStateJson(controller_->inputState(session))}};
+        const auto details = Json::parse(error.message(), nullptr, false);
+        if (details.is_object() && details.value("reason", Json{}) == "point_outside_target") {
+            for (const char* field : {"reason", "target_bounds", "requested_px", "requested_point", "execution_window_id",
+                                      "native_screen_bounds_unit"})
+                if (details.contains(field)) output[field] = details[field];
+            output["status"] = "rejected";
+        }
         return MaiToolResult::failure(error.code(), output.dump());
     }
     MaiToolResult executeInputEvents(const Json& args, const MaiToolContext& context) {
@@ -1997,7 +2227,7 @@ private:
             const std::string& name = field.key();
             const bool allowed =
                 name == "action" || name == "target" || name == "display_id" ||
-                (observing && (name == "wait_ms" || name == "element_window_id")) ||
+                (observing && (name == "wait_ms" || name == "element_window_id" || name == "execution_window_id")) ||
                 (!observing && (name == "snapshot_id" || name == "dry_run")) ||
                 (positioned && (name == "x_ratio" || name == "y_ratio")) ||
                 (elementClick && name == "element_id") ||
@@ -2012,17 +2242,23 @@ private:
             if (context.root.empty()) return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                 "host workspace is missing; display observe requires host context.root");
             std::uint64_t sourceId = 0;
+            std::uint64_t executionId = 0;
             if (args.contains("element_window_id")) {
                 const auto source = windowIdFrom(args["element_window_id"], "element_window_id");
                 if (!source) return failure(source.error());
                 sourceId = source.value();
+            }
+            if (args.contains("execution_window_id")) {
+                const auto receiver = windowIdFrom(args["execution_window_id"], "execution_window_id");
+                if (!receiver) return failure(receiver.error());
+                executionId = receiver.value();
             }
             if (args.contains("wait_ms") && (!args["wait_ms"].is_number_integer() ||
                                              args["wait_ms"].get<double>() < 0 || args["wait_ms"].get<double>() > 5000))
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "display observation wait must be 0..5000ms");
             const auto observed = controller_->observeDisplay(
                 context.sessionId, context.root, parsedId.value(), [&context] { return context.isCanceled(); }, 0, 0,
-                args.value("wait_ms", 0), context.turnId, sourceId);
+                args.value("wait_ms", 0), context.turnId, sourceId, executionId);
             if (!observed) return failure(observed.error());
             return MaiToolResult::successWithImages(observed.value().json,
                                                     {MaiToolImage{observed.value().imagePath, "image/png"}});

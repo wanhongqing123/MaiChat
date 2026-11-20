@@ -50,6 +50,11 @@ struct DesktopComputerAction {
     // Only click/double_click/right_click accept snapshot-local opaque IDs.
     // The ordinary API ignores ratios for this locator; tool JSON enforces XOR.
     std::string elementId;
+    // Derived from the observation by perform(), never supplied by tool JSON.
+    // The input owner must not carry held controls to another receiver while
+    // keeping the same display. A missing value does not remove a bound guard.
+    std::uint64_t executionWindowId = 0;
+    std::uint64_t executionWindowProcessId = 0;
 };
 
 struct DesktopComputerActionResult {
@@ -98,8 +103,10 @@ public:
     MaiResult<DesktopInputFeedbackBatch> feedback(const std::string& sessionId, std::uint64_t afterSequence = 0,
                                                   std::uint32_t limit = 64) const;
     // Observe a whole display using the resident capture worker. The token binds
-    // this Session, input bounds and PNG dimensions. Desktop actions may switch
-    // foreground applications and provide a subsequent screen observation.
+    // this Session, input bounds and PNG dimensions. Unrestricted display
+    // actions may switch foreground applications. executionWindowId instead
+    // binds a receiver whose identity survives each subsequent observation;
+    // all new input checks its foreground family without implicit activation.
     // elementWindowId optionally selects one native accessibility source; it
     // does not narrow or activate the display's existing native input scope.
     MaiResult<DesktopComputerObservation> observeDisplay(const std::string& sessionId, const std::string& workspace,
@@ -107,7 +114,8 @@ public:
                                                          std::uint64_t afterFrameSequence = 0,
                                                          std::int64_t afterFrameReceivedAtMs = 0, int waitMs = 0,
                                                          const std::string& turnId = {},
-                                                         std::uint64_t elementWindowId = 0);
+                                                         std::uint64_t elementWindowId = 0,
+                                                         std::uint64_t executionWindowId = 0);
     MaiResult<DesktopComputerActionResult> perform(const std::string& sessionId, const DesktopComputerAction& action,
                                                    DesktopComputerActionProgress* progress = nullptr);
     MaiError act(const std::string& sessionId, const std::string& action, const std::string& snapshotId,

@@ -7,12 +7,17 @@
 
 #include "MaiChatTools/DesktopComputerPlatform.h"
 
+using DesktopWindowsPenReceiverValidator =
+    std::function<MaiError(const DesktopNativeInput&, std::int32_t, std::int32_t)>;
+
 // One system pen source, independent of the tool protocol. Calls are synchronous
 // and serialize against refresh; overlapping work returns Busy without a new
 // dispatch. state() remains readable during native calls. The cancellation
 // callback is checked around side effects and discarded before dispatch returns;
 // it is never retained for periodic updates. Cleanup uses only cached owned
 // geometry and does not require a current port or an uncanceled caller.
+// Guarded dispatch retains a sanitized receiver value and a factory-owned
+// validator for every effect/retry/refresh; it never retains a caller guard.
 // Physical pixels retain their cached virtual-desktop plane. Layout changes
 // retire the source instead of reinterpreting an old cleanup position.
 // Three logical side-button bits share one system barrel bit (OR), not three
@@ -27,6 +32,16 @@ public:
     virtual ~DesktopComputerWindowsPen() = default;
     virtual MaiError dispatch(const DesktopInputPen& pen, const DesktopInputPort& port,
                               std::function<bool()> isCanceled = {}) = 0;
+    virtual MaiError dispatchGuarded(const DesktopInputPen& pen, const DesktopInputPort& port,
+                                    const DesktopNativeInput& receiverScope,
+                                    std::function<bool()> isCanceled = {}) {
+        DesktopInputEvent event;
+        event.kind = DesktopInputEventKind::Pen;
+        event.pen = pen;
+        if (!maiDesktopInputEventsOnlyRelease({event}))
+            return {MaiErrorCode::NotSupported, "pen source does not support a persistent receiver guard"};
+        return dispatch(pen, port, std::move(isCanceled));
+    }
     virtual DesktopNativeInputState state() const = 0;
     // Read the last asynchronous/cleanup fault without waiting for transport or
     // invoking an earlier caller. Empty native state does not imply no fault.
@@ -40,3 +55,4 @@ public:
 };
 
 std::shared_ptr<DesktopComputerWindowsPen> makeDesktopComputerWindowsPen();
+std::shared_ptr<DesktopComputerWindowsPen> makeDesktopComputerWindowsPen(DesktopWindowsPenReceiverValidator validator);

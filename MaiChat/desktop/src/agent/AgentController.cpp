@@ -50,6 +50,8 @@
 #endif
 #if defined(MAICHAT_DESKTOP_VISION)
 #include "MaiChatTools/DesktopVisionTools.h"
+#elif defined(MAICHAT_DESKTOP_OCR)
+#include "MaiChatTools/DesktopOcrTools.h"
 #endif
 
 #include <QCoreApplication>
@@ -462,6 +464,8 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     tools->add(makeMaiPdfTool(renderDesktopPdf, requestDesktopPdfPassword));
 #if defined(MAICHAT_DESKTOP_VISION)
     registerDesktopVisionTools(*tools);
+#elif defined(MAICHAT_DESKTOP_OCR)
+    registerDesktopOcrTools(*tools);
 #endif
     if (hostTools) hostTools(*tools);
 

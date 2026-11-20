@@ -31,6 +31,13 @@
     <file alias="human_segmentation_pphumanseg_2023mar.onnx">../../MobileAgentAdapter/models/human_segmentation_pphumanseg_2023mar.onnx</file>
   </qresource>
   <!-- Tabler Icons v3.x (MIT) plus MaiChat's creative-studio and player icons. -->
+  <qresource prefix="/maichat/models/ocr">
+    <file alias="det.onnx">../../Media/data/ocr/det.onnx</file>
+    <file alias="rec.onnx">../../Media/data/ocr/rec.onnx</file>
+    <file alias="dictionary.txt">../../Media/data/ocr/dictionary.txt</file>
+    <file alias="LICENSE">../../Media/data/ocr/LICENSE</file>
+    <file alias="PROVENANCE.md">../../Media/data/ocr/PROVENANCE.md</file>
+  </qresource>
   <qresource prefix="/maichat/icons">
     <file alias="message-circle.svg">icons/tabler/message-circle.svg</file>
     <file alias="cloud.svg">icons/cloud.svg</file>

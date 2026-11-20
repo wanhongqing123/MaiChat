@@ -41,4 +41,8 @@ struct DesktopWindowsRawBinding {
 MaiResult<DesktopWindowsRawBinding> maiDesktopWindowsResolveRawKey(
     const DesktopInputRawKey& effective, const DesktopInputOptions& options, std::uintptr_t layout);
 
+// Value-owned pointer reports use the same live Win32 receiver predicate as
+// synchronous input. No caller callback is retained by this ordinary check.
+MaiError maiDesktopWindowsValidatePointerScope(const DesktopNativeInput& input, std::int32_t x, std::int32_t y);
+
 std::shared_ptr<DesktopNativeInputSession> makeDesktopWindowsInputSessionForTesting(DesktopWindowsInputHooks hooks);

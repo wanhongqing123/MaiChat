@@ -1069,7 +1069,7 @@ MaiError InputScope::dispatchTyped(const DesktopInputEvent& event, const Desktop
             else {
                 if (hooks_.emitInput)
                     return {MaiErrorCode::NotSupported, "touch requires its explicit native test transport"};
-                touch_ = makeDesktopComputerWindowsTouch();
+                touch_ = makeDesktopComputerWindowsTouch(maiDesktopWindowsValidatePointerScope);
             }
             std::atomic_store(&snapshot_->touch, touch_);
         }
@@ -1095,7 +1095,10 @@ MaiError InputScope::dispatchTyped(const DesktopInputEvent& event, const Desktop
         // The source may wait for its next ordinary report before adding a
         // contact. Recheck the target at each effect during that synchronous
         // command; the source discards this stack-bound guard before response.
-        const auto result = touch_->dispatch(event.contacts, port, releasing ? std::function<bool()>{} : guard);
+        const auto cancel = releasing ? std::function<bool()>{} : guard;
+        const auto result = input_.executionWindow
+            ? touch_->dispatchGuarded(event.contacts, port, input_, cancel)
+            : touch_->dispatch(event.contacts, port, cancel);
         publish();
         if (guardError) {
             if (result && result.code() != guardError.code())
@@ -1135,11 +1138,16 @@ MaiError InputScope::dispatchTyped(const DesktopInputEvent& event, const Desktop
             else {
                 if (hooks_.emitInput)
                     return {MaiErrorCode::NotSupported, "pen requires its explicit native test transport"};
-                pen_ = makeDesktopComputerWindowsPen();
+                pen_ = makeDesktopComputerWindowsPen(maiDesktopWindowsValidatePointerScope);
             }
             std::atomic_store(&snapshot_->pen, pen_);
         }
-        const auto result = pen_->dispatch(event.pen, port, releasing ? std::function<bool()>{} : input_.isCanceled);
+        // The source owns a sanitized receiver value for all later reports;
+        // only this synchronous operation may borrow the caller cancellation.
+        const auto cancel = releasing ? std::function<bool()>{} : input_.isCanceled;
+        const auto result = input_.executionWindow
+            ? pen_->dispatchGuarded(event.pen, port, input_, cancel)
+            : pen_->dispatch(event.pen, port, cancel);
         publish();
         return result;
     }
@@ -1403,7 +1411,7 @@ public:
             if (const auto fault = touch->validate()) return fault;
         if (state().empty()) return {};
         const auto scope = std::atomic_load(&snapshot_->scope);
-        if (touch && !scope->desktopScope) {
+        if (touch && (!scope->desktopScope || scope->executionWindow)) {
             for (const auto& point : touch->positions()) {
                 const POINT physical{LONG(point.first), LONG(point.second)};
                 if (hooks_.hitTest) {
@@ -1415,7 +1423,7 @@ public:
                 }
             }
         }
-        if (pen && !scope->desktopScope) {
+        if (pen && (!scope->desktopScope || scope->executionWindow)) {
             if (const auto point = pen->position()) {
                 // Foreground identity can remain unchanged while a no-activate
                 // window covers a hovering source. Let the existing owner
@@ -1550,6 +1558,14 @@ MaiError maiDesktopWindowsValidateInputScope(const DesktopNativeInput& input) {
         return {MaiErrorCode::NotConfigured, "Windows input requires the active interactive desktop"};
     InputScope scope(input);
     return scope.validate();
+}
+
+MaiError maiDesktopWindowsValidatePointerScope(const DesktopNativeInput& input, std::int32_t x, std::int32_t y) {
+    DpiScope dpi;
+    if (!interactiveDesktop())
+        return {MaiErrorCode::NotConfigured, "Windows pointer reports require the active interactive desktop"};
+    InputScope scope(input);
+    return scope.validatePoint({LONG(x), LONG(y)});
 }
 
 MaiError maiDesktopInput(const DesktopNativeInput& input) {

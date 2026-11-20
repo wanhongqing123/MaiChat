@@ -21,6 +21,7 @@
 #endif
 
 #include "MaiChatTools/DesktopComputerWindowsTouchInternal.h"
+#include "MaiChatTools/DesktopComputerWindowsPointerScope.h"
 #include "MaiThread.h"
 
 #include <algorithm>
@@ -181,8 +182,10 @@ bool touching(const Contacts& contacts) {
 
 class TouchFrames final : public DesktopComputerWindowsTouch {
 public:
-    TouchFrames(std::shared_ptr<DesktopWindowsTouchTransport> transport, std::chrono::milliseconds interval)
-        : transport_(std::move(transport)), interval_((std::max)(std::chrono::milliseconds(0), interval)) {
+    TouchFrames(std::shared_ptr<DesktopWindowsTouchTransport> transport, std::chrono::milliseconds interval,
+                DesktopWindowsTouchReceiverValidator validator)
+        : transport_(std::move(transport)), receiverValidator_(std::move(validator)),
+          interval_((std::max)(std::chrono::milliseconds(0), interval)) {
         static std::atomic<std::uint64_t> sequence{0};
         sourceName_ = "windows-touch-" + std::to_string(++sequence);
     }
@@ -195,21 +198,15 @@ public:
     }
     MaiError dispatch(const std::vector<DesktopInputTouch>& inputs, const DesktopInputPort& port,
                       std::function<bool()> isCanceled) override {
-        const auto generation = epoch_.load();
-        PublicCall call(admitted_);
-        if (!call.accepted) return busy();
-        if (cleanupRequested_) return busy();
-        DesktopInputEvent request;
-        request.kind = DesktopInputEventKind::Touch;
-        request.contacts = inputs;
-        if (const auto error = maiDesktopValidateInputEvents({request})) return error;
-        auto command = std::make_shared<Command>();
-        command->inputs = inputs;
-        command->port = port;
-        command->cancel = std::move(isCanceled);
-        command->epoch = generation;
-        command->onlyRelease = maiDesktopInputEventsOnlyRelease({request});
-        return execute(std::move(command));
+        return dispatchWithReceiver(inputs, port, {}, std::move(isCanceled));
+    }
+    MaiError dispatchGuarded(const std::vector<DesktopInputTouch>& inputs, const DesktopInputPort& port,
+                            const DesktopNativeInput& receiverScope, std::function<bool()> isCanceled) override {
+        auto receiver = receiverScope;
+        receiver.isCanceled = {};
+        receiver.key.clear();
+        receiver.text.clear();
+        return dispatchWithReceiver(inputs, port, std::move(receiver), std::move(isCanceled));
     }
     DesktopNativeInputState state() const override {
         return std::atomic_load(&published_)->state;
@@ -253,6 +250,7 @@ private:
         std::vector<DesktopInputTouch> inputs;
         DesktopInputPort port;
         std::function<bool()> cancel;
+        std::optional<DesktopNativeInput> receiver;
         std::promise<MaiError> response;
         std::uint64_t epoch = 0;
         bool cleanup = false, onlyRelease = false;
@@ -262,6 +260,26 @@ private:
     }
     static MaiError canceled() {
         return {MaiErrorCode::Canceled, "touch input canceled"};
+    }
+
+    MaiError dispatchWithReceiver(const std::vector<DesktopInputTouch>& inputs, const DesktopInputPort& port,
+                                 std::optional<DesktopNativeInput> receiver, std::function<bool()> isCanceled) {
+        const auto generation = epoch_.load();
+        PublicCall call(admitted_);
+        if (!call.accepted) return busy();
+        if (cleanupRequested_) return busy();
+        DesktopInputEvent request;
+        request.kind = DesktopInputEventKind::Touch;
+        request.contacts = inputs;
+        if (const auto error = maiDesktopValidateInputEvents({request})) return error;
+        auto command = std::make_shared<Command>();
+        command->inputs = inputs;
+        command->port = port;
+        command->cancel = std::move(isCanceled);
+        command->receiver = std::move(receiver);
+        command->epoch = generation;
+        command->onlyRelease = maiDesktopInputEventsOnlyRelease({request});
+        return execute(std::move(command));
     }
 
     MaiError execute(std::shared_ptr<Command> command) {
@@ -371,6 +389,25 @@ private:
         std::sort(value.points.begin(), value.points.end(), [](const auto& a, const auto& b) { return a.pointerId < b.pointerId; });
         for (int attempt = 0; attempt < 8; ++attempt) {
             if (generation && revoked(command, *generation)) return canceled();
+            if (generation && receiverScope_) {
+                // Releases use the cached owned frame. Every in-range effect,
+                // including retries and the resident report, needs a current
+                // native receiver check immediately before transport entry.
+                for (const auto& point : value.points) {
+                    if (!(point.flags & kDesktopTouchInRange)) continue;
+                    MaiError error;
+                    try {
+                        error = receiverValidator_(*receiverScope_, point.screenX, point.screenY);
+                    } catch (...) {
+                        error = {MaiErrorCode::Internal, "touch receiver validation threw"};
+                    }
+                    if (error) {
+                        receiverRejected_ = true;
+                        return error;
+                    }
+                }
+                if (revoked(command, *generation)) return canceled();
+            }
             const auto result = transport_->inject(value);
             switch (result.kind) {
             case DesktopWindowsTouchSubmitKind::Accepted: return {};
@@ -478,6 +515,7 @@ private:
             cleanupFailure_ = {};
         }
         if (epoch_.load() == generation) cleanupRequested_ = false;
+        if (!created_) receiverScope_.reset();
         publish();
         return first;
     }
@@ -498,6 +536,16 @@ private:
         if (fault_ && !command.onlyRelease) return fault_;
         const auto prepared = preflight(command);
         if (!prepared) return prepared.error();  // Entire batch pure preflight, before create or inject.
+        if (!command.onlyRelease) {
+            if (created_ && !maiDesktopWindowsPointerScopeMatches(receiverScope_, command.receiver))
+                return {MaiErrorCode::Busy, "release owned touch source before changing the receiver scope"};
+            if (command.receiver && !receiverValidator_)
+                return {MaiErrorCode::NotSupported, "touch receiver validation is unavailable"};
+            // Only ordinary input may replace receiver authority. An UP must
+            // not remove protection from the reports of surviving contacts.
+            receiverScope_ = command.receiver;
+        }
+        receiverRejected_ = false;
         if (prepared.value().retireLayout) {
             fault_ = {MaiErrorCode::Busy, "touch coordinate plane changed; the source was retired"};
             // Old physical points must never be reinterpreted in a new plane.
@@ -530,7 +578,9 @@ private:
                 if (const auto error = finishSeedReport(command)) {
                     fault_ = error;
                     publish();
-                    retire(false);
+                    const auto released = retire(false);
+                    if (receiverRejected_ && released)
+                        return {error.code(), error.message() + "; cleanup failed: " + released.message()};
                     return error;
                 }
             }
@@ -546,9 +596,11 @@ private:
                     if (const auto error = submit(step.frame, &command, command.epoch)) {
                         fault_ = error;
                         publish();
-                        if (introduced || step.expands || error.code() == MaiErrorCode::Canceled)
-                            retire(false);
-                        else
+                        if (introduced || step.expands || receiverRejected_ || error.code() == MaiErrorCode::Canceled) {
+                            const auto released = retire(false);
+                            if (receiverRejected_ && released)
+                                return {error.code(), error.message() + "; cleanup failed: " + released.message()};
+                        } else
                             publish();  // A failed UP retains its owned binding for retry.
                         return error;
                     }
@@ -662,6 +714,9 @@ private:
     }
 
     std::shared_ptr<DesktopWindowsTouchTransport> transport_;
+    DesktopWindowsTouchReceiverValidator receiverValidator_;
+    std::optional<DesktopNativeInput> receiverScope_;
+    bool receiverRejected_ = false;
     std::chrono::milliseconds interval_;
     std::string sourceName_;
     std::atomic<bool> admitted_{false}, cleanupRequested_{false}, stopping_{false};
@@ -856,12 +911,18 @@ public:
 } // namespace
 
 std::shared_ptr<DesktopComputerWindowsTouch> makeDesktopComputerWindowsTouchWithTransport(
-    std::shared_ptr<DesktopWindowsTouchTransport> transport, std::chrono::milliseconds refreshInterval) {
-    return transport ? std::make_shared<TouchFrames>(std::move(transport), refreshInterval) : nullptr;
+    std::shared_ptr<DesktopWindowsTouchTransport> transport, std::chrono::milliseconds refreshInterval,
+    DesktopWindowsTouchReceiverValidator validator) {
+    return transport ? std::make_shared<TouchFrames>(std::move(transport), refreshInterval, std::move(validator)) : nullptr;
 }
 
 std::shared_ptr<DesktopComputerWindowsTouch> makeDesktopComputerWindowsTouch() {
-    return makeDesktopComputerWindowsTouchWithTransport(std::make_shared<NativeTransport>());
+    return makeDesktopComputerWindowsTouch(DesktopWindowsTouchReceiverValidator{});
+}
+
+std::shared_ptr<DesktopComputerWindowsTouch> makeDesktopComputerWindowsTouch(DesktopWindowsTouchReceiverValidator validator) {
+    return makeDesktopComputerWindowsTouchWithTransport(std::make_shared<NativeTransport>(),
+                                                       std::chrono::milliseconds(50), std::move(validator));
 }
 
 std::shared_ptr<DesktopWindowsTouchTransport> makeDesktopWindowsTouchNativeTransportForTesting(

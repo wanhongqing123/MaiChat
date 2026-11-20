@@ -94,4 +94,5 @@ std::shared_ptr<DesktopWindowsTouchTransport> makeDesktopWindowsTouchNativeTrans
 // for periodic reports.
 std::shared_ptr<DesktopComputerWindowsTouch> makeDesktopComputerWindowsTouchWithTransport(
     std::shared_ptr<DesktopWindowsTouchTransport> transport,
-    std::chrono::milliseconds refreshInterval = std::chrono::milliseconds(50));
+    std::chrono::milliseconds refreshInterval = std::chrono::milliseconds(50),
+    DesktopWindowsTouchReceiverValidator validator = {});

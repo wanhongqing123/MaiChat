@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -22,6 +23,14 @@
 #include <QString>
 
 namespace {
+
+struct ReleaseCFValue {
+    void operator()(CFTypeRef value) const {
+        CFRelease(value);
+    }
+};
+
+using ScopedCFValue = std::unique_ptr<const void, ReleaseCFValue>;
 
 std::string utf8(CFStringRef value) {
     if (!value || CFGetTypeID(value) != CFStringGetTypeID()) return {};
@@ -36,11 +45,10 @@ std::string utf8(CFStringRef value) {
 std::string attribute(AXUIElementRef element, CFStringRef name) {
     if (element) AXUIElementSetMessagingTimeout(element, 0.1f);
     CFTypeRef value = nullptr;
-    if (AXUIElementCopyAttributeValue(element, name, &value) != kAXErrorSuccess ||
-        !value) return {};
-    const std::string result = utf8(static_cast<CFStringRef>(value));
-    CFRelease(value);
-    return result;
+    const AXError copied = AXUIElementCopyAttributeValue(element, name, &value);
+    ScopedCFValue owner(value);
+    if (copied != kAXErrorSuccess || !value) return {};
+    return utf8(static_cast<CFStringRef>(value));
 }
 
 bool bounds(AXUIElementRef element, DesktopNativeElement& result) {
@@ -68,7 +76,7 @@ bool bounds(AXUIElementRef element, DesktopNativeElement& result) {
     return true;
 }
 
-bool currentWindowFrame(const DesktopNativeWindow& window, CGRect& frame) {
+bool currentWindowFrame(const DesktopNativeWindow& window, CGRect& frame, bool* onScreen = nullptr) {
     if (!window.id || window.id > (std::numeric_limits<CGWindowID>::max)()) return false;
     CFArrayRef details = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow,
                                                    CGWindowID(window.id));
@@ -90,6 +98,7 @@ bool currentWindowFrame(const DesktopNativeWindow& window, CGRect& frame) {
             CFNumberGetValue(idValue, kCFNumberSInt32Type, &id) &&
             id == window.id && std::uint64_t(pid) == window.processId &&
             CGRectMakeWithDictionaryRepresentation(frameValue, &frame)) {
+            if (onScreen) *onScreen = CFDictionaryGetValue(entry, kCGWindowIsOnscreen) == kCFBooleanTrue;
             found = true;
             break;
         }
@@ -108,10 +117,13 @@ AXUIElementRef accessibilityWindow(const DesktopNativeWindow& window,
     CGRect frame{};
     if (!currentWindowFrame(window, frame)) return nullptr;
     AXUIElementRef application = AXUIElementCreateApplication(pid_t(window.processId));
+    ScopedCFValue applicationOwner(application);
     if (!application) return nullptr;
     AXUIElementSetMessagingTimeout(application, 0.1f);
     CFTypeRef value = nullptr;
+    ScopedCFValue valueOwner;
     AXUIElementRef found = nullptr;
+    ScopedCFValue foundOwner;
     AXError copied = kAXErrorFailure;
     if (bounded) {
         CFIndex count = 0;
@@ -125,6 +137,7 @@ AXUIElementRef accessibilityWindow(const DesktopNativeWindow& window,
     } else {
         copied = AXUIElementCopyAttributeValue(application, kAXWindowsAttribute, &value);
     }
+    valueOwner.reset(value);
     bool aborted = false;
     if (copied == kAXErrorSuccess && value && CFGetTypeID(value) == CFArrayGetTypeID()) {
         const CFArrayRef windows = static_cast<CFArrayRef>(value);
@@ -146,19 +159,19 @@ AXUIElementRef accessibilityWindow(const DesktopNativeWindow& window,
                 // current PID/frame and require one unique AX geometry match;
                 // identical titles never select an arbitrary sibling window.
                 if (found) {
-                    CFRelease(found);
+                    foundOwner.reset();
                     found = nullptr;
                     break;
                 }
                 found = candidate;
-                CFRetain(found);
+                foundOwner.reset(CFRetain(found));
             }
         }
     }
-    if (aborted || stopped()) { if (found) CFRelease(found); found = nullptr; }
-    if (value) CFRelease(value);
-    CFRelease(application);
-    return found;
+    if (aborted || stopped()) foundOwner.reset();
+    // All local references unwind if a resolver/cancel callback throws. Only
+    // the selected window's owned reference escapes to the caller.
+    return static_cast<AXUIElementRef>(foundOwner.release());
 }
 
 MaiError accessPermission() {
@@ -206,12 +219,6 @@ bool displayContainsPoint(const DesktopNativeDisplay& display, CGPoint point) {
     return point.x >= display.x && point.y >= display.y && point.x < display.x + display.width &&
            point.y < display.y + display.height;
 }
-
-struct ReleaseCFValue {
-    void operator()(CFTypeRef value) const { CFRelease(value); }
-};
-
-using ScopedCFValue = std::unique_ptr<const void, ReleaseCFValue>;
 
 ScopedCFValue copiedAttribute(AXUIElementRef element, CFStringRef name) {
     if (element) AXUIElementSetMessagingTimeout(element, 0.1f);
@@ -364,11 +371,44 @@ bool acceptsInputFromWindow(AXUIElementRef selected, AXUIElementRef focused,
     return false;
 }
 
+// AXWindow proves child ownership; a popup may itself need a parent/sheet
+// relationship. Same-process siblings never inherit the selected receiver.
+bool belongsToInputFamily(AXUIElementRef selected, AXUIElementRef element, pid_t process,
+                          const std::function<bool()>& isCanceled) {
+    if (!sameProcessElement(selected, process) || !sameProcessElement(element, process)) return false;
+    if (CFEqual(selected, element)) return true;
+    const auto owner = copiedAttribute(element, kAXWindowAttribute);
+    if (owner)
+        return sameProcessElement(owner.get(), process) &&
+               acceptsInputFromWindow(selected, static_cast<AXUIElementRef>(owner.get()), process);
+    return acceptsInputFromWindow(selected, element, process) ||
+           axElementBelongsToWindow(element, selected, process, isCanceled);
+}
+
+bool sameExecutionWindow(const std::optional<DesktopNativeWindow>& left,
+                         const std::optional<DesktopNativeWindow>& right) {
+    if (left.has_value() != right.has_value()) return false;
+    if (!left) return true;
+    return left->id == right->id && left->processId == right->processId && left->x == right->x && left->y == right->y &&
+           left->width == right->width && left->height == right->height &&
+           left->boundsAvailable == right->boundsAvailable && left->minimized == right->minimized &&
+           left->cloaked == right->cloaked;
+}
+
 class InputScope {
   public:
     explicit InputScope(const DesktopNativeInput& input) : input_(input) {
         source_ = CGEventSourceCreate(kCGEventSourceStatePrivate);
-        bindTarget();
+        try {
+            bindTarget();
+        } catch (...) {
+            // A canceled/throwing resolver can fail during construction, when
+            // the destructor will not run. No input has been posted yet.
+            clearTarget();
+            if (source_) CFRelease(source_);
+            source_ = nullptr;
+            throw;
+        }
     }
     ~InputScope() {
         while (!releases_.empty())
@@ -377,9 +417,13 @@ class InputScope {
         if (source_)
             CFRelease(source_);
     }
-    MaiError begin(const DesktopNativeInput& input) {
+    MaiError checkBinding(const DesktopNativeInput& input) const {
         if (!releases_.empty() && !sameBinding(input))
             return {MaiErrorCode::Busy, "release held input before changing its native target"};
+        return {};
+    }
+    MaiError begin(const DesktopNativeInput& input) {
+        if (const MaiError binding = checkBinding(input)) return binding;
         const bool retained = !releases_.empty();
         input_ = input;
         if (!retained) {
@@ -406,7 +450,11 @@ class InputScope {
                 return {MaiErrorCode::NotConfigured,
                         "an unlocked interactive macOS desktop is required for "
                         "computer input"};
-            return validateDisplay(input_.display);
+            if (const MaiError display = validateDisplay(input_.display)) return display;
+            if (!input_.executionWindow) return {};
+        }
+        if (input_.executionWindow) {
+            if (const MaiError receiver = validateExecutionWindowFrame()) return receiver;
         }
         if (!window_ || !application_)
             return {MaiErrorCode::NotFound,
@@ -424,7 +472,67 @@ class InputScope {
             !acceptsInputFromWindow(window_, static_cast<AXUIElementRef>(focused.get()), process_))
             return {MaiErrorCode::Busy, "focused macOS window ownership is unproven; "
                                         "explicitly observe or focus that window"};
+        if (input_.executionWindow) {
+            DesktopNativeElement frame;
+            const auto& receiver = *input_.executionWindow;
+            if (!sameProcessElement(window_, process_) || !bounds(window_, frame) ||
+                !validDisplayBounds(CGRectMake(frame.x, frame.y, frame.width, frame.height)) ||
+                std::abs(frame.x - receiver.x) >= 3 || std::abs(frame.y - receiver.y) >= 3 ||
+                std::abs(frame.width - receiver.width) >= 3 || std::abs(frame.height - receiver.height) >= 3)
+                return {MaiErrorCode::Busy, "execution window Accessibility identity changed; observe again"};
+            const bool keyboard = input_.kind == DesktopNativeInputKind::Key ||
+                                  input_.kind == DesktopNativeInputKind::KeyDown ||
+                                  input_.kind == DesktopNativeInputKind::Type ||
+                                  input_.kind == DesktopNativeInputKind::ReplaceFocusedText;
+            if (keyboard) {
+                ScopedCFValue system(AXUIElementCreateSystemWide());
+                CFTypeRef element = nullptr;
+                // Setting the timeout on a system-wide AX object changes a
+                // process-wide setting. This read does not modify that setting.
+                const AXError read = system ? AXUIElementCopyAttributeValue(static_cast<AXUIElementRef>(system.get()),
+                                                                            kAXFocusedUIElementAttribute, &element)
+                                            : kAXErrorFailure;
+                ScopedCFValue owner(element);
+                if (read != kAXErrorSuccess || !sameProcessElement(owner.get(), process_) ||
+                    !belongsToInputFamily(window_, static_cast<AXUIElementRef>(owner.get()), process_,
+                                          input_.isCanceled))
+                    return {MaiErrorCode::Busy, "keyboard receiver is outside the execution window family"};
+            }
+            return validateExecutionWindowFrame();
+        }
         return {};
+    }
+    MaiError validatePointerBounds(CGPoint point) const {
+        if (!std::isfinite(point.x) || !std::isfinite(point.y))
+            return {MaiErrorCode::InvalidInput, "pointer coordinates are invalid"};
+        if (input_.desktopScope && !displayContainsPoint(input_.display, point))
+            return {MaiErrorCode::InvalidInput, "pointer coordinates are outside the observed display"};
+        if (!input_.executionWindow) return {};
+        // This shared predicate owns native-unit rectangle semantics and
+        // structured point_outside_target diagnostics on both platforms.
+        return maiDesktopValidateExecutionPoint(*input_.executionWindow, point.x, point.y);
+    }
+    MaiError validatePointer(CGPoint point) const {
+        if (const MaiError area = validatePointerBounds(point)) return area;
+        if (const MaiError ready = validate()) return ready;
+        if (!input_.executionWindow) return {};
+        ScopedCFValue system(AXUIElementCreateSystemWide());
+        AXUIElementRef element = nullptr;
+        // Application-scoped hit testing would ignore another application's
+        // covering window. The system-wide API follows actual window z-order.
+        const AXError read = system ? AXUIElementCopyElementAtPosition(static_cast<AXUIElementRef>(system.get()),
+                                                                       float(point.x), float(point.y), &element)
+                                    : kAXErrorFailure;
+        ScopedCFValue hit(element);
+        if (read == kAXErrorAPIDisabled)
+            return {MaiErrorCode::NotConfigured, "macOS Accessibility hit testing is unavailable"};
+        if (read != kAXErrorSuccess || !sameProcessElement(hit.get(), process_) ||
+            !belongsToInputFamily(window_, static_cast<AXUIElementRef>(hit.get()), process_, input_.isCanceled))
+            return {MaiErrorCode::Busy, "pointer receiver is outside the execution window family"};
+        // AX ownership checks may involve remote application messages; reread
+        // geometry afterwards, immediately before dispatch. Public APIs do not
+        // offer an atomic validate-and-post operation.
+        return validateExecutionWindowFrame();
     }
     const std::function<bool()>& cancellation() const { return input_.isCanceled; }
     std::size_t heldCount() const { return releases_.size(); }
@@ -490,9 +598,23 @@ class InputScope {
         releases_.reserve(releases_.size() + 1);
         CFRetain(up);
         releases_.push_back(std::move(pending));
-        CGEventSetSource(down, source_);
-        CGEventSetFlags(down, effectiveFlags() | extra);
-        CGEventPost(kCGHIDEventTap, down);
+        MaiError sent;
+        try {
+            sent = post(down, extra);
+        } catch (...) {
+            // Receiver queries/cancel callbacks can throw before dispatch.
+            // Only earlier, actually posted downs belong to outer cleanup.
+            releases_.pop_back();
+            CFRelease(up);
+            throw;
+        }
+        if (sent) {
+            // No down was dispatched. Remove its preallocated ledger entry
+            // without manufacturing an up for an event that never happened.
+            releases_.pop_back();
+            CFRelease(up);
+            return sent;
+        }
         return {};
     }
     void release() {
@@ -550,19 +672,33 @@ class InputScope {
                                                : kCGEventOtherMouseDragged;
         CGEventRef event =
             CGEventCreateMouseEvent(source_, type, point, CGMouseButton((std::max)(0, button)));
+        ScopedCFValue eventOwner(event);
         if (!event)
             return {MaiErrorCode::Internal, "could not create pointer motion event"};
-        post(event);
-        CFRelease(event);
+        const MaiError sent = post(event);
+        eventOwner.reset();
+        if (sent) return sent;
         for (auto& pending : releases_)
             if (!pending.keyboard)
                 CGEventSetLocation(pending.event, point);
         return validate();
     }
-    void post(CGEventRef event) const {
+    MaiError post(CGEventRef event, CGEventFlags extra = 0) const {
+        const CGEventType type = CGEventGetType(event);
+        const bool pointer = type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown ||
+                             type == kCGEventOtherMouseDown || type == kCGEventMouseMoved ||
+                             type == kCGEventLeftMouseDragged || type == kCGEventRightMouseDragged ||
+                             type == kCGEventOtherMouseDragged || type == kCGEventScrollWheel;
+        const MaiError ready = pointer ? validatePointer(CGEventGetLocation(event)) : validate();
+        if (ready) return ready;
+        // The AX checks above can wait on another process. Cancellation that
+        // arrived during those checks must still stop this new event.
+        if (input_.isCanceled && input_.isCanceled())
+            return {MaiErrorCode::Canceled, "computer input canceled before dispatch"};
         CGEventSetSource(event, source_);
-        CGEventSetFlags(event, effectiveFlags());
+        CGEventSetFlags(event, effectiveFlags() | extra);
         CGEventPost(kCGHIDEventTap, event);
+        return {};
     }
 
   private:
@@ -575,6 +711,24 @@ class InputScope {
         std::string name;
         std::string tag;
     };
+    MaiError validateExecutionWindowFrame() const {
+        const auto& receiver = *input_.executionWindow;
+        if (!validAXWindowIdentity(receiver) || !receiver.boundsAvailable || receiver.minimized || receiver.cloaked ||
+            !validDisplayBounds(CGRectMake(receiver.x, receiver.y, receiver.width, receiver.height)) ||
+            !std::isfinite(receiver.x + receiver.width) || !std::isfinite(receiver.y + receiver.height))
+            return {MaiErrorCode::InvalidInput, "a valid observed execution window is required"};
+        if (!input_.desktopScope && input_.expectedWindowId &&
+            (input_.expectedWindowId != receiver.id || input_.expectedProcessId != receiver.processId))
+            return {MaiErrorCode::InvalidInput, "execution window does not match the selected native window"};
+        CGRect frame{};
+        bool onScreen = false;
+        if (!currentWindowFrame(receiver, frame, &onScreen))
+            return {MaiErrorCode::NotFound, "execution window is no longer available"};
+        if (!onScreen || !validDisplayBounds(frame) || frame.origin.x != receiver.x || frame.origin.y != receiver.y ||
+            frame.size.width != receiver.width || frame.size.height != receiver.height)
+            return {MaiErrorCode::Busy, "execution window geometry changed; observe again"};
+        return {};
+    }
     static bool hardwareHeld(bool keyboard, int code) {
         return keyboard ? CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, CGKeyCode(code))
                         : CGEventSourceButtonState(kCGEventSourceStateHIDSystemState,
@@ -608,9 +762,9 @@ class InputScope {
         return CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) | ownedModifiers();
     }
     bool sameBinding(const DesktopNativeInput& other) const {
-        if (input_.desktopScope != other.desktopScope ||
-            input_.expectedWindowId != other.expectedWindowId ||
-            input_.expectedProcessId != other.expectedProcessId)
+        if (input_.desktopScope != other.desktopScope || input_.expectedWindowId != other.expectedWindowId ||
+            input_.expectedProcessId != other.expectedProcessId ||
+            !sameExecutionWindow(input_.executionWindow, other.executionWindow))
             return false;
         return !input_.desktopScope ||
                (input_.display.id == other.display.id && input_.display.x == other.display.x &&
@@ -628,6 +782,16 @@ class InputScope {
     }
     void bindTarget() {
         const auto& input = input_;
+        if (input.executionWindow) {
+            if (accessPermission() || validateExecutionWindowFrame()) return;
+            const auto& receiver = *input.executionWindow;
+            process_ = pid_t(receiver.processId);
+            window_ = accessibilityWindow(receiver, input.isCanceled, true);
+            application_ = AXUIElementCreateApplication(process_);
+            if (application_) AXUIElementSetMessagingTimeout(application_, 0.1f);
+            if (window_) AXUIElementSetMessagingTimeout(window_, 0.1f);
+            return;
+        }
         if (input.desktopScope)
             return;
         if (input.expectedWindowId && input.expectedProcessId) {
@@ -1579,6 +1743,14 @@ MaiError performNativeInput(const DesktopNativeInput& input, InputScope& scope,
             return {MaiErrorCode::InvalidInput,
                     "pointer coordinates are outside the observed display"};
     }
+    // Refuse an outside drag destination before its initial down. Per-event
+    // system-wide hit/identity checks still run again immediately before post.
+    if (input.executionWindow && positioned) {
+        if (const MaiError area = scope.validatePointerBounds(CGPointMake(input.x, input.y))) return area;
+        if (input.kind == DesktopNativeInputKind::Drag) {
+            if (const MaiError area = scope.validatePointerBounds(CGPointMake(input.toX, input.toY))) return area;
+        }
+    }
     DesktopKeyChord chord;
     if (input.kind == DesktopNativeInputKind::Key ||
         input.kind == DesktopNativeInputKind::KeyDown) {
@@ -1670,13 +1842,12 @@ MaiError performNativeInput(const DesktopNativeInput& input, InputScope& scope,
             input.scrollAxis == DesktopScrollAxis::Horizontal
                 ? CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, 0, -input.lines)
                 : CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 1, input.lines);
+        ScopedCFValue eventOwner(event);
         if (!event)
             return {MaiErrorCode::Internal, "could not create scroll event"};
         CGEventSetLocation(event, CGPointMake(input.x, input.y));
-        const MaiError before = scope.validate();
-        if (!before)
-            scope.post(event);
-        CFRelease(event);
+        const MaiError before = scope.post(event);
+        eventOwner.reset();
         return before ? before : scope.validate();
     }
     const DesktopMouseButton chosen =
@@ -1774,6 +1945,12 @@ class MacNativeInputSession final : public DesktopNativeInputSession {
             const MaiError permission = accessPermission();
             if (permission)
                 return fail(permission);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (scope_) {
+                    if (const MaiError binding = scope_->checkBinding(request)) return finish(binding);
+                }
+            }
             NativeKey resolved;
             bool hasResolved = false;
             CGEventFlags flagsAtResolution = 0;
@@ -1793,8 +1970,10 @@ class MacNativeInputSession final : public DesktopNativeInputSession {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (scope_ && request.kind == DesktopNativeInputKind::KeyDown &&
-                        scope_->containsTag(keyTag(chord)))
-                        return finish(scope_->validate());
+                        scope_->containsTag(keyTag(chord))) {
+                        const MaiError begin = scope_->begin(request);
+                        return finish(begin ? begin : scope_->validate());
+                    }
                     flagsAtResolution = scope_ ? scope_->ownedModifiers() : 0;
                 }
                 if ((flagsAtResolution & kCGEventFlagMaskCommand) &&
@@ -1813,14 +1992,17 @@ class MacNativeInputSession final : public DesktopNativeInputSession {
             if (hasResolved && (scope_ ? scope_->ownedModifiers() : 0) != flagsAtResolution)
                 return finish({MaiErrorCode::Busy,
                                "held modifiers changed while resolving the key; observe again"});
-            if (scope_ && request.kind == DesktopNativeInputKind::MouseDown &&
-                mouseNumber(request.button) >= 0 &&
-                scope_->containsTag("mouse:" + mouseName(request.button)))
-                return finish(scope_->validate());
+            if (scope_ && request.kind == DesktopNativeInputKind::MouseDown && mouseNumber(request.button) >= 0 &&
+                scope_->containsTag("mouse:" + mouseName(request.button))) {
+                const MaiError begin = scope_->begin(request);
+                return finish(begin ? begin : scope_->validatePointer(CGPointMake(request.x, request.y)));
+            }
             if (scope_ && request.kind == DesktopNativeInputKind::KeyDown) {
                 const auto parsed = maiDesktopParseKey(request.key);
-                if (parsed && scope_->containsTag(keyTag(parsed.value())))
-                    return finish(scope_->validate());
+                if (parsed && scope_->containsTag(keyTag(parsed.value()))) {
+                    const MaiError begin = scope_->begin(request);
+                    return finish(begin ? begin : scope_->validate());
+                }
             }
             if (!scope_)
                 scope_ = std::make_unique<InputScope>(request);

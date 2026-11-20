@@ -58,3 +58,8 @@ public:
 std::shared_ptr<DesktopComputerWindowsPen> makeDesktopComputerWindowsPenWithTransport(
     std::shared_ptr<DesktopWindowsPenTransport> transport,
     std::chrono::milliseconds refreshInterval = std::chrono::milliseconds(16));
+// The validator is owned by the source. Production passes an ordinary native
+// function; deterministic tests supply owned receiver observations only.
+std::shared_ptr<DesktopComputerWindowsPen> makeDesktopComputerWindowsPenWithTransport(
+    std::shared_ptr<DesktopWindowsPenTransport> transport, std::chrono::milliseconds refreshInterval,
+    DesktopWindowsPenReceiverValidator validator);
