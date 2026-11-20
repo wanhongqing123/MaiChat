@@ -13,6 +13,7 @@
 
 #include "MaiError.h"
 #include "MaiModelContinuationState.h"
+#include "MaiModelTokenEstimate.h"
 
 // ── 中立的模型抽象 ──────────────────────────────────────────────
 // 这里的结构**不是** OpenAI 的线格式，是我们自己的中间表示。
@@ -165,13 +166,6 @@ struct MaiModelContextLimits {
     // 可指定更保守的运行时余量策略，
     // 因为其真实输出上限由“窗口减实际输入”动态决定，不能预留整个窗口而拒绝所有输入。
     std::size_t defaultOutputReserveTokens = 0;
-};
-
-// 本地估算与供应商 usage 分开，避免把 UTF-8 字节或启发式结果当成实际计费 token。
-// exact=false 时 tokens 仅用于提前压缩；不能保证包含供应商模板/媒体成本的精确窗口校验。
-struct MaiModelTokenEstimate {
-    std::size_t tokens = 0;
-    bool exact = false;
 };
 
 struct MaiModelUsage {

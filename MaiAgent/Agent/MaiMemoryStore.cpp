@@ -16,6 +16,61 @@ namespace {
 
 class MemoryStore final : public MaiSessionStore {
 public:
+    MaiResult<MaiMessage> readTurnMetadata(const std::string& sessionId,
+                                           const std::string& turnId) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mMessages.find(sessionId);
+        if (found == mMessages.end()) return {MaiErrorCode::NotFound, "Turn not found."};
+        const MaiMessage* source = nullptr;
+        for (const auto& candidate : found->second) {
+            if (turnId.empty()) {
+                if (candidate.role == MaiRole::Assistant && (!source || candidate.id > source->id))
+                    source = &candidate;
+            } else if (candidate.id == turnId) {
+                source = &candidate;
+                break;
+            }
+        }
+        if (!source) return {MaiErrorCode::NotFound, "Turn not found."};
+        if (turnId.empty() && !source->turnId.empty() && source->turnId != source->id) {
+            const auto initialId = source->turnId;
+            source = nullptr;
+            for (const auto& item : found->second)
+                if (item.id == initialId) {
+                    source = &item;
+                    break;
+                }
+        }
+        if (!source) return {MaiErrorCode::NotFound, "Originating turn not found."};
+        MaiMessage result;
+        result.id = source->id;
+        result.role = source->role;
+        result.created = source->created;
+        result.completed = source->completed;
+        result.turnId = source->turnId;
+        result.turnOutcome = source->turnOutcome;
+        return result;
+    }
+    MaiError updateTurnContext(const std::string& sessionId, const std::string& turnId,
+                               const MaiContextStatus& status) override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mMessages.find(sessionId);
+        if (found == mMessages.end()) return {MaiErrorCode::NotFound, "Turn not found."};
+        for (auto& message : found->second) {
+            if (message.id != turnId) continue;
+            if (message.role != MaiRole::Assistant ||
+                (!message.turnId.empty() && message.turnId != turnId))
+                return {MaiErrorCode::InvalidInput, "Context status requires an originating turn."};
+            if (!message.turnOutcome || message.turnOutcome->turnId != turnId)
+                return {MaiErrorCode::NotSupported, "This message is not a recorded turn."};
+            if (message.turnOutcome->status != MaiTurnStatus::Running)
+                return {MaiErrorCode::Busy, "The originating turn is already terminal."};
+            message.turnId = turnId;
+            message.turnOutcome->context = status;
+            return {};
+        }
+        return {MaiErrorCode::NotFound, "Turn not found."};
+    }
     MaiResult<MaiContextImportProgress> beginContextImport(
         const MaiContextImportSpec& spec) override {
         if (const auto error = maiValidateContextImportSpec(spec)) return error;
@@ -619,6 +674,12 @@ public:
                     message.turnOutcome->status = MaiTurnStatus::Interrupted;
                     message.turnOutcome->completed = completedAt;
                     message.turnOutcome->error = {MaiErrorCode::Canceled, error};
+                    if (message.turnOutcome->context &&
+                        (message.turnOutcome->context->phase == MaiContextPhase::Preparing ||
+                         message.turnOutcome->context->phase == MaiContextPhase::Summarizing)) {
+                        message.turnOutcome->context->phase = MaiContextPhase::Interrupted;
+                        message.turnOutcome->context->error = {MaiErrorCode::Canceled, error};
+                    }
                     changed = true;
                 }
                 for (MaiMessagePart& part : message.parts) {

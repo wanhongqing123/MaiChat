@@ -40,6 +40,14 @@ public:
     virtual bool clearMessages(const std::string& sessionId) = 0;
 
     virtual void putMessage(const std::string& sessionId, const MaiMessage& message) = 0;
+    // 只更新已有 Running 初始 assistant 的上下文元数据，不覆盖正文或重写整批工具片段。
+    // 内建后端在同一锁内核对归属并更新；旧自定义后端默认 NotSupported，不伪造持久成功。
+    virtual MaiError updateTurnContext(const std::string& sessionId, const std::string& turnId,
+                                       const MaiContextStatus& status);
+    // 只读轮次元数据，不加载 parts；空 ID 定位最近真实 assistant，再解析其初始 turnId。
+    // 新的无记录消息不能跳过。明确 ID 不自动解析分段。旧后端默认 NotSupported。
+    virtual MaiResult<MaiMessage> readTurnMetadata(const std::string& sessionId,
+                                                   const std::string& turnId) const;
     virtual std::vector<MaiMessage> listMessages(const std::string& sessionId) const = 0;
 
     // 暂存批次在 commit 前对普通读取与模型不可见。seq 从 0 连续递增，完整相同重试幂等。

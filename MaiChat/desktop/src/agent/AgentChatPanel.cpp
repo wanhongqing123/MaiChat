@@ -1514,11 +1514,13 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     runtime_->title->setWordWrap(false);
     headRow->addWidget(runtime_->title, 1);
 
-    // 历史字数仍留在内部状态，不占用顶栏空间。
+    // 使用 Core 的上次请求容量与整理阶段，不把界面分页加载的字数当成模型占用。
     runtime_->contextSize = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkFaint);
+    runtime_->contextSize->setObjectName(QStringLiteral("agentContextStatus"));
     runtime_->contextSize->setWordWrap(false);
     runtime_->contextSize->setParent(head);
     runtime_->contextSize->hide();
+    headRow->addWidget(runtime_->contextSize);
     auto* moreButton = new QPushButton(QStringLiteral("⋯"));
     runtime_->moreButton = moreButton;
     moreButton->setObjectName(QStringLiteral("agentMoreActions"));
@@ -2163,6 +2165,9 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         setRunning(true);
         startPendingThinking();
         scrollToBottom();
+    });
+    connect(&controller, &AgentController::contextStatusChanged, this, [this](const QString& sessionId) {
+        if (isCurrentSession(sessionId)) refreshContextSize();
     });
     connect(&controller, &AgentController::textDelta, this,
             [this](const QString& sessionId, const QString& messageId, const QString& partId, const QString& delta) {
@@ -4849,14 +4854,43 @@ void AgentChatPanel::scrollToBottom() {
 }
 
 void AgentChatPanel::refreshContextSize() {
-    int characters = 0;
-    for (int count : runtime_->userTextCharacters) characters += count;
-    for (const QString& answer : runtime_->answers) characters += answer.size();
-    // This describes only material loaded by the UI. Paging never changes the
-    // complete conversation used by Core when constructing model context.
-    runtime_->contextSize->setText(runtime_->loadedMessageIds.isEmpty()
-                                       ? QString()
-                                       : QStringLiteral("\u5df2\u52a0\u8f7d %1 \u6761\uff0c\u7ea6 %2 \u5b57")
-                                             .arg(runtime_->loadedMessageIds.size())
-                                             .arg(characters));
+    const auto status = runtime_->controller->contextStatus(runtime_->sessionId);
+    if (!status) { runtime_->contextSize->hide(); return; }
+    QString text;
+    switch (status->phase) {
+        case MaiContextPhase::Preparing: text = QStringLiteral("准备上下文…"); break;
+        case MaiContextPhase::Summarizing: text = QStringLiteral("正在整理对话…"); break;
+        case MaiContextPhase::Deferred: text = QStringLiteral("对话整理暂缓"); break;
+        case MaiContextPhase::Failed: text = QStringLiteral("对话整理未完成"); break;
+        case MaiContextPhase::Interrupted: text = QStringLiteral("对话整理已中断"); break;
+        case MaiContextPhase::Ready:
+            if (status->historyIndexRecovery) text = QStringLiteral("摘要不完整 · 原史可查");
+            else if (status->windowTokens != 0) {
+                const auto percent = static_cast<int>(std::min(100.0L, 100.0L * status->after.tokens /
+                    status->windowTokens));
+                text = QStringLiteral("上次上下文已用%1%2%").arg(status->after.exact ? QString() : QStringLiteral("约"))
+                    .arg(percent);
+            } else if (status->checkpointRevision != 0) text = QStringLiteral("较早对话已整理");
+            break;
+    }
+    QStringList detail;
+    detail << QStringLiteral("显示最近一次请求的上下文状态，新的输入会在请求准备时更新。");
+    const auto estimate = status->phase == MaiContextPhase::Ready || status->phase == MaiContextPhase::Deferred
+                            ? status->after : status->before;
+    if (status->windowTokens != 0)
+        detail << QStringLiteral("输入%1 %2 tokens / 窗口 %3；有效输入上限 %4。")
+            .arg(estimate.exact ? QStringLiteral("计数") : QStringLiteral("估算"))
+            .arg(qulonglong(estimate.tokens)).arg(qulonglong(status->windowTokens))
+            .arg(qulonglong(status->inputBudgetTokens));
+    if (status->historyIndexRecovery)
+        detail << QStringLiteral("语义摘要未完整生成，当前使用部分来源索引继续；遗漏内容须从原始记录回查。");
+    else if (status->checkpointRevision != 0)
+        detail << QStringLiteral("较早对话使用摘要；原始消息仍可回查，摘要不保证语义无损。");
+    if (status->originalUserMessages != 0)
+        detail << QStringLiteral("较早用户消息原文已纳入 %1 / %2 条；其余可从原始记录回查。")
+            .arg(qulonglong(status->retainedUserMessages)).arg(qulonglong(status->originalUserMessages));
+    if (status->error) detail << QStringLiteral("整理未完成，原始记录保留。");
+    runtime_->contextSize->setText(text);
+    runtime_->contextSize->setToolTip(detail.join(QLatin1Char('\n')));
+    runtime_->contextSize->setVisible(!text.isEmpty());
 }

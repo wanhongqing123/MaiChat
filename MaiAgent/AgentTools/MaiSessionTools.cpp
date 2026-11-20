@@ -65,14 +65,27 @@ public:
             context.sessionId, parsed.value().value("turn_id", std::string{}));
         if (!outcome) return failed(outcome.error());
         const auto& value = outcome.value();
-        return MaiToolResult::success(Json{
-            {"turn_id", value.turnId},
-            {"status", maiTurnStatusToString(value.status)},
-            {"result_message_id", value.resultMessageId},
-            {"completed", value.completed},
-            {"error_code", maiErrorCodeToString(value.error.code())},
-            {"error",
-             value.error.message()}}.dump());
+        Json response{{"turn_id", value.turnId},
+                      {"status", maiTurnStatusToString(value.status)},
+                      {"result_message_id", value.resultMessageId},
+                      {"completed", value.completed},
+                      {"error_code", maiErrorCodeToString(value.error.code())},
+                      {"error", value.error.message()}};
+        if (value.context) {
+            const auto& state = *value.context;
+            response["context"] = {{"phase", maiContextPhaseToString(state.phase)},
+                                   {"before_tokens", state.before.tokens},
+                                   {"after_tokens", state.after.tokens},
+                                   {"count_is_exact", state.after.exact},
+                                   {"window_tokens", state.windowTokens},
+                                   {"input_budget_tokens", state.inputBudgetTokens},
+                                   {"checkpoint_revision", state.checkpointRevision},
+                                   {"original_user_messages", state.originalUserMessages},
+                                   {"retained_user_messages", state.retainedUserMessages},
+                                   {"history_index_recovery", state.historyIndexRecovery}};
+        } else
+            response["context"] = nullptr;
+        return MaiToolResult::success(response.dump());
     }
 };
 

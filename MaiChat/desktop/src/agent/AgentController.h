@@ -187,8 +187,11 @@ public:
     // Returns a value snapshot shared by GUI validation and worker Stop errors.
     // Copying this diagnostic is thread-safe; it does not make other GUI APIs so.
     QString lastError() const;
+    // GUI 线程读取最近请求的容量/整理快照；实时事件走缓存，冷会话从持久轮次恢复一次。
+    std::optional<MaiContextStatus> contextStatus(const QString& sessionId) const;
 
 signals:
+    void contextStatusChanged(const QString& sessionId);
     // Core 已受理并登记活动轮次；所有输入入口统一通知，不依赖首 token 或本地发送按钮。
     // GUI 消费时还须核对 activeTurnId，过期的开始事件不能恢复已结束/被替换的等待状态。
     void turnStarted(const QString& sessionId, const QString& turnId);

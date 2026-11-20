@@ -24,6 +24,7 @@
 
 #include "MaiIdGenerator.h"
 #include "MaiSessionStore.h"
+#include "MaiAgent.h"
 #include "MaiMemoryStore.h"
 #include "MaiSqliteStore.h"
 #include "MaiTime.h"
@@ -1580,11 +1581,26 @@ void test_turn_outcomes_survive_storage_and_recover_without_replay() {
         initial.created = 1;
         initial.turnId = initial.id;
         initial.turnOutcome = MaiTurnOutcome{initial.id, MaiTurnStatus::Running, {}, 0, {}};
+        initial.parts.push_back({"prt_context_body", MaiTextPart{"owned body stays unchanged"}, 1});
         store->putMessage("ses_turn", initial);
+        MaiContextStatus context;
+        context.phase = MaiContextPhase::Summarizing;
+        context.before = {7900, false};
+        context.windowTokens = 8192;
+        context.inputBudgetTokens = 7782;
+        CHECK(!store->updateTurnContext("ses_turn", initial.id, context));
         MaiMessage read;
         CHECK(store->getMessage("ses_turn", initial.id, read));
         CHECK(read.turnOutcome.has_value());
         CHECK(read.turnId == initial.id);
+        CHECK(read.text() == "owned body stays unchanged");
+        CHECK(read.turnOutcome && read.turnOutcome->context);
+        const auto metadata = store->readTurnMetadata("ses_turn", initial.id);
+        CHECK(metadata.isOk());
+        if (metadata) {
+            CHECK(metadata.value().parts.empty());
+            CHECK(metadata.value().turnOutcome && metadata.value().turnOutcome->context);
+        }
         const auto page = store->listMessagesPage("ses_turn", {}, 5);
         CHECK(page.size() == 1);
         if (!page.empty()) CHECK(page[0].turnOutcome.has_value());
@@ -1596,6 +1612,11 @@ void test_turn_outcomes_survive_storage_and_recover_without_replay() {
             CHECK(read.turnOutcome->status == MaiTurnStatus::Interrupted);
             CHECK(read.turnOutcome->completed == 10);
             CHECK(read.turnOutcome->error.code() == MaiErrorCode::Canceled);
+            CHECK(read.turnOutcome->context.has_value());
+            if (read.turnOutcome->context) {
+                CHECK(read.turnOutcome->context->phase == MaiContextPhase::Interrupted);
+                CHECK(read.turnOutcome->context->windowTokens == 8192);
+            }
         }
         initial.completed = 12;
         initial.turnOutcome = MaiTurnOutcome{initial.id,
@@ -1603,6 +1624,11 @@ void test_turn_outcomes_survive_storage_and_recover_without_replay() {
                                              "msg_turn_tail",
                                              12,
                                              {MaiErrorCode::Network, "owned failed response"}};
+        context.phase = MaiContextPhase::Ready;
+        context.after = {1000, false};
+        context.originalUserMessages = 4;
+        context.retainedUserMessages = 3;
+        initial.turnOutcome->context = context;
         store->putMessage("ses_turn", initial);
         MaiMessage tail;
         tail.id = "msg_turn_tail";
@@ -1625,10 +1651,30 @@ void test_turn_outcomes_survive_storage_and_recover_without_replay() {
             CHECK(read.turnOutcome->resultMessageId == tail.id);
             CHECK(read.turnOutcome->error.code() == MaiErrorCode::Network);
             CHECK(read.turnOutcome->error.message() == "owned failed response");
+            CHECK(read.turnOutcome->context.has_value());
+            if (read.turnOutcome->context) {
+                CHECK(read.turnOutcome->context->phase == MaiContextPhase::Ready);
+                CHECK(read.turnOutcome->context->after.tokens == 1000);
+                CHECK(read.turnOutcome->context->retainedUserMessages == 3);
+            }
         }
         CHECK(store->getMessage("ses_turn", tail.id, read));
         CHECK(read.turnId == initial.id);
         CHECK(!read.turnOutcome);
+        // 恢复导入顺序不等于消息时序；最新未知 assistant 不能因随后写入旧消息而被跳过。
+        MaiMessage unknown;
+        unknown.id = "msg_z_unknown";
+        unknown.role = MaiRole::Assistant;
+        store->putMessage("ses_turn", unknown);
+        auto older = initial;
+        older.id = "msg_a_older";
+        older.parts.clear();
+        older.turnId = older.id;
+        older.turnOutcome->turnId = older.id;
+        store->putMessage("ses_turn", older);
+        const auto latestMetadata = store->readTurnMetadata("ses_turn", {});
+        CHECK(latestMetadata.isOk());
+        if (latestMetadata) CHECK(latestMetadata.value().id == unknown.id);
         CHECK(!store->lastWriteError());
     }
 }
@@ -1675,9 +1721,42 @@ void test_v13_turn_migration_keeps_legacy_outcomes_unknown() {
     CHECK(makeMaiSqliteStore(path).isOk());
 }
 
+void test_turn_metadata_does_not_hide_a_failed_terminal_write() {
+    TempDir temp;
+    const auto path = temp.file("turn-write-failure.db");
+    auto opened = makeMaiSqliteStore(path);
+    CHECK(opened.isOk());
+    if (!opened) return;
+    auto* store = opened.value().get();
+    MaiAgent agent(std::move(opened.value()), nullptr);
+    const auto session = agent.submit(MaiCreateSession{"", "owned", ""});
+    CHECK(session.isOk());
+    if (!session) return;
+    MaiMessage initial;
+    initial.id = "msg_owned_failed_write";
+    initial.role = MaiRole::Assistant;
+    initial.turnId = initial.id;
+    initial.turnOutcome = MaiTurnOutcome{initial.id};
+    store->putMessage(session.value(), initial);
+    sqlite3* database = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+    CHECK(sqlite3_exec(database,
+                       "CREATE TRIGGER reject_owned_write BEFORE INSERT ON messages "
+                       "BEGIN SELECT RAISE(FAIL,'owned write failure'); END;",
+                       nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(database);
+    store->putMessage(session.value(), initial);
+    CHECK(store->lastWriteError().hasError());
+    CHECK(store->readTurnMetadata(session.value(), {}).isOk());
+    const auto result = agent.getTurnOutcome(session.value());
+    CHECK(!result);
+    CHECK(result.error().code() == MaiErrorCode::Internal);
+}
+
 int main(int argc, char** argv) {
     test_turn_outcomes_survive_storage_and_recover_without_replay();
     test_v13_turn_migration_keeps_legacy_outcomes_unknown();
+    test_turn_metadata_does_not_hide_a_failed_terminal_write();
     if (argc == 2 && std::string(argv[1]) == "--turn-outcomes") return failures ? 1 : 0;
     test_continuation_fingerprint_preserves_legacy_hashes();
     std::printf("-> contract: memory store\n");

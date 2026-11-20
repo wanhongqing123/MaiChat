@@ -46,6 +46,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <variant>
 
@@ -642,6 +643,8 @@ class AgentPanelSessionTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void contextStatusIsVisibleAndIsolated_data();
+    void contextStatusIsVisibleAndIsolated();
     void newSessionAvoidsFilesystemRoot();
     void emptySessionShowsWelcomeAndFirstMessageHidesIt();
     void welcomeToolRowsExplainEveryCategoryAndWrapAtNarrowWidths();
@@ -4908,6 +4911,124 @@ void AgentPanelSessionTest::quoteActionFollowsStreamedOwnerAfterSessionRestore()
     QTRY_VERIFY_WITH_TIMEOUT(view->itemRect(footerId).top() >= view->itemRect(lastTextPart).bottom(), 3000);
     QVERIFY(footer);
     QVERIFY(captureAgentFixture(panel, QStringLiteral("quote-after-owner")));
+}
+
+void AgentPanelSessionTest::contextStatusIsVisibleAndIsolated_data() {
+    QTest::addColumn<bool>("summaryFails");
+    QTest::addColumn<bool>("summaryThrows");
+    QTest::addColumn<bool>("sourceIndex");
+    QTest::addColumn<bool>("missingTerminalUpdate");
+    QTest::newRow("ready") << false << false << false << false;
+    QTest::newRow("failed") << true << false << false << false;
+    QTest::newRow("exception") << false << true << false << false;
+    QTest::newRow("source-index") << false << false << true << false;
+    QTest::newRow("terminal-update-unavailable") << true << false << false << true;
+}
+
+void AgentPanelSessionTest::contextStatusIsVisibleAndIsolated() {
+    QFETCH(bool, summaryFails);
+    QFETCH(bool, summaryThrows);
+    QFETCH(bool, sourceIndex);
+    QFETCH(bool, missingTerminalUpdate);
+    struct State { std::atomic<bool> summarizing{false}, release{false}; std::atomic<int> calls{0}; };
+    class ContextModel final : public MaiModelClient {
+    public:
+        std::shared_ptr<State> state;
+        bool fail;
+        bool raise;
+        bool indexOnly;
+        ContextModel(std::shared_ptr<State> value, bool failing, bool throwing, bool sourceOnly)
+            : state(std::move(value)), fail(failing), raise(throwing), indexOnly(sourceOnly) {}
+        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+        MaiModelContextLimits contextLimits(const std::string&) const override { return {8192, 2048}; }
+        MaiModelTokenEstimate estimateInputTokens(const MaiModelRequest& request) const override {
+            // 这是本地受控模型的固定词表计数，仅用于复现 UI 阶段；真实容量计数由 Core 套件验证。
+            std::size_t count = (request.baseInstructions.empty() ? 16 : 512) + request.tools.size();
+            for (const auto& part : request.messages) count += part.content.size() / 4 + 16;
+            return {count, false};
+        }
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                        const std::atomic<bool>& cancel) override {
+            if (request.baseInstructions.find("Summarize earlier conversation") == 0) {
+                state->summarizing = true;
+                while (!state->release && !cancel) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (cancel) return {MaiErrorCode::Canceled, "Owned context fixture canceled."};
+                if (raise) throw std::runtime_error("Owned context fixture exception.");
+                if (fail) return {MaiErrorCode::Network, "Owned summary fixture unavailable."};
+                if (indexOnly) {
+                    if (sink.onText) sink.onText("Owned invalid summary data.");
+                    return {};
+                }
+                if (sink.onText) sink.onText(R"({"goals":["Continue owned task"],"constraints":[],"decisions":[],"progress":[],"open_questions":[],"source_notes":[]})");
+            } else if (sink.onText) {
+                const auto answer = state->calls++ == 0 ? std::string(32000, 'x') : "Owned final answer.";
+                sink.onText(answer);
+            }
+            return {};
+        }
+    };
+    auto state = std::make_shared<State>();
+    QTemporaryDir directory;
+    AgentController controller(std::make_unique<ContextModel>(state, summaryFails, summaryThrows, sourceIndex), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(760, 540);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel, 2000));
+    const auto session = controller.createSession(directory.path());
+    panel.openSession(session);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    auto* status = panel.findChild<QLabel*>(QStringLiteral("agentContextStatus"));
+    QVERIFY(editor && send && status);
+    editor->setPlainText(QStringLiteral("OWNED: keep the draft private and preserve label cobalt."));
+    QTest::mouseClick(send, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(state->calls.load() == 1, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(send->isEnabled(), 5000);
+    const auto firstTurn = controller.agent().getTurnOutcome(session.toStdString());
+    QVERIFY(firstTurn);
+    editor->setPlainText(QStringLiteral("Continue the owned task."));
+    QTest::mouseClick(send, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(state->summarizing.load(), 5000);
+    QTRY_VERIFY(status->isVisible() && status->text().contains(QStringLiteral("正在整理")));
+    QVERIFY(captureAgentFixture(panel, summaryFails ? QStringLiteral("context-failure-start") : QStringLiteral("context-start")));
+    const auto other = controller.createSession(directory.path());
+    panel.openSession(other);
+    QTRY_VERIFY(!status->isVisible());
+    panel.openSession(session);
+    QTRY_VERIFY(status->isVisible() && status->text().contains(QStringLiteral("正在整理")));
+    if (missingTerminalUpdate) {
+        // 模拟已观察到轮次错误、但最终上下文状态没有成功交付。不能一直显示整理中。
+        MaiEvent terminalError;
+        terminalError.type = MaiEventType::SessionError;
+        terminalError.sessionId = session.toStdString();
+        terminalError.turnId = controller.agent().activeTurnId(terminalError.sessionId);
+        terminalError.detail = "Owned terminal context state unavailable.";
+        QObject::disconnect(&controller, nullptr, &controller, nullptr);
+        state->release = true;
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+        auto staleError = terminalError;
+        staleError.turnId = firstTurn.value().turnId;
+        QVERIFY(QMetaObject::invokeMethod(&controller, "onEventQueued", Qt::DirectConnection,
+                                          Q_ARG(MaiEvent, staleError)));
+        QVERIFY(status->text().contains(QStringLiteral("正在整理")));
+        QVERIFY(QMetaObject::invokeMethod(&controller, "onEventQueued", Qt::DirectConnection,
+                                          Q_ARG(MaiEvent, terminalError)));
+        QTRY_VERIFY(status->text().contains(QStringLiteral("未完成")));
+        QVERIFY(captureAgentFixture(panel, QStringLiteral("context-terminal-unavailable")));
+        return; // 只处理自造已失败轮次的丢失/迟到通知，不产生外部模型请求。
+    }
+    state->release = true;
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+    const auto recorded = controller.agent().getTurnOutcome(session.toStdString());
+    QVERIFY(recorded && recorded.value().context);
+    QCOMPARE(recorded.value().context->historyIndexRecovery, sourceIndex);
+    QTRY_VERIFY_WITH_TIMEOUT(status->text().contains(summaryFails || summaryThrows ? QStringLiteral("未完成")
+        : sourceIndex ? QStringLiteral("摘要不完整") : QStringLiteral("上下文")), 5000);
+    if (!summaryFails && !summaryThrows) QVERIFY(status->toolTip().contains(QStringLiteral("用户消息原文")));
+    if (sourceIndex) QVERIFY(status->toolTip().contains(QStringLiteral("来源索引")));
+    QVERIFY(captureAgentFixture(panel, sourceIndex ? QStringLiteral("context-source-index") : summaryThrows ? QStringLiteral("context-exception")
+        : summaryFails ? QStringLiteral("context-failed") : QStringLiteral("context-ready")));
 }
 
 QTEST_MAIN(AgentPanelSessionTest)

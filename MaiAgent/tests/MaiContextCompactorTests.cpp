@@ -3626,7 +3626,147 @@ void test_oversized_summary_recovery_continues_the_same_runner() {
 
 }  // namespace
 
+void test_successful_summary_keeps_original_user_requirements_outside_model_summary() {
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    const std::string requirement =
+        "OWNED_REQUIREMENT_ALPHA: never publish the draft; keep the exact label cobalt.";
+    for (int index = 0; index != 5; ++index) {
+        store->putMessage(
+            id, message(MaiRole::User, index == 0 ? requirement : "Continue the owned task."));
+        store->putMessage(id, message(MaiRole::Assistant, std::string(12000, 'a' + index)));
+    }
+    store->putMessage(id, message(MaiRole::User, "Continue."));
+    SummaryModel model;
+    // 格式完全合法但漏掉关键约束；不能用更强的摘要提示替代原文保护。
+    model.response =
+        R"({"goals":["Continue the task"],"constraints":[],"decisions":[],"progress":[],"open_questions":[],"source_notes":[]})";
+    std::vector<MaiContextStatus> stages;
+    MaiContextCompactor::Options options;
+    options.onStatus = [&](const MaiContextStatus& state) { stages.push_back(state); };
+    std::atomic<bool> cancel{false};
+    const auto first = MaiContextCompactor(options).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(first.isOk());
+    if (!first) return;
+    bool preserved = false;
+    for (const auto& part : first.value().request.messages)
+        preserved = preserved || part.content.find(requirement) != std::string::npos;
+    CHECK(preserved);
+    CHECK(first.value().status.retainedUserMessages > 0);
+    CHECK(first.value().status.advancedCheckpoint);
+    CHECK(first.value().status.phase == MaiContextPhase::Ready);
+    CHECK(first.value().status.before.tokens > first.value().status.after.tokens);
+    CHECK(stages.size() >= 3);
+    if (!stages.empty()) CHECK(stages.front().phase == MaiContextPhase::Preparing);
+    bool summarizing = false;
+    for (const auto& stage : stages) summarizing |= stage.phase == MaiContextPhase::Summarizing;
+    CHECK(summarizing);
+    const auto summaries = model.requests().size();
+    const auto reused = MaiContextCompactor(options).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(reused.isOk());
+    if (!reused) return;
+    CHECK(reused.value().status.reusedCheckpoint);
+    CHECK(model.requests().size() == summaries);
+    preserved = false;
+    for (const auto& part : reused.value().request.messages)
+        preserved = preserved || part.content.find(requirement) != std::string::npos;
+    CHECK(preserved);
+    appendRound(*store, id, "Correct the owned label to azure; the no-publish rule remains.");
+    store->putMessage(id, message(MaiRole::Assistant, std::string(32000, 'r')));
+    store->putMessage(id, message(MaiRole::User, "Continue after the correction."));
+    const auto again = MaiContextCompactor(options).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(again.isOk());
+    if (again) {
+        CHECK(again.value().status.checkpointRevision > first.value().status.checkpointRevision);
+        std::string input;
+        for (const auto& part : again.value().request.messages) input += part.content;
+        CHECK(input.find(requirement) != std::string::npos);
+        CHECK(input.find("label to azure") != std::string::npos);
+    }
+}
+
+void test_reused_original_user_layer_respects_the_same_hard_budget() {
+    bool exercised = false;
+    for (int size = 17000; size <= 22000 && !exercised; size += 250) {
+        auto store = makeMaiMemoryStore();
+        const auto id = newSession(*store);
+        store->putMessage(
+            id, message(MaiRole::User, "OWNED original requirement " + std::string(2000, 'a')));
+        store->putMessage(id, message(MaiRole::Assistant, std::string(40000, 'b')));
+        store->putMessage(
+            id, message(MaiRole::User, "OWNED current instruction " + std::string(size, 'c')));
+        SummaryModel model;
+        std::atomic<bool> cancel{false};
+        const auto first = prepare(*store, model, id, cancel);
+        if (!first || !first.value().advancedCheckpoint ||
+            first.value().status.originalUserMessages <= first.value().status.retainedUserMessages)
+            continue;
+        exercised = true;
+        const auto calls = model.requests().size();
+        const auto reused = prepare(*store, model, id, cancel);
+        CHECK(reused.isOk());
+        CHECK(model.requests().size() == calls);
+        if (reused) {
+            CHECK(reused.value().reusedCheckpoint);
+            CHECK(reused.value().inputEstimate.tokens <= reused.value().status.inputBudgetTokens);
+        }
+    }
+    CHECK(exercised);
+}
+
+void test_visible_context_estimates_use_the_capacity_calibration() {
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    store->putMessage(id, message(MaiRole::User, "OWNED small request."));
+    SummaryModel model;
+    MaiContextCompactor::Options options;
+    options.estimateMultiplier = 2.0;
+    std::atomic<bool> cancel{false};
+    const auto result = MaiContextCompactor(options).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(result.isOk());
+    if (!result) return;
+    const auto raw = model.estimateInputTokens(result.value().request);
+    CHECK(result.value().status.after.tokens == 2 * raw.tokens);
+    CHECK(result.value().status.before.tokens == 2 * raw.tokens);
+    CHECK(!result.value().status.after.exact);
+    CHECK(result.value().inputEstimate.tokens == raw.tokens);
+}
+
+void test_compaction_failure_reports_status_without_claiming_a_checkpoint() {
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    populate(*store, id);
+    SummaryModel model;
+    model.failAt = 1;
+    std::vector<MaiContextStatus> stages;
+    MaiContextCompactor::Options options;
+    options.onStatus = [&](const MaiContextStatus& state) { stages.push_back(state); };
+    std::atomic<bool> cancel{false};
+    const auto result = MaiContextCompactor(options).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(!result);
+    CHECK(!stages.empty());
+    if (!stages.empty()) {
+        CHECK(stages.back().phase == MaiContextPhase::Failed);
+        CHECK(stages.back().error.code() == MaiErrorCode::Network);
+        CHECK(!stages.back().advancedCheckpoint);
+    }
+    MaiContextCheckpoint checkpoint;
+    CHECK(!store->getContextCheckpoint(id, checkpoint));
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--retained-requirements") {
+        test_successful_summary_keeps_original_user_requirements_outside_model_summary();
+        test_compaction_failure_reports_status_without_claiming_a_checkpoint();
+        test_reused_original_user_layer_respects_the_same_hard_budget();
+        test_visible_context_estimates_use_the_capacity_calibration();
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--codex-window") {
         test_codex_window_defaults_do_not_reserve_the_catalog_maximum_output();
         test_codex_window_trigger_starts_at_ninety_percent();
@@ -3693,6 +3833,10 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     std::puts("MaiContextCompactorTests");
+    test_successful_summary_keeps_original_user_requirements_outside_model_summary();
+    test_compaction_failure_reports_status_without_claiming_a_checkpoint();
+    test_reused_original_user_layer_respects_the_same_hard_budget();
+    test_visible_context_estimates_use_the_capacity_calibration();
     test_codex_window_defaults_do_not_reserve_the_catalog_maximum_output();
     test_codex_window_trigger_starts_at_ninety_percent();
     test_codex_window_hard_limit_counts_tools_and_images_once();

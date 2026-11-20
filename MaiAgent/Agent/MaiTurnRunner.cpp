@@ -242,6 +242,14 @@ void MaiTurnRunner::finishOutcome(const std::atomic<bool>& cancel, bool cleanupF
                                  : MaiTurnStatus::Completed;
     outcome.resultMessageId = mAssistant.id;
     outcome.completed = MaiTime::getCurrentTime();
+    outcome.context = mContextStatus;
+    if (outcome.context && (outcome.context->phase == MaiContextPhase::Preparing ||
+                            outcome.context->phase == MaiContextPhase::Summarizing)) {
+        outcome.context->phase =
+            interrupted ? MaiContextPhase::Interrupted : MaiContextPhase::Failed;
+        outcome.context->error =
+            mError ? mError : MaiError{MaiErrorCode::Canceled, "Context preparation stopped."};
+    }
     outcome.error =
         interrupted ? MaiError{MaiErrorCode::Canceled, "The turn was interrupted."} : mError;
     if (interrupted && !mError) mError = outcome.error;
@@ -255,7 +263,18 @@ void MaiTurnRunner::finishOutcome(const std::atomic<bool>& cancel, bool cleanupF
         return;
     }
     // 与普通 API 读取同一持久事实；不把事件本身当作可恢复的结果存储。
-    mDependencies.emitter->emitTurnOutcome(mSessionId, mInitialAssistantId);
+    mDependencies.emitter->emitTurnOutcome(mSessionId, mInitialAssistantId,
+                                           initial.turnOutcome->context);
+}
+
+void MaiTurnRunner::publishContextStatus(const MaiContextStatus& status) {
+    mContextStatus = status;
+    if (mAssistant.id == mInitialAssistantId) {
+        if (!mAssistant.turnOutcome) mAssistant.turnOutcome = MaiTurnOutcome{mInitialAssistantId};
+        mAssistant.turnOutcome->context = status;
+    }
+    if (mDependencies.store->updateTurnContext(mSessionId, mInitialAssistantId, status)) return;
+    mDependencies.emitter->emitContextStatus(mSessionId, mInitialAssistantId, status);
 }
 
 bool MaiTurnRunner::succeeded() const {
@@ -542,6 +561,7 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
     if (includeTools && mDependencies.tools && !mDependencies.tools->isEmpty())
         request.tools = mDependencies.tools->specs(mModelName);
     MaiContextCompactor::Options options;
+    options.onStatus = [this](const MaiContextStatus& status) { publishContextStatus(status); };
     options.estimateMultiplier = mContextEstimateMultiplier;
     options.deferUntilHardLimit = mCompactionDeferred;
     // 注册名和真实请求声明均需存在，且工具上下文绑定本会话门面；不能用回答提示猜能力。

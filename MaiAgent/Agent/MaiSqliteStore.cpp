@@ -99,6 +99,24 @@ std::string turnStateJson(const MaiMessage& message) {
                             {"completed", outcome.completed},
                             {"error_code", maiErrorCodeToString(outcome.error.code())},
                             {"error", outcome.error.message()}};
+        if (outcome.context) {
+            const auto& value = *outcome.context;
+            state["outcome"]["context"] = {{"phase", maiContextPhaseToString(value.phase)},
+                                           {"before", value.before.tokens},
+                                           {"after", value.after.tokens},
+                                           {"before_exact", value.before.exact},
+                                           {"after_exact", value.after.exact},
+                                           {"window", value.windowTokens},
+                                           {"input_budget", value.inputBudgetTokens},
+                                           {"revision", value.checkpointRevision},
+                                           {"original_users", value.originalUserMessages},
+                                           {"retained_users", value.retainedUserMessages},
+                                           {"reused", value.reusedCheckpoint},
+                                           {"advanced", value.advancedCheckpoint},
+                                           {"history_index", value.historyIndexRecovery},
+                                           {"error_code", maiErrorCodeToString(value.error.code())},
+                                           {"error", value.error.message()}};
+        }
     }
     return state.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
@@ -142,6 +160,49 @@ void restoreTurnState(const std::string& raw, MaiMessage& message) {
     if (!knownCode) return;
     outcome.resultMessageId = value["result_message_id"].get<std::string>();
     outcome.completed = value["completed"].get<std::int64_t>();
+    const auto context = value.value("context", nlohmann::json{});
+    if (context.is_object()) {
+        bool valid = context.contains("phase") && context["phase"].is_string() &&
+                     context.contains("error_code") && context["error_code"].is_string() &&
+                     context.contains("error") && context["error"].is_string();
+        for (const char* field : {"before", "after", "window", "input_budget", "revision",
+                                  "original_users", "retained_users"})
+            valid = valid && context.contains(field) && context[field].is_number_unsigned();
+        for (const char* field :
+             {"before_exact", "after_exact", "reused", "advanced", "history_index"})
+            valid = valid && context.contains(field) && context[field].is_boolean();
+        if (valid) {
+            MaiContextStatus status;
+            bool knownPhase = false;
+            for (auto phase :
+                 {MaiContextPhase::Preparing, MaiContextPhase::Summarizing, MaiContextPhase::Ready,
+                  MaiContextPhase::Deferred, MaiContextPhase::Failed, MaiContextPhase::Interrupted})
+                if (context["phase"] == maiContextPhaseToString(phase)) {
+                    status.phase = phase;
+                    knownPhase = true;
+                }
+            status.before = {context["before"].get<std::size_t>(),
+                             context["before_exact"].get<bool>()};
+            status.after = {context["after"].get<std::size_t>(),
+                            context["after_exact"].get<bool>()};
+            status.windowTokens = context["window"].get<std::size_t>();
+            status.inputBudgetTokens = context["input_budget"].get<std::size_t>();
+            status.checkpointRevision = context["revision"].get<std::uint64_t>();
+            status.originalUserMessages = context["original_users"].get<std::size_t>();
+            status.retainedUserMessages = context["retained_users"].get<std::size_t>();
+            status.reusedCheckpoint = context["reused"].get<bool>();
+            status.advancedCheckpoint = context["advanced"].get<bool>();
+            status.historyIndexRecovery = context["history_index"].get<bool>();
+            for (auto code :
+                 {MaiErrorCode::Ok, MaiErrorCode::NotFound, MaiErrorCode::Busy,
+                  MaiErrorCode::InvalidInput, MaiErrorCode::NotConfigured, MaiErrorCode::Network,
+                  MaiErrorCode::RateLimited, MaiErrorCode::Protocol, MaiErrorCode::Canceled,
+                  MaiErrorCode::NotSupported, MaiErrorCode::Internal})
+                if (context.value("error_code", std::string{}) == maiErrorCodeToString(code))
+                    status.error = {code, context.value("error", std::string{})};
+            if (knownPhase) outcome.context = std::move(status);
+        }
+    }
     message.turnOutcome = std::move(outcome);
 }
 
@@ -1112,6 +1173,97 @@ public:
         return {};
     }
 
+    MaiResult<MaiMessage> readTurnMetadata(const std::string& sessionId,
+                                           const std::string& turnId) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto read = [&](const std::string& id) -> MaiResult<MaiMessage> {
+            auto* statement = prepareLocked(
+                id.empty() ? "SELECT id,role,created,completed,turn_state FROM messages WHERE "
+                             "session_id=?1 "
+                             "AND role=1 AND context_import_id IS NULL ORDER BY id DESC LIMIT 1"
+                           : "SELECT id,role,created,completed,turn_state FROM messages WHERE "
+                             "session_id=?1 "
+                             "AND id=?2 AND context_import_id IS NULL");
+            if (!statement) return mLastWriteError;
+            Reset guard(statement);
+            bindText(statement, 1, sessionId);
+            if (!id.empty()) bindText(statement, 2, id);
+            const int code = sqlite3_step(statement);
+            if (code == SQLITE_DONE) return {MaiErrorCode::NotFound, "Turn not found."};
+            if (code != SQLITE_ROW) return {MaiErrorCode::Internal, "Cannot read turn metadata."};
+            MaiMessage result;
+            result.id = textColumn(statement, 0);
+            result.role = columnToRole(sqlite3_column_int(statement, 1));
+            result.created = sqlite3_column_int64(statement, 2);
+            result.completed = sqlite3_column_int64(statement, 3);
+            restoreTurnState(textColumn(statement, 4), result);
+            return result;
+        };
+        auto result = read(turnId);
+        if (result && turnId.empty() && !result.value().turnId.empty() &&
+            result.value().turnId != result.value().id)
+            return read(result.value().turnId);
+        return result;
+    }
+
+    MaiError updateTurnContext(const std::string& sessionId, const std::string& turnId,
+                               const MaiContextStatus& status) override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!executeTransactionStatement("BEGIN IMMEDIATE")) return mLastWriteError;
+        MaiMessage message;
+        message.id = turnId;
+        auto* read = prepareLocked(
+            "SELECT role,turn_state FROM messages WHERE session_id=?1 AND id=?2 "
+            "AND context_import_id IS NULL");
+        if (!read) {
+            executeTransactionStatement("ROLLBACK");
+            return mLastWriteError;
+        }
+        bool found = false;
+        {
+            Reset guard(read);
+            bindText(read, 1, sessionId);
+            bindText(read, 2, turnId);
+            if (sqlite3_step(read) == SQLITE_ROW && sqlite3_column_int(read, 0) == 1) {
+                found = true;
+                restoreTurnState(textColumn(read, 1), message);
+            }
+        }
+        if (!found || (!message.turnId.empty() && message.turnId != turnId)) {
+            executeTransactionStatement("ROLLBACK");
+            return {MaiErrorCode::NotFound, "An originating assistant turn is required."};
+        }
+        message.turnId = turnId;
+        if (!message.turnOutcome || message.turnOutcome->turnId != turnId) {
+            executeTransactionStatement("ROLLBACK");
+            return {MaiErrorCode::NotSupported, "This message is not a recorded turn."};
+        }
+        if (message.turnOutcome->status != MaiTurnStatus::Running) {
+            executeTransactionStatement("ROLLBACK");
+            return {MaiErrorCode::Busy, "The originating turn is already terminal."};
+        }
+        message.turnOutcome->context = status;
+        auto* update =
+            prepareLocked("UPDATE messages SET turn_state=?1 WHERE session_id=?2 AND id=?3");
+        if (!update) {
+            executeTransactionStatement("ROLLBACK");
+            return mLastWriteError;
+        }
+        bool saved;
+        {
+            Reset guard(update);
+            bindText(update, 1, turnStateJson(message));
+            bindText(update, 2, sessionId);
+            bindText(update, 3, turnId);
+            saved = executePreparedStatement(update);
+        }
+        if (!saved || !executeTransactionStatement("COMMIT")) {
+            executeTransactionStatement("ROLLBACK");
+            return mLastWriteError;
+        }
+        return {};
+    }
+
     void putMessage(const std::string& sessionId, const MaiMessage& message) override {
         std::lock_guard<std::mutex> lock(mMutex);
         if (!executeTransactionStatement("BEGIN IMMEDIATE")) return;
@@ -1632,6 +1784,12 @@ public:
                 message.turnOutcome->status = MaiTurnStatus::Interrupted;
                 message.turnOutcome->completed = completedAt;
                 message.turnOutcome->error = {MaiErrorCode::Canceled, error};
+                if (message.turnOutcome->context &&
+                    (message.turnOutcome->context->phase == MaiContextPhase::Preparing ||
+                     message.turnOutcome->context->phase == MaiContextPhase::Summarizing)) {
+                    message.turnOutcome->context->phase = MaiContextPhase::Interrupted;
+                    message.turnOutcome->context->error = {MaiErrorCode::Canceled, error};
+                }
                 interrupted.emplace_back(message.id, turnStateJson(message));
             }
             if (code != SQLITE_DONE) {

@@ -5,10 +5,12 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "MaiTime.h"
+#include "MaiContextStatus.h"
 
 // ── 事件类型 ────────────────────────────────────────────────────
 // 已有枚举值的顺序是原生宿主接口的一部分；新增事件只追加，不能挪动旧值。
@@ -40,6 +42,7 @@ enum class MaiEventType {
     // 原始轮次的结果已持久化；turnId/messageId 均为初始 assistant ID。
     // 事件是查询通知，不把完成时间或正文存在误认为成功；详情从 getTurnOutcome 读取。
     TurnOutcomeUpdated,
+    ContextStatusUpdated,
 };
 
 // 转成 "message.part.delta" 这类线上字符串。
@@ -87,6 +90,8 @@ struct MaiEvent {
     // 仅 TurnSteeringApplied 使用，按实际消费顺序列出 user ID；messageId 是新 assistant。
     // 发布前用户状态及新 assistant 均已持久化。事件可早于提交线程返回，不提供历史重放。
     std::vector<std::string> inputMessageIds;
+    // 只包含容量和阶段的宿主快照，不包含用户内容。异步 UI 不必再按“最新”读串轮次。
+    std::optional<MaiContextStatus> contextStatus;
 };
 
 // ── 事件总线 ────────────────────────────────────────────────────

@@ -21,10 +21,20 @@ MaiEvent makeEvent(MaiEventType type, const std::string& sessionId) {
 
 }  // namespace
 
-void MaiEventEmitter::emitTurnOutcome(const std::string& sessionId, const std::string& turnId) {
+void MaiEventEmitter::emitTurnOutcome(const std::string& sessionId, const std::string& turnId,
+                                      const std::optional<MaiContextStatus>& context) {
     MaiEvent event = makeEvent(MaiEventType::TurnOutcomeUpdated, sessionId);
     event.turnId = turnId;
     event.messageId = turnId;
+    event.contextStatus = context;
+    mBus.publish(event);
+}
+
+void MaiEventEmitter::emitContextStatus(const std::string& sessionId, const std::string& turnId,
+                                        const MaiContextStatus& status) {
+    MaiEvent event = makeEvent(MaiEventType::ContextStatusUpdated, sessionId);
+    event.turnId = turnId;
+    event.contextStatus = status;
     mBus.publish(event);
 }
 

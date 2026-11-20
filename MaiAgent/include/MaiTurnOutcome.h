@@ -1,8 +1,10 @@
 // 文件作用：定义一轮执行的持久状态，和响应正文、消息分段结束及工具状态分别建模。
 #pragma once
 
+#include <optional>
 #include <string>
 
+#include "MaiContextStatus.h"
 #include "MaiError.h"
 #include "MaiTime.h"
 
@@ -22,4 +24,6 @@ struct MaiTurnOutcome {
     std::string resultMessageId;
     MaiMillis completed = 0;
     MaiError error;
+    // 最新一次上下文准备的事实；无值表示尚未准备或旧数据，不能推测占用为零。
+    std::optional<MaiContextStatus> context;
 };

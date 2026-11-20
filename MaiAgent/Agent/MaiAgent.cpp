@@ -1133,7 +1133,13 @@ MaiResult<MaiTurnOutcome> MaiAgent::getTurnOutcome(const std::string& sessionId,
         return {MaiErrorCode::NotFound, "Session not found."};
     }
     MaiMessage message;
-    if (!turnId.empty()) {
+    const auto metadata = mRuntime->store->readTurnMetadata(sessionId, turnId);
+    if (metadata) {
+        if (const auto error = mRuntime->store->lastWriteError()) return error;
+        message = metadata.value();
+    } else if (metadata.error().code() != MaiErrorCode::NotSupported) {
+        return metadata.error();
+    } else if (!turnId.empty()) {
         if (!mRuntime->store->getMessage(sessionId, turnId, message)) {
             if (const auto error = mRuntime->store->lastWriteError()) return error;
             return {MaiErrorCode::NotFound, "Turn not found in this session."};

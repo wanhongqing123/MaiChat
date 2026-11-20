@@ -9,6 +9,16 @@
 
 #include <openssl/evp.h>
 
+MaiResult<MaiMessage> MaiSessionStore::readTurnMetadata(const std::string&,
+                                                        const std::string&) const {
+    return {MaiErrorCode::NotSupported, "This store has no separate turn metadata reader."};
+}
+
+MaiError MaiSessionStore::updateTurnContext(const std::string&, const std::string&,
+                                            const MaiContextStatus&) {
+    return {MaiErrorCode::NotSupported, "This store cannot update context status independently."};
+}
+
 namespace {
 
 bool isImportUtf8(std::string_view value) {
