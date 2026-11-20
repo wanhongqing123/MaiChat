@@ -17,6 +17,7 @@ enum class MaiApprovalPolicy;
 struct MaiMessage;
 struct MaiMessagePart;
 struct MaiSession;
+struct MaiContextStatus;
 
 // AI 助手的聊天页。
 //
@@ -139,6 +140,8 @@ private:
 
     void onSend();
     void onClear();
+    // 只跟随实际摘要阶段，独立于消息历史；复用检查点/普通准备不创建新提示。
+    void refreshCompactionNotice(const MaiContextStatus* status);
     bool insertComposerMimeData(const QMimeData* mime);
     void insertComposerImage(const QImage& image);
     void insertComposerImageFile(const QString& path);

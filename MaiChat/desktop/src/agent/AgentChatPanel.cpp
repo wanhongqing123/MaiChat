@@ -1409,6 +1409,10 @@ struct AgentChatPanel::Runtime : AgentChatPanel::ConversationState {
 
     QLabel* title = nullptr;
     QLabel* contextSize = nullptr;
+    QLabel* compactionNotice = nullptr;
+    QTimer* compactionNoticeTimer = nullptr;
+    QString compactionNoticeSession;
+    bool compactionNoticeActive = false;
     QPushButton* modelChip = nullptr;
     QPushButton* modelSection = nullptr;
     QLabel* modelSectionValue = nullptr;
@@ -1561,6 +1565,23 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     connect(runtime_->olderMessages, &QPushButton::clicked, this, &AgentChatPanel::loadEarlierMessages);
     conversationColumn->addWidget(runtime_->olderMessages);
     conversationColumn->addWidget(runtime_->view, 1);
+    // 明确的实时提示固定在对话区底部，不插入用户历史，也不重建 Markdown 页面。
+    runtime_->compactionNotice = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkSoft);
+    runtime_->compactionNotice->setObjectName(QStringLiteral("agentCompactionNotice"));
+    runtime_->compactionNotice->setTextFormat(Qt::PlainText);
+    runtime_->compactionNotice->setWordWrap(true);
+    runtime_->compactionNotice->setToolTip(QStringLiteral("仅整理模型输入，原始聊天记录不会因此删除。"));
+    UiZoom::setStyle(runtime_->compactionNotice,
+        QStringLiteral("QLabel#agentCompactionNotice{background:#eef6fd;color:#175cd3;"
+                       "border:1px solid #d1e9ff;border-radius:8px;padding:8px 12px;}"));
+    runtime_->compactionNotice->hide();
+    conversationColumn->addWidget(runtime_->compactionNotice);
+    runtime_->compactionNoticeTimer = new QTimer(this);
+    runtime_->compactionNoticeTimer->setSingleShot(true);
+    runtime_->compactionNoticeTimer->setInterval(4000);
+    connect(runtime_->compactionNoticeTimer, &QTimer::timeout, this, [this] {
+        if (!runtime_->compactionNoticeActive) runtime_->compactionNotice->hide();
+    });
     conversationLayers->addWidget(conversationContent);
     auto* welcomeView = new WelcomeView(conversationSurface, [this](const QString& example) {
         if (!runtime_->editor) return;
@@ -2162,6 +2183,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
             return;
         // 绑定/调度等入口不经过 onSend；由实际受理轮次开启同一等待 UI。
         // 本地 onSend 的即时反馈仍可保留，startPendingThinking 本身去重。
+        refreshCompactionNotice(nullptr);
         setRunning(true);
         startPendingThinking();
         scrollToBottom();
@@ -4811,6 +4833,7 @@ void AgentChatPanel::onClear() {
     }
     runtime_->title->setText(QStringLiteral("创作中心"));
     clearQuote();
+    refreshCompactionNotice(nullptr);
     reloadFromStore();
 }
 
@@ -4855,6 +4878,7 @@ void AgentChatPanel::scrollToBottom() {
 
 void AgentChatPanel::refreshContextSize() {
     const auto status = runtime_->controller->contextStatus(runtime_->sessionId);
+    refreshCompactionNotice(status ? &*status : nullptr);
     if (!status) { runtime_->contextSize->hide(); return; }
     QString text;
     switch (status->phase) {
@@ -4893,4 +4917,45 @@ void AgentChatPanel::refreshContextSize() {
     runtime_->contextSize->setText(text);
     runtime_->contextSize->setToolTip(detail.join(QLatin1Char('\n')));
     runtime_->contextSize->setVisible(!text.isEmpty());
+}
+
+void AgentChatPanel::refreshCompactionNotice(const MaiContextStatus* status) {
+    if (runtime_->compactionNoticeSession != runtime_->sessionId || !status) {
+        runtime_->compactionNoticeTimer->stop();
+        runtime_->compactionNotice->hide();
+        runtime_->compactionNoticeActive = false;
+        runtime_->compactionNoticeSession = runtime_->sessionId;
+    }
+    if (!status) return;
+    if (status->phase == MaiContextPhase::Summarizing) {
+        runtime_->compactionNoticeTimer->stop();
+        runtime_->compactionNoticeActive = true;
+        runtime_->compactionNotice->setText(QStringLiteral("正在压缩上下文，请稍候…"));
+        runtime_->compactionNotice->show();
+        return;
+    }
+    // 只有确实观察到本会话的压缩开始才宣布结果，冷历史/普通准备/复用不重复通知。
+    if (!runtime_->compactionNoticeActive || status->phase == MaiContextPhase::Preparing) return;
+    runtime_->compactionNoticeActive = false;
+    switch (status->phase) {
+        case MaiContextPhase::Ready:
+            if (status->historyIndexRecovery)
+                runtime_->compactionNotice->setText(QStringLiteral("摘要不完整，原始记录仍可回查。"));
+            else {
+                runtime_->compactionNotice->setText(QStringLiteral("上下文已压缩，原始记录仍可回查。"));
+                runtime_->compactionNoticeTimer->start();
+            }
+            break;
+        case MaiContextPhase::Deferred:
+            runtime_->compactionNotice->setText(QStringLiteral("上下文压缩暂缓，原始记录未删除。"));
+            break;
+        case MaiContextPhase::Failed:
+            runtime_->compactionNotice->setText(QStringLiteral("上下文压缩未完成，原始记录未删除。"));
+            break;
+        case MaiContextPhase::Interrupted:
+            runtime_->compactionNotice->setText(QStringLiteral("上下文压缩已中断，原始记录未删除。"));
+            break;
+        default: return;
+    }
+    runtime_->compactionNotice->show();
 }

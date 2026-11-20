@@ -4979,7 +4979,9 @@ void AgentPanelSessionTest::contextStatusIsVisibleAndIsolated() {
     auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
     auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
     auto* status = panel.findChild<QLabel*>(QStringLiteral("agentContextStatus"));
-    QVERIFY(editor && send && status);
+    auto* notice = panel.findChild<QLabel*>(QStringLiteral("agentCompactionNotice"));
+    QVERIFY(editor && send && status && notice);
+    QVERIFY(!notice->isVisible());
     editor->setPlainText(QStringLiteral("OWNED: keep the draft private and preserve label cobalt."));
     QTest::mouseClick(send, Qt::LeftButton);
     QTRY_VERIFY_WITH_TIMEOUT(state->calls.load() == 1, 5000);
@@ -4987,16 +4989,20 @@ void AgentPanelSessionTest::contextStatusIsVisibleAndIsolated() {
     QTRY_VERIFY_WITH_TIMEOUT(send->isEnabled(), 5000);
     const auto firstTurn = controller.agent().getTurnOutcome(session.toStdString());
     QVERIFY(firstTurn);
+    QVERIFY(!notice->isVisible()); // 普通准备不冒充一次压缩。
     editor->setPlainText(QStringLiteral("Continue the owned task."));
     QTest::mouseClick(send, Qt::LeftButton);
     QTRY_VERIFY_WITH_TIMEOUT(state->summarizing.load(), 5000);
     QTRY_VERIFY(status->isVisible() && status->text().contains(QStringLiteral("正在整理")));
+    QTRY_VERIFY(notice->isVisible() && notice->text().contains(QStringLiteral("正在压缩上下文")));
     QVERIFY(captureAgentFixture(panel, summaryFails ? QStringLiteral("context-failure-start") : QStringLiteral("context-start")));
     const auto other = controller.createSession(directory.path());
     panel.openSession(other);
     QTRY_VERIFY(!status->isVisible());
+    QTRY_VERIFY(!notice->isVisible());
     panel.openSession(session);
     QTRY_VERIFY(status->isVisible() && status->text().contains(QStringLiteral("正在整理")));
+    QTRY_VERIFY(notice->isVisible() && notice->text().contains(QStringLiteral("正在压缩上下文")));
     if (missingTerminalUpdate) {
         // 模拟已观察到轮次错误、但最终上下文状态没有成功交付。不能一直显示整理中。
         MaiEvent terminalError;
@@ -5015,6 +5021,7 @@ void AgentPanelSessionTest::contextStatusIsVisibleAndIsolated() {
         QVERIFY(QMetaObject::invokeMethod(&controller, "onEventQueued", Qt::DirectConnection,
                                           Q_ARG(MaiEvent, terminalError)));
         QTRY_VERIFY(status->text().contains(QStringLiteral("未完成")));
+        QTRY_VERIFY(notice->text().contains(QStringLiteral("压缩未完成")));
         QVERIFY(captureAgentFixture(panel, QStringLiteral("context-terminal-unavailable")));
         return; // 只处理自造已失败轮次的丢失/迟到通知，不产生外部模型请求。
     }
@@ -5027,8 +5034,23 @@ void AgentPanelSessionTest::contextStatusIsVisibleAndIsolated() {
         : sourceIndex ? QStringLiteral("摘要不完整") : QStringLiteral("上下文")), 5000);
     if (!summaryFails && !summaryThrows) QVERIFY(status->toolTip().contains(QStringLiteral("用户消息原文")));
     if (sourceIndex) QVERIFY(status->toolTip().contains(QStringLiteral("来源索引")));
+    QTRY_VERIFY(notice->isVisible());
+    QVERIFY(notice->text().contains(summaryFails || summaryThrows ? QStringLiteral("压缩未完成")
+        : sourceIndex ? QStringLiteral("摘要不完整") : QStringLiteral("已压缩")));
     QVERIFY(captureAgentFixture(panel, sourceIndex ? QStringLiteral("context-source-index") : summaryThrows ? QStringLiteral("context-exception")
         : summaryFails ? QStringLiteral("context-failed") : QStringLiteral("context-ready")));
+    if (!summaryFails && !summaryThrows && !sourceIndex) {
+        QTRY_VERIFY_WITH_TIMEOUT(!notice->isVisible(), 6000);
+        editor->setPlainText(QStringLiteral("One more owned request using the saved summary."));
+        QTest::mouseClick(send, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(state->calls.load() == 3, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+        QCoreApplication::processEvents();
+        const auto reused = controller.agent().getTurnOutcome(session.toStdString());
+        QVERIFY(reused && reused.value().context && reused.value().context->reusedCheckpoint);
+        QVERIFY(!reused.value().context->advancedCheckpoint);
+        QVERIFY(!notice->isVisible());
+    }
 }
 
 QTEST_MAIN(AgentPanelSessionTest)
