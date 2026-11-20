@@ -10,6 +10,7 @@
 #include "MaiTime.h"
 #include "MaiToolExecution.h"
 #include "MaiModelContinuationState.h"
+#include "MaiTurnOutcome.h"
 
 // 一次对话里的消息和它的组成片段。
 //
@@ -167,6 +168,12 @@ struct MaiMessage {
     // 仅标准存储的导入读取路径赋值；普通消息保持无值。追加在数据尾部，保留原聚合字段顺序。
     // 模型上下文仍使用原 role/parts；宿主可据此选择单独的显示投影，不能把导入资料升为真实回复。
     std::optional<MaiContextImportOrigin> contextImportOrigin;
+
+    // 仅初始 assistant 持有整轮状态，分段 completed 不替代此终态。
+    // 追加末尾保留旧聚合字段位置；无值表示旧数据/导入资料，没有可推断的执行结果。
+    std::optional<MaiTurnOutcome> turnOutcome;
+    // 每个核心 assistant 分段指向所属初始轮次；旧数据为空，不按相邻位置猜归属。
+    std::string turnId;
 
     bool isInProgress() const;
 

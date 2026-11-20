@@ -130,6 +130,8 @@ private:
     void checkpointStreamedParts(bool force);
     void fillStreamedPart(const std::string& partId, const std::string& buffer);
     void finish(const std::atomic<bool>& cancel);
+    // 工具清理与普通消息收尾结束后保存整轮终态；分段结束不提前完成原始轮次。
+    void finishOutcome(const std::atomic<bool>& cancel, bool cleanupFailed);
 
     Dependencies mDependencies;
     std::string mSessionId;

@@ -25,6 +25,7 @@
 #include "MaiSessionStore.h"
 #include "MaiTool.h"
 #include "MaiSubAgentTools.h"
+#include "MaiSessionTools.h"
 
 using nlohmann::json;
 
@@ -279,12 +280,160 @@ void test_waiting_on_a_still_running_child_is_not_an_error() {
     context.sessionId = root;
     context.subAgents = agent.get();
 
-    // 一个不存在的 id：等不到，但也不该当成工具出错。
+    // 不存在不能冒充仍在执行；调用方须能区分拼错 ID 和正常超时。
     const MaiToolResult result =
         tool->execute(args({{"agent_id", "ses_nope"}, {"timeout_ms", 1000}}), context);
-    CHECK(!result.hasError());
-    CHECK(result.output().find("still working") != std::string::npos);
+    CHECK(result.hasError());
+    CHECK(result.error().code() == MaiErrorCode::NotFound);
     agent->waitIdle();
+}
+
+void test_turn_outcomes_do_not_return_an_earlier_answer() {
+    auto model = std::make_unique<MaiFakeModelClient>();
+    MaiFakeModelClient::Turn first;
+    first.textChunks = {"old answer"};
+    MaiFakeModelClient::Turn second;
+    second.error = {MaiErrorCode::Network, "owned failure"};
+    model =
+        std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{first, second});
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model));
+    const auto root = newRootSession(agent);
+    const auto child = agent.spawnSubAgent(root, "owned", "first");
+    CHECK(child.isOk());
+    if (!child) return;
+    agent.waitIdle();
+    const auto completed = agent.getTurnOutcome(child.value());
+    CHECK(completed.isOk());
+    if (completed) CHECK(completed.value().status == MaiTurnStatus::Completed);
+    CHECK(!agent.sendToSubAgent(root, child.value(), "second"));
+    agent.waitIdle();
+    const auto failed = agent.getTurnOutcome(child.value());
+    CHECK(failed.isOk());
+    if (failed) {
+        CHECK(failed.value().status == MaiTurnStatus::Failed);
+        CHECK(failed.value().error.code() == MaiErrorCode::Network);
+        CHECK(failed.value().completed > 0);
+        if (completed) CHECK(failed.value().turnId != completed.value().turnId);
+        CHECK(!agent.getTurnOutcome(root, failed.value().turnId));
+    }
+    CHECK(agent.subAgentReport(child.value()).empty());
+    MaiToolContext context;
+    context.sessionId = root;
+    context.subAgents = &agent;
+    const auto report = makeMaiWaitAgentTool()->execute(
+        args({{"agent_id", child.value()}, {"timeout_ms", 1000}}), context);
+    CHECK(report.hasError());
+    CHECK(report.error().code() == MaiErrorCode::Network);
+    const auto old =
+        completed ? agent.getTurnOutcome(child.value(), completed.value().turnId) : completed;
+    CHECK(old.isOk());
+    if (old) CHECK(old.value().status == MaiTurnStatus::Completed);
+    if (completed) {
+        // 另一轮已经失败或开始，也必须按捕获的轮次读原结果，不重新查“最新”。
+        const auto fixed =
+            agent.subAgentReportForTurn(root, child.value(), completed.value().turnId);
+        CHECK(fixed.isOk());
+        if (fixed) CHECK(fixed.value() == "old answer");
+        CHECK(!agent.subAgentReportForTurn(child.value(), child.value(), completed.value().turnId));
+    }
+}
+
+void test_unanswered_response_and_interruption_have_distinct_outcomes() {
+    for (bool interrupted : {false, true}) {
+        MaiFakeModelClient::Turn response;
+        if (interrupted) response.error = {MaiErrorCode::Canceled, "owned interruption"};
+        auto model = std::make_unique<MaiFakeModelClient>();
+        model->setRepeatingTurn(response);
+        MaiAgent agent(makeMaiMemoryStore(), std::move(model));
+        const auto session = newRootSession(agent);
+        const auto started = agent.submit(MaiSendPrompt{session, "owned"});
+        CHECK(started.isOk());
+        agent.waitIdle();
+        if (!started) continue;
+        const auto outcome = agent.getTurnOutcome(session, started.value());
+        CHECK(outcome.isOk());
+        if (!outcome) continue;
+        CHECK(outcome.value().turnId == started.value());
+        CHECK(outcome.value().resultMessageId == started.value());
+        // 普通 Runner 仍保留原有空回答补答策略；补答也没有正文时是失败，不是成功。
+        CHECK(outcome.value().status ==
+              (interrupted ? MaiTurnStatus::Interrupted : MaiTurnStatus::Failed));
+        CHECK(outcome.value().error.code() ==
+              (interrupted ? MaiErrorCode::Canceled : MaiErrorCode::Internal));
+    }
+}
+
+void test_status_queries_share_persisted_outcomes_and_keep_session_scope() {
+    auto store = makeMaiMemoryStore();
+    auto* saved = store.get();
+    MaiAgent agent(std::move(store), nullptr);
+    const auto session = newRootSession(agent);
+    const auto other = newRootSession(agent);
+    MaiMessage initial;
+    initial.id = "msg_owned_initial";
+    initial.role = MaiRole::Assistant;
+    initial.turnId = initial.id;
+    initial.completed = 20;
+    initial.turnOutcome =
+        MaiTurnOutcome{initial.id, MaiTurnStatus::Completed, "msg_owned_tail", 30, {}};
+    saved->putMessage(session, initial);
+    MaiMessage tail;
+    tail.id = "msg_owned_tail";
+    tail.role = MaiRole::Assistant;
+    tail.completed = 30;
+    tail.turnId = initial.id;
+    saved->putMessage(session, tail);
+    const auto latest = agent.getTurnOutcome(session);
+    CHECK(latest.isOk());
+    if (latest) CHECK(latest.value().turnId == initial.id);
+    CHECK(!agent.getTurnOutcome(other, initial.id));
+    CHECK(!agent.getTurnOutcome(session, tail.id));
+    MaiToolRegistry tools;
+    registerMaiSessionTools(tools, false);
+    auto* status = tools.find("session_status");
+    CHECK(status != nullptr);
+    if (!status) return;
+    MaiToolContext context;
+    context.sessionId = session;
+    context.sessionAgent = &agent;
+    const auto response = status->execute("{}", context);
+    CHECK(!response.hasError());
+    if (!response.hasError()) {
+        const auto value = json::parse(response.output());
+        CHECK(value["turn_id"] == initial.id);
+        CHECK(value["status"] == "completed");
+    }
+    CHECK(status->execute("{\"session_id\":\"other\"}", context).hasError());
+    CHECK(status->execute("{\"turn_id\":12}", context).hasError());
+    CHECK(!status->requiresApproval("{}"));
+    CHECK(!status->requiresWorkingDirectory("{}"));
+    // 更新的未知旧消息不能让空 ID 查询跳回更早的成功轮次。
+    tail.id = "msg_z_legacy";
+    tail.turnId.clear();
+    saved->putMessage(session, tail);
+    const auto unknown = agent.getTurnOutcome(session);
+    CHECK(!unknown);
+    CHECK(unknown.error().code() == MaiErrorCode::NotSupported);
+}
+
+void test_outcome_event_follows_persistence() {
+    auto model = std::make_unique<MaiFakeModelClient>();
+    MaiFakeModelClient::Turn response;
+    response.textChunks = {"owned"};
+    model->setRepeatingTurn(response);
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model));
+    const auto session = newRootSession(agent);
+    int events = 0;
+    agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type != MaiEventType::TurnOutcomeUpdated) return;
+        ++events;
+        const auto outcome = agent.getTurnOutcome(session, event.turnId);
+        CHECK(outcome.isOk());
+        if (outcome) CHECK(outcome.value().status == MaiTurnStatus::Completed);
+    });
+    agent.submit(MaiSendPrompt{session, "owned"});
+    agent.waitIdle();
+    CHECK(events == 1);
 }
 
 }  // namespace
@@ -296,7 +445,12 @@ void test_waiting_on_a_still_running_child_is_not_an_error() {
         f();                        \
     } while (0)
 
-int main() {
+int main(int argc, char** argv) {
+    RUN(test_turn_outcomes_do_not_return_an_earlier_answer);
+    RUN(test_unanswered_response_and_interruption_have_distinct_outcomes);
+    RUN(test_status_queries_share_persisted_outcomes_and_keep_session_scope);
+    RUN(test_outcome_event_follows_persistence);
+    if (argc == 2 && std::string(argv[1]) == "--turn-outcomes") return failures == 0 ? 0 : 1;
     RUN(test_depth_is_capped);
     RUN(test_depth_is_recorded_on_the_session);
     RUN(test_open_count_is_capped_and_closing_frees_a_slot);

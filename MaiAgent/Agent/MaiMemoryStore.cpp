@@ -614,6 +614,13 @@ public:
         for (auto& entry : mMessages) {
             for (MaiMessage& message : entry.second) {
                 bool changed = false;
+                if (message.turnOutcome && message.turnOutcome->turnId == message.id &&
+                    message.turnOutcome->status == MaiTurnStatus::Running) {
+                    message.turnOutcome->status = MaiTurnStatus::Interrupted;
+                    message.turnOutcome->completed = completedAt;
+                    message.turnOutcome->error = {MaiErrorCode::Canceled, error};
+                    changed = true;
+                }
                 for (MaiMessagePart& part : message.parts) {
                     auto* tool = std::get_if<MaiToolPart>(&part.body);
                     if (!tool || (tool->state != MaiToolState::Pending &&

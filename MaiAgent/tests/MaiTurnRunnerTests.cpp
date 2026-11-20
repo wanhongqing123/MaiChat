@@ -440,6 +440,7 @@ void test_turn_cleanup_covers_success_failure_and_cancel() {
         if (outcome == 2) fixture.resource->cancelAfterExecute = &fixture.cancel;
         if (outcome == 3) fixture.model.outcome = TurnCleanupModel::Outcome::Exception;
         const bool succeeded = fixture.run();
+        if (outcome == 2) CHECK(!succeeded);
         CHECK(fixture.resource->executions == 1);
         CHECK(fixture.resource->executedTurn == fixture.assistant.id);
         CHECK(fixture.resource->finished.size() == 1);
@@ -494,6 +495,19 @@ void test_turn_cleanup_uses_original_identity_after_steering() {
     };
     CHECK(fixture.run());
     CHECK(steered == 3);
+    MaiMessage original;
+    CHECK(fixture.store->getMessage(fixture.session.id, fixture.assistant.id, original));
+    CHECK(original.turnOutcome.has_value());
+    if (original.turnOutcome) {
+        CHECK(original.turnOutcome->turnId == fixture.assistant.id);
+        CHECK(original.turnOutcome->status == MaiTurnStatus::Completed);
+        CHECK(original.turnOutcome->resultMessageId == "msg_cleanup_steered_segment_3");
+        MaiMessage result;
+        CHECK(fixture.store->getMessage(fixture.session.id, original.turnOutcome->resultMessageId,
+                                        result));
+        CHECK(result.turnId == fixture.assistant.id);
+        CHECK(!result.turnOutcome);
+    }
     CHECK(fixture.resource->executedTurns == std::vector<std::string>(3, fixture.assistant.id));
     CHECK(fixture.resource->finished.size() == 1);
     if (fixture.resource->finished.size() == 1)

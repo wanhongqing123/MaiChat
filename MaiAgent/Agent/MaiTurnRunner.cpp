@@ -156,7 +156,11 @@ MaiTurnRunner::MaiTurnRunner(Dependencies dependencies, std::string sessionId, M
     : mDependencies(std::move(dependencies)),
       mSessionId(std::move(sessionId)),
       mInitialAssistantId(assistant.id),
-      mAssistant(std::move(assistant)) {}
+      mAssistant(std::move(assistant)) {
+    // 直接使用普通 Runner 的宿主同样获得轮次身份，不依赖某个 UI 的受理流程。
+    mAssistant.turnId = mInitialAssistantId;
+    mAssistant.turnOutcome = MaiTurnOutcome{mInitialAssistantId};
+}
 
 void MaiTurnRunner::run(const std::atomic<bool>& cancel) {
     // 所有出口共用一次收尾。先封闭输入闸门，再清理工具资源，避免清理阻塞期间
@@ -207,6 +211,51 @@ void MaiTurnRunner::run(const std::atomic<bool>& cancel) {
             unexpected("unexpected error notification failure");
         }
     }
+    try {
+        finishOutcome(cancel, cleanupError.hasError());
+    } catch (const std::exception& error) {
+        unexpected(std::string("unexpected turn outcome failure: ") + error.what());
+    } catch (...) {
+        unexpected("unexpected turn outcome failure");
+    }
+}
+
+void MaiTurnRunner::finishOutcome(const std::atomic<bool>& cancel, bool cleanupFailed) {
+    MaiMessage initial;
+    if (mAssistant.id == mInitialAssistantId) {
+        initial = mAssistant;
+    } else if (!mDependencies.store->getMessage(mSessionId, mInitialAssistantId, initial)) {
+        mError = {MaiErrorCode::Internal, "The originating turn message is unavailable."};
+        return;
+    }
+    if (const auto error = mDependencies.store->lastWriteError()) {
+        mError = error;
+        return;
+    }
+    const bool interrupted =
+        !cleanupFailed && (mError.code() == MaiErrorCode::Canceled ||
+                           (!mError && cancel.load(std::memory_order_relaxed)));
+    MaiTurnOutcome outcome;
+    outcome.turnId = mInitialAssistantId;
+    outcome.status = interrupted ? MaiTurnStatus::Interrupted
+                     : mError    ? MaiTurnStatus::Failed
+                                 : MaiTurnStatus::Completed;
+    outcome.resultMessageId = mAssistant.id;
+    outcome.completed = MaiTime::getCurrentTime();
+    outcome.error =
+        interrupted ? MaiError{MaiErrorCode::Canceled, "The turn was interrupted."} : mError;
+    if (interrupted && !mError) mError = outcome.error;
+    if (cleanupFailed && outcome.error.code() == MaiErrorCode::Canceled)
+        outcome.error = {MaiErrorCode::Internal, mError.message()};
+    initial.turnId = mInitialAssistantId;
+    initial.turnOutcome = std::move(outcome);
+    mDependencies.store->putMessage(mSessionId, initial);
+    if (const auto error = mDependencies.store->lastWriteError()) {
+        mError = error;
+        return;
+    }
+    // 与普通 API 读取同一持久事实；不把事件本身当作可恢复的结果存储。
+    mDependencies.emitter->emitTurnOutcome(mSessionId, mInitialAssistantId);
 }
 
 bool MaiTurnRunner::succeeded() const {
@@ -226,7 +275,11 @@ bool MaiTurnRunner::advanceSteering(bool closeIfEmpty) {
         mError = advanced.error();
         return false;
     }
-    if (advanced.value()) mCurrentUserMessageIds = std::move(currentUserMessageIds);
+    if (advanced.value()) {
+        mCurrentUserMessageIds = std::move(currentUserMessageIds);
+        mAssistant.turnId = mInitialAssistantId;
+        if (mAssistant.id != mInitialAssistantId) mAssistant.turnOutcome.reset();
+    }
     return advanced.value();
 }
 
@@ -594,7 +647,8 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     sink.onContinuationState = [&](const MaiModelContinuationState& state) {
         if (continuationError) return;
         if (continuationPublished) {
-            continuationError = {MaiErrorCode::Protocol, "multiple continuation states for one response"};
+            continuationError = {MaiErrorCode::Protocol,
+                                 "multiple continuation states for one response"};
             return;
         }
         continuationPublished = true;
@@ -602,9 +656,9 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
         carrier.id = continuationPartId;
         carrier.created = MaiTime::getCurrentTime();
         carrier.body = MaiReasoningPart{"", state};
-        mAssistant.parts.insert(mAssistant.parts.begin() +
-                                    static_cast<std::ptrdiff_t>(mResponseFirstPart),
-                                std::move(carrier));
+        mAssistant.parts.insert(
+            mAssistant.parts.begin() + static_cast<std::ptrdiff_t>(mResponseFirstPart),
+            std::move(carrier));
         // 状态可能没有一个显示字节，不能等待文本 checkpoint 才持久化。
         mDependencies.store->putMessage(mSessionId, mAssistant);
         continuationError = mDependencies.store->lastWriteError();
@@ -621,15 +675,17 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     if (mError && continuationPublished) {
         // state 回调期间也可能 Stop，此时 wire 可拒绝交付后续调用元数据。
         // 没有任何工具进入执行，撤下本次载体而保留可见草稿，避免回放无结果的调用。
-        mAssistant.parts.erase(
-            std::remove_if(mAssistant.parts.begin(), mAssistant.parts.end(),
-                           [&](const MaiMessagePart& part) { return part.id == continuationPartId; }),
-            mAssistant.parts.end());
+        mAssistant.parts.erase(std::remove_if(mAssistant.parts.begin(), mAssistant.parts.end(),
+                                              [&](const MaiMessagePart& part) {
+                                                  return part.id == continuationPartId;
+                                              }),
+                               mAssistant.parts.end());
         mDependencies.store->putMessage(mSessionId, mAssistant);
         if (const auto writeError = mDependencies.store->lastWriteError())
             mError = writeError;
         else
-            mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mSessionId, mAssistant.id);
+            mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mSessionId,
+                                               mAssistant.id);
         calls.clear();
     }
     return calls;

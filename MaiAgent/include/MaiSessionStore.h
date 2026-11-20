@@ -90,7 +90,8 @@ public:
                                                      std::size_t limit) const = 0;
 
     // 进程重启时，上次遗留的 Pending/Running 工具调用已没有执行线程。
-    // 原子地把这些工具标为 Error，并给所属的未完成消息补 completed 时间。
+    // 原子地把这些工具标为 Error，并给所属的未完成消息补 completed 时间；
+    // 核心记录的遗留 Running 轮次（包括无工具的文本请求）标为 Interrupted。
     // 只修改符合条件的记录，不向调用方加载其他会话的完整消息；无匹配项是空操作。
     // error 是回灌给模型及界面的真实错误文本，调用方负责提供；允许与普通读并发。
     // 原 output 保留；Pending 的执行事实为 NotStarted/None，Running 则为 Unknown/Unknown，

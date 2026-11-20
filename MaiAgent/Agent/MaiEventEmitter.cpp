@@ -21,6 +21,13 @@ MaiEvent makeEvent(MaiEventType type, const std::string& sessionId) {
 
 }  // namespace
 
+void MaiEventEmitter::emitTurnOutcome(const std::string& sessionId, const std::string& turnId) {
+    MaiEvent event = makeEvent(MaiEventType::TurnOutcomeUpdated, sessionId);
+    event.turnId = turnId;
+    event.messageId = turnId;
+    mBus.publish(event);
+}
+
 void MaiEventEmitter::emitSession(MaiEventType type, const std::string& sessionId,
                                   const std::string& detail, const std::string& field) {
     MaiEvent event = makeEvent(type, sessionId);

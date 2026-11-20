@@ -33,6 +33,49 @@ MaiToolResult failed(const MaiError& error) {
     return MaiToolResult::failure(error.code(), error.message());
 }
 
+// 当前会话状态是普通查询的薄适配，不允许模型用 session_id 越界读其他对话。
+class SessionStatusTool final : public MaiTool {
+public:
+    std::string name() const override {
+        return "session_status";
+    }
+    std::string description() const override {
+        return "Read the recorded execution outcome of a turn in this conversation. "
+               "Omit turn_id for the latest turn; use its original assistant ID for an exact "
+               "read. Running, completed, failed and interrupted are distinct. This does not "
+               "start or retry any task. Legacy messages may have no recorded outcome.";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object","properties":{"turn_id":{"type":"string"}},"required":[],"additionalProperties":false})";
+    }
+    bool requiresWorkingDirectory(const std::string&) const override {
+        return false;
+    }
+    MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
+        if (!context.sessionAgent || context.sessionId.empty()) return unavailable();
+        if (context.isCanceled())
+            return MaiToolResult::failure(MaiErrorCode::Canceled, "Status read was canceled.");
+        const auto parsed = parseArguments(raw);
+        if (!parsed) return failed(parsed.error());
+        for (auto it = parsed.value().begin(); it != parsed.value().end(); ++it)
+            if (it.key() != "turn_id" || !it.value().is_string())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "Only a turn_id string is accepted.");
+        const auto outcome = context.sessionAgent->getTurnOutcome(
+            context.sessionId, parsed.value().value("turn_id", std::string{}));
+        if (!outcome) return failed(outcome.error());
+        const auto& value = outcome.value();
+        return MaiToolResult::success(Json{
+            {"turn_id", value.turnId},
+            {"status", maiTurnStatusToString(value.status)},
+            {"result_message_id", value.resultMessageId},
+            {"completed", value.completed},
+            {"error_code", maiErrorCodeToString(value.error.code())},
+            {"error",
+             value.error.message()}}.dump());
+    }
+};
+
 class ListSessionsTool final : public MaiTool {
 public:
     std::string name() const override {
@@ -595,6 +638,7 @@ std::unique_ptr<MaiTool> makeMaiCreateSessionTool(MaiSessionCreateMode mode,
 
 void registerMaiSessionTools(MaiToolRegistry& registry, bool includeWorkspaceSwitch) {
     registry.add(std::make_unique<ListSessionsTool>());
+    registry.add(std::make_unique<SessionStatusTool>());
     registry.add(std::make_unique<ConversationHistoryTool>());
     registry.add(makeMaiCreateSessionTool(MaiSessionCreateMode::InheritWorkspace));
     registry.add(std::make_unique<DeleteSessionTool>());

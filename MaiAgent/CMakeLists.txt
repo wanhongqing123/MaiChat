@@ -375,6 +375,7 @@ add_library(maiagent STATIC
   Agent/MaiError.cpp
   Agent/MaiSession.cpp
   Agent/MaiMessage.cpp
+  Agent/MaiSubAgent.cpp
   Agent/MaiSessionStore.cpp
   Agent/MaiIdGenerator.cpp
   Agent/MaiEventBus.cpp

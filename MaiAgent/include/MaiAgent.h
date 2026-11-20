@@ -284,6 +284,18 @@ public:
     // 按生成顺序。会话不存在时返回空 vector，和"会话存在但没有消息"分不开——要分清先用 getSession。
     std::vector<MaiMessage> listMessages(const std::string& sessionId) const;
 
+    // 查询核心持久化的一轮事实，可与执行并发。turnId 非空时精确读取该会话的原始
+    // assistant；空值读取最近一轮。旧消息没有记录返回 NotSupported，不猜成功。
+    // 会话/指定消息不存在返回 NotFound；存储失败返回其错误。轮内分段 ID 不能替代
+    // 初始 turnId；查询不启动任务、不改变授权、不加载所有消息正文。
+    MaiResult<MaiTurnOutcome> getTurnOutcome(const std::string& sessionId,
+                                             const std::string& turnId = {}) const;
+    MaiResult<MaiTurnOutcome> subAgentOutcome(const std::string& parentSessionId,
+                                              const std::string& childSessionId) const override;
+    MaiResult<std::string> subAgentReportForTurn(const std::string& parentSessionId,
+                                                 const std::string& childSessionId,
+                                                 const std::string& turnId) const override;
+
     // 不执行模型的外部引用上下文。begin/append 可与活动轮次并发，暂存不可见；
     // commit 要求该 Session 没有活动或启动轮次，Busy 可在轮次结束后重试。
     // seq 从 0 连续递增，同批完整相同重试幂等；每批和单条上限见 MaiContextImport.h。

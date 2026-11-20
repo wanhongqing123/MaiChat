@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <json.hpp>
+
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
@@ -85,12 +87,71 @@ std::string textColumn(sqlite3_stmt* statement, int index) {
                        static_cast<std::size_t>(sqlite3_column_bytes(statement, index)));
 }
 
+// 元数据不进入正文；使用稳定字符串而非枚举序号，旧消息无值保持未知。
+std::string turnStateJson(const MaiMessage& message) {
+    if (message.turnId.empty() && !message.turnOutcome) return {};
+    nlohmann::json state{{"turn_id", message.turnId}};
+    if (message.turnOutcome) {
+        const auto& outcome = *message.turnOutcome;
+        state["outcome"] = {{"turn_id", outcome.turnId},
+                            {"status", maiTurnStatusToString(outcome.status)},
+                            {"result_message_id", outcome.resultMessageId},
+                            {"completed", outcome.completed},
+                            {"error_code", maiErrorCodeToString(outcome.error.code())},
+                            {"error", outcome.error.message()}};
+    }
+    return state.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+void restoreTurnState(const std::string& raw, MaiMessage& message) {
+    message.turnId.clear();
+    message.turnOutcome.reset();
+    if (raw.empty()) return;
+    const auto state = nlohmann::json::parse(raw, nullptr, false);
+    if (!state.is_object() || !state.contains("turn_id") || !state["turn_id"].is_string()) return;
+    message.turnId = state["turn_id"].get<std::string>();
+    const auto value = state.value("outcome", nlohmann::json{});
+    if (!value.is_object()) return;
+    for (const char* name : {"turn_id", "status", "result_message_id", "error_code", "error"})
+        if (!value.contains(name) || !value[name].is_string()) return;
+    if (!value.contains("completed") || !value["completed"].is_number_integer()) return;
+    MaiTurnOutcome outcome;
+    outcome.turnId = value["turn_id"].get<std::string>();
+    const auto status = value["status"].get<std::string>();
+    if (status == "running")
+        outcome.status = MaiTurnStatus::Running;
+    else if (status == "completed")
+        outcome.status = MaiTurnStatus::Completed;
+    else if (status == "failed")
+        outcome.status = MaiTurnStatus::Failed;
+    else if (status == "interrupted")
+        outcome.status = MaiTurnStatus::Interrupted;
+    else
+        return;
+    bool knownCode = false;
+    for (auto code : {MaiErrorCode::Ok, MaiErrorCode::NotFound, MaiErrorCode::Busy,
+                      MaiErrorCode::InvalidInput, MaiErrorCode::NotConfigured,
+                      MaiErrorCode::Network, MaiErrorCode::RateLimited, MaiErrorCode::Protocol,
+                      MaiErrorCode::Canceled, MaiErrorCode::NotSupported, MaiErrorCode::Internal}) {
+        if (value["error_code"] == maiErrorCodeToString(code)) {
+            outcome.error = {code, value["error"].get<std::string>()};
+            knownCode = true;
+            break;
+        }
+    }
+    if (!knownCode) return;
+    outcome.resultMessageId = value["result_message_id"].get<std::string>();
+    outcome.completed = value["completed"].get<std::int64_t>();
+    message.turnOutcome = std::move(outcome);
+}
+
 // 两列仅来自同一会话已提交导入账本的 join；不从正文或普通 putMessage 输入推测来源。
 void restoreImportOrigin(sqlite3_stmt* statement, MaiMessage& message) {
     const auto sourceKey = textColumn(statement, 6);
     const auto sourceId = textColumn(statement, 7);
     if (!sourceKey.empty() && !sourceId.empty())
         message.contextImportOrigin = MaiContextImportOrigin{sourceKey, sourceId};
+    restoreTurnState(textColumn(statement, 8), message);
 }
 
 // SQLite 接口要求有效 UTF-8；逐段保留合法字节，并把非法序列替换掉，避免一条坏消息破坏整次写入。
@@ -1058,11 +1119,11 @@ public:
         // context_* 只能由导入事务建立；公开快照中的只读 origin 不参与普通写入。
         sqlite3_stmt* upsert = prepareLocked(
             "INSERT INTO messages(id, session_id, role, created, completed, input_request_id, "
-            "pending_input) "
-            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) "
+            "pending_input,turn_state) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) "
             "ON CONFLICT(id) DO UPDATE SET role=excluded.role, created=excluded.created, "
             "completed=excluded.completed, input_request_id=excluded.input_request_id, "
-            "pending_input=excluded.pending_input");
+            "pending_input=excluded.pending_input,turn_state=excluded.turn_state");
         if (upsert) {
             Reset guard(upsert);
             bindText(upsert, 1, message.id);
@@ -1072,6 +1133,7 @@ public:
             sqlite3_bind_int64(upsert, 5, message.completed);
             bindText(upsert, 6, message.inputRequestId);
             sqlite3_bind_int(upsert, 7, message.pendingInput ? 1 : 0);
+            bindText(upsert, 8, turnStateJson(message));
             executePreparedStatement(upsert);
         }
 
@@ -1192,12 +1254,15 @@ private:
         // 两个索引分开查询，隐藏的旧快照再大也不影响普通消息或当前快照的 keyset 分页。
         auto* statement = prepareLocked(
             importId.empty()
-                ? "SELECT id,role,created,completed,input_request_id,pending_input,NULL,NULL FROM "
+                ? "SELECT "
+                  "id,role,created,completed,input_request_id,pending_input,NULL,NULL,turn_state "
+                  "FROM "
                   "messages "
                   "WHERE session_id=?1 AND context_import_id IS NULL AND id<?2 ORDER BY id DESC "
                   "LIMIT ?3"
                 : "SELECT m.id,m.role,m.created,m.completed,m.input_request_id,m.pending_input,"
-                  "i.source_key,m.context_source_id FROM messages m JOIN context_imports i "
+                  "i.source_key,m.context_source_id,m.turn_state FROM messages m JOIN "
+                  "context_imports i "
                   "ON i.id=m.context_import_id AND i.session_id=m.session_id AND i.state=1 "
                   "WHERE m.context_import_id=?1 AND m.id<?2 ORDER BY m.id DESC LIMIT ?3");
         if (!statement) return false;
@@ -1283,7 +1348,8 @@ private:
 
         sqlite3_stmt* statement = prepareLocked(
             "SELECT m.id,m.role,m.created,m.completed,m.input_request_id,m.pending_input,"
-            "i.source_key,m.context_source_id FROM messages m LEFT JOIN context_imports i "
+            "i.source_key,m.context_source_id,m.turn_state FROM messages m LEFT JOIN "
+            "context_imports i "
             "ON i.id=m.context_import_id AND i.session_id=m.session_id AND i.state=1 "
             "WHERE m.session_id = ?1 AND (m.context_import_id IS NULL OR "
             "(i.id IS NOT NULL AND m.context_import_id IN "
@@ -1353,7 +1419,8 @@ public:
         std::lock_guard<std::mutex> lock(mMutex);
         sqlite3_stmt* statement = prepareLocked(
             "SELECT m.id,m.role,m.created,m.completed,m.input_request_id,m.pending_input,"
-            "i.source_key,m.context_source_id FROM messages m LEFT JOIN context_imports i "
+            "i.source_key,m.context_source_id,m.turn_state FROM messages m LEFT JOIN "
+            "context_imports i "
             "ON i.id=m.context_import_id AND i.session_id=m.session_id AND i.state=1 "
             "WHERE m.session_id = ?1 AND m.id = ?2 AND (m.context_import_id IS NULL OR "
             "(i.id IS NOT NULL AND m.context_import_id IN "
@@ -1429,6 +1496,8 @@ public:
         out.pendingInput = sqlite3_column_int(query, 5) != 0;
         // 接收凭据属于普通实时输入，复用输出对象时不能残留上一条导入消息的来源。
         out.contextImportOrigin.reset();
+        out.turnOutcome.reset();
+        out.turnId.clear();
         out.parts = readPartsLocked(out.id);
         return true;
     }
@@ -1537,6 +1606,54 @@ public:
             bindText(update, 2, entry.second);
             bindText(update, 3, entry.first);
             if (!executePreparedStatement(update)) {
+                executeTransactionStatement("ROLLBACK");
+                return;
+            }
+        }
+        // 即使没有工具，遗留的模型轮次也已失去原工作线程。只修复事实，不重发请求。
+        auto* turns = prepareLocked(
+            "SELECT id,turn_state FROM messages WHERE role=1 AND "
+            "turn_state IS NOT NULL AND turn_state<>''");
+        if (!turns) {
+            executeTransactionStatement("ROLLBACK");
+            return;
+        }
+        std::vector<std::pair<std::string, std::string>> interrupted;
+        {
+            Reset guard(turns);
+            int code;
+            while ((code = sqlite3_step(turns)) == SQLITE_ROW) {
+                MaiMessage message;
+                message.id = textColumn(turns, 0);
+                restoreTurnState(textColumn(turns, 1), message);
+                if (!message.turnOutcome || message.turnOutcome->turnId != message.id ||
+                    message.turnOutcome->status != MaiTurnStatus::Running)
+                    continue;
+                message.turnOutcome->status = MaiTurnStatus::Interrupted;
+                message.turnOutcome->completed = completedAt;
+                message.turnOutcome->error = {MaiErrorCode::Canceled, error};
+                interrupted.emplace_back(message.id, turnStateJson(message));
+            }
+            if (code != SQLITE_DONE) {
+                noteError("interrupted turn recovery read failed");
+                executeTransactionStatement("ROLLBACK");
+                return;
+            }
+        }
+        auto* updateTurn = prepareLocked(
+            "UPDATE messages SET turn_state=?1,"
+            "completed=CASE WHEN completed=0 THEN ?2 ELSE completed END "
+            "WHERE id=?3");
+        if (!updateTurn) {
+            executeTransactionStatement("ROLLBACK");
+            return;
+        }
+        for (const auto& entry : interrupted) {
+            Reset guard(updateTurn);
+            bindText(updateTurn, 1, entry.second);
+            sqlite3_bind_int64(updateTurn, 2, completedAt);
+            bindText(updateTurn, 3, entry.first);
+            if (!executePreparedStatement(updateTurn)) {
                 executeTransactionStatement("ROLLBACK");
                 return;
             }
@@ -2392,6 +2509,38 @@ MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
             sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
             sqlite3_close(database);
             return {MaiErrorCode::Internal, "cannot migrate schema to v13: " + what};
+        }
+        sqlite3_free(migrationError);
+    }
+    if (readUserVersion(database) < 14) {
+        // 写锁内复核列，兼容并发打开及保留新列的旧版本号；不推断历史轮次状态。
+        char* migrationError = nullptr;
+        bool ok = sqlite3_exec(database, "BEGIN IMMEDIATE", nullptr, nullptr, &migrationError) ==
+                  SQLITE_OK;
+        bool hasColumn = false;
+        sqlite3_stmt* columns = nullptr;
+        if (ok)
+            ok = sqlite3_prepare_v2(database, "PRAGMA table_info(messages)", -1, &columns,
+                                    nullptr) == SQLITE_OK;
+        if (ok) {
+            int code;
+            while ((code = sqlite3_step(columns)) == SQLITE_ROW)
+                hasColumn = hasColumn || textColumn(columns, 1) == "turn_state";
+            ok = code == SQLITE_DONE;
+        }
+        sqlite3_finalize(columns);
+        if (ok && !hasColumn)
+            ok = sqlite3_exec(database, "ALTER TABLE messages ADD COLUMN turn_state TEXT", nullptr,
+                              nullptr, &migrationError) == SQLITE_OK;
+        if (ok)
+            ok = sqlite3_exec(database, "PRAGMA user_version=14;COMMIT;", nullptr, nullptr,
+                              &migrationError) == SQLITE_OK;
+        if (!ok) {
+            const std::string what = migrationError ? migrationError : sqlite3_errmsg(database);
+            sqlite3_free(migrationError);
+            sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
+            sqlite3_close(database);
+            return {MaiErrorCode::Internal, "cannot migrate schema to v14: " + what};
         }
         sqlite3_free(migrationError);
     }

@@ -37,6 +37,9 @@ enum class MaiEventType {
     MessageTextCommitted,
     // 补充已在安全点消费，新 assistant 已落库；先于其 MessageUpdated 广播。
     TurnSteeringApplied,
+    // 原始轮次的结果已持久化；turnId/messageId 均为初始 assistant ID。
+    // 事件是查询通知，不把完成时间或正文存在误认为成功；详情从 getTurnOutcome 读取。
+    TurnOutcomeUpdated,
 };
 
 // 转成 "message.part.delta" 这类线上字符串。

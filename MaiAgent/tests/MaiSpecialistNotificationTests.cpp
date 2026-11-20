@@ -400,6 +400,10 @@ void testProviderCancellationIsNotReportedAsGenerationFailure() {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     CHECK(visible);
+    // 无主模型时只交付专业任务通知，不能创建永远 Running 的普通模型轮次。
+    const auto outcome = scenario.agent->getTurnOutcome(scenario.sessionId);
+    CHECK(!outcome);
+    CHECK(outcome.error().code() == MaiErrorCode::NotSupported);
 }
 
 }  // namespace

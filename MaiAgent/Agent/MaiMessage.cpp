@@ -2,6 +2,16 @@
 // 主要实现：isInProgress、text；对应公开接口中的状态和错误处理。
 #include "MaiMessage.h"
 
+const char* maiTurnStatusToString(MaiTurnStatus status) {
+    switch (status) {
+        case MaiTurnStatus::Running: return "running";
+        case MaiTurnStatus::Completed: return "completed";
+        case MaiTurnStatus::Failed: return "failed";
+        case MaiTurnStatus::Interrupted: return "interrupted";
+    }
+    return "unknown";
+}
+
 const char* maiToolStateToString(MaiToolState state) {
     switch (state) {
         case MaiToolState::Pending: return "pending";
