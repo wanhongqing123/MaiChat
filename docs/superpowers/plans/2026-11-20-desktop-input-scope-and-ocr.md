@@ -44,7 +44,9 @@ The Windows foreground-owned receiver mode was executed but returned 77 because 
 
 ## 4. Review and delivery
 
-- [ ] Review scope compliance, then code quality across both independent lanes, with no unresolved input bypass, stuck-key, path escape or OCR shape/memory issue.
-- [ ] Run only relevant regressions once after the final changes, then normal Windows build, staging smoke and actual ZIP extraction smoke under bare PATH. Keep the installed running process intact until the existing restart question receives approval.
-- [ ] Ask the Apple owner to consume exact shared headers and native contract, compile/validate Mac on its own platform and report honest permission/runtime boundaries. Do not claim iOS/Android OCR integration or Mac GUI validation from Windows tests.
-- [ ] Update `docs/diagnostics/2026-11-20-desktop-coordinate-ocr-triage.md` with RED/GREEN, exact source, artifacts and remaining target-platform limits. Coordinate the sole main commit/push and preserve all unrelated WIP.
+- [x] Review scope compliance, then code quality across both independent lanes, with no unresolved input bypass, stuck-key, path escape or OCR shape/memory issue.
+- [x] Run only relevant regressions once after the final changes, then normal Windows build, staging smoke and actual ZIP extraction smoke under bare PATH. Keep the installed running process intact until the existing restart question receives approval.
+- [x] Ask the Apple owner to consume exact shared headers and native contract, compile/validate Mac on its own platform and report honest permission/runtime boundaries. Do not claim iOS/Android OCR integration or Mac GUI validation from Windows tests.
+- [x] Update `docs/diagnostics/2026-11-20-desktop-coordinate-ocr-triage.md` with RED/GREEN, exact source, artifacts and remaining target-platform limits. Coordinate the sole main commit/push and preserve all unrelated WIP.
+
+Product source committed as `940c459ce4139bc9bd84b95423d0f56197a06ae8`. Normal Windows staging and actual ZIP extraction smoke plus packaged-runtime owned OCR probes passed. Mac native adapter and ordinary OCR compiled/tested within documented limits. Installed Windows PID 59396 was not replaced; restart confirmation remains pending, actual foreground receiver positive mode returned 77, and macOS window-image/native-frame mapping is explicitly unverified in tool metadata. These are delivery boundaries, not silently completed tests.

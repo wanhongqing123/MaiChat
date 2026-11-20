@@ -188,3 +188,35 @@ AX hit 正向均未验，不能由 pure predicate 或权限状态替代。Mac �
 
 最后的产品提交、最终 metadata 源产物及实际 ZIP 解压验证在交付回执补齐；本记录不预称
 未完成的安装或前台输入验收通过。
+
+## 最终产品提交与 ZIP 回执
+
+产品提交：`940c459ce4139bc9bd84b95423d0f56197a06ae8`，共 44 件，包含普通 OCR、
+固定模型、共享/Windows/Mac receiver、工具适配、相关测试与诊断。原 Qt gitlink 未入
+提交，其 HEAD 和完整工作区补丁 SHA 均保留。最终 Mac MM 另收口局部 CF/CGEvent
+异常 RAII，post blob `8813017973461a98872fab213d9407464f4e7466`；Root 独立窄审
+确认无遗漏释放或 double free，正常 Mac 编译/链接及 64/0 用的也是该新对象。
+资源异常路径仅静态审查，不宣传为已注入异常实测。
+
+最终 Windows exe SHA256：
+`0a6134691d0a2901bac392eccd0b8e40bd2a1ceda11595386c1980df5052c5d6`。
+正常打包脚本生成 `MaiChat-win64-v3.0.1-20261120-940c459c.zip`，236446296 字节，
+SHA256 `01fb0c96f678ef0077d2bc99efe21fd29c6363844adc6ca8bcf8a42e583a830b`。
+该文件位于 `.cache/desktop-ocr-coordinates-20261120/windows-generic-ocr-receiver/`，
+不是替换 public release/tag。
+
+staging 和真实 ZIP 解压目录分别清除 Qt 环境、仅 Windows/System32 PATH 运行
+`--smoke`，exit 均为 0（1.730/1.790 秒）。相同隔离环境、使用各目录自身 ORT DLL
+的普通自造图 OCR 探针也均 exit 0（1.927/1.798 秒）；source/build/staging/解压后的
+exe 与 runtime 哈希一致。普通探针模型来自固定仓库资产，不把它冒充 App 工具 UI
+或全新系统安装验收。最终新增 metadata 合同和 owned image 映射在实际重链产物再验
+通过，未用旧产物代替。
+
+Mac 最终源的正常 flags/libs 下 Tools/MM fresh 编译为 0（5.310/3.633 秒），完整
+App link 为 0（0.834 秒），exe 180275688 字节、SHA256
+`40ff43ff3be901cb0a16f6d00465dd8011b7b340cbd613bd793cb1bb228d4758`。
+这些为同源普通编链结果，不是新 App 安装/运行或 AX 输入正向验收；详见 Mac 专项
+记录的源、对象、归档及安全用例边界。
+
+真实供应商生成请求、外部工具执行、凭据/服务配置变更均为 0。Windows 现装进程
+仍未停止或替换，安装和前台输入正向验收边界仍如上；后续按用户的运行中更新确认处理。
