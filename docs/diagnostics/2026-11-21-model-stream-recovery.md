@@ -109,3 +109,35 @@ CLI 端到端 **all checks passed**。新增工具重规划用例也在最终工
 未发生付费请求。测试通过不能推断用户正在运行的 App 已更新。
 已有 UI/IM 消费者的协议不变；CLI 显示具体重连次数，其他宿主沿用现有活动轮次显示，
 未新增各端重连文案界面。未自动修改、停止或删除用户应用/数据/缓存。
+
+## 后续 Desktop 3.1.1 发布（2026-11-21）
+
+用户后续要求提交、推送并发布 GitHub Release。修复提交 `4e716835c` 已在远端，
+版本与 changelog 提交为 `af01f9ca2cf8fc7aa0a304f1cbc1e00b0c4da5c1`。
+annotated tag `v3.1.1` 精确指向该版本提交，不移动 `v3.1.0`。
+
+macOS 以私有 clean 源码快进到该提交，沿相同 CMAKE_HOME_DIRECTORY 正常依赖重编，
+没有移动旧 Ninja 缓存或把旧 App 改名。配置 0/10.630s、构建 0/187.090s、
+普通 package-macos.sh 打包 0/51.332s。继续使用已核验的 14.4 SDK/runtime，
+实际最终链接的静态输入及包内动态映像均通过 arm64/minOS 门禁。
+签后 staging、实际 ZIP 提取与只读 DMG 三副本的文件字节、模式、符号链接、
+strict 签名、依赖闭包、隔离裸 PATH 启动与包内 ORT 三项自有 OCR 用例均通过。
+DMG 已正常卸载，测试进程均退出；未读取用户图片、触发模型请求或改变现装/TCC。
+
+发布地址：https://github.com/wanhongqing123/MaiChat/releases/tag/v3.1.1
+Release ID `453479619`。本阶段先公开 macOS arm64 的 DMG、ZIP、manifest 和 SUMS，
+四件服务端 size/digest/uploaded 逐等，两 metadata 下载后与原件逐字节相同；
+匿名 public latest 和 UTF-8 发布说明回读均通过。
+DMG SHA256 `9a0d0a158c8cb6f4a85d5e8e7862455ee0b2a185fea09f43d689b57f0eb89cc3`；
+ZIP SHA256 `e12fdca33acddf6065338be112e7e3938b787a3e6c25f79f0aa2eb1aeda3dfcb`。
+本地完整回执位于 `/private/tmp/maichat-release-3.1.1-20261121/`。
+
+Mac 为 ad-hoc 签名、未公证，实际验包 host 为 macOS 27.2 arm64；14.4 仅为
+构建目标与静态门禁，未实机验证旧 macOS 或 Intel。未替换用户现装，未做新的
+原生 AX 输入正向或窗口图原点校准。旧 v3.1.0 的八个附件 ID/name/size/digest/state
+核验保持不变。
+
+Windows producer 在独立同源目录继续正常构建，首次编译器选择错误已有具体日志，
+随后显式使用 MSVC 14.44 配置；其 Qt 需要正常全量编译。本阶段没有 Windows 3.1.1
+附件或构建成功回执，因此 Release 标题及说明明确先提供 Mac，Windows 仍待补齐。
+producer 原有三个未合并提交和 Qt/WIP 均保留，不纳入或冒称本次发布功能。
