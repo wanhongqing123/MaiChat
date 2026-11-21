@@ -175,7 +175,45 @@ bool isReadOnlyGitCommand(const std::string& command) {
 // 有的话就不能只看第一个词了：`ls; rm -rf .` 的第一个词是 ls，但它真正干的是 rm。
 // 这种一律要审批，不管第一个词多无害。
 bool hasShellControlCharacters(const std::string& command) {
-    return command.find_first_of(";&|><`$\n") != std::string::npos;
+    // CR/C0 控制字符和 Windows 变量展开同样可能改变真实执行语义。
+    return command.find_first_of(";&|><`$%!^") != std::string::npos ||
+           std::any_of(command.begin(), command.end(),
+                       [](unsigned char c) { return (c < 32 && c != '\t') || c == 127; });
+}
+
+// 核对自动批准的程序写法，不能把任意路径或脚本剥成可信 basename。
+bool hasTrustedProgramSpelling(const std::string& command) {
+    const auto begin = command.find_first_not_of(" \t");
+    if (begin == std::string::npos) return false;
+    const auto end = command.find_first_of(" \t", begin);
+    auto token = command.substr(begin, end == std::string::npos ? end : end - begin);
+    if (token.size() >= 2 && (token.front() == '\'' || token.front() == '"') &&
+        token.back() == token.front())
+        token = token.substr(1, token.size() - 2);
+    const auto program = programOf(command);
+    if (token.find_first_of("/\\") != std::string::npos) {
+#if defined(_WIN32)
+        // Windows 路径、批处理和 UNC 不参与自动批准，仍可走普通逐次审批。
+        return false;
+#else
+        return token == "/bin/" + program || token == "/usr/bin/" + program;
+#endif
+    }
+    if (token.size() >= 4) {
+        auto extension = token.substr(token.size() - 4);
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (extension == ".cmd" || extension == ".bat") return false;
+    }
+    return token == program || token == program + ".exe";
+}
+
+bool shellCommandRequiresApproval(const std::string& command) {
+    if (command.empty() || hasShellControlCharacters(command) ||
+        !hasTrustedProgramSpelling(command))
+        return true;
+    const auto program = programOf(command);
+    return program == "git" ? !isReadOnlyGitCommand(command) : !isReadOnlyProgram(program);
 }
 
 class ShellTool final : public MaiTool {
@@ -206,14 +244,7 @@ public:
     // 这一层的兜底方向永远是「不放行」。
     bool requiresApproval(const std::string& argumentsJson) const override {
         const json args = parseArguments(argumentsJson);
-        const std::string command = commandOf(args);
-        if (command.empty()) return true;
-        if (hasShellControlCharacters(command)) return true;
-
-        const std::string program = programOf(command);
-        if (program.empty()) return true;
-        if (program == "git") return !isReadOnlyGitCommand(command);
-        return !isReadOnlyProgram(program);
+        return maiShellCommandRequiresApproval(commandOf(args));
     }
 
     // 「这个会话以后都允许」只记到**完整命令**这一级。
@@ -234,6 +265,9 @@ public:
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
         const json args = parseArguments(raw);
         const std::string command = commandOf(args);
+        if (command.find('\0') != std::string::npos)
+            return beforeStartFailure(MaiErrorCode::InvalidInput,
+                                      "The command contains a NUL byte.");
         if (command.empty()) {
             return beforeStartFailure(MaiErrorCode::InvalidInput,
                                       "the command parameter is required");
@@ -365,6 +399,10 @@ public:
 };
 
 }  // namespace
+
+bool maiShellCommandRequiresApproval(const std::string& command) {
+    return shellCommandRequiresApproval(command);
+}
 
 std::unique_ptr<MaiTool> makeMaiShellTool() {
     return std::make_unique<ShellTool>();

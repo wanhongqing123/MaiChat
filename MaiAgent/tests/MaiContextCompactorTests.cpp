@@ -237,6 +237,73 @@ void test_turn_recovers_summary_stream_before_sampling_main_response() {
     bus.unsubscribe(token);
 }
 
+// 供应商容量低于本地估计时，只进行一次强制整理；没有缩小的请求不得重发。
+void test_provider_context_rejection_forces_one_compaction() {
+    for (int mode = 0; mode < 3; ++mode) {
+        class Model final : public SummaryModel {
+        public:
+            int mainCalls = 0, summaryCalls = 0;
+            std::size_t rejected = 0;
+            int mode = 0;
+            MaiError stream(const MaiModelRequest& input, const MaiStreamSink& sink,
+                            const std::atomic<bool>& cancel) override {
+                bool summary = false;
+                for (const auto& item : input.messages)
+                    summary |= item.content.find("\"source_fragments\"") != std::string::npos;
+                if (summary) {
+                    ++summaryCalls;
+                    if (mode == 2 && summaryCalls == 1)
+                        return MaiError{MaiErrorCode::Network, "owned failed summary"}
+                            .withRetryAdvice({1, 0, -1, false});
+                    return SummaryModel::stream(input, sink, cancel);
+                }
+                ++mainCalls;
+                const auto size = estimateInputTokens(input).tokens;
+                if (mainCalls == 1) {
+                    rejected = size;
+                    return {MaiErrorCode::ContextWindowExceeded, "owned server context rejection"};
+                }
+                CHECK(size < rejected);
+                if (mode == 1) return {MaiErrorCode::ContextWindowExceeded, "still too large"};
+                sink.onText("Recovered after forced compaction.");
+                return {};
+            }
+        } model;
+        model.mode = mode;
+        model.limits = {32768, 1024};
+        auto store = makeMaiMemoryStore();
+        const auto id = newSession(*store);
+        populate(*store, id, 4);
+        auto assistant = message(MaiRole::Assistant, {});
+        assistant.parts.clear();
+        assistant.completed = 0;
+        store->putMessage(id, assistant);
+        MaiContextBuilder builder;
+        MaiEventBus bus;
+        MaiEventEmitter emitter(bus);
+        int errors = 0, compacting = 0;
+        const auto token = bus.subscribe([&](const MaiEvent& e) {
+            if (e.type == MaiEventType::SessionError) ++errors;
+            if (e.type == MaiEventType::TurnPhaseChanged && e.detail == "compacting") ++compacting;
+        });
+        MaiTurnRunner::Dependencies dependencies;
+        dependencies.store = store.get();
+        dependencies.model = &model;
+        dependencies.context = &builder;
+        dependencies.emitter = &emitter;
+        dependencies.defaultModel = "fixture";
+        MaiTurnRunner runner(dependencies, id, assistant);
+        const std::atomic<bool> cancel{false};
+        runner.run(cancel);
+        CHECK(runner.succeeded() == (mode != 1));
+        CHECK(model.mainCalls == 2);
+        CHECK(model.summaryCalls == (mode == 2 ? 2 : 1));
+        CHECK(compacting == model.summaryCalls);
+        CHECK(errors == (mode == 1 ? 1 : 0));
+        bus.unsubscribe(token);
+    }
+}
+
 void test_failed_model_draft_is_excluded_from_summary_sources() {
     auto store = makeMaiMemoryStore();
     const auto id = newSession(*store);
@@ -3771,6 +3838,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     std::puts("MaiContextCompactorTests");
+    test_provider_context_rejection_forces_one_compaction();
     test_turn_recovers_summary_stream_before_sampling_main_response();
     test_failed_model_draft_is_excluded_from_summary_sources();
     test_codex_window_defaults_do_not_reserve_the_catalog_maximum_output();

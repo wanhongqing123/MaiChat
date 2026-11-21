@@ -39,6 +39,8 @@ enum class MaiErrorCode {
     // 嵌入式上可能连文件系统都没有——对这两种情况说"没配置"会让人白找半天。
     NotSupported,
     Internal,  // 剩下的。落库失败、curl 初始化失败之类
+    // 服务方明确返回上下文超限；用于一次强制压缩恢复，不从错误文案推断。
+    ContextWindowExceeded,
 };
 
 // 转成 "not_found" 这类稳定字符串。给日志和跨进程传递用——接收方据此分支，

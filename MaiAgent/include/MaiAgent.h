@@ -258,6 +258,8 @@ public:
         int maxSubAgentDepth = 2;
         // 一棵会话树里同时开着的子 Agent 上限。收掉的不算。
         int maxOpenSubAgents = 8;
+        // 仅显式只读工具可并发；审批、交互和写操作保持独占，1 可关闭并行。
+        int maxParallelTools = 4;
     };
 
     // 三个依赖**都被接管所有权**，活到 MaiAgent 析构为止。

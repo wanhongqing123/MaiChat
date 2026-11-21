@@ -30,6 +30,7 @@ const char* maiEventTypeToString(MaiEventType type) {
         case MaiEventType::MessageTextCommitted: return "message.text.committed";
         case MaiEventType::TurnSteeringApplied: return "turn.steering.applied";
         case MaiEventType::ModelRequestRetrying: return "model.request.retrying";
+        case MaiEventType::TurnPhaseChanged: return "turn.phase.changed";
     }
     return "session.status";
 }

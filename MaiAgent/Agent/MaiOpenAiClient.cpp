@@ -20,6 +20,8 @@
 #include "MaiFileSystem.h"
 #include "MaiPathGuard.h"
 #include "MaiModelRetry.h"
+#include "MaiModelConnectionPool.h"
+#include "MaiModelHttpFraming.h"
 #include "MaiResponsesClient.h"
 
 namespace {
@@ -344,7 +346,9 @@ struct StreamCtx {
     std::string rawBody;
     std::string finishReason;
     bool sawOutput = false;
+    MaiModelHttpFraming framing;
     bool transientStreamError = false;
+    bool contextLengthError = false;
     long retryAfterSeconds = -1;
     bool done = false;
     bool manualRedirects = false;
@@ -403,6 +407,9 @@ void handleSseLine(StreamCtx& context, const std::string& line) {
         if (error.is_object()) {
             auto code = error.value("code", json{});
             if (code.is_null()) code = error.value("type", json{});
+            context.contextLengthError =
+                code.is_string() &&
+                MaiModelRetry::isContextLengthCode(code.get_ref<const std::string&>());
             context.transientStreamError =
                 code.is_string() && MaiModelRetry::isTransientProviderCode(code.get<std::string>());
         }
@@ -468,6 +475,7 @@ std::size_t headerCallback(char* bytes, std::size_t size, std::size_t count, voi
     auto& context = *static_cast<StreamCtx*>(user);
     if (count != 0 && size > SIZE_MAX / count) return 0;
     const auto length = size * count;
+    context.framing.onHeader(std::string_view(bytes, length));
     if (length >= 5 && std::memcmp(bytes, "HTTP/", 5) == 0) {
         context.retryAfterSeconds = -1;
         if (context.manualRedirects) {
@@ -508,6 +516,7 @@ std::size_t writeCallback(char* ptr, std::size_t size, std::size_t nmemb, void* 
     // 逐跳选路时，重定向正文不是供应商输出，不应推进工具或文字。
     if (context.redirectResponse) return total;
     context.responseBytes += total;
+    context.framing.received(total);
     if (total > 0) context.lastStreamActivity = std::chrono::steady_clock::now();
     // 返回不等于 total 的值会让 curl 以 CURLE_WRITE_ERROR 中断传输。取消和收到完整的
     // [DONE] 都在这里结束，不等服务端继续保持连接。
@@ -521,7 +530,8 @@ std::size_t writeCallback(char* ptr, std::size_t size, std::size_t nmemb, void* 
     context.lines.append(ptr, total);
     std::string line;
     while (context.lines.nextLine(line)) handleSseLine(context, line);
-    return context.done ? 0 : total;
+    // 精确读完实体时让 curl 正常完成以复用连接；否则仍立即结束，不等长连接关闭。
+    return context.done && !context.framing.isComplete() ? 0 : total;
 }
 
 int progressCallback(void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t uploadNow) {
@@ -614,7 +624,8 @@ public:
                         return MaiError::make(MaiErrorCode::Network,
                                               "model proxy selection failed");
                 }
-                CURL* curl = curl_easy_init();
+                auto connection = mConnections.acquire();
+                CURL* curl = static_cast<CURL*>(connection.nativeHandle());
                 if (!curl) return MaiError::make(MaiErrorCode::Internal, "curl_easy_init failed");
                 curl_slist* headers = nullptr;
                 headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -672,7 +683,7 @@ public:
                     const auto remaining = mConfig.totalTimeoutSeconds * 1000LL - elapsed;
                     if (remaining <= 0) {
                         curl_slist_free_all(headers);
-                        curl_easy_cleanup(curl);
+                        connection.finish(false);
                         // 与 curl 传输内的同一超时一致，仍由外层决定是否重试。
                         transfer = CURLE_OPERATION_TIMEDOUT;
                         break;
@@ -699,7 +710,9 @@ public:
                 lastStreamActivity = context.lastStreamActivity;
                 lastModelProgress = context.lastModelProgress;
                 curl_slist_free_all(headers);
-                curl_easy_cleanup(curl);
+                connection.finish(transfer == CURLE_OK ||
+                                  (context.done && transfer == CURLE_WRITE_ERROR &&
+                                   !cancel.load(std::memory_order_relaxed)));
                 if (!mConfig.proxyResolver || transfer != CURLE_OK || nextUrl.empty() ||
                     cancel.load(std::memory_order_relaxed))
                     break;
@@ -767,6 +780,9 @@ public:
                                                           ? transportError
                                                           : curl_easy_strerror(transfer))),
                                   canRetry);
+                if (status == 400 && MaiModelRetry::isContextLengthError(context.rawBody))
+                    return {MaiErrorCode::ContextWindowExceeded,
+                            "The provider rejected the model context length."};
                 if (status >= 400) {
                     const std::string provider = providerErrorMessage(context.rawBody);
                     std::string message = "HTTP " + std::to_string(status);
@@ -778,6 +794,8 @@ public:
                                                               : MaiErrorCode::Protocol;
                     return advise(MaiError::make(code, std::move(message)), canRetry);
                 }
+                if (context.contextLengthError)
+                    return {MaiErrorCode::ContextWindowExceeded, context.error};
                 if (!context.error.empty())
                     return advise(MaiError::make(MaiErrorCode::Protocol, context.error),
                                   context.transientStreamError);
@@ -823,19 +841,33 @@ private:
             return {MaiErrorCode::InvalidInput,
                     "image exceeds the 2 MB model request budget; resize it before retrying"};
         const std::string key = workspace + "\n" + source;
+        const auto path = MaiFilePath::fromUtf8(source);
+        MaiRegularFileInfo before;
+        const bool known = MaiFileSystem::regularFileInfo(path, before);
+        const auto same = [](const MaiRegularFileInfo& a, const MaiRegularFileInfo& b) {
+            return a.bytes == b.bytes && a.modified == b.modified && a.identity == b.identity;
+        };
         std::lock_guard<std::mutex> lock(mPreviewMutex);
         const auto existing = mPreviewCache.find(key);
-        if (existing != mPreviewCache.end() &&
-            MaiFileSystem::exists(MaiFilePath::fromUtf8(existing->second)))
-            return existing->second;
+        if (known && existing != mPreviewCache.end() && same(before, existing->second.first) &&
+            MaiFileSystem::exists(MaiFilePath::fromUtf8(existing->second.second)))
+            return existing->second.second;
+        mPreviewCache.erase(key);
         MaiResult<std::string> result = mConfig.prepareImage(source, workspace);
-        if (result) mPreviewCache[key] = result.value();
+        MaiRegularFileInfo after;
+        // 跨请求复用必须核对真实文件身份；生成期间改变或无法确认的来源不能缓存。
+        // 长寿命客户端限制缓存条目，不能因历史附件无限增长。
+        if (result && known && MaiFileSystem::regularFileInfo(path, after) && same(before, after)) {
+            if (mPreviewCache.size() >= 64) mPreviewCache.clear();
+            mPreviewCache[key] = {after, result.value()};
+        }
         return result;
     }
 
     MaiModelConfig mConfig;
+    MaiModelConnectionPool mConnections;
     std::mutex mPreviewMutex;
-    std::unordered_map<std::string, std::string> mPreviewCache;
+    std::unordered_map<std::string, std::pair<MaiRegularFileInfo, std::string>> mPreviewCache;
 };
 
 struct CurlGlobal {

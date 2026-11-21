@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <set>
+#include <mutex>
+#include <map>
 #include <utility>
 
 #include "MaiOpenAiClient.h"
@@ -42,7 +44,7 @@ public:
                     "The selected model is not in the route directory."};
         // 只读取已选供应商的凭据，不尝试其余路由；失败不能改变模型、会话或供应商。
         MaiModelConfig config = route->config;
-        std::unique_ptr<MaiModelClient> client;
+        std::shared_ptr<MaiModelClient> client;
         try {
             if (route->clientFactory) {
                 client = route->clientFactory();
@@ -50,10 +52,24 @@ public:
                 if (route->apiKeyProvider) config.apiKey = route->apiKeyProvider();
                 if (config.apiKey.empty() || config.apiKey.size() > 8192 ||
                     config.apiKey.find_first_of("\r\n") != std::string::npos ||
-                    config.apiKey.find('\0') != std::string::npos)
+                    config.apiKey.find('\0') != std::string::npos) {
+                    std::lock_guard<std::mutex> lock(mClientsMutex);
+                    mClients.erase(route);
                     return {MaiErrorCode::NotConfigured,
                             "The selected provider credential is unavailable."};
-                client = makeMaiModelClient(std::move(config));
+                }
+                // 凭据每次仍由宿主读取；同一路由同凭据复用客户端及连接池。
+                // 新凭据/退出登录丢弃旧缓存，已在途请求仅持有自己的 shared_ptr。
+                std::lock_guard<std::mutex> lock(mClientsMutex);
+                auto& cached = mClients[route];
+                if (!cached.client || cached.credential != config.apiKey) {
+                    const auto credential = config.apiKey;
+                    auto replacement = makeMaiModelClient(std::move(config));
+                    // 构造成功后才一起替换，异常不能把旧客户端标记成新凭据。
+                    cached.credential = credential;
+                    cached.client = std::move(replacement);
+                }
+                client = cached.client;
             }
         } catch (...) {
             return {MaiErrorCode::NotConfigured, "The selected provider could not be configured."};
@@ -85,6 +101,12 @@ public:
     }
 
 private:
+    struct CachedClient {
+        std::string credential;
+        std::shared_ptr<MaiModelClient> client;
+    };
+    std::mutex mClientsMutex;
+    std::map<const MaiModelRoute*, CachedClient> mClients;
     void reject(const char* reason) {
         if (!mError) mError = {MaiErrorCode::InvalidInput, reason};
     }

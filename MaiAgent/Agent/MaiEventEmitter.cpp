@@ -49,6 +49,14 @@ void MaiEventEmitter::emitTurnIdle(const std::string& sessionId, const std::stri
     mBus.publish(event);
 }
 
+void MaiEventEmitter::emitTurnPhase(const std::string& sessionId, const std::string& turnId,
+                                    MaiTurnPhase phase) {
+    MaiEvent event = makeEvent(MaiEventType::TurnPhaseChanged, sessionId);
+    event.turnId = turnId;
+    event.detail = maiTurnPhaseToString(phase);
+    mBus.publish(event);
+}
+
 void MaiEventEmitter::emitModelRetry(const std::string& sessionId, const std::string& turnId,
                                      int retry, int limit, long delayMs) {
     MaiEvent event = makeEvent(MaiEventType::ModelRequestRetrying, sessionId);

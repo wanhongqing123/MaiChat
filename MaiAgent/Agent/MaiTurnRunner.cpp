@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <chrono>
 #include <exception>
+#include <future>
+#include "MaiThread.h"
 #include <map>
 #include <tuple>
 #include <utility>
@@ -19,6 +21,7 @@
 #include "MaiIdGenerator.h"
 #include "MaiContextCompactor.h"
 #include "MaiModelRetry.h"
+#include "MaiToolCallValidation.h"
 
 namespace {
 
@@ -156,8 +159,7 @@ MaiObservedToolBatch observeToolBatch(const std::vector<MaiMessagePart>& parts,
 
 MaiTurnRunner::MaiTurnRunner(Dependencies dependencies, std::string sessionId, MaiMessage assistant)
     : mDependencies(std::move(dependencies)),
-      mSessionId(std::move(sessionId)),
-      mInitialAssistantId(assistant.id),
+      mContext{std::move(sessionId), assistant.id, {}, {}, {}},
       mAssistant(std::move(assistant)) {}
 
 void MaiTurnRunner::run(const std::atomic<bool>& cancel) {
@@ -182,7 +184,7 @@ void MaiTurnRunner::run(const std::atomic<bool>& cancel) {
         unexpected("unexpected input cleanup failure");
     }
     const MaiError cleanupError =
-        mDependencies.tools ? mDependencies.tools->finishTurn(mSessionId, mInitialAssistantId)
+        mDependencies.tools ? mDependencies.tools->finishTurn(mContext.sessionId, mContext.turnId)
                             : MaiError{};
     if (cleanupError) {
         const std::string detail = "tool turn cleanup failed: " + cleanupError.message();
@@ -201,7 +203,8 @@ void MaiTurnRunner::run(const std::atomic<bool>& cancel) {
         cancel.load(std::memory_order_relaxed) || mError.code() == MaiErrorCode::Canceled;
     if (mError && (!canceled || cleanupError)) {
         try {
-            mDependencies.emitter->emitTurnError(mSessionId, mInitialAssistantId, mError.message());
+            mDependencies.emitter->emitTurnError(mContext.sessionId, mContext.turnId,
+                                                 mError.message());
         } catch (const std::exception& error) {
             // 错误订阅方也可能抛异常，不能越过线程入口造成整个宿主 terminate。
             unexpected(std::string("unexpected error notification failure: ") + error.what());
@@ -241,30 +244,31 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
     }
 
     MaiSession session;
-    if (!mDependencies.store->getSession(mSessionId, session)) {
+    if (!mDependencies.store->getSession(mContext.sessionId, session)) {
         mError = MaiError::make(MaiErrorCode::NotFound, "session not found");
         return;
     }
-    mWorkingDirectory = session.directory;
+    mContext.workingDirectory = session.directory;
 
-    mModelName = session.model.empty() ? mDependencies.defaultModel : session.model;
-    mReasoningEffort =
+    mContext.model = session.model.empty() ? mDependencies.defaultModel : session.model;
+    mContext.reasoningEffort =
         session.reasoningEffort.empty()
             ? (mDependencies.reasoningEffortProvider ? mDependencies.reasoningEffortProvider()
                                                      : mDependencies.reasoningEffort)
             : session.reasoningEffort;
     // 宿主/旧会话可带入另一型号的已知档位；只归一请求快照，不改写继承偏好。
-    mReasoningEffort = maiNormalizeReasoningEffortForModel(mModelName, mReasoningEffort);
-    if (!maiIsValidReasoningEffortForModel(mModelName, mReasoningEffort)) {
+    mContext.reasoningEffort =
+        maiNormalizeReasoningEffortForModel(mContext.model, mContext.reasoningEffort);
+    if (!maiIsValidReasoningEffortForModel(mContext.model, mContext.reasoningEffort)) {
         mError = {MaiErrorCode::InvalidInput, "Unsupported reasoning effort."};
         return;
     }
     if (!mDependencies.specialistReply.empty()) {
-        const auto history = mDependencies.store->listMessages(mSessionId);
+        const auto history = mDependencies.store->listMessages(mContext.sessionId);
         const auto pending = mDependencies.pendingSteering ? mDependencies.pendingSteering()
                                                            : std::vector<std::string>{};
         for (const MaiMessage& message : history) {
-            if (message.id != mInitialAssistantId &&
+            if (message.id != mContext.turnId &&
                 std::find(pending.begin(), pending.end(), message.id) == pending.end())
                 mSpecialistHistoryIds.insert(message.id);
         }
@@ -368,16 +372,16 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
     // 上下文压缩也属于本次采样；摘要失败必须回到同一恢复预算，避免适配器叠加重试。
     request.callerManagesRetries = true;
     // 沿用持久会话身份；每轮/工具跟进/补答不得创建新的缓存路由身份。
-    request.sessionId = mSessionId;
+    request.sessionId = mContext.sessionId;
     request.model = modelName;
     const auto capability = maiCloudModelInfo(modelName);
     if (capability && capability->supportsReasoningEffort)
-        request.reasoningEffort = mReasoningEffort;
+        request.reasoningEffort = mContext.reasoningEffort;
     request.baseInstructions = mDependencies.baseInstructions;
 
     // 历史里那条正在写的 assistant 消息，
     // 要用内存中最新的版本——存储里的那份可能还没包含刚执行完的工具结果。
-    auto history = mDependencies.store->listMessages(mSessionId);
+    auto history = mDependencies.store->listMessages(mContext.sessionId);
     if (mDependencies.pendingSteering) {
         const auto pending = mDependencies.pendingSteering();
         history.erase(std::remove_if(history.begin(), history.end(),
@@ -469,7 +473,7 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
         messages.insert(messages.end(), current.begin(), current.end());
         return messages;
     };
-    request.workingDirectory = mWorkingDirectory;
+    request.workingDirectory = mContext.workingDirectory;
     const auto buildContext = [&](std::size_t firstMessage, std::size_t firstPart,
                                   const std::string& preservedUserMessageId) {
         auto messages = buildHistory(firstMessage, firstPart, preservedUserMessageId);
@@ -483,17 +487,22 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
     };
 
     if (includeTools && mDependencies.tools && !mDependencies.tools->isEmpty())
-        request.tools = mDependencies.tools->specs(mModelName);
+        request.tools = mDependencies.tools->specs(mContext.model);
     MaiContextCompactor::Options options;
     options.estimateMultiplier = mContextEstimateMultiplier;
     options.deferUntilHardLimit = mCompactionDeferred;
+    options.force = mForceCompaction;
+    options.onCompactionStarted = [this] {
+        mDependencies.emitter->emitTurnPhase(mContext.sessionId, mContext.turnId,
+                                             MaiTurnPhase::Compacting);
+    };
     // 注册名和真实请求声明均需存在，且工具上下文绑定本会话门面；不能用回答提示猜能力。
     options.allowHistoryIndexRecovery =
         mDependencies.sessionAgent &&
         std::any_of(request.tools.begin(), request.tools.end(),
                     [](const MaiToolSpec& tool) { return tool.name == "session_history"; });
     const auto prepared = MaiContextCompactor(options).prepare(
-        *mDependencies.store, *mDependencies.model, *mDependencies.context, mSessionId,
+        *mDependencies.store, *mDependencies.model, *mDependencies.context, mContext.sessionId,
         sourceHistory, std::move(request), cancel, buildContext);
     if (!prepared) return prepared.error();
     if (prepared.value().advancedCheckpoint)
@@ -508,6 +517,9 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestWithRecovery(bool includeTo
                                                                   const char* finalAnswerHint) {
     int retries = 0;
     int retryLimit = -1;
+    bool contextRecoveryAttempted = false;
+    std::size_t rejectedInputTokens = 0;
+    MaiError contextError;
     for (;;) {
         if (cancel.load(std::memory_order_relaxed)) {
             mError = {MaiErrorCode::Canceled, "canceled by user"};
@@ -516,13 +528,33 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestWithRecovery(bool includeTo
         // 重连期间接受的补充必须先消费，不能继续发送第一次捕获的旧请求体。
         advanceSteering(false);
         if (mError) return {};
-        auto built = buildRequest(mModelName, false, includeTools, cancel, finalAnswerHint);
+        mDependencies.emitter->emitTurnPhase(mContext.sessionId, mContext.turnId,
+                                             MaiTurnPhase::PreparingContext);
+        const bool forced = mForceCompaction;
+        auto built = buildRequest(mContext.model, false, includeTools, cancel, finalAnswerHint);
+        mForceCompaction = forced && !built;
+        if (forced && built &&
+            mDependencies.model->estimateInputTokens(built.value()).tokens >= rejectedInputTokens) {
+            // 没有严格缩小就不能重新发送已被拒绝的请求，避免容量错误无限循环。
+            mError = contextError;
+            return {};
+        }
         std::vector<MaiToolInvocation> calls;
         if (!built)
             mError = built.error();
         else
             calls = requestCompletion(built.value(), cancel);
         if (!mError) return calls;
+        if (built && mError.code() == MaiErrorCode::ContextWindowExceeded &&
+            !contextRecoveryAttempted) {
+            contextRecoveryAttempted = true;
+            rejectedInputTokens = mDependencies.model->estimateInputTokens(built.value()).tokens;
+            contextError = mError;
+            mForceCompaction = true;
+            mCompactionDeferred = false;
+            mError = {};
+            continue;
+        }
         const auto advice = mError.retryAdvice();
         if (!advice || cancel.load(std::memory_order_relaxed)) return {};
         if (retryLimit < 0) retryLimit = advice->maxRetries;
@@ -530,8 +562,10 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestWithRecovery(bool includeTo
         if (retries >= retryLimit) return {};
         const long delay = MaiModelRetry::delayMilliseconds(*advice, retries);
         ++retries;
-        mDependencies.emitter->emitModelRetry(mSessionId, mInitialAssistantId, retries, retryLimit,
-                                              delay);
+        mDependencies.emitter->emitTurnPhase(mContext.sessionId, mContext.turnId,
+                                             MaiTurnPhase::Recovering);
+        mDependencies.emitter->emitModelRetry(mContext.sessionId, mContext.turnId, retries,
+                                              retryLimit, delay);
         const auto retryAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay);
         for (;;) {
             const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
@@ -623,7 +657,8 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
         }
         mText.append(chunk);
         checkpointStreamedParts(false);
-        mDependencies.emitter->emitDelta(mSessionId, mAssistant.id, mTextPartId, "text", chunk);
+        mDependencies.emitter->emitDelta(mContext.sessionId, mAssistant.id, mTextPartId, "text",
+                                         chunk);
     };
     // 终止快照可补足较早的 item，不能把它的后缀写进当前最后一段正文。
     sink.onTextItemDelta = [&](const MaiModelTextItem& item, std::string_view chunk) {
@@ -637,8 +672,8 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
         }
         mReasoning.append(chunk);
         checkpointStreamedParts(false);
-        mDependencies.emitter->emitDelta(mSessionId, mAssistant.id, mReasoningPartId, "text",
-                                         chunk);
+        mDependencies.emitter->emitDelta(mContext.sessionId, mAssistant.id, mReasoningPartId,
+                                         "text", chunk);
     };
     sink.onContinuationState = [&](const MaiModelContinuationState& state) {
         if (continuationError) return;
@@ -656,18 +691,22 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
             mAssistant.parts.begin() + static_cast<std::ptrdiff_t>(mResponseFirstPart),
             std::move(carrier));
         // 状态可能没有一个显示字节，不能等待文本 checkpoint 才持久化。
-        mDependencies.store->putMessage(mSessionId, mAssistant);
+        mDependencies.store->putMessage(mContext.sessionId, mAssistant);
         continuationError = mDependencies.store->lastWriteError();
         if (!continuationError)
-            mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId,
-                                            mAssistant.id, continuationPartId, mInitialAssistantId);
+            mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mContext.sessionId,
+                                            mAssistant.id, continuationPartId, mContext.turnId);
     };
     sink.onToolCall = [&](const MaiToolInvocation& call) {
         if (!continuationError) calls.push_back(call);
     };
 
+    mDependencies.emitter->emitTurnPhase(mContext.sessionId, mContext.turnId,
+                                         MaiTurnPhase::Sampling);
     const auto streamError = mDependencies.model->stream(request, sink, cancel);
     mError = continuationError ? continuationError : streamError;
+    // 先核对整批身份，避免同一 callId 的两个操作已经执行后才发现无法配对结果。
+    if (!mError) mError = MaiToolCallValidation::validateBatch(calls);
     // 尾部先写入同一 part。只有完整成功尝试才转成可供模型/摘要使用的历史。
     commitStreamedParts();
     // 持久化失败不是模型网络故障，不能沿用断流恢复建议而继续采样。
@@ -675,7 +714,7 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     if (!mError && !cancel.load(std::memory_order_relaxed)) {
         for (std::size_t index = mResponseFirstPart; index < mAssistant.parts.size(); ++index)
             mAssistant.parts[index].modelDraft = false;
-        mDependencies.store->putMessage(mSessionId, mAssistant);
+        mDependencies.store->putMessage(mContext.sessionId, mAssistant);
         if (const auto error = mDependencies.store->lastWriteError()) {
             mError = error;
             for (std::size_t index = mResponseFirstPart; index < mAssistant.parts.size(); ++index)
@@ -690,11 +729,11 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
                                                   return part.id == continuationPartId;
                                               }),
                                mAssistant.parts.end());
-        mDependencies.store->putMessage(mSessionId, mAssistant);
+        mDependencies.store->putMessage(mContext.sessionId, mAssistant);
         if (const auto writeError = mDependencies.store->lastWriteError())
             mError = writeError;
         else
-            mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mSessionId,
+            mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mContext.sessionId,
                                                mAssistant.id);
         calls.clear();
     }
@@ -705,14 +744,13 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
 // 未执行项仍保留原 callId 和明确回执，模型才能先看到新指令再决定是否重新调用。
 void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
                                  const std::atomic<bool>& cancel) {
-    MaiSession session;
-    mDependencies.store->getSession(mSessionId, session);
-
+    mDependencies.emitter->emitTurnPhase(mContext.sessionId, mContext.turnId,
+                                         MaiTurnPhase::ExecutingTools);
     MaiToolContext context;
-    context.sessionId = mSessionId;
-    context.turnId = mInitialAssistantId;
-    context.model = mModelName;
-    context.root = session.directory;
+    context.sessionId = mContext.sessionId;
+    context.turnId = mContext.turnId;
+    context.model = mContext.model;
+    context.root = mContext.workingDirectory;
     context.fileAccessRoot = mDependencies.fileAccessRoot;
     context.allowOutsideWorkingDirectory = mDependencies.allowOutsideWorkingDirectory;
     context.decodeText = mDependencies.decodeText;
@@ -725,7 +763,7 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
     context.messageId = mAssistant.id;
     // 广播是在这儿绑的，而不是让工具自己去碰事件总线：工具层不该认识事件。
     MaiEventEmitter* emitter = mDependencies.emitter;
-    const std::string sessionId = mSessionId;
+    const std::string sessionId = mContext.sessionId;
     context.announceQuestion = [emitter, sessionId](const MaiQuestionRequest& request) {
         if (emitter != nullptr) emitter->emitQuestion(sessionId, request);
     };
@@ -747,7 +785,22 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
     const char* canceledHint =
         "This tool was not executed because the task was canceled. Do not retry it automatically.";
 
-    for (const auto& call : calls) {
+    for (std::size_t callIndex = 0; callIndex < calls.size(); ++callIndex) {
+        const auto& call = calls[callIndex];
+        if (!replan && !hasPendingInput() && !cancel.load(std::memory_order_relaxed) &&
+            mDependencies.maxParallelTools > 1 && isParallelCall(call, context)) {
+            const auto limit =
+                std::min(calls.size(), callIndex + static_cast<std::size_t>(std::clamp(
+                                                       mDependencies.maxParallelTools, 1, 8)));
+            auto end = callIndex + 1;
+            while (end < limit && isParallelCall(calls[end], context)) ++end;
+            if (end > callIndex + 1) {
+                executeParallelTools(calls, callIndex, end, context, cancel, resultImages);
+                if (mError) return;
+                callIndex = end - 1;
+                continue;
+            }
+        }
         if (!preserveCallPairing && cancel.load(std::memory_order_relaxed)) break;
         // 已捕获的整批调用都需要回执。Stop 只阻止执行，不能留下 raw output 中
         // 没有 function_call_output 的尾部调用；这些占位明确记为从未启动。
@@ -768,7 +821,7 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         // 要审批的工具先挂在 Pending：界面靠这个状态显示"等待授权"，
         // 不用另外对着 permission.asked 事件维护一张表。
         MaiTool* tool = mDependencies.tools
-                            ? mDependencies.tools->findForModel(call.name, mModelName)
+                            ? mDependencies.tools->findForModel(call.name, mContext.model)
                             : nullptr;
         const bool needsApproval = !replan && toolNeedsApproval(call);
         body.state = replan          ? MaiToolState::Canceled
@@ -783,9 +836,13 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         // 顺序反了会有个不容易发现的洞：事件说"有个 part 更新了"，
         // 界面拿着这个 id 去 /message 拉全量，却什么都拉不到——因为那时还没入库。工具跑几秒是常事，
         // 等授权更是以分钟计，这个窗口期足够用户刷新一次。
-        mDependencies.store->putMessage(mSessionId, mAssistant);
-        mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId, mAssistant.id,
-                                        part.id, mInitialAssistantId);
+        mDependencies.store->putMessage(mContext.sessionId, mAssistant);
+        if (const auto error = mDependencies.store->lastWriteError()) {
+            mError = error;
+            return;
+        }
+        mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mContext.sessionId,
+                                        mAssistant.id, part.id, mContext.turnId);
 
         MaiToolResult result;
         bool enteredExecution = false;
@@ -802,12 +859,14 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
             MaiTool* publicTool =
                 mDependencies.tools ? mDependencies.tools->findForModel(call.name) : nullptr;
             result =
-                publicTool && !publicTool->isAvailableForModel(mModelName)
+                publicTool && !publicTool->isAvailableForModel(mContext.model)
                     ? MaiToolResult::failure(
                           MaiErrorCode::NotSupported,
                           "tool \"" + call.name + "\" is unavailable for the current primary model")
                     : MaiToolResult::failure(MaiErrorCode::NotFound,
                                              "no tool named \"" + call.name + "\" is registered");
+        } else if (const auto invalid = MaiToolCallValidation::validateArguments(call)) {
+            result = MaiToolResult::failure(invalid.code(), invalid.message());
         } else if (context.root.empty() && tool->requiresWorkingDirectory(call.arguments)) {
             // 文件工具仍然必须有显式工作目录；纯清理调用可由工具声明独立执行，
             // 例如会话尚无工作区时也能释放进程中的常驻采集资源。
@@ -841,81 +900,24 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
                     }
                     running.state = MaiToolState::Running;
                     running.execution = execution;
-                    mDependencies.store->putMessage(mSessionId, mAssistant);
+                    mDependencies.store->putMessage(mContext.sessionId, mAssistant);
+                    if (const auto error = mDependencies.store->lastWriteError()) {
+                        mError = error;
+                        return;
+                    }
                     if (needsApproval)
                         mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated,
-                                                        mSessionId, mAssistant.id, part.id,
-                                                        mInitialAssistantId);
+                                                        mContext.sessionId, mAssistant.id, part.id,
+                                                        mContext.turnId);
                     enteredExecution = true;
                     result = tool->execute(call.arguments, context);
                 }
             }
         }
 
-        auto& stored = std::get<MaiToolPart>(mAssistant.parts.back().body);
-        stored.execution = result.execution();
-        if (!stored.execution && result.hasError()) {
-            if (enteredExecution) {
-                // 查询期间任务表可能被工具/后台更新为终态；新的可信状态优先于进入前快照。
-                if (const auto latest = acceptedTaskExecution(call, context))
-                    knownTaskExecution = latest;
-            }
-            MaiToolExecution execution = knownTaskExecution ? *knownTaskExecution
-                                         : enteredExecution ? MaiToolExecution{}
-                                                            : notStartedExecution();
-            if (enteredExecution && !knownTaskExecution)
-                execution.nextAction = MaiToolNextAction::InspectState;
-            if (result.error().code() == MaiErrorCode::Canceled) {
-                execution.canceled = true;
-                if (!enteredExecution) {
-                    execution.nextAction = MaiToolNextAction::AskUser;
-                } else if (execution.status == MaiToolExecutionStatus::Completed) {
-                    execution.nextAction = MaiToolNextAction::None;
-                    execution.recoveryTool.clear();
-                } else if (!knownTaskExecution ||
-                           execution.nextAction == MaiToolNextAction::QueryStatus) {
-                    execution.status = MaiToolExecutionStatus::Canceled;
-                    execution.nextAction = MaiToolNextAction::InspectState;
-                }
-            } else if (enteredExecution) {
-                const auto error = nlohmann::json::parse(result.error().message(), nullptr, false);
-                if (knownTaskExecution && execution.status == MaiToolExecutionStatus::Unknown &&
-                    execution.nextAction == MaiToolNextAction::QueryStatus && error.is_object() &&
-                    error.value("code", nlohmann::json{}) == "task_failed") {
-                    // 已验证任务归属后，供应商工具的结构化 task_failed 是生成终态，
-                    // 与 provider_error 的查询连接故障不同；原始错误文本仍逐字保留。
-                    execution.status = MaiToolExecutionStatus::Failed;
-                    execution.nextAction = MaiToolNextAction::None;
-                    execution.recoveryTool.clear();
-                }
-            }
-            stored.execution = std::move(execution);
-        }
-        if (result.isTruncated()) {
-            if (!stored.execution) {
-                MaiToolExecution execution;
-                execution.status = MaiToolExecutionStatus::Completed;
-                execution.nextAction = MaiToolNextAction::InspectState;
-                stored.execution = std::move(execution);
-            }
-            stored.execution->outputTruncated = true;
-        }
-        if (result.hasError()) {
-            stored.state = result.error().code() == MaiErrorCode::Canceled ? MaiToolState::Canceled
-                                                                           : MaiToolState::Error;
-            stored.error = result.error().message();
-            // 错误也要回灌给模型——它需要知道失败了才能换个做法。
-            stored.output = result.error().message();
-        } else {
-            stored.state = MaiToolState::Completed;
-            stored.output = result.output();
-
-            resultImages.insert(resultImages.end(), result.images().begin(), result.images().end());
-        }
-        // 每执行完一个工具就落一次库：工具可能跑很久，中途崩了不该丢掉已完成的部分。
-        mDependencies.store->putMessage(mSessionId, mAssistant);
-        mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId, mAssistant.id,
-                                        part.id, mInitialAssistantId);
+        completeToolCall(mAssistant.parts.size() - 1, call, context, result, enteredExecution,
+                         knownTaskExecution, resultImages);
+        if (mError) return;
     }
 
     // 一次模型响应可能同时请求多个工具。各 MaiToolPart 要相邻保存，方便上下文构造器
@@ -929,14 +931,203 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
             imagePart.body = MaiImagePart{image.path, image.mimeType};
             mAssistant.parts.push_back(std::move(imagePart));
         }
-        mDependencies.store->putMessage(mSessionId, mAssistant);
+        mDependencies.store->putMessage(mContext.sessionId, mAssistant);
+        if (const auto error = mDependencies.store->lastWriteError()) {
+            mError = error;
+            return;
+        }
         // 图片先持久化，再立即通知界面与绑定输出，不等待下一次模型响应或整轮工具结束。
         // 宿主只按准确 ID 读取 typed part，不把任意工具 JSON 中的路径当作媒体。
         for (auto index = firstImage; index < mAssistant.parts.size(); ++index)
-            mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId,
+            mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mContext.sessionId,
                                             mAssistant.id, mAssistant.parts[index].id,
-                                            mInitialAssistantId);
+                                            mContext.turnId);
     }
+}
+
+// 独占准入不能仅依据审批模式：Never 也不会把写操作升级成并行只读。
+bool MaiTurnRunner::isParallelCall(const MaiToolInvocation& call,
+                                   const MaiToolContext& context) const {
+    const auto* tool = mDependencies.tools
+                           ? mDependencies.tools->findForModel(call.name, mContext.model)
+                           : nullptr;
+    return tool && tool->executionMode() == MaiToolExecutionMode::ParallelReadOnly &&
+           !MaiToolCallValidation::validateArguments(call) &&
+           (!context.root.empty() || !tool->requiresWorkingDirectory(call.arguments)) &&
+           !tool->requiresApproval(call.arguments) &&
+           !tool->requiresPerCallApproval(call.arguments) &&
+           !tool->requiresPaidApproval(call.arguments);
+}
+
+void MaiTurnRunner::executeParallelTools(const std::vector<MaiToolInvocation>& calls,
+                                         std::size_t begin, std::size_t end,
+                                         const MaiToolContext& baseContext,
+                                         const std::atomic<bool>& cancel,
+                                         std::vector<MaiToolImage>& images) {
+    struct Pending {
+        std::size_t partIndex = 0;
+        MaiToolContext context;
+        std::future<MaiToolResult> future;
+        MaiToolResult result;
+        bool entered = false;
+    };
+    std::vector<Pending> pending;
+    pending.reserve(end - begin);
+    for (auto i = begin; i < end; ++i) {
+        MaiMessagePart part;
+        part.id = MaiIdGenerator::newPartId();
+        part.created = MaiTime::getCurrentTime();
+        MaiToolPart tool;
+        tool.tool = calls[i].name;
+        tool.callId = calls[i].id;
+        tool.input = calls[i].arguments;
+        tool.state = MaiToolState::Running;
+        MaiToolExecution execution;
+        execution.status = MaiToolExecutionStatus::Running;
+        execution.nextAction = MaiToolNextAction::InspectState;
+        tool.execution = execution;
+        part.body = std::move(tool);
+        Pending work;
+        work.partIndex = mAssistant.parts.size();
+        work.context = baseContext;
+        work.context.partId = part.id;
+        work.context.callId = calls[i].id;
+        pending.push_back(std::move(work));
+        mAssistant.parts.push_back(std::move(part));
+    }
+    // 先保存整组占位/未知执行事实；磁盘拒绝时不能启动任何成员。
+    mDependencies.store->putMessage(mContext.sessionId, mAssistant);
+    if (const auto error = mDependencies.store->lastWriteError()) {
+        mError = error;
+        return;
+    }
+    for (const auto& work : pending)
+        mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mContext.sessionId,
+                                        mAssistant.id, work.context.partId, mContext.turnId);
+    bool stopped = false;
+    for (std::size_t i = 0; i < pending.size(); ++i) {
+        auto& work = pending[i];
+        stopped = stopped || cancel.load(std::memory_order_relaxed) ||
+                  (mDependencies.pendingSteering && !mDependencies.pendingSteering().empty());
+        if (stopped) {
+            work.result = MaiToolResult::failure(
+                MaiErrorCode::Canceled,
+                "This tool was not started because the turn was canceled or new input arrived.");
+            continue;
+        }
+        const auto call = calls[begin + i];
+        auto* tool = mDependencies.tools->findForModel(call.name, mContext.model);
+        // 占位事件可触发宿主更新可用性；启动前再核对，不能解引用已撤销的工具。
+        if (!tool || !isParallelCall(call, work.context)) {
+            work.result = MaiToolResult::failure(
+                MaiErrorCode::NotSupported,
+                "The tool became unavailable or requires exclusive admission before execution.");
+            continue;
+        }
+        try {
+            // std::future 的析构也会等待 async 任务；异常出口不得遗留访问本轮的后台线程。
+            work.future = std::async(std::launch::async, [tool, call, context = work.context] {
+                MaiThread::setCurrentName("mai-read-tool");
+                try {
+                    return tool->execute(call.arguments, context);
+                } catch (const std::exception& error) {
+                    return MaiToolResult::failure(
+                        MaiErrorCode::Internal,
+                        std::string("Tool execution failed: ") + error.what());
+                } catch (...) {
+                    return MaiToolResult::failure(MaiErrorCode::Internal, "Tool execution failed.");
+                }
+            });
+            work.entered = true;
+        } catch (...) {
+            stopped = true;
+            work.result =
+                MaiToolResult::failure(MaiErrorCode::Internal, "Unable to start tool worker.");
+        }
+    }
+    // 排空所有已启动工作，结果/图片维持模型调用顺序；随后才允许独占工具或恢复请求。
+    for (std::size_t i = 0; i < pending.size(); ++i) {
+        auto& work = pending[i];
+        if (work.future.valid()) work.result = work.future.get();
+        completeToolCall(work.partIndex, calls[begin + i], work.context, work.result, work.entered,
+                         {}, images);
+        if (mError) return;
+    }
+}
+
+void MaiTurnRunner::completeToolCall(std::size_t partIndex, const MaiToolInvocation& call,
+                                     const MaiToolContext& context, const MaiToolResult& result,
+                                     bool enteredExecution,
+                                     std::optional<MaiToolExecution> knownTaskExecution,
+                                     std::vector<MaiToolImage>& resultImages) {
+    auto& stored = std::get<MaiToolPart>(mAssistant.parts[partIndex].body);
+    stored.execution = result.execution();
+    if (!stored.execution && result.hasError()) {
+        if (enteredExecution) {
+            // 查询期间任务表可能被工具/后台更新为终态；新的可信状态优先于进入前快照。
+            if (const auto latest = acceptedTaskExecution(call, context))
+                knownTaskExecution = latest;
+        }
+        MaiToolExecution execution = knownTaskExecution ? *knownTaskExecution
+                                     : enteredExecution ? MaiToolExecution{}
+                                                        : notStartedExecution();
+        if (enteredExecution && !knownTaskExecution)
+            execution.nextAction = MaiToolNextAction::InspectState;
+        if (result.error().code() == MaiErrorCode::Canceled) {
+            execution.canceled = true;
+            if (!enteredExecution) {
+                execution.nextAction = MaiToolNextAction::AskUser;
+            } else if (execution.status == MaiToolExecutionStatus::Completed) {
+                execution.nextAction = MaiToolNextAction::None;
+                execution.recoveryTool.clear();
+            } else if (!knownTaskExecution ||
+                       execution.nextAction == MaiToolNextAction::QueryStatus) {
+                execution.status = MaiToolExecutionStatus::Canceled;
+                execution.nextAction = MaiToolNextAction::InspectState;
+            }
+        } else if (enteredExecution) {
+            const auto error = nlohmann::json::parse(result.error().message(), nullptr, false);
+            if (knownTaskExecution && execution.status == MaiToolExecutionStatus::Unknown &&
+                execution.nextAction == MaiToolNextAction::QueryStatus && error.is_object() &&
+                error.value("code", nlohmann::json{}) == "task_failed") {
+                // 已验证任务归属后，供应商工具的结构化 task_failed 是生成终态，
+                // 与 provider_error 的查询连接故障不同；原始错误文本仍逐字保留。
+                execution.status = MaiToolExecutionStatus::Failed;
+                execution.nextAction = MaiToolNextAction::None;
+                execution.recoveryTool.clear();
+            }
+        }
+        stored.execution = std::move(execution);
+    }
+    if (result.isTruncated()) {
+        if (!stored.execution) {
+            MaiToolExecution execution;
+            execution.status = MaiToolExecutionStatus::Completed;
+            execution.nextAction = MaiToolNextAction::InspectState;
+            stored.execution = std::move(execution);
+        }
+        stored.execution->outputTruncated = true;
+    }
+    if (result.hasError()) {
+        stored.state = result.error().code() == MaiErrorCode::Canceled ? MaiToolState::Canceled
+                                                                       : MaiToolState::Error;
+        stored.error = result.error().message();
+        // 错误也要回灌给模型——它需要知道失败了才能换个做法。
+        stored.output = result.error().message();
+    } else {
+        stored.state = MaiToolState::Completed;
+        stored.output = result.output();
+
+        resultImages.insert(resultImages.end(), result.images().begin(), result.images().end());
+    }
+    // 每执行完一个工具就落一次库：工具可能跑很久，中途崩了不该丢掉已完成的部分。
+    mDependencies.store->putMessage(mContext.sessionId, mAssistant);
+    if (const auto error = mDependencies.store->lastWriteError()) {
+        mError = error;
+        return;
+    }
+    mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mContext.sessionId,
+                                    mAssistant.id, mAssistant.parts[partIndex].id, mContext.turnId);
 }
 
 // 在执行可能写入或访问外部资源的工具前检查用户授权。
@@ -946,8 +1137,9 @@ MaiToolResult MaiTurnRunner::checkPermission(const MaiToolInvocation& call,
                                              const MaiToolContext& context, bool& allowed,
                                              const std::atomic<bool>& cancel) {
     allowed = true;
-    MaiTool* tool =
-        mDependencies.tools ? mDependencies.tools->findForModel(call.name, mModelName) : nullptr;
+    MaiTool* tool = mDependencies.tools
+                        ? mDependencies.tools->findForModel(call.name, mContext.model)
+                        : nullptr;
     if (!tool || !toolNeedsApproval(call)) return {};
 
     // 模型被拒之后经常原样再试一次。第二次不再弹框，直接回同样的话。
@@ -975,14 +1167,14 @@ MaiToolResult MaiTurnRunner::checkPermission(const MaiToolInvocation& call,
     if (!perCallApproval) {
         const bool allAllowed =
             std::all_of(approvalKeys.begin(), approvalKeys.end(), [&](const std::string& key) {
-                return mDependencies.permissions->isAllowedInSession(mSessionId, key);
+                return mDependencies.permissions->isAllowedInSession(mContext.sessionId, key);
             });
         if (allAllowed) return {};
     }
 
     MaiPermissionRequest request;
     request.id = MaiIdGenerator::newPermissionId();
-    request.sessionId = mSessionId;
+    request.sessionId = mContext.sessionId;
     request.messageId = mAssistant.id;
     request.partId = partId;
     request.toolName = call.name;
@@ -1032,8 +1224,9 @@ MaiToolResult MaiTurnRunner::checkPermission(const MaiToolInvocation& call,
 }
 
 bool MaiTurnRunner::toolNeedsApproval(const MaiToolInvocation& call) const {
-    MaiTool* tool =
-        mDependencies.tools ? mDependencies.tools->findForModel(call.name, mModelName) : nullptr;
+    MaiTool* tool = mDependencies.tools
+                        ? mDependencies.tools->findForModel(call.name, mContext.model)
+                        : nullptr;
     if (tool == nullptr) return false;
     if (tool->requiresPaidApproval(call.arguments)) return true;
     if (mDependencies.approvalPolicy == MaiApprovalPolicy::Never) return false;
@@ -1057,9 +1250,9 @@ void MaiTurnRunner::beginStreamedPart(const std::string& partId, MaiMessagePartB
 
     // 先落库，再广播。理由见头文件里这个函数的注释——这里错了的话，界面分不出正文和思考过程，
     // 会把模型的草稿当答案显示出来。
-    mDependencies.store->putMessage(mSessionId, mAssistant);
-    mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId, mAssistant.id,
-                                    partId, mInitialAssistantId);
+    mDependencies.store->putMessage(mContext.sessionId, mAssistant);
+    mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mContext.sessionId,
+                                    mAssistant.id, partId, mContext.turnId);
 }
 
 void MaiTurnRunner::commitStreamedParts() {
@@ -1081,7 +1274,7 @@ void MaiTurnRunner::announceCommittedTextParts(const std::atomic<bool>& cancel) 
         const auto& part = mAssistant.parts[index];
         const auto* text = std::get_if<MaiTextPart>(&part.body);
         if (!text || text->text.empty() || part.modelDraft) continue;
-        mDependencies.emitter->emitTextCommitted(mSessionId, mInitialAssistantId, mAssistant.id,
+        mDependencies.emitter->emitTextCommitted(mContext.sessionId, mContext.turnId, mAssistant.id,
                                                  part.id);
     }
 }
@@ -1096,7 +1289,7 @@ void MaiTurnRunner::checkpointStreamedParts(bool force) {
         return;
     fillStreamedPart(mReasoningPartId, mReasoning);
     fillStreamedPart(mTextPartId, mText);
-    mDependencies.store->putMessage(mSessionId, mAssistant);
+    mDependencies.store->putMessage(mContext.sessionId, mAssistant);
     mLastPersistedStreamBytes = currentBytes;
 }
 
@@ -1118,15 +1311,20 @@ void MaiTurnRunner::finish(const std::atomic<bool>&) {
     commitStreamedParts();  // 中断时可能还有没落库的半截内容
 
     mAssistant.completed = MaiTime::getCurrentTime();
-    mDependencies.store->putMessage(mSessionId, mAssistant);
-    mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mSessionId, mAssistant.id);
+    mDependencies.store->putMessage(mContext.sessionId, mAssistant);
+    // 完成身份先落库，进度订阅方的异常不能让消息永久停在 in-progress。
+    mDependencies.emitter->emitTurnPhase(mContext.sessionId, mContext.turnId,
+                                         MaiTurnPhase::Finalizing);
+    mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mContext.sessionId,
+                                       mAssistant.id);
 
     // 给会话起名不是"跑一轮"的职责，委托出去（见 session_titler.h）。
     if (mDependencies.titler) {
-        const std::string title = mDependencies.titler->apply(*mDependencies.store, mSessionId);
+        const std::string title =
+            mDependencies.titler->apply(*mDependencies.store, mContext.sessionId);
         if (!title.empty()) {
-            mDependencies.emitter->emitSession(MaiEventType::SessionUpdated, mSessionId, title,
-                                               "title");
+            mDependencies.emitter->emitSession(MaiEventType::SessionUpdated, mContext.sessionId,
+                                               title, "title");
         }
     }
 

@@ -16,6 +16,7 @@
 #include "MaiSessionStore.h"
 #include "MaiTool.h"
 #include "MaiTime.h"
+#include "MaiTurnContext.h"
 #include "MaiError.h"
 
 #include "MaiContextBuilder.h"
@@ -71,6 +72,8 @@ public:
         // 构造请求时先读历史快照再取列表，避免尚未消费的 user 提前进入模型请求。
         std::function<std::vector<std::string>()> pendingSteering;
         std::function<void()> closeSteering;
+        // 显式只读工具的并发上限，1 禁用并行；执行器进一步限制到最多 8。
+        int maxParallelTools = 4;
     };
 
     MaiTurnRunner(Dependencies dependencies, std::string sessionId, MaiMessage assistant);
@@ -100,6 +103,16 @@ private:
     // 顺序执行工具，当前工具结束后若有新输入，跳过本批其余调用并补齐取消结果。
     // 所有原调用及真实/未执行结果相邻落库，返回后由工具循环消费补充并请求模型重评。
     void executeTools(const std::vector<MaiToolInvocation>& calls, const std::atomic<bool>& cancel);
+
+    bool isParallelCall(const MaiToolInvocation& call, const MaiToolContext& context) const;
+    // 并行工作线程不读写 mAssistant，不广播事件；所有结果在返回前排空并按原序合并。
+    void executeParallelTools(const std::vector<MaiToolInvocation>& calls, std::size_t begin,
+                              std::size_t end, const MaiToolContext& context,
+                              const std::atomic<bool>& cancel, std::vector<MaiToolImage>& images);
+    void completeToolCall(std::size_t partIndex, const MaiToolInvocation& call,
+                          const MaiToolContext& context, const MaiToolResult& result,
+                          bool enteredExecution, std::optional<MaiToolExecution> knownTaskExecution,
+                          std::vector<MaiToolImage>& resultImages);
 
     // 这次调用该不该放行。需要审批的话会在这里阻塞等用户裁决。返回空表示放行；
     // 非空就是要直接回灌给模型的失败结果。
@@ -138,17 +151,12 @@ private:
     void finish(const std::atomic<bool>& cancel);
 
     Dependencies mDependencies;
-    std::string mSessionId;
-    std::string mInitialAssistantId;
+    MaiTurnContext mContext;
     // 只保存当前显式补充组，下一组替换；不累积历史图片，也不另建待执行输入队列。
     std::vector<std::string> mCurrentUserMessageIds;
     // 专业通知可能重用较旧的消息 ID；不能按这个 ID 把既存的新用户历史移到回复之后。
     std::set<std::string> mSpecialistHistoryIds;
     MaiMessage mAssistant;
-    std::string mWorkingDirectory;
-    std::string mModelName;
-    // 与模型一起在本轮开始时固定，工具跟进和压缩请求均不读取别的会话选择。
-    std::string mReasoningEffort;
 
     // 每一圈的文本和推理各自是独立的 part——模型在工具调用前后说的话是两段不同的发言，
     // 混成一个 part 会让界面把工具卡夹在一段文字中间。
@@ -165,6 +173,7 @@ private:
     double mContextEstimateMultiplier = 1.0;
     // 只属于当前轮次；一次软区整理失败后不在每项工具后重复整理，硬上限仍会重检。
     bool mCompactionDeferred = false;
+    bool mForceCompaction = false;
 
     MaiError mError;
     bool mHasVisibleText = false;

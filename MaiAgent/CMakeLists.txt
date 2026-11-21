@@ -449,6 +449,10 @@ add_library(maiagent STATIC
   Agent/MaiAgent.cpp
   Agent/MaiAgentProgressInstructions.cpp
   Agent/MaiTurnRunner.cpp
+  Agent/MaiTurnContext.cpp
+  Agent/MaiToolCallValidation.cpp
+  Agent/MaiModelConnectionPool.cpp
+  Agent/MaiModelHttpFraming.cpp
   Agent/MaiContextBuilder.cpp
   Agent/MaiModelClient.cpp
   Agent/MaiModelRetry.cpp
@@ -608,6 +612,7 @@ if(MAIAGENT_BUILD_TESTS)
   target_link_libraries(maiagent_test_support PUBLIC maiagent)
 
   foreach(test_name
+      MaiRuntimeTests # 进程内阶段、并行准入、身份与取消边界
       MaiCoreTests          # id / 会话 / 事件总线
       MaiInputQueueTests    # 所属端持续接收、收尾排队、幂等与普通/工具入口
       MaiSessionRenameTests # 当前会话改名、普通入口、显式命名与持久化

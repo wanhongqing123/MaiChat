@@ -77,6 +77,8 @@ struct FakeServer {
     std::string lastBody;
     std::string lastAuthorization;
     std::vector<std::string> requestBodies;
+    std::vector<int> clientPorts;
+    bool fixedBody = false;
 
     // 本地假服务器记录真实请求字节，并按测试配置模拟断流、心跳和重试；客户端协议断言不能只对自身数据结构做比较。
     void start() {
@@ -87,6 +89,7 @@ struct FakeServer {
                 lastBody = request.body;
                 lastAuthorization = request.get_header_value("Authorization");
                 requestBodies.push_back(request.body);
+                clientPorts.push_back(request.remote_port);
             }
             if (requestNumber <= transientFailures) {
                 response.status = transientStatus;
@@ -98,6 +101,10 @@ struct FakeServer {
                 response.status = status;
                 if (!retryAfter.empty()) response.set_header("Retry-After", retryAfter);
                 response.set_content(script, "application/json");
+                return;
+            }
+            if (fixedBody) {
+                response.set_content(script, "text/event-stream");
                 return;
             }
             if (keepOpenAfterDone || requestNumber <= stallRequests) {
@@ -1466,6 +1473,11 @@ void test_large_historical_image_uses_cached_bounded_preview() {
     CHECK(!client->stream(request, sink, cancel));
     CHECK(!client->stream(request, sink, cancel));
     CHECK(prepared == 4);
+    // 同路径同尺寸的新内容也必须使预览失效；其他历史图片继续命中缓存。
+    large[5] = 'b';
+    CHECK(!MaiFileSystem::writeFile(sources.front(), large));
+    CHECK(!client->stream(request, sink, cancel));
+    CHECK(prepared == 5);
     std::string body;
     {
         std::lock_guard<std::mutex> lock(fake.mutex);
@@ -3576,7 +3588,75 @@ void test_agent_transport_retry_budget_and_permanent_rejections(MaiWireApi wire)
     }
 }
 
+// 通过服务端观察真实 TCP 来源端口，不能用客户端“命中缓存”计数代替连接复用证明。
+void test_routed_clients_reuse_connections_and_retire_changed_credentials() {
+    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
+        FakeServer fake;
+        fake.fixedBody = true;
+        fake.script = wire == MaiWireApi::ChatCompletions
+                          ? text_delta("pooled") + kDone
+                          : sse(json{{"type", "response.output_text.delta"},
+                                     {"output_index", 0},
+                                     {"delta", "pooled"}}) +
+                                sse(json{{"type", "response.completed"}});
+        fake.start();
+        std::string key = "owned-key-one";
+        MaiModelRoute route;
+        route.modelNames = {"fixture"};
+        route.config.baseUrl = fake.base();
+        route.config.wire = wire;
+        route.config.maxRetries = 0;
+        route.apiKeyProvider = [&] { return key; };
+        MaiRoutedModelConfig routes;
+        routes.routes.push_back(route);
+        auto client = makeMaiRoutedModelClient(std::move(routes));
+        MaiModelRequest request;
+        request.model = "fixture";
+        const std::atomic<bool> cancel{false};
+        const auto send = [&] {
+            std::string text;
+            MaiStreamSink sink;
+            sink.onText = [&](std::string_view chunk) { text.append(chunk); };
+            const auto result = client->stream(request, sink, cancel);
+            if (!result) CHECK(text == "pooled");
+            return result;
+        };
+        CHECK(!send());
+        CHECK(!send());
+        key = "owned-key-two";
+        CHECK(!send());
+        key.clear();
+        CHECK(send().code() == MaiErrorCode::NotConfigured);
+        key = "owned-key-two";
+        CHECK(!send());
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        CHECK(fake.clientPorts.size() == 4);
+        if (fake.clientPorts.size() == 4) {
+            CHECK(fake.clientPorts[0] == fake.clientPorts[1]);
+            CHECK(fake.clientPorts[1] != fake.clientPorts[2]);
+            CHECK(fake.clientPorts[2] != fake.clientPorts[3]);
+        }
+        CHECK(fake.lastAuthorization == "Bearer owned-key-two");
+    }
+}
+void test_context_length_failure_is_typed_without_network_retry() {
+    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
+        FakeServer fake;
+        fake.status = 400;
+        fake.script =
+            R"({"error":{"code":"context_length_exceeded","message":"owned context limit"}})";
+        fake.start();
+        MaiModelRequest request;
+        request.model = "fixture";
+        const auto result = runAgainst(fake, request, wire);
+        CHECK(result.code == MaiErrorCode::ContextWindowExceeded);
+        CHECK(fake.requestCount.load() == 1);
+    }
+}
+
 void test_stream_recovery() {
+    test_routed_clients_reuse_connections_and_retire_changed_credentials();
+    test_context_length_failure_is_typed_without_network_retry();
     for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
         test_agent_recovers_partial_stream_without_replaying_draft(wire, false);
         test_agent_recovers_partial_stream_without_replaying_draft(wire, true);
@@ -3586,6 +3666,10 @@ void test_stream_recovery() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--image-preview") {
+        test_large_historical_image_uses_cached_bounded_preview();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--stream-recovery") {
         test_stream_recovery();
         return failures == 0 ? 0 : 1;

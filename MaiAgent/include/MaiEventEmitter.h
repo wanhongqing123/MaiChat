@@ -34,6 +34,8 @@ public:
     void emitTurnStarted(const std::string& sessionId, const std::string& turnId);
     // 恢复期间任务仍在运行；独立 ModelRequestRetrying 事件承载宿主进度。
     // 不产生成功提交、工具调用或 idle，准确绑定原轮次。
+    // 发布同一轮的内部阶段，不改变输入闸门和终态。
+    void emitTurnPhase(const std::string& sessionId, const std::string& turnId, MaiTurnPhase phase);
     void emitModelRetry(const std::string& sessionId, const std::string& turnId, int retry,
                         int limit, long delayMs);
     // 结束事件保留准确轮次，宿主不得用旧 idle 清理替代轮次的跨调用资源。

@@ -34,6 +34,18 @@ bool MaiModelRetry::isTransient(long status, bool transportRetryable, std::strin
     return transportRetryable || status == 408 || status == 429 || status >= 500;
 }
 
+bool MaiModelRetry::isContextLengthCode(std::string_view code) {
+    return code == "context_length_exceeded" || code == "context_window_exceeded";
+}
+bool MaiModelRetry::isContextLengthError(std::string_view body) {
+    const auto parsed = nlohmann::json::parse(body, nullptr, false);
+    if (!parsed.is_object()) return false;
+    const auto error = parsed.value("error", nlohmann::json{});
+    if (!error.is_object()) return false;
+    const auto code = error.value("code", nlohmann::json{});
+    return code.is_string() && isContextLengthCode(code.get_ref<const std::string&>());
+}
+
 bool MaiModelRetry::isTransientProviderCode(std::string_view code) {
     return code == "server_error" || code == "rate_limit_exceeded" || code == "overloaded_error";
 }

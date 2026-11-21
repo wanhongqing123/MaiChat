@@ -415,6 +415,11 @@ std::size_t renderedPageLimit(const MaiToolContext& context, const MaiFilePath& 
 
 class ReadTool final : public MaiTool {
 public:
+    // 只读文件查询可跨调用并发；路径与参数校验仍由同一 execute 核心完成。
+    MaiToolExecutionMode executionMode() const override {
+        return MaiToolExecutionMode::ParallelReadOnly;
+    }
+
     std::string name() const override { return "file_read"; }
     std::string description() const override {
         return "Read a text file with line numbers and bounded streaming. Offset is a 1-based line, "
@@ -754,6 +759,11 @@ public:
 // ── file_glob / file_grep ───────────────────────────────────────
 class GlobTool final : public MaiTool {
 public:
+    // 只读文件查询可跨调用并发；路径与参数校验仍由同一 execute 核心完成。
+    MaiToolExecutionMode executionMode() const override {
+        return MaiToolExecutionMode::ParallelReadOnly;
+    }
+
     std::string name() const override { return "file_glob"; }
     std::string description() const override {
         return "Find files using either pattern (glob *, **, ?, [] and {a,b}) or query (ranked fuzzy name). "
@@ -795,6 +805,11 @@ public:
 
 class GrepTool final : public MaiTool {
 public:
+    // 只读文件查询可跨调用并发；路径与参数校验仍由同一 execute 核心完成。
+    MaiToolExecutionMode executionMode() const override {
+        return MaiToolExecutionMode::ParallelReadOnly;
+    }
+
     std::string name() const override { return "file_grep"; }
     std::string description() const override {
         return "Search full text lines before clipping previews. Prefer mode=literal for exact text; "

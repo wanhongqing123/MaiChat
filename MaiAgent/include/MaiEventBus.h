@@ -1,6 +1,7 @@
 // 文件作用：分发 Agent 事件并管理订阅者生命周期。
 // 对外类型：MaiEventType、MaiEvent、MaiEventBus；线程、失败和生命周期以类型附近注释为准。
 #pragma once
+#include "MaiTurnContext.h"
 
 #include <cstdint>
 #include <functional>
@@ -40,6 +41,8 @@ enum class MaiEventType {
     // 同一轮次内的模型采样正在恢复，不代表新轮次开始、完成或失败。
     // detail 为宿主进度文案，不可回灌模型或当作助手正文提交。
     ModelRequestRetrying,
+    // 同一 turn 的执行阶段；不表示新一轮启动或终止，detail 是稳定阶段名。
+    TurnPhaseChanged,
 };
 
 // 转成 "message.part.delta" 这类线上字符串。

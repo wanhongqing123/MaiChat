@@ -168,6 +168,10 @@ MaiToolSpec MaiTool::specForModel(const std::string&) const {
     return {name(), description(), parametersSchema()};
 }
 
+MaiToolExecutionMode MaiTool::executionMode() const {
+    return MaiToolExecutionMode::Exclusive;
+}
+
 void MaiToolRegistry::add(std::unique_ptr<MaiTool> tool) {
     if (!tool) return;
     const std::string name = tool->name();

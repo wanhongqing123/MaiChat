@@ -424,6 +424,7 @@ struct MaiAgent::Runtime {
         dependencies.reasoningEffortProvider = options.reasoningEffortProvider;
         dependencies.baseInstructions = options.baseInstructions;
         dependencies.maxIterations = options.maxToolIterations;
+        dependencies.maxParallelTools = options.maxParallelTools;
         dependencies.approvalPolicy = options.approvalPolicy;
         dependencies.fileAccessRoot = options.fileAccessRoot;
         dependencies.allowOutsideWorkingDirectory = options.allowOutsideWorkingDirectory;

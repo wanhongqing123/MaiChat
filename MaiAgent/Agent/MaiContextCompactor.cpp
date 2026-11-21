@@ -722,12 +722,12 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
         return scaledTokens(model.estimateInputTokens(value), mOptions.estimateMultiplier);
     };
     prepared.inputEstimate = model.estimateInputTokens(request);
-    if (estimate(request) < trigger) {
+    if (!mOptions.force && estimate(request) < trigger) {
         prepared.request = std::move(request);
         return prepared;
     }
     // 同轮已安全延后时，只免除软阈值整理；倍率和各项 reserve 已按本次请求重新计算。
-    if (mOptions.deferUntilHardLimit && estimate(request) <= inputBudget) {
+    if (!mOptions.force && mOptions.deferUntilHardLimit && estimate(request) <= inputBudget) {
         if (const MaiError error = store.lastWriteError()) return error;
         prepared.deferredCompaction = true;
         prepared.request = std::move(request);
@@ -903,7 +903,8 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
         if (cancel.load(std::memory_order_relaxed))
             return {MaiErrorCode::Canceled, "Context summarization was canceled."};
         // 缺终止事件虽然属于 Protocol，仍是可恢复传输失败；不能先走容量降级吞掉它。
-        if (error.retryAdvice() || error.code() != MaiErrorCode::Protocol) return error;
+        if (mOptions.force || error.retryAdvice() || error.code() != MaiErrorCode::Protocol)
+            return error;
         if (const MaiError sourceError = verifySource()) return sourceError;
         if (estimate(request) > inputBudget) {
             if (!mOptions.allowHistoryIndexRecovery) return error;
@@ -932,8 +933,13 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
         return prepared;
     };
     Json batch = Json::array();
+    bool announced = false;
     const auto flush = [&]() -> MaiError {
         if (batch.empty()) return {};
+        if (!announced) {
+            announced = true;
+            if (mOptions.onCompactionStarted) mOptions.onCompactionStarted();
+        }
         const auto merged =
             summarize(model, summaryRequest(request, summary, batch, summaryOutput), summaryLimit,
                       summaryInput, mOptions.estimateMultiplier, cancel);

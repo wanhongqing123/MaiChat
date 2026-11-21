@@ -58,6 +58,10 @@ public:
         // 取消、网络、限流、存储/来源/CAS 冲突不恢复；索引也须满足完整预算和严格缩小检查。
         // 无工具收尾或自定义宿主没有该保证时须保持 false；不隐式调用工具协议。
         bool allowHistoryIndexRecovery = false;
+        // 已确认供应商拒绝容量时忽略软阈值，只尝试一次；仍保留原文/工具配对及 CAS 边界。
+        bool force = false;
+        // 只在开始真实摘要调用时通知；在准备线程同步调用，不能执行阻塞宿主操作。
+        std::function<void()> onCompactionStarted;
     };
 
     // 特殊宿主可注入“从消息/片段边界构建原文并保留指定 user”的同线程回调。

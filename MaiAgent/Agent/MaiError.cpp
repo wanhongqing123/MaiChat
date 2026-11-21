@@ -15,6 +15,7 @@ const char* maiErrorCodeToString(MaiErrorCode code) {
         case MaiErrorCode::Canceled: return "canceled";
         case MaiErrorCode::NotSupported: return "not_supported";
         case MaiErrorCode::Internal: return "internal";
+        case MaiErrorCode::ContextWindowExceeded: return "context_window_exceeded";
     }
     return "internal";
 }
