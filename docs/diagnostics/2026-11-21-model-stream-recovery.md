@@ -141,3 +141,32 @@ Windows producer 在独立同源目录继续正常构建，首次编译器选择
 随后显式使用 MSVC 14.44 配置；其 Qt 需要正常全量编译。本阶段没有 Windows 3.1.1
 附件或构建成功回执，因此 Release 标题及说明明确先提供 Mac，Windows 仍待补齐。
 producer 原有三个未合并提交和 Qt/WIP 均保留，不纳入或冒称本次发布功能。
+
+### Windows 补包与最终八件收口（2026-11-21）
+
+Windows producer 已完成独立同源 `af01f9ca2` 的正常配置（0/62.858s）与
+Release 构建（0/716.118s）。新 Qt SDK 正常全量编译；复用的中性 OpenSSL C SDK
+仅限同源已核验库和生成头文件，未搬移 Ninja 缓存、产品对象或伪造 stamp。
+其本地未合并提交、Qt working/index 和三份诊断保持原状。
+staging、实际 ZIP 提取与 Setup 静态提取的 85 个载荷文件逐 hash 核等，
+37 个应用 PE 无缺失依赖；三副本裸 PATH/独立 profile 启动均为 0，
+版本、PID、路径及 exe SHA 精等，包内 ORT 1.26 的自有 OCR 验证三副本均通过。
+未执行安装器，未替换现装，未发真实模型请求。
+
+Win ZIP `261172155` 字节，SHA256
+`e0b28e6cdfc87764d0bb0e6c57b5145a0e76a4a820de25975d47a481ab0af1d2`；
+Setup `220027666` 字节，SHA256
+`4d9739c780b7093884966e4f8e6b29efa6f2e1eb6f4ae9eddc7b7dae3c72e474`。
+四件 Windows 附件正常上传，无 clobber：ZIP ID `774752378`、Setup `774754796`、
+manifest `774764845`、SUMS `774765272`。
+
+Parent 独立 GET 共八件，逐 ID/name/size/digest/uploaded 核验；四 metadata 从
+GitHub 实际下载，与 Mac 原件及 Windows IM 原件逐字节相同。两平台四棵 source tree
+与冻结提交 Git 对象一致，SUMS 的每项摘要与服务端匹配，原有 Mac 四件和旧 v3.1.0
+八件均保持。仅更新 v3.1.1 标题为 `MaiChat Desktop 3.1.1` 与完整双平台说明，
+公开 latest/UTF-8 body readback 再核对，不移动发布 tag 或改变产品源码。
+最终小回执：`/private/tmp/maichat-release-3.1.1-20261121/eight-intake-final-safe.json`。
+
+Windows 应用及安装包未签名，Mac ad-hoc/未公证和旧系统/Intel 未验边界继续保留。
+本次没有在 Mac 下载、执行 Windows 安装器或冒称本机完成 Windows 跨平台整包复测；
+Windows 正常构建与三副本运行证据来自目标机 producer，Parent 独立核服务器摘要和元数据。
