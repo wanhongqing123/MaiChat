@@ -1403,6 +1403,10 @@ private struct AIActionPanel: View {
                             selectModel(AIModelSettings.fableModel)
                         }
                         .accessibilityIdentifier("ai-primary-model-" + AIModelSettings.fableModel)
+                        option("Claude Opus 5.5", selected: selectedModelID == AIModelSettings.opusModel) {
+                            selectModel(AIModelSettings.opusModel)
+                        }
+                        .accessibilityIdentifier("ai-primary-model-" + AIModelSettings.opusModel)
                         // Keep free-tier limits beside the explicit free model choice.
                         option("Particle-1（免费）", selected: selectedModelID == AIModelSettings.particleFreeModel) {
                             selectModel(AIModelSettings.particleFreeModel)

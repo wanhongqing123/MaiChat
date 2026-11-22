@@ -735,7 +735,8 @@ struct MaiMobileAgent {
             else if (providerName == "deepseek")
                 route.modelNames = {"deepseek-flash", "deepseek-v4-pro"};
             else
-                route.modelNames = {"anthropic/claude-fable-5.2", "particle-ai/particle-1:free"};
+                route.modelNames = {"anthropic/claude-fable-5.2", "anthropic/claude-opus-5.5",
+                                    "particle-ai/particle-1:free"};
             route.config = config;
             route.config.apiKey.clear();
             route.config.wire = MaiWireApi::Responses;

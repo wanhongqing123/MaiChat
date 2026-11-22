@@ -314,7 +314,8 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
         if (capability->provider == "openrouter") {
             body["session_id"] = request.sessionId;
             // 此显式自动断点是已核 Claude 合同，不能仅凭同为 OpenRouter 推给免费模型。
-            if (request.model == "anthropic/claude-fable-5.2")
+            if (request.model == "anthropic/claude-fable-5.2" ||
+                request.model == "anthropic/claude-opus-5.5")
                 body["cache_control"] = Json{{"type", "ephemeral"}};
         } else if (capability->provider == "glm") {
             body["prompt_cache_key"] = request.sessionId;

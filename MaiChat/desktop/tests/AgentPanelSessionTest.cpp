@@ -1784,8 +1784,12 @@ void AgentPanelSessionTest::mainModelChoicesStaySeparateFromReasoningEffort() {
     QVERIFY(high && high->isVisible() && high->isChecked());
     QTest::mouseClick(models, Qt::LeftButton);
     QVERIFY(!high->isVisible());
-    const QStringList ids{QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
-                          QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2")};
+    const QStringList ids{QStringLiteral("glm-5.3"),
+                          QStringLiteral("glm-5.3-flash"),
+                          QStringLiteral("deepseek-flash"),
+                          QStringLiteral("deepseek-v4-pro"),
+                          QStringLiteral("anthropic/claude-fable-5.2"),
+                          QStringLiteral("anthropic/claude-opus-5.5")};
     for (const QString& id : ids) {
         auto* option = actions->findChild<QPushButton*>(QStringLiteral("agentModelOption-") + id);
         QVERIFY2(option && option->isVisible(), qPrintable(id));
@@ -1810,6 +1814,17 @@ void AgentPanelSessionTest::mainModelChoicesStaySeparateFromReasoningEffort() {
     auto* value = actions->findChild<QLabel*>(QStringLiteral("agentModelValue"));
     QVERIFY(value);
     QCOMPARE(value->text(), QStringLiteral("anthropic/claude-fable-5.2"));
+    QTest::mouseClick(more, Qt::LeftButton);
+    auto* opus = actions->findChild<QPushButton*>(QStringLiteral("agentModelOption-anthropic/claude-opus-5.5"));
+    QVERIFY(opus);
+    if (!opus->isVisible()) QTest::mouseClick(models, Qt::LeftButton);
+    QVERIFY(opus->isVisible());
+    QTest::mouseClick(opus, Qt::LeftButton);
+    QCOMPARE(modelChanged.count(), 2);
+    QCOMPARE(modelChanged.last().first().toString(), QStringLiteral("anthropic/claude-opus-5.5"));
+    QCOMPARE(effortChanged.count(), 0);
+    QVERIFY(harness.controller->agent().getSession(harness.mine.toStdString(), session));
+    QCOMPARE(QString::fromStdString(session.model), QStringLiteral("anthropic/claude-opus-5.5"));
 }
 
 void AgentPanelSessionTest::mainModelEffortOptionsFollowTheSelectedModel() {

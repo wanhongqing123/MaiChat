@@ -2382,6 +2382,57 @@ void test_glm_responses_completes_without_done_and_keeps_metadata_only_state() {
     }
 }
 
+// Opus 使用正式客户端入口核对型号能力与真实请求，不借用其它型号的声明或凭据。
+void test_opus_55_catalog_and_responses_request() {
+    const std::string model = "anthropic/claude-opus-5.5";
+    const auto info = maiCloudModelInfo(model);
+    CHECK(info && info->provider == "openrouter" && info->wire == MaiWireApi::Responses);
+    CHECK(info && info->supportsImages && info->supportsReasoningEffort);
+    CHECK(info && info->contextLimits.contextWindowTokens == 1000000);
+    CHECK(info && info->contextLimits.maxOutputTokens == 128000);
+    const auto limits = maiOfficialModelContextLimits("https://openrouter.ai/api/v1", model);
+    CHECK(limits.contextWindowTokens == 1000000 && limits.maxOutputTokens == 128000);
+    CHECK(!maiCloudModelInfo(model + "-preview"));
+    CHECK(maiReasoningEffortsForModel(model) ==
+          std::vector<std::string>({"low", "medium", "high", "xhigh", "max"}));
+    CHECK(maiNormalizeReasoningEffortForModel(model, "medium") == "medium");
+    CHECK(maiNormalizeReasoningEffortForModel(model, "xhigh") == "xhigh");
+    CHECK(maiNormalizeReasoningEffortForModel("deepseek-flash", "xhigh") == "high");
+    FakeServer fake;
+    fake.script = sse(json{{"type", "response.completed"},
+                           {"response", {{"status", "completed"}, {"output", json::array()}}}});
+    fake.start();
+    MaiModelRequest request;
+    request.model = model;
+    request.sessionId = "owned_opus_session";
+    request.baseInstructions = "Keep this fixed instruction.";
+    MaiModelMessage user;
+    user.role = MaiModelRole::User;
+    user.content = "Check the selected model.";
+    request.messages.push_back(user);
+    request.tools = {{"lookup", "Read an owned fixture", R"({"type":"object"})"}};
+    for (const char* effort : {"low", "medium", "high", "xhigh", "max"}) {
+        request.reasoningEffort = effort;
+        CHECK(maiIsValidReasoningEffortForModel(model, effort));
+        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        const auto body = json::parse(fake.lastBody);
+        CHECK(wireValue(body, "/model") == model);
+        CHECK(wireValue(body, "/reasoning/effort") == effort);
+        CHECK(wireValue(body, "/session_id") == request.sessionId);
+        CHECK(wireValue(body, "/cache_control") == json({{"type", "ephemeral"}}));
+        CHECK(wireValue(body, "/instructions") == request.baseInstructions);
+        CHECK(wireValue(body, "/tools/0/name") == "lookup");
+        CHECK(wireValue(body, "/store") == false);
+    }
+    const auto before = fake.requestCount.load();
+    for (const char* effort : {"none", "invalid"}) {
+        request.reasoningEffort = effort;
+        CHECK(runAgainst(fake, request, MaiWireApi::Responses).code == MaiErrorCode::InvalidInput);
+    }
+    CHECK(fake.requestCount == before);
+}
+
 // 会话提示只增加已核供应商的顶层字段；工具 schema 本身含同名字段，不能对原始 JSON 搜索判定。
 void test_responses_cache_session_hints_preserve_the_original_request() {
     struct ProviderCase {
@@ -2390,6 +2441,7 @@ void test_responses_cache_session_hints_preserve_the_original_request() {
     };
     const ProviderCase cases[] = {
         {"anthropic/claude-fable-5.2", 1},
+        {"anthropic/claude-opus-5.5", 1},
         {"glm-5.3", 2},
         {"glm-5.3-flash", 2},
         {"deepseek-flash", 0},
@@ -3666,6 +3718,10 @@ void test_stream_recovery() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--opus-55") {
+        test_opus_55_catalog_and_responses_request();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--image-preview") {
         test_large_historical_image_uses_cached_bounded_preview();
         return failures == 0 ? 0 : 1;
@@ -3799,6 +3855,7 @@ int main(int argc, char** argv) {
     test_user_image_is_sent_as_multimodal_content();
     test_view_image_tool_pixels_reach_next_http_request(MaiWireApi::ChatCompletions);
     test_view_image_tool_pixels_reach_next_http_request(MaiWireApi::Responses);
+    test_opus_55_catalog_and_responses_request();
     test_large_historical_image_uses_cached_bounded_preview();
     test_absolute_desktop_image_can_be_outside_the_workspace();
     test_missing_historical_image_does_not_break_later_turns();

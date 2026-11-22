@@ -1090,18 +1090,20 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile_data(
     QTest::addColumn<QString>("effort");
     for (const QString& model :
          {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
-          QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2")}) {
+          QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2"),
+          QStringLiteral("anthropic/claude-opus-5.5")}) {
         for (const QString& effort : {QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high"),
                                       QStringLiteral("xhigh"), QStringLiteral("max")}) {
             if (model != QStringLiteral("anthropic/claude-fable-5.2") &&
+                model != QStringLiteral("anthropic/claude-opus-5.5") &&
                 (effort == QStringLiteral("medium") || effort == QStringLiteral("xhigh")))
                 continue;
             const QByteArray name = (model + QLatin1Char('-') + effort).toUtf8();
             QTest::newRow(name.constData())
                 << model
-                << (model.startsWith(QStringLiteral("glm-"))                ? QStringLiteral("glm")
-                    : model == QStringLiteral("anthropic/claude-fable-5.2") ? QStringLiteral("openrouter")
-                                                                            : QStringLiteral("deepseek"))
+                << (model.startsWith(QStringLiteral("glm-"))         ? QStringLiteral("glm")
+                    : model.startsWith(QStringLiteral("anthropic/")) ? QStringLiteral("openrouter")
+                                                                     : QStringLiteral("deepseek"))
                 << effort;
         }
     }

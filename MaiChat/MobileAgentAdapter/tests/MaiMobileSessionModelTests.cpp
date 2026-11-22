@@ -210,16 +210,16 @@ MaiFilePath effortWorkspace() {
 
 Json effortConfiguration(const MaiFilePath& root, const EffortProvider& openrouter, const EffortProvider& deepseek,
                          const std::string& model, const std::string& effort) {
-    const bool fable = model == "anthropic/claude-fable-5.2";
+    const bool openrouterModel = model == "anthropic/claude-fable-5.2" || model == "anthropic/claude-opus-5.5";
     return {{"op", "configure"},
             {"database", root.append(MaiFilePath::fromUtf8("sessions.sqlite")).toUtf8()},
             {"workspace", root.toUtf8()},
             {"appRoot", root.toUtf8()},
-            {"baseUrl", fable ? openrouter.url : deepseek.url},
+            {"baseUrl", openrouterModel ? openrouter.url : deepseek.url},
             {"openrouterBaseUrl", openrouter.url},
             {"glmBaseUrl", deepseek.url},
             {"deepseekBaseUrl", deepseek.url},
-            {"apiKey", fable ? "synthetic-openrouter-key" : "synthetic-deepseek-key"},
+            {"apiKey", openrouterModel ? "synthetic-openrouter-key" : "synthetic-deepseek-key"},
             {"wire", "responses"},
             {"model", model},
             {"reasoningEffort", effort},
@@ -306,9 +306,9 @@ void expectEffortChoices(ModelEffortChecks& checks, void* handle, const std::str
                   entry + " remote_snapshot supportedReasoningEfforts");
 }
 
-int runModelEfforts() {
+int runModelEfforts(const std::string& model = "anthropic/claude-fable-5.2") {
     EffortProvider openrouter("openrouter"), deepseek("deepseek");
-    const std::string fable = "anthropic/claude-fable-5.2";
+    const std::string fable = model;
     const std::string ds = "deepseek-flash";
     ModelEffortChecks checks;
     Keys keys;
@@ -606,6 +606,7 @@ int main(int argc, char** argv) {
 #endif
     try {
         if (argc == 2 && std::string(argv[1]) == "--model-efforts") return runModelEfforts();
+        if (argc == 2 && std::string(argv[1]) == "--opus-55") return runModelEfforts("anthropic/claude-opus-5.5");
         run(argc == 2 && std::string(argv[1]) == "--legacy-overwrite");
         return 0;
     } catch (const std::exception& error) {

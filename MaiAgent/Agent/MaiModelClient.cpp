@@ -62,7 +62,8 @@ MaiModelContextLimits maiOfficialModelContextLimits(const std::string& baseUrl,
     if ((endpoint == "https://api.deepseek.com" || endpoint == "https://api.deepseek.com/v1") &&
         (model == "deepseek-flash" || model == "deepseek-v4-pro"))
         return {1048576, 393216};
-    if (endpoint == "https://openrouter.ai/api/v1" && model == "anthropic/claude-fable-5.2")
+    if (endpoint == "https://openrouter.ai/api/v1" &&
+        (model == "anthropic/claude-fable-5.2" || model == "anthropic/claude-opus-5.5"))
         return {1000000, 128000};
     // https://docs.particle.ai/models；不把收费同名或其它代理地址视为此免费目录容量。
     if (endpoint == "https://openrouter.ai/api/v1" && model == "particle-ai/particle-1:free")

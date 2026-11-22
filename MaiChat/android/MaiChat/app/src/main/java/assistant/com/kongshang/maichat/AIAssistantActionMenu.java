@@ -48,6 +48,7 @@ final class AIAssistantActionMenu extends LinearLayout {
     private static final String[] POLICIES = {"on-request", "unless-trusted", "never"};
     private static final String[] MODELS = {"glm-5.3", "glm-5.3-flash", "deepseek-flash",
         "deepseek-v4-pro", AIAssistantModelSettings.OPENROUTER_MODEL,
+        AIAssistantModelSettings.OPUS_MODEL,
         AIAssistantModelSettings.PARTICLE_FREE_MODEL, AIAssistantSessionModels.LOCAL};
     private String model = "deepseek-flash";
     private String effort = "high", policy = "on-request";
@@ -76,7 +77,7 @@ final class AIAssistantActionMenu extends LinearLayout {
             ignored -> toggle(MODEL_SECTION));
         addView(modelHeading, match(dp(52)));
         String[] titles = {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
-            AIAssistantModelSettings.OPENROUTER_MODEL, "Particle-1（免费）", "本地模型"};
+            AIAssistantModelSettings.OPENROUTER_MODEL, "Claude Opus 5.5", "Particle-1（免费）", "本地模型"};
         modelGroup = options(remote ? java.util.Arrays.copyOf(titles, models.length) : titles, models,
             modelChoices, modelChecks, MODEL_SECTION);
         addView(modelGroup, match(LayoutParams.WRAP_CONTENT));
@@ -144,7 +145,8 @@ final class AIAssistantActionMenu extends LinearLayout {
         modelValue.setText(changingModelSource ? remote ? "等待所属设备确认…" : "正在切换…"
             : model.isEmpty() ? "未读取模型"
             : model.startsWith("local:") ? "本地模型"
-            : AIAssistantModelSettings.PARTICLE_FREE_MODEL.equals(model) ? "Particle-1（免费）" : model);
+            : AIAssistantModelSettings.PARTICLE_FREE_MODEL.equals(model) ? "Particle-1（免费）"
+            : AIAssistantModelSettings.OPUS_MODEL.equals(model) ? "Claude Opus 5.5" : model);
         effortValue.setText(remote && model.isEmpty() ? "未读取" : effort.isEmpty() ? "跟随默认"
             : effort.equals("low") ? "低" : effort.equals("medium") ? "中"
             : effort.equals("xhigh") ? "超高" : effort.equals("max") ? "最高" : "高");

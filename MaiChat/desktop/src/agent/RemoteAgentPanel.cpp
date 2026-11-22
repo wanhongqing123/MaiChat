@@ -117,6 +117,7 @@ const QStringList& sessionModelChoices() {
                                     QStringLiteral("deepseek-flash"),
                                     QStringLiteral("deepseek-v4-pro"),
                                     QStringLiteral("anthropic/claude-fable-5.2"),
+                                    QStringLiteral("anthropic/claude-opus-5.5"),
                                     QStringLiteral("particle-ai/particle-1:free")};
     return models;
 }

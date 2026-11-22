@@ -52,3 +52,98 @@ PATH 只有 Windows/System32，Qt 环境已清除。这是启动与依赖验证�
 iOS 同源正常签名 Release 231 已就绪；安装前可信连接检查返回 CoreDevice 4016，
 未派发安装或启动，最新独立已装版本仍是 230。连接与解锁请求已在 Apple 端等待用户回复，
 具体构建和阻塞边界见 `2026-11-19-ios231-cache-package-delivery.md`。
+
+## 2026-11-22：低命中率日志访问与源码排查
+
+用户提供 Activity 的低缓存命中率截图，要求分析 `https://openrouter.ai/logs`。
+独立网页工具打开该 URL 实际重定向至登录页；后续按进程识别同机已登录的 Chrome，
+激活原窗口后使用现有辅助功能接口读取统计页。未更改浏览器脚本权限，未提取 Cookie
+或账户令牌，不需要用户导出 CSV。下面源码风险与历史账单根因分开，不能仅由汇总
+命中率认定某条代码路径在生产请求中实际触发。
+
+审查本地 HEAD `0875e487dd5de0f652ae5d25f0cf49d7baf0940d`：
+
+- `MaiTurnRunner::buildRequest` 使用持久会话 ID；`MaiResponsesClient::buildBody`
+  对已注册 OpenRouter 型号发送 `session_id`，Fable 5.2 另发送顶层
+  `cache_control: {"type":"ephemeral"}`。没有指定 1 小时 TTL。
+- 按[OpenRouter 缓存文档](https://openrouter.ai/docs/guides/best-practices/prompt-caching)，
+  该参数默认 5 分钟。按[Anthropic 文档](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)，
+  TTL 从读写请求开始计时，生成耗时也占用有效期。`session_id` 可稳定路由，不保证命中。
+- `MaiContextBuilder.cpp` 中，用户图片转为历史后会改写 `Current/Earlier` 附件说明，
+  并不再发送旧图像像素；工具旧图亦被过滤。`omittedImages` 非零时，包含数量的
+  `Omitted N older image observations` 提示被插到消息最前面。该计数变化会改变
+  请求前缀，有破坏旧缓存条目的风险。上述路径亦存在于已交付 233 的产品提交
+  `67f0d37d`，但未据此断言用户这次日志运行了哪一版本或实际触发了该路径。
+- 当前移动端基础指令在配置时建立；没有在已审查的主请求构造路径中发现每次采样
+  自动追加当前时间的代码，不把时间戳变化猜作已确认原因。
+
+下一步须对照相邻请求的缓存写入/读取、间隔、模型/提供商与会话身份：读写均为零
+与反复写入但不读取是不同现象；过期、提供商变化和前缀变化需要分别用事实验证。
+未读取 Key、手机数据库或私人正文，未发新模型请求，未修改既有缓存参数、TTL、
+历史投影或工具顺序。
+
+
+### 已登录后台核对结果
+
+原浏览器的当前时间范围内，收费 Fable 记录均发生在稳定会话/缓存参数交付之前。
+缓存功能提交 `2dd34dc0f` 的时间为 2026-11-19 09:59:05 +08:00；包含它的
+233 安装回执时间为当天 22:08 +08:00（见对应交付记录）。账单里该功能交付后
+没有新的 Fable 样本，不能据历史低命中率评价新版本的实际缓存效果。
+
+在最新收费记录与一条连续工具轮次记录中，原生缓存读取均为零、session 缺失，
+收费与普通输入/输出单价相符。整体费用主要来自大量输入，而最新记录亦有大量内部
+思考 tokens；未保存原始参数，因此不能凭用量反推具体思考档位。后台明确未启用
+I/O logging，不能逐字对比当时的 prompt 或工具前缀；未打开该设置。
+
+本记录不保存账户账单逐行数据、原始 JSON、请求 ID、用户标识、密钥或聊天正文。
+旧图片投影改变前缀仍是独立的后续风险，不冒称它已被证实为该批历史费用的根因。
+
+## 2026-11-22：Opus 5.5 主模型接入与手机 234
+
+用户另要求接入 `anthropic/claude-opus-5.5`，源码基线为 `0875e487d`。
+按 [OpenRouter 官方型号](https://openrouter.ai/anthropic/claude-opus-5.5) 与公开模型目录
+核对：Responses、1,000,000 输入窗口、128,000 最大输出，支持图像/工具及
+low/medium/high/xhigh/max 五档。图像能力为官方声明，没有触发真实视觉探针。
+
+普通 `MaiModelClient`、共享能力/容量、Desktop 与 Mobile 的正式路由、iOS/Android
+设置和本地/远端选择菜单同步增加精确 ID；普通会话 ID 与 Claude 自动缓存提示沿用
+现有协议。复用账号的 OpenRouter 凭据，不借 GLM/DeepSeek Key；不改变现有默认、
+用户选择、输出预算、免费 Particle 的零价约束或服务 env。仅公共头注释改变，
+没有新增结构布局、协议字段、第三方库、模型代理或模型专用的第二执行核心。
+
+### 验证
+
+- 正常 Core target：新用例编译成功后业务 RED27；目录/请求实现接通后同例 GREEN。
+  新模型五档真实 loopback JSON、session/cache hints、普通 tools 及非法档位零 HTTP
+  均通过。完整九套 Core 9/9，40.03 秒。
+- 普通 Mobile C ABI 的 `--opus-55` 与既有 `--model-efforts` 各 107 检查/0 失败，
+  配置、create/set/get、snapshot/remote snapshot、重开与跨型号归一均零供应商 HTTP。
+  沿实际 simulator producer cache 正常构建已有 target，执行后恢复 tests-off 构建选项。
+- Android 生产 Java 正常编译，设置/菜单/ACK/媒体四组 38/0。编译继续使用项目的
+  Java 11，Robolectric SDK34 在现有 JDK17 测试进程运行；只使用私有 init script，
+  未改 Gradle 产品配置或安装依赖。当前无连接的 Android 设备/模拟器，不冒称实装通过。
+- iOS 专用 iPhone 14 Pro/iOS26.5 模拟器普通 App：Fable 回归和 Opus 普通界面/本地
+  HTTP 接通两例均通过，正常 xcodebuild exit0/159.680 秒。Opus 选择、五档、medium
+  回复与实际请求中的 model/effort/session/cache、供应商隔离均断言通过。
+  新行增加后，XCTest 将部分露出的行误判为 hittable；已亲看录屏/截图，测试改为
+  在同一普通菜单内滚动到整行可见，慢拖后停留以避免惯性越过目标。保留失败记录，
+  未删减五档/请求断言或修改产品 UI 行为来放行。
+- Mac 正常 Release App 与两个既有消费者 target 构建通过；凭据/协议矩阵 22 数据行
+  （含 Opus 五档）及 setup/cleanup 共24/0，普通菜单点击3/0；菜单截图已查看。
+  原14.4 SDK缺生成头，按相同版本、相同公开头字节与运行库版本补全私有 include
+  overlay；未替换运行库、改变版本或伪造 load commands，未替换 Mac 现装。
+
+### 234 正常设备交付
+
+App build number 两处从233改为234；营销版本与测试目标版本不变。沿原 workspace、
+scheme、Release 和已使用的开发团队正常构建，exit0/185.144秒；深度 strict 验签0。
+候选可执行文件95,651,376字节，SHA256
+`3dc71ac62789ed90cb688d5df700b5530c7bbb4b5b766a06c5055e5dd3d6cbad`。
+初次连接4016如实保留；用户确认连接后独立 metadata 原为233，同 bundle 正常更新
+exit0/59.207秒。随后独立 metadata 为3.0.1(234)，无附加参数启动0，独立进程查询
+只找到一个匹配新 bundle 的 PID86827。
+
+没有卸载/清空、重新配对或更改 TCC，没有比较用户数据字节或读回设备 exe。
+未为本轮发真实付费模型、图像或签名续接探针；目标机普通启动不等于私人会话任务验收。
+Desktop 公开 Release/tag 本轮未动，当前公开3.1.1仍固定其原发行源码。
+完整本地验证回执位于 `.cache/opus55-20261122/`；账户原始日志不作为测试产物保存。

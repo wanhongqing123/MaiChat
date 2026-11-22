@@ -301,6 +301,16 @@ final class SessionModelsUITests: XCTestCase {
 
     @MainActor
     func testFableOffersFiveReasoningLevelsAndOtherModelsKeepThree() throws {
+        try checkFiveReasoningLevels(model: "anthropic/claude-fable-5.2")
+    }
+
+    @MainActor
+    func testOpusFiveReasoningLevelsUseTheOrdinaryOpenRouterRoute() throws {
+        try checkFiveReasoningLevels(model: "anthropic/claude-opus-5.5")
+    }
+
+    @MainActor
+    private func checkFiveReasoningLevels(model: String) throws {
         continueAfterFailure = false
         let glm = try SessionModelHTTPFixture(provider: .glm)
         let deepseek = try SessionModelHTTPFixture(provider: .deepseek)
@@ -314,29 +324,67 @@ final class SessionModelsUITests: XCTestCase {
         app.launchEnvironment["MAICHAT_SESSION_MODELS_OPENROUTER_PORT"] = String(openrouter.port)
         app.launch(); defer { app.terminate() }
         XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 30))
-        app.buttons["更多"].tap(); app.buttons["ai-primary-model-settings"].tap()
-        let choice = app.buttons["ai-primary-model-anthropic/claude-fable-5.2"]
-        XCTAssertTrue(choice.waitForExistence(timeout: 5)); choice.tap()
+        let panel = app.descendants(matching: .any)["ai-action-panel"]
+        func tapPanel(_ control: XCUIElement) {
+            XCTAssertTrue(panel.waitForExistence(timeout: 5))
+            XCTAssertTrue(control.waitForExistence(timeout: 5))
+            // A partially clipped row can be hittable while its center is outside the viewport.
+            // Scroll within the ordinary popup before tapping; keep a one-point AX rounding tolerance.
+            for _ in 0..<6 {
+                if panel.frame.contains(control.frame.insetBy(dx: 1, dy: 1)) { break }
+                let limit = panel.frame.height * 0.35
+                let delta = max(-limit, min(limit, control.frame.midY - panel.frame.midY))
+                let start = panel.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+                start.press(forDuration: 0.08, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -delta)),
+                            withVelocity: .slow, thenHoldForDuration: 0.3)
+            }
+            XCTAssertTrue(panel.frame.contains(control.frame.insetBy(dx: 1, dy: 1)))
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "enabled == true"), object: control)], timeout: 10), .completed)
+            control.tap()
+        }
+        app.buttons["更多"].tap(); tapPanel(app.buttons["ai-primary-model-settings"])
+        let choice = app.buttons["ai-primary-model-" + model]
+        XCTAssertTrue(choice.waitForExistence(timeout: 5)); tapPanel(choice)
         let config = app.staticTexts["primary-ui-session-configuration"]
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate:
-            NSPredicate(format: "value CONTAINS %@", "model:anthropic/claude-fable-5.2;"), object: config)],
+            NSPredicate(format: "value CONTAINS %@", "model:" + model + ";"), object: config)],
             timeout: 12), .completed)
-        app.buttons["思考强度"].tap()
+        tapPanel(app.buttons["思考强度"])
         let menu = app.descendants(matching: .any)["ai-effort-menu"]
         XCTAssertTrue(menu.waitForExistence(timeout: 5))
         let image = XCTAttachment(screenshot: app.screenshot())
-        image.name = "fable-five-effort-menu"; image.lifetime = .keepAlways; add(image)
-        XCTAssertEqual(menu.buttons.count, 5, "The Fable model requires five distinct reasoning levels")
+        image.name = "claude-five-effort-menu-" + model.replacingOccurrences(of: "/", with: "-"); image.lifetime = .keepAlways; add(image)
+        XCTAssertEqual(menu.buttons.count, 5, "The selected Claude model requires five distinct reasoning levels")
         for label in ["低", "中", "高", "超高", "最高"] {
-            XCTAssertTrue(menu.buttons[label].exists, "Missing Fable level: " + label)
+            XCTAssertTrue(menu.buttons[label].exists, "Missing Claude level: " + label)
+        }
+        if model == "anthropic/claude-opus-5.5" {
+            tapPanel(menu.buttons["中"])
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate:
+                NSPredicate(format: "value CONTAINS %@", "effort:medium;"), object: config)],
+                timeout: 10), .completed)
+            app.buttons["更多"].tap()
+            app.textViews["ai-composer"].tap()
+            app.textViews["ai-composer"].typeText("Owned Opus route reply\n")
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate:
+                NSPredicate(format: "value CONTAINS %@", "Fixture OpenRouter reply (medium)"),
+                object: app.staticTexts["primary-ui-model-output"])], timeout: 15), .completed)
+            let request = try XCTUnwrap(openrouter.requests().last)
+            XCTAssertEqual(request["model"] as? String, model)
+            XCTAssertEqual((request["reasoning"] as? [String: Any])?["effort"] as? String, "medium")
+            XCTAssertFalse((request["session_id"] as? String ?? "").isEmpty)
+            XCTAssertEqual((request["cache_control"] as? [String: Any])?["type"] as? String, "ephemeral")
+            XCTAssertTrue(glm.requests().isEmpty && deepseek.requests().isEmpty)
+            app.buttons["更多"].tap()
         }
         // The same ordinary panel must still offer the original three choices for DeepSeek.
-        app.buttons["ai-primary-model-settings"].tap()
-        app.buttons["ai-primary-model-deepseek-flash"].tap()
+        tapPanel(app.buttons["ai-primary-model-settings"])
+        tapPanel(app.buttons["ai-primary-model-deepseek-flash"])
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate:
             NSPredicate(format: "value CONTAINS %@", "model:deepseek-flash;"), object: config)],
             timeout: 12), .completed)
-        app.buttons["思考强度"].tap()
+        tapPanel(app.buttons["思考强度"])
         XCTAssertEqual(menu.buttons.count, 3)
         for label in ["低", "高", "最高"] { XCTAssertTrue(menu.buttons[label].exists) }
         XCTAssertFalse(menu.buttons["中"].exists); XCTAssertFalse(menu.buttons["超高"].exists)

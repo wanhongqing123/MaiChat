@@ -8,6 +8,7 @@ import org.json.JSONObject;
 final class AIAssistantModelSettings {
     static final String LOCAL_MODEL_ID = "builtin-qwen3.5-2b-q4_k_m";
     static final String OPENROUTER_MODEL = "anthropic/claude-fable-5.2";
+    static final String OPUS_MODEL = "anthropic/claude-opus-5.5";
     static final String PARTICLE_FREE_MODEL = "particle-ai/particle-1:free";
     final String cloudModel, policy, effort;
     private final boolean local;
@@ -94,10 +95,10 @@ final class AIAssistantModelSettings {
         return "deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model)
             || "glm-5.3".equals(model) || "glm-5.3-flash".equals(model) || isOpenRouterModel(model);
     }
-    // Both exact product identifiers use the current account's OpenRouter route;
+    // Exact product identifiers use the current account's OpenRouter route;
     // aliases or the paid Particle endpoint must not borrow this credential.
     static boolean isOpenRouterModel(String model) {
-        return OPENROUTER_MODEL.equals(model) || PARTICLE_FREE_MODEL.equals(model);
+        return OPENROUTER_MODEL.equals(model) || OPUS_MODEL.equals(model) || PARTICLE_FREE_MODEL.equals(model);
     }
     private static boolean supportedPolicy(String policy) {
         return "on-request".equals(policy) || "unless-trusted".equals(policy) || "never".equals(policy);
@@ -106,10 +107,12 @@ final class AIAssistantModelSettings {
     // unsupported explicit input is rejected before any compatibility normalization.
     static boolean supportedEffortForModel(String model, String effort) {
         return "".equals(effort) || "low".equals(effort) || "high".equals(effort) || "max".equals(effort)
-            || (OPENROUTER_MODEL.equals(model) && ("medium".equals(effort) || "xhigh".equals(effort)));
+            || ((OPENROUTER_MODEL.equals(model) || OPUS_MODEL.equals(model))
+                && ("medium".equals(effort) || "xhigh".equals(effort)));
     }
     static String normalizeEffortForModel(String model, String effort) {
-        return !OPENROUTER_MODEL.equals(model) && ("medium".equals(effort) || "xhigh".equals(effort))
+        return !OPENROUTER_MODEL.equals(model) && !OPUS_MODEL.equals(model)
+            && ("medium".equals(effort) || "xhigh".equals(effort))
             ? "high" : effort;
     }
 }

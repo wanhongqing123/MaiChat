@@ -19,6 +19,22 @@ import org.robolectric.shadows.ShadowAlertDialog;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34, manifest = Config.NONE)
 public final class AIAssistantActionMenuTest {
+    @Test public void opusLocalAndRemoteMenusOfferTheModelAndAllFiveEfforts() {
+        for (boolean remote : new boolean[]{false, true}) {
+            AIAssistantActionMenu menu = menu(remote);
+            click(menu, "主模型");
+            assertNotNull(option(menu, "Claude Opus 5.5"));
+            option(menu, "Claude Opus 5.5").performClick();
+            assertEquals("anthropic/claude-opus-5.5", modelSelections.get(modelSelections.size() - 1));
+            menu.update("anthropic/claude-opus-5.5", false, "medium", "on-request", true, true, true);
+            click(menu, "思考强度");
+            for (String title : new String[]{"低", "中", "高", "超高", "最高"})
+                assertNotNull(option(menu, title));
+            assertTrue(option(menu, "中").isSelected());
+            option(menu, "超高").performClick();
+            assertEquals("xhigh", efforts.get(efforts.size() - 1));
+        }
+    }
     @Test public void fableMenusOfferFiveEffortsAndSwitchBackToThreeForOtherModels() {
         for (boolean remote : new boolean[]{false, true}) {
             AIAssistantActionMenu menu = menu(remote);

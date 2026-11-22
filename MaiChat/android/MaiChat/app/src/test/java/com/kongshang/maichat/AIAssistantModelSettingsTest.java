@@ -9,6 +9,24 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public final class AIAssistantModelSettingsTest {
+    @Test public void opusFiveEffortsUseOpenRouterAndSurviveSettingsReopen() throws Exception {
+        for (String effort : new String[]{"low", "medium", "high", "xhigh", "max"}) {
+            String model = "anthropic/claude-opus-5.5";
+            AIAssistantModelSettings settings = AIAssistantModelSettings.defaults()
+                .withOptions(model, "on-request", effort);
+            JSONObject config = settings.configuration(null, "synthetic-openrouter-key");
+            assertEquals(model, config.getString("model"));
+            assertEquals("responses", config.getString("wire"));
+            assertEquals("https://openrouter.ai/api/v1", config.getString("baseUrl"));
+            assertEquals("synthetic-openrouter-key", config.getString("apiKey"));
+            assertEquals(effort, config.getString("reasoningEffort"));
+            AIAssistantModelSettings reopened = AIAssistantModelSettings.fromJson(settings.toJson());
+            assertEquals(model, reopened.model());
+            assertEquals(effort, reopened.effort);
+        }
+        assertFalse(AIAssistantModelSettings.supportedCloud("anthropic/claude-opus-5.5-preview"));
+        assertFalse(AIAssistantModelSettings.supportedEffortForModel("deepseek-flash", "medium"));
+    }
     @Test public void allFiveCloudChoicesUseResponsesAndTheirOwnEndpoint() throws Exception {
         for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
                 "anthropic/claude-fable-5.2"}) {

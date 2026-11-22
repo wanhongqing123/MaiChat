@@ -1867,7 +1867,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     for (const QString& model :
          {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
           QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2"),
-          QStringLiteral("particle-ai/particle-1:free")}) {
+          QStringLiteral("anthropic/claude-opus-5.5"), QStringLiteral("particle-ai/particle-1:free")}) {
         const QString title =
             model == QStringLiteral("particle-ai/particle-1:free") ? QStringLiteral("Particle-1（免费）") : model;
         auto* option = new QPushButton(title, modelOptions);

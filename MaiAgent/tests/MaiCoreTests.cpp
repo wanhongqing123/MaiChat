@@ -99,15 +99,16 @@ static void test_session_crud_and_events() {
 }
 
 static std::vector<MaiSession> model_effort_session_contract(
-    std::unique_ptr<MaiSessionStore> store) {
+    std::unique_ptr<MaiSessionStore> store,
+    const std::string& expandedModel = "anthropic/claude-fable-5.2") {
     auto* stored = store.get();
     MaiAgent::Options options;
-    options.defaultModel = "anthropic/claude-fable-5.2";
+    options.defaultModel = expandedModel;
     MaiAgent agent(std::move(store), nullptr, nullptr, options);
     std::vector<MaiSession> expectedPersisted;
     for (const auto& effort : {"low", "medium", "high", "xhigh", "max"}) {
-        const auto created = agent.submit(
-            MaiCreateSession{"", "Fable effort", "anthropic/claude-fable-5.2", effort});
+        const auto created =
+            agent.submit(MaiCreateSession{"", "Fable effort", expandedModel, effort});
         CHECK(created);
         if (created) {
             MaiSession session;
@@ -147,8 +148,8 @@ static std::vector<MaiSession> model_effort_session_contract(
             expectedPersisted.push_back(session);
         }
         for (const auto& target : {"deepseek-flash", "glm-5.3"}) {
-            const auto created = agent.submit(
-                MaiCreateSession{"", "Original title", "anthropic/claude-fable-5.2", "high"});
+            const auto created =
+                agent.submit(MaiCreateSession{"", "Original title", expandedModel, "high"});
             CHECK(created);
             if (!created) continue;
             const auto id = created.value();
@@ -188,12 +189,12 @@ static std::vector<MaiSession> model_effort_session_contract(
             CHECK(promoted);
             if (promoted) {
                 CHECK(agent.submit(MaiUpdateSession{promoted.value(), "Fable selected",
-                                                    "anthropic/claude-fable-5.2", "", "", effort}));
+                                                    expandedModel, "", "", effort}));
                 MaiSession session;
                 CHECK(agent.getSession(promoted.value(), session));
-                CHECK(session.model == "anthropic/claude-fable-5.2" &&
-                      session.reasoningEffort == effort && session.title == "Fable selected");
-                session.model = "anthropic/claude-fable-5.2";
+                CHECK(session.model == expandedModel && session.reasoningEffort == effort &&
+                      session.title == "Fable selected");
+                session.model = expandedModel;
                 session.reasoningEffort = effort;
                 session.title = "Fable selected";
                 expectedPersisted.push_back(session);
@@ -204,6 +205,7 @@ static std::vector<MaiSession> model_effort_session_contract(
 }
 
 static void test_model_specific_effort_creation_updates_and_reopen() {
+    model_effort_session_contract(makeMaiMemoryStore(), "anthropic/claude-opus-5.5");
     model_effort_session_contract(makeMaiMemoryStore());
     const auto path = MaiFileSystem::temporaryDirectory().append(
         MaiFilePath::fromUtf8("mai-model-effort-" + MaiIdGenerator::newSessionId() + ".sqlite"));

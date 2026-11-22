@@ -50,17 +50,18 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     static let glmResponsesUrl = "https://open.bigmodel.cn/api/v1"
     static let openRouterUrl = "https://openrouter.ai/api/v1"
     static let fableModel = "anthropic/claude-fable-5.2"
+    static let opusModel = "anthropic/claude-opus-5.5"
     static let particleFreeModel = "particle-ai/particle-1:free"
     static let cloudModels = ["deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash",
-                              fableModel, particleFreeModel]
+                              fableModel, opusModel, particleFreeModel]
     static let deepSeekUrl = "https://api.deepseek.com"
     static let ordinaryReasoningEfforts = ["low", "high", "max"]
     static let fableReasoningEfforts = ["low", "medium", "high", "xhigh", "max"]
 
     static func reasoningEfforts(for model: String, advertised: [String]? = nil) -> [String] {
-        let known = model == fableModel ? fableReasoningEfforts : ordinaryReasoningEfforts
+        let known = [fableModel, opusModel].contains(model) ? fableReasoningEfforts : ordinaryReasoningEfforts
         guard let advertised else { return known }
-        // Choice metadata may narrow capability, but cannot grant another model Fable-only values.
+        // Choice metadata may narrow capability, but cannot grant an unknown model extra values.
         return !advertised.isEmpty && Set(advertised).count == advertised.count &&
             advertised.allSatisfy(known.contains) ? advertised : known
     }
@@ -83,7 +84,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
             return supported.contains("high") ? "high" : (supported.first ?? "high")
         }
         if supported.contains(value) { return value }
-        // Only a known Fable-only global default crosses to a three-level model
+        // Only a known five-level Claude default crosses to a three-level model
         // as high. Unknown strings (or inconsistent capability metadata) remain
         // invalid so callers reject them instead of reporting a made-up default.
         if fableReasoningEfforts.contains(value) && !reasoningEfforts(for: model).contains(value) {
@@ -93,7 +94,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     }
 
     static func reasoningEffortTitle(_ value: String, for model: String) -> String {
-        if model == fableModel {
+        if [Self.fableModel, Self.opusModel].contains(model) {
             switch value {
             case "low": return "低"
             case "medium": return "中"
@@ -116,7 +117,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
         switch model {
         case "deepseek-flash", "deepseek-v4-pro": return "deepseek"
         case "glm-5.3", "glm-5.3-flash": return "glm"
-        case fableModel, particleFreeModel: return "openrouter"
+        case fableModel, opusModel, particleFreeModel: return "openrouter"
         default: return nil
         }
     }
@@ -148,6 +149,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
         case "glm-5.3-flash": return "GLM-5.3-Flash"
         case "deepseek-v4-pro": return "DeepSeek V4 Pro"
         case Self.fableModel: return "Claude Fable 5.2"
+        case Self.opusModel: return "Claude Opus 5.5"
         case Self.particleFreeModel: return "Particle-1（免费）"
         default: return "DeepSeek Flash"
         }
@@ -206,7 +208,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.deepSeekUrl
         } else if ["glm-5.3", "glm-5.3-flash"].contains(selected) {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.glmResponsesUrl
-        } else if [Self.fableModel, Self.particleFreeModel].contains(selected) {
+        } else if [Self.fableModel, Self.opusModel, Self.particleFreeModel].contains(selected) {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.openRouterUrl
         }
     }
