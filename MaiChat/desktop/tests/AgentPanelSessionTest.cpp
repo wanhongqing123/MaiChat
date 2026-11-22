@@ -642,6 +642,8 @@ class AgentPanelSessionTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void qrCodeToolProducesOneImageLiveAndAfterReplay_data();
+    void qrCodeToolProducesOneImageLiveAndAfterReplay();
     void newSessionAvoidsFilesystemRoot();
     void emptySessionShowsWelcomeAndFirstMessageHidesIt();
     void welcomeToolRowsExplainEveryCategoryAndWrapAtNarrowWidths();
@@ -4923,6 +4925,202 @@ void AgentPanelSessionTest::quoteActionFollowsStreamedOwnerAfterSessionRestore()
     QTRY_VERIFY_WITH_TIMEOUT(view->itemRect(footerId).top() >= view->itemRect(lastTextPart).bottom(), 3000);
     QVERIFY(footer);
     QVERIFY(captureAgentFixture(panel, QStringLiteral("quote-after-owner")));
+}
+
+void AgentPanelSessionTest::qrCodeToolProducesOneImageLiveAndAfterReplay_data() {
+    QTest::addColumn<bool>("deliver");
+    QTest::addColumn<bool>("copyImage");
+    QTest::newRow("generation-only") << false << false;
+    QTest::newRow("generation-then-explicit-delivery") << true << false;
+    QTest::newRow("different-files-with-identical-bytes-stay-separate") << true << true;
+}
+
+void AgentPanelSessionTest::qrCodeToolProducesOneImageLiveAndAfterReplay() {
+    QFETCH(bool, deliver);
+    QFETCH(bool, copyImage);
+    // 只用自有内容走正式二维码工具；不连接截图中的服务器或读取二维码里的凭据。
+    class OwnedQrModel final : public MaiModelClient {
+    public:
+        OwnedQrModel(QString directory, bool deliver, bool copyImage)
+            : directory_(std::move(directory)), deliver_(deliver), copyImage_(copyImage) {}
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink, const std::atomic<bool>&) override {
+            const int step = calls.fetch_add(1);
+            if (step == 0) {
+                sink.onToolCall(
+                    {"owned-qr-call", "maichat_generate_qr_code", R"({"text":"https://example.invalid/owned-qr"})"});
+            } else if (step == 1) {
+                for (const auto& message : request.messages) {
+                    if (message.role != MaiModelRole::ToolResult || message.toolCallId != "owned-qr-call") continue;
+                    const auto receipt = QJsonDocument::fromJson(QByteArray::fromStdString(message.content)).object();
+                    const QString path = receipt.value(QStringLiteral("file_path")).toString();
+                    if (path.isEmpty()) return {MaiErrorCode::Internal, "owned QR receipt has no path"};
+                    relative_ = QDir(directory_).relativeFilePath(path);
+                    if (deliver_) {
+                        send(sink, "owned-delivery", QStringLiteral("./") + relative_);
+                        if (copyImage_) {
+                            const QString copy = QDir(directory_).filePath(QStringLiteral("owned-qr-copy.png"));
+                            if (!QFile::copy(path, copy)) return {MaiErrorCode::Internal, "owned QR copy failed"};
+                            send(sink, "owned-copy-delivery", QStringLiteral("owned-qr-copy.png"));
+                        }
+                        return {};
+                    }
+                    if (sink.onText) sink.onText("![Owned QR](" + path.toStdString() + ")\n\nOwned QR is ready.");
+                    return {};
+                }
+                return {MaiErrorCode::Internal, "owned QR tool result is missing"};
+            } else if (step == 3)
+                send(sink, "owned-later-delivery", relative_);
+            else if (sink.onText)
+                sink.onText("Owned QR is ready.");
+            return {};
+        }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
+        std::atomic<int> calls{0};
+
+    private:
+        static void send(const MaiStreamSink& sink, const char* id, const QString& relative) {
+            const QJsonObject arguments{{QStringLiteral("file_path"), relative},
+                                        {QStringLiteral("type"), QStringLiteral("image")},
+                                        {QStringLiteral("caption"), QStringLiteral("Owned QR delivery caption")}};
+            sink.onToolCall(
+                {id, "agent_send_media", QJsonDocument(arguments).toJson(QJsonDocument::Compact).toStdString()});
+        }
+        QString directory_;
+        QString relative_;
+        bool deliver_;
+        bool copyImage_;
+    };
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    const QString workspacePath = QFileInfo(workspace.path()).canonicalFilePath();
+    QVERIFY(!workspacePath.isEmpty());
+    auto model = std::make_unique<OwnedQrModel>(workspacePath, deliver, copyImage);
+    auto* observed = model.get();
+    AgentController controller(std::move(model), QString());
+    const QString session = controller.createSession(workspacePath);
+    QVERIFY(!session.isEmpty());
+    auto panel = std::make_unique<AgentChatPanel>(controller);
+    panel->resize(1000, 850);
+    panel->openSession(session);
+    panel->show();
+    QVERIFY(QTest::qWaitForWindowExposed(panel.get()));
+    QVERIFY(controller.sendPrompt(session, QStringLiteral("Create the owned QR code once.")));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().listPendingPermissions().empty(), 5000);
+    const auto permissions = controller.agent().listPendingPermissions();
+    QCOMPARE(permissions.size(), std::size_t(1));
+    QCOMPARE(permissions.front().toolName, std::string("maichat_generate_qr_code"));
+    QVERIFY(controller.approvePermission(QString::fromStdString(permissions.front().id)));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+    controller.agent().waitIdle();
+    QCOMPARE(observed->calls.load(), deliver ? 3 : 2);
+    int generations = 0;
+    int images = 0;
+    MaiMessage owner;
+    std::string imagePart;
+    for (const auto& message : controller.agent().listMessages(session.toStdString())) {
+        for (const auto& part : message.parts) {
+            if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
+                if (tool->tool == "maichat_generate_qr_code" && tool->state == MaiToolState::Completed) ++generations;
+            } else if (std::holds_alternative<MaiImagePart>(part.body)) {
+                ++images;
+                owner = message;
+                imagePart = part.id;
+            }
+        }
+    }
+    QCOMPARE(generations, 1);
+    QCOMPARE(images, 1);
+    DesktopSessionSyncHost sync(controller);
+    const auto synchronized = sync.historyMessage(session, QString::fromStdString(owner.id));
+    int publishedImages = 0;
+    for (const auto& part : synchronized.value(QStringLiteral("parts")).toArray())
+        if (part.toObject().value(QStringLiteral("kind")) == QStringLiteral("image")) ++publishedImages;
+    QCOMPARE(publishedImages, 1);
+    const int expectedImages = copyImage ? 2 : 1;
+    const auto imageCount = [&] {
+        return panel->findChildren<QPushButton*>(QStringLiteral("agentMediaImageOpen")).size();
+    };
+    const QString evidenceTag = QString::fromLatin1(QTest::currentDataTag());
+    if (deliver) {
+        // Wait for the queued delivery UI event before assessing duplicate cards.
+        const auto captionVisible = [&] {
+            for (const auto* label : panel->findChildren<QLabel*>())
+                if (label->isVisible() && label->text() == QStringLiteral("Owned QR delivery caption")) return true;
+            return false;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(captionVisible(), 5000);
+    }
+    QVERIFY(captureAgentFixture(*panel, QStringLiteral("owned-qr-live-") + evidenceTag));
+    QCOMPARE(imageCount(), expectedImages);
+    for (int index = 0; index < 3; ++index) {
+        MaiEvent updated;
+        updated.id = "evt_owned_qr_replay_" + std::to_string(index);
+        updated.type = MaiEventType::MessagePartUpdated;
+        updated.sessionId = session.toStdString();
+        updated.messageId = owner.id;
+        updated.partId = imagePart;
+        controller.agent().eventBus().publish(updated);
+        QCoreApplication::processEvents();
+    }
+    QCOMPARE(imageCount(), expectedImages);
+    panel->openSession(controller.createSession(workspacePath));
+    panel->openSession(session);
+    QCOMPARE(imageCount(), expectedImages);
+    panel.reset();
+    panel = std::make_unique<AgentChatPanel>(controller);
+    panel->resize(1000, 850);
+    panel->openSession(session);
+    panel->show();
+    QCOMPARE(imageCount(), expectedImages);
+    QVERIFY(captureAgentFixture(*panel, QStringLiteral("owned-qr-restored-") + evidenceTag));
+    if (deliver) {
+        int captions = 0;
+        for (const auto* label : panel->findChildren<QLabel*>())
+            if (label->text() == QStringLiteral("Owned QR delivery caption")) ++captions;
+        QCOMPARE(captions, expectedImages);
+    }
+    // 展示合并不得修改真实的 image part、工具输入输出或 part 身份。
+    MaiMessage unchanged;
+    QVERIFY(controller.agent().getMessage(session.toStdString(), owner.id, unchanged));
+    QCOMPARE(unchanged.parts.size(), owner.parts.size());
+    for (std::size_t index = 0; index < owner.parts.size(); ++index) {
+        QCOMPARE(unchanged.parts[index].id, owner.parts[index].id);
+        QCOMPARE(unchanged.parts[index].body.index(), owner.parts[index].body.index());
+        if (const auto* tool = std::get_if<MaiToolPart>(&owner.parts[index].body)) {
+            const auto& after = std::get<MaiToolPart>(unchanged.parts[index].body);
+            QCOMPARE(after.input, tool->input);
+            QCOMPARE(after.output, tool->output);
+            QCOMPARE(after.state, tool->state);
+        } else if (const auto* image = std::get_if<MaiImagePart>(&owner.parts[index].body)) {
+            const auto& after = std::get<MaiImagePart>(unchanged.parts[index].body);
+            QCOMPARE(after.path, image->path);
+            QCOMPARE(after.mimeType, image->mimeType);
+        }
+    }
+    if (deliver && !copyImage) {
+        bool previewOpened = false;
+        QTimer closeOwnedPreview;
+        connect(&closeOwnedPreview, &QTimer::timeout, panel.get(), [&] {
+            if (auto* dialog = panel->findChild<ImagePreviewDialog*>()) {
+                previewOpened = !dialog->sourceImage().isNull();
+                dialog->close();
+            }
+        });
+        closeOwnedPreview.start(25);
+        panel->findChild<QPushButton*>(QStringLiteral("agentMediaImageOpen"))->click();
+        QTRY_VERIFY_WITH_TIMEOUT(previewOpened, 5000);
+        closeOwnedPreview.stop();
+    }
+    if (deliver) {
+        QVERIFY(controller.sendPrompt(session, QStringLiteral("Show that same owned file again in a new reply.")));
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+        controller.agent().waitIdle();
+        QCOMPARE(observed->calls.load(), 5);
+        QTRY_COMPARE(imageCount(), expectedImages + 1);
+    }
+    qInfo("owned-qr generation=1 stored_images=1 synchronized_images=1 visible_replayed=%d", expectedImages);
 }
 
 QTEST_MAIN(AgentPanelSessionTest)

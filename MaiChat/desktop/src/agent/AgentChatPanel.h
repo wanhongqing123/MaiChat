@@ -182,8 +182,10 @@ private:
     // Imported history remains passive; callers must exclude its reference-only projection.
     bool appendStoredImagePart(const QString& messageId, const QString& partId, const QString& path,
                                const QString& workspace);
-    // Ordinary typed parts and explicit delivery receipts share only the renderer,
-    // not a fabricated tool receipt or a second media transport.
+    // Ordinary typed parts and explicit delivery receipts share the renderer and,
+    // within one assistant message, the same unchanged canonical image file card.
+    // Preserve captions/actions and original stored parts; never deduplicate across
+    // messages or alter video/audio publication eligibility.
     bool appendResolvedMediaCard(const QString& messageId, const QString& partId, const QString& path,
                                  const QString& type, const QString& caption,
                                  const std::function<void()>& publishVideo = {});

@@ -1378,6 +1378,13 @@ struct AgentChatPanel::ConversationState {
     QHash<QString, ToolCard*> toolCards;
     QHash<QString, ToolGroupCard*> toolGroups;
     QHash<QString, ToolGroupCard*> toolCardGroups;
+    struct ImageCard {
+        QString rowId;
+        QPointer<QLabel> caption;
+    };
+    // 同一助手消息可同时保存 typed image 和显式交付回执；它们共享图片卡，不修改原始 part。
+    // 索引与会话页面一起保存/回收，不跨消息、跨会话或按文件内容全局去重。
+    QHash<QString, QHash<QString, ImageCard>> messageImageCards;
     QHash<QString, SubAgentCard*> subAgentCards;
     // child session -> (parent message, spawn part). Keep receipts even when
     // the child metadata arrives later, and retain them with the same page.
@@ -3712,6 +3719,31 @@ bool AgentChatPanel::appendResolvedMediaCard(const QString& messageId, const QSt
                                              const QString& type, const QString& caption,
                                              const std::function<void()>& publishVideo) {
     const QString id = partId + QStringLiteral("-agent-media");
+    QString imageKey;
+    const auto mergeImageCaption = [&](QLabel* label) {
+        if (!label || caption.isEmpty()) return;
+        QStringList captions = label->property("imageCaptions").toStringList();
+        if (captions.contains(caption)) return;
+        captions.append(caption);
+        label->setProperty("imageCaptions", captions);
+        label->setText(captions.join(QStringLiteral("\n\n")));
+        label->show();
+    };
+    if (type == QStringLiteral("image")) {
+        const QFileInfo file(path);
+        const QString canonical = file.canonicalFilePath();
+        if (canonical.isEmpty()) return false;
+        // 只复用当前消息中同一个未变化的文件。相对/绝对路径和符号链接归一，
+        // 不按 basename 或图像字节合并；改写同一路径后也保留独立观察。
+        imageKey = canonical + QChar(u'\0') + QString::number(file.size()) + QLatin1Char(':') +
+                   QString::number(file.lastModified().toMSecsSinceEpoch());
+        const auto existing = runtime_->messageImageCards.value(messageId).value(imageKey);
+        if (!existing.rowId.isEmpty() && existing.caption && runtime_->view->contains(existing.rowId)) {
+            mergeImageCaption(existing.caption.data());
+            // 保留首张卡的时间线位置及查看/保存/转发动作；回执仍由调用方正常收起工具卡。
+            return true;
+        }
+    }
     if (runtime_->view->contains(id)) return true;
 
     auto* card = new QWidget;
@@ -3849,10 +3881,19 @@ bool AgentChatPanel::appendResolvedMediaCard(const QString& messageId, const QSt
         audio->setSource(path);
         layout->addWidget(audioCard);
     }
-    if (!caption.isEmpty()) {
-        auto* label = new QLabel(caption, card);
+    QLabel* imageCaption = nullptr;
+    if (type == QStringLiteral("image") || !caption.isEmpty()) {
+        auto* label = new QLabel(card);
         label->setWordWrap(true);
         layout->addWidget(label);
+        if (type == QStringLiteral("image")) {
+            imageCaption = label;
+            label->setObjectName(QStringLiteral("agentMediaImageCaption"));
+            label->setTextFormat(Qt::PlainText);
+            label->hide();
+            mergeImageCaption(label);
+        } else
+            label->setText(caption);
     }
     if (type == QStringLiteral("video")) {
         auto* saveCloud = new QPushButton(QStringLiteral("保存到视频云盘"), card);
@@ -3916,6 +3957,8 @@ bool AgentChatPanel::appendResolvedMediaCard(const QString& messageId, const QSt
         }
     });
     runtime_->view->addWidget(id, card);
+    if (imageCaption)
+        runtime_->messageImageCards[messageId].insert(imageKey, ConversationState::ImageCard{id, imageCaption});
     recordMessageItem(messageId, id);
     scrollToBottom();
     return true;
