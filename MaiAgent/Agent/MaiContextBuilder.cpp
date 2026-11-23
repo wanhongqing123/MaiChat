@@ -63,6 +63,7 @@ std::string toolGroupObservation(const MaiMessage& message, std::size_t imageInd
     Json source{{"type", "tool_group_image_observation"},
                 {"source_message_id", message.id},
                 {"image_part_id", message.parts[imageIndex].id},
+                {"workspace_path", std::get<MaiImagePart>(message.parts[imageIndex].body).path},
                 {"ownership", "tool_group_only"},
                 {"tool_count", end - start},
                 {"first_tool_part_id", start < end ? message.parts[start].id : ""},
@@ -76,6 +77,8 @@ std::string toolGroupObservation(const MaiMessage& message, std::size_t imageInd
                  "tool ownership was not recorded. When available, use the exact message and part "
                  "range with session_history list_parts/read to recover original "
                  "calls and results; do not infer ownership from names or filenames."}};
+    if (std::get<MaiImagePart>(message.parts[imageIndex].body).path.empty())
+        source["pixel_status"] = "unavailable_no_workspace_path";
     return dump(source);
 }
 
@@ -101,8 +104,8 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
     out.reserve(history.size() + 1);
     std::size_t currentUserOutputIndex = std::numeric_limits<std::size_t>::max();
 
-    // 先确定本轮用户输入与可回灌图片数量；过旧的像素不进入本次模型请求，
-    // 但仍留在会话和工作区里，用户引用时可以按原路径再次读取。
+    // 最新输入只用于宿主显式开启的文本预算，不参与图片翻译。
+    // 同一源图片在后续轮次保留相同的标签和像素引用，只有压缩边界可以移除它。
     std::size_t latestUserIndex = history.size();
     for (std::size_t index = 0; index < history.size(); ++index) {
         if (history[index].role == MaiRole::User && !history[index].pendingInput)
@@ -113,39 +116,6 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
                std::find(currentUserMessageIds.begin(), currentUserMessageIds.end(),
                          history[index].id) != currentUserMessageIds.end();
     };
-    const auto isCurrentInput = [&](std::size_t index) {
-        // 每条 user 只遍历一次，最新输入若也在补充组中不会重复注入其像素。
-        return index == latestUserIndex || isFreshInput(index);
-    };
-    std::size_t currentToolImages = 0;
-    for (std::size_t index = std::max(latestUserIndex, firstMessage); index < history.size();
-         ++index) {
-        if (history[index].role != MaiRole::Assistant) continue;
-        for (std::size_t partIndex = index == firstMessage ? firstPart : 0;
-             partIndex < history[index].parts.size(); ++partIndex) {
-            const auto& part = history[index].parts[partIndex];
-            if (std::holds_alternative<MaiImagePart>(part.body)) ++currentToolImages;
-        }
-    }
-    const std::size_t skipCurrentImages = currentToolImages > mOptions.maxRecentToolImages
-                                              ? currentToolImages - mOptions.maxRecentToolImages
-                                              : 0;
-    std::size_t currentImageIndex = 0;
-    std::size_t omittedImages = 0;
-    std::size_t userImageCount = 0;
-    for (std::size_t index = 0; index < history.size(); ++index) {
-        const MaiMessage& message = history[index];
-        if (index < firstMessage && message.id != preservedUserMessageId && !isFreshInput(index))
-            continue;
-        if (message.role != MaiRole::User || message.pendingInput) continue;
-        for (const MaiMessagePart& part : message.parts)
-            if (std::holds_alternative<MaiImagePart>(part.body)) ++userImageCount;
-    }
-    const std::size_t skippedUserReferences =
-        userImageCount > mOptions.maxRecentUserImageReferences
-            ? userImageCount - mOptions.maxRecentUserImageReferences
-            : 0;
-    std::size_t userImageIndex = 0;
 
     for (std::size_t messageIndex = 0; messageIndex < history.size(); ++messageIndex) {
         const auto& message = history[messageIndex];
@@ -155,7 +125,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
         if (message.pendingInput) continue;
         if (message.role == MaiRole::User) {
             // 用户消息的文字、图片、视频和引用共享同一模型消息。
-            // 当前轮附件使用精确工作区路径，避免模型根据文件名猜测来源。
+            // 附件身份只取本消息的序号/part ID/路径，不按当前轮次或后续图片数改写。
             MaiModelMessage modelMessage;
             modelMessage.role = MaiModelRole::User;
             modelMessage.content = message.text();
@@ -163,23 +133,20 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
             for (const auto& part : message.parts) {
                 if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
                     ++attachmentIndex;
-                    const bool current = isCurrentInput(messageIndex);
-                    const bool recent = userImageIndex++ >= skippedUserReferences;
-                    if ((current || recent) && !image->path.empty()) {
-                        if (!modelMessage.content.empty()) modelMessage.content += "\n";
+                    if (!modelMessage.content.empty()) modelMessage.content += "\n";
+                    modelMessage.content +=
+                        "Image attachment " + std::to_string(attachmentIndex) + " (id=" + part.id +
+                        ", workspace_path=" + nlohmann::json(image->path).dump() + ").";
+                    if (!image->path.empty()) {
                         modelMessage.content +=
-                            std::string(current ? "Current" : "Earlier") + " image attachment " +
-                            std::to_string(attachmentIndex) + " (id=" + part.id +
-                            ", workspace_path=" + nlohmann::json(image->path).dump() + ").";
-                        if (current)
-                            modelMessage.content +=
-                                " Use this exact path in file tools; do not search for this "
-                                "attachment by filename or time.";
-                    }
-                    if (current)
+                            " Use this exact path in file tools; do not search for this "
+                            "attachment by filename or time.";
                         modelMessage.images.push_back({image->path, image->mimeType});
-                    else
-                        ++omittedImages;
+                    } else {
+                        // 无路径的旧损坏记录没有可编码像素；说明固定在本图，不能改写全局前缀。
+                        modelMessage.content +=
+                            " Pixels are unavailable: no workspace path was recorded.";
+                    }
                 } else if (const auto* video = std::get_if<MaiVideoPart>(&part.body)) {
                     if (!modelMessage.content.empty()) modelMessage.content += "\n";
                     modelMessage.content += "Attached video in the Agent workspace: " + video->path;
@@ -354,6 +321,12 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
                 if (!pending.content.empty()) pending.content += "\n";
                 pending.content += text->text;
             } else if (const auto* toolResult = std::get_if<MaiReasoningPart>(&part.body)) {
+                if (maiIsResponseBoundaryPart(part)) {
+                    // 空记录是原生响应边界，既不显示思考也不发给模型；先前批次/正文须封口。
+                    flush_batch();
+                    flush_pending();
+                    continue;
+                }
                 if (toolResult->continuation) {
                     // 一个 carrier 就是一个成功 response 边界。即便前一个响应没有
                     // 工具或可见文字，也必须独立输出；状态不经过文本裁剪或拼接。
@@ -380,38 +353,22 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
                     batch.push_back(toolPart);
                 }
             } else if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
-                const bool isCurrentTurn = messageIndex > latestUserIndex;
-                if (!isCurrentTurn || currentImageIndex++ < skipCurrentImages) {
-                    ++omittedImages;
-                    continue;
-                }
                 // Chat Completions 只允许用户消息携带 image_url：
                 // 先保留工具调用与回执的相邻顺序，再把实际像素作为下一条观察消息。
+                // 不在当前轮内部滑动删除截图；已发送的观察仅在压缩覆盖其 part 后移除。
                 flush_batch();
                 MaiModelMessage observation;
                 observation.role = MaiModelRole::User;
                 observation.content = toolGroupObservation(
                     message, partIndex, messageIndex == firstMessage ? firstPart : 0);
-                observation.images.push_back({image->path, image->mimeType});
+                if (!image->path.empty())
+                    observation.images.push_back({image->path, image->mimeType});
                 out.push_back(std::move(observation));
             }
         }
         flush_batch();
 
         flush_pending();
-    }
-    // 对未回灌的旧图明确告知模型：文件仍存在，只是本轮上下文没有携带像素。
-    if (omittedImages != 0) {
-        MaiModelMessage note;
-        note.role = MaiModelRole::System;
-        note.content =
-            "[Omitted " + std::to_string(omittedImages) +
-            " older image observations to keep this request bounded. The files remain available, "
-            "but their omitted pixels were not provided to this request. Do not infer their visual "
-            "contents from filenames or metadata.]";
-        out.insert(out.begin(), std::move(note));
-        if (currentUserOutputIndex != std::numeric_limits<std::size_t>::max())
-            ++currentUserOutputIndex;
     }
     const std::size_t latestUser =
         currentUserOutputIndex < out.size() ? currentUserOutputIndex : out.size();

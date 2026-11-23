@@ -2,6 +2,11 @@
 // 主要实现：isInProgress、text；对应公开接口中的状态和错误处理。
 #include "MaiMessage.h"
 
+bool maiIsResponseBoundaryPart(const MaiMessagePart& part) {
+    const auto* reasoning = std::get_if<MaiReasoningPart>(&part.body);
+    return part.created == 0 && reasoning && reasoning->text.empty() && !reasoning->continuation;
+}
+
 const char* maiToolStateToString(MaiToolState state) {
     switch (state) {
         case MaiToolState::Pending: return "pending";

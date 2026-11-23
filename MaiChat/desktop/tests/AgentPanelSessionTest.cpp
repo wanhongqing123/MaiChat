@@ -654,6 +654,7 @@ private slots:
     void welcomeToolRowsUseModelIdsInsteadOfStatusLabels_data();
     void welcomeToolRowsUseModelIdsInsteadOfStatusLabels();
     void newSessionUsesAppWorkspaceInsteadOfProcessDirectory();
+    void toolGroupCategoriesStayWithinTheirOwnGroup();
     void newSessionOffersWorkspaceChoice();
     void chosenWorkspaceKeepsCurrentSession();
     void explicitNewSessionUsesChosenDirectory();
@@ -4376,6 +4377,66 @@ void AgentPanelSessionTest::conversationUsesAvailableWidth() {
     QTRY_COMPARE(qRound(view->itemRect(QStringLiteral("wide-document")).left()), UiZoom::s(48));
     QCOMPARE(qRound(view->viewport()->width() - view->itemRect(QStringLiteral("wide-document")).right()),
              UiZoom::s(48));
+}
+
+void AgentPanelSessionTest::toolGroupCategoriesStayWithinTheirOwnGroup() {
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    const QString database = storage.filePath(QStringLiteral("owned-tool-categories.db"));
+    const std::string sessionId = "ses_owned_tool_categories";
+    {
+        auto opened = makeMaiSqliteStore(database.toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        MaiSession session;
+        session.id = sessionId;
+        session.directory = storage.path().toStdString();
+        session.created = session.updated = 1;
+        store->putSession(session);
+        MaiMessage message;
+        message.id = "msg_owned_categories";
+        message.role = MaiRole::Assistant;
+        message.created = message.completed = 2;
+        const auto appendTool = [&](const std::string& name, MaiToolState state) {
+            MaiToolPart tool;
+            tool.tool = name;
+            tool.callId = "call_owned_" + std::to_string(message.parts.size());
+            tool.state = state;
+            tool.output = "Owned synthetic result; no tool was executed.";
+            message.parts.push_back({"prt_owned_" + std::to_string(message.parts.size()), std::move(tool), 2});
+        };
+        appendTool("ssh_exec", MaiToolState::Completed);
+        appendTool("curl", MaiToolState::Completed);
+        appendTool("openssl", MaiToolState::Completed);
+        // Stored parts replay in lexicographic ID order, so separator IDs must
+        // share the same monotonic sequence as the surrounding tool parts.
+        message.parts.push_back({"prt_owned_3", MaiTextPart{"Owned category boundary A"}, 2});
+        appendTool("shell", MaiToolState::Error);
+        appendTool("file_read", MaiToolState::Completed);
+        message.parts.push_back({"prt_owned_6", MaiTextPart{"Owned category boundary B"}, 2});
+        appendTool("desktop_process_read", MaiToolState::Completed);
+        store->putMessage(sessionId, message);
+        QVERIFY(!store->lastWriteError().hasError());
+    }
+    AgentController controller(std::make_unique<SilentModel>(), database);
+    QVERIFY2(controller.openError().isEmpty(), qPrintable(controller.openError()));
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 800);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    panel.openSession(QString::fromStdString(sessionId));
+    QTRY_COMPARE(panel.findChildren<QPushButton*>(QStringLiteral("agentToolGroupDisclosure")).size(), 3);
+    const QStringList expected{QStringLiteral("内置工具调用 3 次 · 已完成"),
+                               QStringLiteral("内置工具调用 1 次 · shell 调用 1 次 · 有失败"),
+                               QStringLiteral("shell 调用 1 次 · 已完成")};
+    const auto buttons = panel.findChildren<QPushButton*>(QStringLiteral("agentToolGroupDisclosure"));
+    for (int i = 0; i < buttons.size(); ++i) {
+        QCOMPARE(buttons[i]->text(), QStringLiteral("⌘  %1  ›").arg(expected[i]));
+        buttons[i]->click();
+        QCOMPARE(buttons[i]->text(), QStringLiteral("⌘  %1  ⌄").arg(expected[i]));
+        buttons[i]->click();
+    }
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("tool-categories-local-owned")));
 }
 
 void AgentPanelSessionTest::historyOpensLatestPageAndPrependsWithoutMovingReadingAnchor() {

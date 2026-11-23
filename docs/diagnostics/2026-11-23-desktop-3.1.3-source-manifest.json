@@ -1,0 +1,136 @@
+{
+  "baseCommit": "11a4e287c750bdbb953f0cb6d3c8a59fd6116004",
+  "scope": "Three features19 plus OCR7; release version/docs handled by sole main writer",
+  "files": {
+    "MaiAgent/Agent/MaiContextBuilder.cpp": {
+      "bytes": 24128,
+      "sha256": "a184bf6d980929d85072ba8f87397681dbfa853f00b576e30425da7eb0d00543",
+      "gitBlob": "cd1262fa38f62b1ca08b15630395969d828ffe2d"
+    },
+    "MaiAgent/Agent/MaiContextCompactor.cpp": {
+      "bytes": 98810,
+      "sha256": "de83ba4ce7e27c31bb12fc38011915e64e4002feaf2da91e8aea2ed81c854bab",
+      "gitBlob": "1cd62c47647e64fec122c3cb90a5e3d04ff282b1"
+    },
+    "MaiAgent/Agent/MaiMessage.cpp": {
+      "bytes": 1261,
+      "sha256": "da07f18fb73696e2f30158e3aea6672f28d4b13998867a3f949f5bd2008bbfc4",
+      "gitBlob": "f8133c5b7f5e11327ea2e4cf70ac0dbda18f8063"
+    },
+    "MaiAgent/Agent/MaiToolOutput.cpp": {
+      "bytes": 8956,
+      "sha256": "cda9588e6623c09e7ae88193fb49c8bcd0e745ae0748961a69d8b467258ff11a",
+      "gitBlob": "f3ef5d1f26ae0319e4e754e3c20300b524b0de09"
+    },
+    "MaiAgent/Agent/MaiTurnRunner.cpp": {
+      "bytes": 71584,
+      "sha256": "492ccfc3f793b33766a53dc39d12e1899c6bffa59c2dde49f9db9b4f030f3a02",
+      "gitBlob": "b0b36f3b0a2de44411d0774b41efdba112abcd0a"
+    },
+    "MaiAgent/include/MaiContextBuilder.h": {
+      "bytes": 3862,
+      "sha256": "ebbfab4b6298ca9c483d0a103dec38612ff3ac558b396cc36b8ec4f3e3ddd2e5",
+      "gitBlob": "60ad36694139f5a6176b25207c6712dfe6f9d46c"
+    },
+    "MaiAgent/include/MaiContextCompactor.h": {
+      "bytes": 7148,
+      "sha256": "ac86f8d7b6361ab02bd3dae3030dcb4b1e492a582967807473ecaf6e732f05c6",
+      "gitBlob": "dea6345c5e9fdb615b41bcebb378ebe5bf91cbd2"
+    },
+    "MaiAgent/include/MaiMessage.h": {
+      "bytes": 9850,
+      "sha256": "43d95ee043bb715f6a2197e4bee94dbc8ad2069f7bcff0b9ba20087c0745f1ec",
+      "gitBlob": "ded7cdbfb4eca5a3181a95f555672de6614f0924"
+    },
+    "MaiAgent/include/MaiToolOutput.h": {
+      "bytes": 4900,
+      "sha256": "285bcff6bed69edc3e6320edee95702ead8024c77c2ba980221d4d0bc731c8bd",
+      "gitBlob": "1a0622f72ded9ae19c2824d2218ecef8ccb16786"
+    },
+    "MaiAgent/tests/MaiContextBuilderImageTests.cpp": {
+      "bytes": 30087,
+      "sha256": "74dfa75a3bf11fe19934f4b282db1da88c99a37f11c64896aa4ca623ae1eb3b4",
+      "gitBlob": "3b835f5687eaafce300230d9bd18e5db686f4473"
+    },
+    "MaiAgent/tests/MaiContextCompactorTests.cpp": {
+      "bytes": 229234,
+      "sha256": "14a6cb4bd46cfe6d9d409e70593ec35910373fe435450dc875a0581f867f95d3",
+      "gitBlob": "340618cf7251abdfb133da97f987a2d134085540"
+    },
+    "MaiAgent/tests/MaiToolLoopTests.cpp": {
+      "bytes": 113117,
+      "sha256": "c5c2056d839623ff744ec98d7f948c375650d6734e1eb0f15a8a79f519660f46",
+      "gitBlob": "e70232f40c0d580ae1b136c9a0130e11d767c087"
+    },
+    "MaiAgent/tests/MaiTurnRunnerTests.cpp": {
+      "bytes": 134632,
+      "sha256": "74631fe43a4c3c72c28b9d11b3f1f430e6f9b97a5cfdc9b978e9aa7dddeb5bd8",
+      "gitBlob": "fdf39ebb7be5b39c73b7c9e5abe189b3f6c9aad5"
+    },
+    "MaiChat/desktop/src/agent/AgentChatPanel.cpp": {
+      "bytes": 259746,
+      "sha256": "200c369c39419bb7ff5628be0973075faee307a12616cf03aa91194e81b18ae9",
+      "gitBlob": "1526192772e5a923ade555f47d1dd4a31e9fec31"
+    },
+    "MaiChat/desktop/src/agent/AgentToolGroupWidget.cpp": {
+      "bytes": 6454,
+      "sha256": "c8c435d350c4b6591d5d4a0e62648948b57d693f9384e8c1177db75b9954d994",
+      "gitBlob": "f34a43de85422c12e365da586630003d876212a9"
+    },
+    "MaiChat/desktop/src/agent/AgentToolGroupWidget.h": {
+      "bytes": 1566,
+      "sha256": "a449fca567e3bdfdb2ee34d0e3a10fe6ed9a13bcf0352316523b2868cce86bb8",
+      "gitBlob": "254f0652988d8d5d654a5544908e650251f63504"
+    },
+    "MaiChat/desktop/src/agent/RemoteAgentPanel.cpp": {
+      "bytes": 155372,
+      "sha256": "52ce36bb0fc36eba392731df76c95f9883d30eed72999e905da523efc2a6425a",
+      "gitBlob": "f405fe35e40dd91c0c11a7ff9e6b90d9c2ffc36c"
+    },
+    "MaiChat/desktop/tests/AgentPanelSessionTest.cpp": {
+      "bytes": 262712,
+      "sha256": "cb69b45b578d65609ed0f63b2a0e2cc04c847e17cbef40837e58b015a5a43a18",
+      "gitBlob": "bb37290c531fbc71c1cbb60009ed7c1f3dfff94b"
+    },
+    "MaiChat/desktop/tests/RemoteToolDetailTest.cpp": {
+      "bytes": 39231,
+      "sha256": "b10f806308ba276f46759d2128d3006653cac96c47a76dc9913bdd94243ee942",
+      "gitBlob": "5a0d801fdcb940c41c8084e9e045cb9dad079ed8"
+    },
+    "MaiChat/Media/MaiOcr.cpp": {
+      "bytes": 43656,
+      "sha256": "2873c7eb0ed67e5b0fc69ee68e9ac6fd8e30e750e554c6f3a9fdfb20608a5d1b",
+      "gitBlob": "122200cf7c85a1980b13771e4946cead543de922"
+    },
+    "MaiChat/Media/MaiOcr.h": {
+      "bytes": 4715,
+      "sha256": "2373f251cae07ba8fb0b7bc2896f7bc980dd4b3f4ebc53354409b522ea269c1d",
+      "gitBlob": "c0442175fc9ac1480561e77c7af7a590434632b3"
+    },
+    "MaiChat/Media/MaiOcrInternal.h": {
+      "bytes": 1252,
+      "sha256": "a02575ced7aa5c2223149f6de47254fb2a56f059a9de82a2f1f379f934f8c767",
+      "gitBlob": "9a886956dd2c24f81a56a892b503db8853e254f1"
+    },
+    "MaiChat/Media/tests/MaiOcrTest.cpp": {
+      "bytes": 29178,
+      "sha256": "c8ae65f471d9c34323fe08ecd741fbfd996a17c6a19ca86b0b5955e4ba5a6b05",
+      "gitBlob": "407120bbb31a8522acdc465a2973f60ae08922c3"
+    },
+    "MaiChat/desktop/src/MaiChatTools/DesktopOcrTools.cpp": {
+      "bytes": 15190,
+      "sha256": "1524230336acec0a8dd5e962052198e8b31f9b5f1eed7883e878389eafa107d5",
+      "gitBlob": "9701d4fa481834876383f9b5c94329f787770e7a"
+    },
+    "MaiChat/desktop/src/MaiChatTools/DesktopOcrTools.h": {
+      "bytes": 2038,
+      "sha256": "f922be3660dc72fe9d8ffefdb69ee12f543a4a7b54ec03e3524fb4d6de37474d",
+      "gitBlob": "9d47691b78c4efff6db5279353af59a8f9505ff8"
+    },
+    "MaiChat/desktop/tests/DesktopOcrToolsTest.cpp": {
+      "bytes": 22613,
+      "sha256": "d0609d8894150f4f815022716327f54912a4a2a89b47805ec0caa3c5c8c1b800",
+      "gitBlob": "e4b8a1af2ba5b58e36f163e2a1a85caa7627765b"
+    }
+  }
+}

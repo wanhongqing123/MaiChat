@@ -91,6 +91,11 @@ QJsonObject encodeResult(const DesktopOcrResult& result, const QString& sourcePa
     }
     return {{QStringLiteral("image_width"), result.imageWidth},
             {QStringLiteral("image_height"), result.imageHeight},
+            {QStringLiteral("partial"), result.partial},
+            {QStringLiteral("skipped_lines"), static_cast<qint64>(result.skippedLines)},
+            {QStringLiteral("segmented_lines"), static_cast<qint64>(result.segmentedLines)},
+            {QStringLiteral("recognition_height"), MAI_OCR_RECOGNITION_HEIGHT},
+            {QStringLiteral("max_recognition_width"), MAI_OCR_MAX_RECOGNITION_WIDTH},
             {QStringLiteral("source_path"), sourcePath},
             {QStringLiteral("space"), QStringLiteral("image")},
             {QStringLiteral("space_id"), sourcePath},
@@ -109,6 +114,8 @@ public:
     std::string description() const override {
         return "Read text from one accessible local raster using local OCR. Returns image-space "
                "quadrilaterals in the original decoded raster pixels after EXIF orientation. "
+               "Wide text can return separate fragment blocks; partial/skipped_lines report incomplete "
+               "wide-line recovery even when no blocks remain. Recognition limits are normalized dimensions. "
                "Confidence and boxes do not establish clickable controls; inspect repeated labels "
                "before choosing a target. This tool does not create a computer snapshot. For "
                "screenshot input use the same actual snapshot and its frame mapping separately; "
@@ -275,6 +282,9 @@ MaiResult<DesktopOcrResult> DesktopOcrService::recognizeImageFile(
     DesktopOcrResult result;
     result.imageWidth = native.value.width;
     result.imageHeight = native.value.height;
+    result.partial = native.value.partial != 0;
+    result.skippedLines = native.value.skipped_lines;
+    result.segmentedLines = native.value.segmented_lines;
     result.blocks.reserve(native.value.count);
     for (std::size_t index = 0; index < native.value.count; ++index) {
         const MaiOcrRegion& region = native.value.regions[index];

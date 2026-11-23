@@ -22,9 +22,11 @@
 #include <json.hpp>
 
 #include "MaiAgent.h"
+#include "MaiContextBuilder.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiMemoryStore.h"
+#include "MaiSqliteStore.h"
 #include "MaiModelRetry.h"
 #include "MaiFileTools.h"
 #include "MaiFakeModelClient.h"
@@ -1186,14 +1188,15 @@ void test_steering_image_group_backpressure_keeps_rejected_input_retryable() {
     agent.waitIdle();
     CHECK(observed->requestCount() == 3);
     if (observed->requestCount() == 3) {
-        std::size_t firstCount = 0;
+        std::vector<std::string> firstPaths;
         for (const auto& message : observed->request(1).messages)
-            firstCount += message.images.size();
-        CHECK(firstCount == 10);
+            for (const auto& image : message.images) firstPaths.push_back(image.path);
+        CHECK(firstPaths.size() == 10);
         std::vector<std::string> finalPaths;
         for (const auto& message : observed->request(2).messages)
             for (const auto& image : message.images) finalPaths.push_back(image.path);
-        CHECK(finalPaths == std::vector<std::string>{"owned-last.png"});
+        firstPaths.push_back("owned-last.png");
+        CHECK(finalPaths == firstPaths);
     }
 }
 
@@ -1593,14 +1596,21 @@ void test_image_steering_survives_a_later_text_input_at_the_same_safe_boundary()
             hasText |= message.content == "Inspect that image";
             for (const auto& attached : message.images) paths.push_back(attached.path);
         }
-        CHECK(paths == std::vector<std::string>{freshImage});
+        CHECK((paths == std::vector<std::string>{oldImage, freshImage}));
+        CHECK(request.messages.front().content == observed->request(0).messages.front().content);
         CHECK(hasText);
     }
     CHECK(agent.submit(MaiSendPrompt{session, "Continue without another image"}));
     agent.waitIdle();
     CHECK(observed->requestCount() == 4);
-    if (observed->requestCount() == 4)
-        for (const auto& message : observed->request(3).messages) CHECK(message.images.empty());
+    if (observed->requestCount() == 4) {
+        std::vector<std::string> paths;
+        for (const auto& message : observed->request(3).messages)
+            for (const auto& image : message.images) paths.push_back(image.path);
+        CHECK((paths == std::vector<std::string>{oldImage, freshImage}));
+        CHECK(observed->request(3).messages.front().content ==
+              observed->request(0).messages.front().content);
+    }
 }
 
 void test_steering_receipt_precedes_new_assistant_update_and_names_consumed_inputs() {
@@ -2198,7 +2208,167 @@ void test_specialist_reply_keeps_existing_history_and_new_steering_in_order() {
 
 }  // namespace
 
-int main() {
+void test_native_tool_responses_keep_every_previously_sent_message_unchanged(bool sqlite = false) {
+    MaiMessagePart emptyProvider{"prt_owned_empty", MaiReasoningPart{}, 1};
+    CHECK(!maiIsResponseBoundaryPart(emptyProvider));
+    auto boundary = emptyProvider;
+    boundary.created = 0;
+    CHECK(maiIsResponseBoundaryPart(boundary));
+    boundary.body = MaiReasoningPart{
+        "", MaiModelContinuationState{"responses.output.v1", "owned", "owned", "{}"}};
+    CHECK(!maiIsResponseBoundaryPart(boundary));
+    MaiMessage providerUser;
+    providerUser.role = MaiRole::User;
+    providerUser.parts.push_back({"prt_owned_user", MaiTextPart{"Owned input"}, 1});
+    MaiMessage providerAssistant;
+    providerAssistant.role = MaiRole::Assistant;
+    providerAssistant.parts = {boundary, emptyProvider};
+    MaiToolPart proposed;
+    proposed.tool = "owned";
+    proposed.callId = "owned-call";
+    proposed.input = "{}";
+    proposed.output = "Owned result";
+    proposed.state = MaiToolState::Completed;
+    providerAssistant.parts.push_back({"prt_owned_call", proposed, 1});
+    const auto providerContext = MaiContextBuilder{}.build({providerUser, providerAssistant});
+    CHECK(providerContext.size() == 3);
+    if (providerContext.size() == 3)
+        CHECK(providerContext[1].continuation && providerContext[1].invocations.size() == 1);
+    class PrefixTool final : public MaiTool {
+    public:
+        std::string name() const override {
+            return "owned_prefix";
+        }
+        std::string description() const override {
+            return "Return an owned immutable result.";
+        }
+        std::string parametersSchema() const override {
+            return R"({"type":"object"})";
+        }
+        bool requiresApproval(const std::string&) const override {
+            return false;
+        }
+        MaiToolResult execute(const std::string& input, const MaiToolContext&) override {
+            return MaiToolResult::success("Owned result " + input);
+        }
+    };
+    auto first = callTurn("owned_prefix", R"({"step":0})", "prefix-first");
+    first.invocations.push_back({"prefix-parallel", "owned_prefix", R"({"step":1})"});
+    auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+        first, callTurn("owned_prefix", R"({"step":2})", "prefix-next"),
+        sayTurn("Finished the first user turn."), sayTurn("Finished the second user turn.")});
+    auto* observed = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(std::make_unique<PrefixTool>());
+    auto store = makeMaiMemoryStore();
+    const auto database = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8("owned-prefix-" + MaiIdGenerator::newSessionId() + ".sqlite"));
+    if (sqlite) {
+        auto opened = makeMaiSqliteStore(database.toUtf8());
+        CHECK(opened);
+        if (!opened) return;
+        store = std::move(opened.value());
+    }
+    std::string sessionId;
+    std::vector<MaiModelMessage> sentPrefix;
+    const auto snapshot = [](const MaiModelMessage& message) {
+        using Json = nlohmann::json;
+        Json calls = Json::array(), images = Json::array();
+        for (const auto& call : message.invocations)
+            calls.push_back({{"id", call.id}, {"name", call.name}, {"arguments", call.arguments}});
+        for (const auto& image : message.images)
+            images.push_back({{"path", image.path}, {"mime", image.mimeType}});
+        Json state = nullptr;
+        if (message.continuation)
+            state = {{"format", message.continuation->format},
+                     {"provider", message.continuation->provider},
+                     {"model", message.continuation->model},
+                     {"payload", message.continuation->payload}};
+        return Json{{"role", static_cast<int>(message.role)},
+                    {"content", message.content},
+                    {"reasoning", message.reasoning},
+                    {"call_id", message.toolCallId},
+                    {"calls", calls},
+                    {"images", images},
+                    {"continuation", state}};
+    };
+    {
+        MaiAgent::Options options;
+        options.defaultModel = "owned-prefix-fixture";
+        MaiAgent agent(std::move(store), std::move(model), std::move(tools), options);
+        const auto created =
+            agent.submit(MaiCreateSession{MaiFileSystem::temporaryDirectory().toUtf8(), "", ""});
+        CHECK(created);
+        if (!created) return;
+        sessionId = created.value();
+        CHECK(agent.submit(MaiSendPrompt{created.value(), "Perform the owned checks."}));
+        agent.waitIdle();
+        CHECK(agent.submit(MaiSendPrompt{created.value(), "Continue with a new user turn."}));
+        agent.waitIdle();
+        CHECK(observed->requestCount() == 4);
+        for (std::size_t requestIndex = 1; requestIndex < observed->requestCount();
+             ++requestIndex) {
+            const auto before = observed->request(requestIndex - 1);
+            const auto after = observed->request(requestIndex);
+            CHECK(before.baseInstructions == after.baseInstructions);
+            CHECK(before.model == after.model && before.workingDirectory == after.workingDirectory);
+            CHECK(before.reasoningEffort == after.reasoningEffort &&
+                  before.temperature == after.temperature &&
+                  before.maxOutputTokens == after.maxOutputTokens &&
+                  before.sessionId == after.sessionId);
+            CHECK(before.tools.size() == after.tools.size());
+            for (std::size_t index = 0; index < before.tools.size() && index < after.tools.size();
+                 ++index)
+                CHECK(before.tools[index].name == after.tools[index].name &&
+                      before.tools[index].description == after.tools[index].description &&
+                      before.tools[index].parametersJson == after.tools[index].parametersJson);
+            CHECK(before.messages.size() < after.messages.size());
+            for (std::size_t index = 0;
+                 index < before.messages.size() && index < after.messages.size(); ++index)
+                CHECK(snapshot(before.messages[index]) == snapshot(after.messages[index]));
+        }
+        const auto restored = MaiContextBuilder{}.build(agent.listMessages(created.value()));
+        if (observed->requestCount() == 4) {
+            const auto sent = observed->request(3);
+            sentPrefix = sent.messages;
+            CHECK(restored.size() > sent.messages.size());
+            for (std::size_t index = 0; index < sent.messages.size() && index < restored.size();
+                 ++index)
+                CHECK(snapshot(sent.messages[index]) == snapshot(restored[index]));
+        }
+    }
+    if (sqlite) {
+        {
+            auto reopened = makeMaiSqliteStore(database.toUtf8());
+            CHECK(reopened);
+            if (reopened) {
+                const auto history = reopened.value()->listMessages(sessionId);
+                const auto context = MaiContextBuilder{}.build(history);
+                CHECK(context.size() > sentPrefix.size());
+                for (std::size_t index = 0; index < sentPrefix.size() && index < context.size();
+                     ++index)
+                    CHECK(snapshot(sentPrefix[index]) == snapshot(context[index]));
+                std::size_t boundaries = 0;
+                for (const auto& message : history)
+                    for (const auto& part : message.parts)
+                        boundaries += maiIsResponseBoundaryPart(part) ? 1 : 0;
+                CHECK(boundaries >= 2);
+            }
+        }
+        MaiFileSystem::removeFile(database);
+        MaiFileSystem::removeFile(MaiFilePath::fromUtf8(database.toUtf8() + "-wal"));
+        MaiFileSystem::removeFile(MaiFilePath::fromUtf8(database.toUtf8() + "-shm"));
+    }
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--request-prefix-only") {
+        test_native_tool_responses_keep_every_previously_sent_message_unchanged();
+        test_native_tool_responses_keep_every_previously_sent_message_unchanged(true);
+        return failures == 0 ? 0 : 1;
+    }
+    test_native_tool_responses_keep_every_previously_sent_message_unchanged();
+    test_native_tool_responses_keep_every_previously_sent_message_unchanged(true);
     test_stream_recovery_preserves_completed_tools_and_discards_failed_calls();
     test_stream_recovery_exhaustion_keeps_drafts_without_commit_receipts();
     test_stream_recovery_wait_accepts_steering_and_cancel();

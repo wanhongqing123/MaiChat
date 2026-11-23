@@ -24,12 +24,8 @@ public:
         // 显式启用时才把草稿交给模型。原响应的 opaque continuation 独立保留，
         // 不由此显示文本选项或 maxReasoningBytes 裁剪。
         bool includeReasoning = false;
-        // 只保留当前用户轮次里最新的工具图片。旧像素仍在磁盘和会话存储中，
-        // 但每轮都重新嵌入全部图片会让模型请求不断膨胀，最终耗尽流式期限。
-        std::size_t maxRecentToolImages = 8;
-        // 模型文本中只保留最近的用户图片引用；当前用户新发送的附件始终保留，
-        // 不能被旧图集挤掉。
-        std::size_t maxRecentUserImageReferences = 12;
+        // 用户/工具图片没有滚动数量预算：未压缩的像素引用和标签必须保持前缀稳定。
+        // 请求容量由 MaiContextCompactor 统一计量，推进检查点后才移除已覆盖的图片。
         // 这四个文本预算的零值均表示不设限；默认不省略旧消息、不替换原文中段。
         // 非零值是宿主明确选择的有损策略，只影响请求副本，不改会话存储；
         // maxHistoryTextBytes 同时限制当前用户输入和总历史，另三项分别限制对应内容。
@@ -46,13 +42,13 @@ public:
 
     // firstMessage 为已成功摘要覆盖的源前缀长度，默认 0；firstPart 只跳过其 assistant
     // 稳定片段前缀。preservedUserMessageId 允许把部分 assistant 的当前 user 原文保留在前。
-    // 越界/试图裁 user parts 返回空列表。引用仍在完整 history 中解析；图片预算只计剩余 tail。
+    // 越界/试图裁 user parts 返回空列表。引用仍在完整 history 中解析；未覆盖的图片全部保留。
     // preserveReasoning 用于 GLM 等要求工具跟进回传原思考的协议：仅填独立 reasoning，
     // 不把它复制成可见 content。默认 false 保持旧契约；原显式字节策略仍适用，
     // 产品默认各预算为零，因此原始片段字节及其 call/result 归属保持不变。
     // currentUserMessageIds 是本次安全点消费的显式补充组，和默认最新输入按 ID 合并去重。
-    // 该组先前的图片不能因为同组最后一条只有文字而省略。调用方必须在接收阶段限制组预算，
-    // 下一组替换此集合；默认空集合保持既有历史像素省略及工具图片预算。
+    // 压缩边界前仍需保留的补充输入按此集合恢复，调用方在接收阶段限制组预算。
+    // 它不是图片选择开关；未压缩历史的图片不随当前输入组变化而改写或消失。
     std::vector<MaiModelMessage> build(
         const std::vector<MaiMessage>& history, std::size_t firstMessage = 0,
         std::size_t firstPart = 0, const std::string& preservedUserMessageId = {},

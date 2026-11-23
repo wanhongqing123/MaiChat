@@ -9,6 +9,9 @@ extern "C" {
 
 typedef struct MaiOcrEngine MaiOcrEngine;
 
+// Normalized recognition tensor dimensions, not source image pixels.
+enum { MAI_OCR_RECOGNITION_HEIGHT = 48, MAI_OCR_MAX_RECOGNITION_WIDTH = 2048 };
+
 typedef enum MaiOcrStatus {
     MAI_OCR_OK = 0,
     MAI_OCR_INVALID_INPUT,
@@ -75,6 +78,13 @@ typedef struct MaiOcrResult {
     int height;
     MaiOcrRegion* regions;
     size_t count;
+    // Counts source lines incompletely recovered after bounded wide-line
+    // subdivision. Partial results may have zero regions. Ordinary confidence
+    // filtering alone does not indicate a width-recovery failure.
+    int partial;
+    size_t skipped_lines;
+    // Source lines for which at least two fragment recognitions were attempted.
+    size_t segmented_lines;
 } MaiOcrResult;
 
 // 同步调用。宿主须用同一把 mutex 串行保护同一个 engine 的 recognize 和 destroy；
@@ -86,7 +96,9 @@ void maiOcrDestroy(MaiOcrEngine* engine);
 
 // out_result 必须已清零或已释放。失败/取消保持全零，不发布已完成的前几个文本块。
 // 检测按模型 resize-long 960 后向上对齐 128（最长边 1,024），最多 512 个候选、
-// 256 个结果；识别高度 48、宽度最多 2,048，
+// 256 个结果；识别高度 48、宽度最多 2,048（归一化尺寸，非源图像素），
+// 过宽行最多分为 8 个不重叠片段；无法安全分割时以 partial/skipped_lines 报告。
+// 每图最多 512 次识别推理、30 秒识别阶段；单次 ORT 推理不能立即中断。
 // 单块 UTF-8 文本最多 8,192 字节，总文本最多 65,536 字节。超过限制明确失败。
 MaiOcrStatus maiOcrRecognize(MaiOcrEngine* engine, const MaiOcrImage* image, const MaiOcrOptions* options,
                              MaiOcrResult* out_result, char* error, size_t error_capacity);

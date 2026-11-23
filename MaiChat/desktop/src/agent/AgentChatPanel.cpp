@@ -1335,6 +1335,7 @@ public:
 
     void setSummary(const MaiMessage& message, const QHash<QString, ToolCard*>& visibleCards) {
         QStringList states;
+        QStringList tools;
         bool running = false;
         bool pending = false;
         for (const MaiMessagePart& part : message.parts) {
@@ -1343,10 +1344,11 @@ public:
             ToolCard* card = visibleCards.value(fromUtf8(part.id), nullptr);
             if (!tool || !card || !isAncestorOf(card)) continue;
             states.append(QString::fromLatin1(maiToolStateToString(tool->state)));
+            tools.append(fromUtf8(tool->tool));
             running |= tool->state == MaiToolState::Running;
             pending |= tool->state == MaiToolState::Pending;
         }
-        setTitle(agentToolGroupTitle(states));
+        setTitle(agentToolGroupTitle(states, tools));
         if (!running && !pending && autoExpanded_) {
             autoExpanded_ = false;
             setExpanded(false);

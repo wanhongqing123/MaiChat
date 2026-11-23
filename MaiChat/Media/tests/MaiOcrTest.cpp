@@ -114,6 +114,54 @@ struct MaiOcrSmallUiFixture {
     std::array<cv::Rect, 2> textInk;
 };
 
+// A long continuous line and unrelated short labels reproduce a screenshot's
+// aspect-ratio limit without reading any desktop pixels or user documents.
+cv::Mat ownedWideLineFixture(int width = 2464, int height = 1600, int repeats = 8, bool withLabel = true) {
+    cv::Mat rgba(height, width, CV_8UC4, cv::Scalar(255, 255, 255, 255));
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = rgba.cols;
+    info.bmiHeader.biHeight = -rgba.rows;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    CHECK(dc && bitmap && pixels);
+    if (dc && bitmap && pixels) {
+        HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+        RECT background{0, 0, rgba.cols, rgba.rows};
+        FillRect(dc, &background, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(24, 24, 24));
+        HFONT narrow = CreateFontW(-24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                   FIXED_PITCH, L"Consolas");
+        HGDIOBJ oldFont = SelectObject(dc, narrow);
+        std::wstring line;
+        for (int repeat = 0; repeat < repeats; ++repeat) line += L"MAICHATOCR1234567890";
+        TextOutW(dc, 32, 100, line.c_str(), static_cast<int>(line.size()));
+        HFONT label = CreateFontW(-48, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                  DEFAULT_PITCH, L"Arial");
+        SelectObject(dc, label);
+        const wchar_t* shortLabel = L"HELLO 12345";
+        if (withLabel) TextOutW(dc, 32, 320, shortLabel, static_cast<int>(wcslen(shortLabel)));
+        GdiFlush();
+        std::memcpy(rgba.data, pixels, rgba.total() * rgba.elemSize());
+        for (int y = 0; y < rgba.rows; ++y)
+            for (int x = 0; x < rgba.cols; ++x) rgba.at<cv::Vec4b>(y, x)[3] = 255;
+        SelectObject(dc, oldFont);
+        SelectObject(dc, oldBitmap);
+        DeleteObject(narrow);
+        DeleteObject(label);
+    }
+    if (bitmap) DeleteObject(bitmap);
+    if (dc) DeleteDC(dc);
+    return rgba;
+}
+
 MaiOcrSmallUiFixture ownedSmallUiFixture(int fontHeight) {
     MaiOcrSmallUiFixture fixture;
     fixture.rgba = cv::Mat(1080, 1920, CV_8UC4, cv::Scalar(247, 247, 247, 255));
@@ -210,6 +258,40 @@ void saveOwnedBitmap(const cv::Mat& rgba, const std::string& name) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // A full-height foreground stroke is uniform too. The only flat run in
+    // either owned theme must not be mistaken for background whitespace.
+    for (const bool dark : {false, true}) {
+        const unsigned char background = dark ? 16 : 240;
+        const unsigned char foreground = dark ? 240 : 16;
+        cv::Mat patch(48, 192, CV_8UC1, cv::Scalar(background));
+        for (int y = 4; y < 44; ++y)
+            for (int x = 1; x < 191; ++x)
+                if (y % 2) patch.at<unsigned char>(y, x) = foreground;
+        patch.colRange(94, 98).setTo(foreground);
+        CHECK(maiOcrFindWhitespaceCut(patch.data, patch.cols, patch.rows, static_cast<int>(patch.step)) == -1);
+        patch.colRange(70, 75).setTo(background);
+        const int safe = maiOcrFindWhitespaceCut(patch.data, patch.cols, patch.rows, static_cast<int>(patch.step));
+        CHECK(safe >= 70 && safe < 75);
+        patch.rowRange(44, 48).setTo(foreground);
+        CHECK(maiOcrFindWhitespaceCut(patch.data, patch.cols, patch.rows, static_cast<int>(patch.step)) == -1);
+        patch.setTo(foreground);
+        CHECK(maiOcrFindWhitespaceCut(patch.data, patch.cols, patch.rows, static_cast<int>(patch.step)) == -1);
+    }
+    MaiOcrLineLayout layout;
+    std::array<MaiOcrPoint, 4> boundary{{{0, 0}, {2048, 0}, {2048, 48}, {0, 48}}};
+    CHECK(maiOcrMeasureLine(boundary, layout) == MAI_OCR_OK);
+    CHECK(layout.recognitionWidth == 2048);
+    boundary[1].x = boundary[2].x = 2048.25f;
+    CHECK(maiOcrMeasureLine(boundary, layout) == MAI_OCR_OK);
+    CHECK(layout.recognitionWidth == 2049);
+    boundary = {{{10, 20}, {58, 20}, {58, 2068}, {10, 2068}}};
+    CHECK(maiOcrMeasureLine(boundary, layout) == MAI_OCR_OK);
+    CHECK(layout.recognitionWidth == 2048);
+    const auto verticalHalf = maiOcrSliceLine(layout, 0, .5);
+    CHECK(verticalHalf[0].x == 58 && verticalHalf[0].y == 20);
+    CHECK(verticalHalf[1].x == 58 && verticalHalf[1].y == 1044);
+    CHECK(verticalHalf[2].x == 10 && verticalHalf[2].y == 1044);
+    CHECK(verticalHalf[3].x == 10 && verticalHalf[3].y == 20);
     // 重复标签在 blank 之后必须重新输出，不能把合法双字母错误合并。
     const std::vector<std::string> symbols{"", "A", "B", " "};
     std::vector<float> probabilities{.05f, .9f, .03f, .02f, .05f, .9f,  .03f, .02f, .9f,  .05f, .03f, .02f,
@@ -335,6 +417,119 @@ int main(int argc, char** argv) {
     CHECK(maiOcrRecognize(engine, &view, &midFlight, &result, error, sizeof(error)) == MAI_OCR_CANCELED);
     CHECK(polls >= 4 && result.regions == nullptr && result.count == 0 && result.width == 0);
 #if defined(_WIN32)
+    const cv::Mat wideFixture = ownedWideLineFixture();
+    // Cropping changes the line's aspect ratio; uniform scaling does not.
+    const cv::Mat narrow = wideFixture(cv::Rect(0, 0, 600, 500)).clone();
+    view = imageView(narrow);
+    const MaiOcrStatus narrowStatus = maiOcrRecognize(engine, &view, nullptr, &result, error, sizeof(error));
+    std::printf("wide-line narrow control: status %d, %zu regions, %s\n", narrowStatus, result.count, error);
+    CHECK(narrowStatus == MAI_OCR_OK);
+    CHECK(collectText(result).find("HELLO") != std::string::npos);
+    maiOcrResultFree(&result);
+    for (const double scale : {1., .5, .25}) {
+        cv::Mat scaled;
+        cv::resize(wideFixture, scaled, {}, scale, scale, cv::INTER_AREA);
+        view = imageView(scaled);
+        const MaiOcrStatus status = maiOcrRecognize(engine, &view, nullptr, &result, error, sizeof(error));
+        std::printf("wide-line scale %.2f: status %d, %zu regions, partial %d, skipped %zu, segmented %zu, %s\n",
+                    scale, status, result.count, result.partial, result.skipped_lines, result.segmented_lines, error);
+        // A difficult source line must not discard unrelated useful labels.
+        CHECK(status == MAI_OCR_OK);
+        CHECK(result.width == scaled.cols && result.height == scaled.rows);
+        CHECK(collectText(result).find("HELLO") != std::string::npos);
+        CHECK(result.segmented_lines > 0 || (result.partial && result.skipped_lines > 0));
+        CHECK(result.partial == (result.skipped_lines != 0));
+        bool labelPosition = false;
+        for (size_t index = 0; index < result.count; ++index) {
+            const auto& region = result.regions[index];
+            if (std::string(region.text).find("HELLO") == std::string::npos) continue;
+            float x = 0;
+            float y = 0;
+            for (const auto& point : region.quad) { x += point.x / 4; y += point.y / 4; }
+            CHECK(x / scale > 30 && x / scale < 420);
+            CHECK(y / scale > 315 && y / scale < 390);
+            labelPosition = true;
+        }
+        CHECK(labelPosition);
+        checkGeometry(result);
+        cv::Mat annotated = scaled.clone();
+        float previousRight = -1;
+        for (size_t index = 0; index < result.count; ++index) {
+            const auto& region = result.regions[index];
+            std::vector<cv::Point> polygon;
+            std::array<MaiOcrPoint, 4> quad;
+            for (size_t point = 0; point < quad.size(); ++point) {
+                quad[point] = region.quad[point];
+                polygon.emplace_back(cvRound(quad[point].x), cvRound(quad[point].y));
+            }
+            cv::polylines(annotated, polygon, true, cv::Scalar(255, 0, 0, 255), 2);
+            if (region.quad[0].y / scale > 200) continue;
+            MaiOcrLineLayout fragment;
+            CHECK(maiOcrMeasureLine(quad, fragment) == MAI_OCR_OK);
+            CHECK(fragment.recognitionWidth <= MAI_OCR_MAX_RECOGNITION_WIDTH);
+            // The owned line is horizontal. Published neighboring fragments
+            // share a cut instead of returning duplicate overlapping glyphs.
+            CHECK(region.quad[0].x >= previousRight - 1.5);
+            previousRight = region.quad[1].x;
+        }
+        if (scale == 1) saveOwnedBitmap(annotated, "ocr-wide-line-owned-annotated.bmp");
+        maiOcrResultFree(&result);
+    }
+    cv::Mat verticalWide;
+    cv::rotate(wideFixture, verticalWide, cv::ROTATE_90_CLOCKWISE);
+    view = imageView(verticalWide);
+    CHECK(maiOcrRecognize(engine, &view, nullptr, &result, error, sizeof(error)) == MAI_OCR_OK);
+    CHECK(result.width == 1600 && result.height == 2464);
+    CHECK(collectText(result).find("HELLO") != std::string::npos);
+    CHECK(result.segmented_lines > 0 || (result.partial && result.skipped_lines > 0));
+    checkGeometry(result);
+    bool verticalLabelPosition = false;
+    for (size_t index = 0; index < result.count; ++index) {
+        const auto& region = result.regions[index];
+        CHECK(region.quad[0].x <= region.quad[1].x);
+        CHECK(region.quad[0].y <= region.quad[3].y);
+        if (std::string(region.text).find("HELLO") == std::string::npos) continue;
+        float x = 0;
+        float y = 0;
+        for (const auto& point : region.quad) { x += point.x / 4; y += point.y / 4; }
+        CHECK(y > 30 && y < 420);
+        CHECK(1600 - x > 315 && 1600 - x < 390);
+        verticalLabelPosition = true;
+    }
+    CHECK(verticalLabelPosition);
+    maiOcrResultFree(&result);
+
+    // This line exceeds eight bounded fragments. With no unrelated labels,
+    // an empty result must still state that detected content was skipped.
+    const cv::Mat allWide = ownedWideLineFixture(16384, 160, 60, false);
+    view = imageView(allWide);
+    const MaiOcrStatus allWideStatus = maiOcrRecognize(engine, &view, nullptr, &result, error, sizeof(error));
+    std::printf("all-wide: status %d, %zu regions, partial %d, skipped %zu, segmented %zu, %s\n",
+                allWideStatus, result.count, result.partial, result.skipped_lines, result.segmented_lines, error);
+    CHECK(allWideStatus == MAI_OCR_OK);
+    CHECK(result.width == allWide.cols && result.height == allWide.rows);
+    CHECK(result.count == 0 && result.regions == nullptr);
+    CHECK(result.partial && result.skipped_lines > 0);
+    CHECK(result.segmented_lines == 0);
+    maiOcrResultFree(&result);
+
+    // Cancel after the owned wide fixture has reached fragment inference.
+    // Poll count is sampled, not tied to detector contour implementation.
+    view = imageView(wideFixture);
+    int fullPolls = 0;
+    MaiOcrOptions sampled{[](void* context) -> int { ++*static_cast<int*>(context); return 0; }, &fullPolls};
+    CHECK(maiOcrRecognize(engine, &view, &sampled, &result, error, sizeof(error)) == MAI_OCR_OK);
+    CHECK(result.segmented_lines > 0);
+    maiOcrResultFree(&result);
+    struct CancelAt { int polls; int limit; } cancelAt{0, fullPolls - 4};
+    MaiOcrOptions cancelFragments{[](void* context) -> int {
+        auto& value = *static_cast<CancelAt*>(context);
+        return ++value.polls >= value.limit;
+    }, &cancelAt};
+    CHECK(maiOcrRecognize(engine, &view, &cancelFragments, &result, error, sizeof(error)) == MAI_OCR_CANCELED);
+    CHECK(result.width == 0 && result.height == 0 && result.count == 0 && result.regions == nullptr);
+    CHECK(result.partial == 0 && result.skipped_lines == 0 && result.segmented_lines == 0);
+    saveOwnedBitmap(wideFixture, "ocr-wide-line-owned.bmp");
     const std::array<std::string, 2> labels{u8"\u65b0\u589e\u6587\u4ef6", u8"\u8986\u76d6\u6587\u4ef6"};
     for (const int fontHeight : {18, 20}) {
         const MaiOcrSmallUiFixture small = ownedSmallUiFixture(fontHeight);

@@ -28,6 +28,11 @@
 // 界面就按这个顺序渲染。片段顺序 = 生成顺序，
 // 落库靠 id 的字典序还原（见 MaiIdGenerator.h 对单调性的许诺）。
 
+// 原生响应的宿主分界：空reasoning、无供应商状态、created==0。真实流片段有实际创建时间。
+// 不携带可见正文/思考，不发给模型；ID须在响应开始前预留，保证持久化重放顺序。
+struct MaiMessagePart;
+bool maiIsResponseBoundaryPart(const MaiMessagePart& part);
+
 // ── 消息片段 ────────────────────────────────────────────────────
 //
 // 用 std::variant 而不是继承 + 虚函数，理由有三个：
@@ -48,6 +53,8 @@ struct MaiTextPart {
 // 界面上通常折叠显示，所以它和 MaiTextPart 必须是**两个片段**而不是拼在一起：混成一个的话，
 // 界面没办法只折叠思考那一段。
 struct MaiReasoningPart {
+    // 所在part.created==0且text/continuation都为空时，是宿主原生响应边界（见下方谓词）；
+    // 与真实流中可能产生的空思考分开，不能在opaque载体和它的工具投影中间切断。
     std::string text;
     // 每次成功响应独立保存，可为空文本。仅用于持久化和同来源模型续接，
     // UI/普通历史展示不输出它，也不能在上下文裁剪时截断或从同批工具中间切开。

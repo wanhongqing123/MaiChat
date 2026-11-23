@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -43,9 +44,14 @@ constexpr uint64_t kMaxPixels = 16000000;
 constexpr int kDetectorLongEdge = 960;
 constexpr int kDetectorStride = 128;
 constexpr int kMaxDetectorAxis = 1024;
-constexpr int kRecognitionHeight = 48;
+constexpr int kRecognitionHeight = MAI_OCR_RECOGNITION_HEIGHT;
 constexpr int kRecognitionMinWidth = 320;
-constexpr int kRecognitionMaxWidth = 2048;
+constexpr int kRecognitionMaxWidth = MAI_OCR_MAX_RECOGNITION_WIDTH;
+constexpr size_t kMaxLineFragments = 8;
+constexpr size_t kMaxRecognitionCalls = 512;
+constexpr int kFragmentTargetWidth = 1536;
+constexpr int kBoundarySearchWidth = 192;
+constexpr auto kRecognitionTimeLimit = std::chrono::seconds(30);
 
 void copyError(char* destination, size_t capacity, const char* message) {
     if (destination && capacity) std::snprintf(destination, capacity, "%s", message);
@@ -118,10 +124,77 @@ struct MaiOcrRecognizedRegion {
     MaiOcrDecodedLine line;
 };
 
+std::array<MaiOcrPoint, 4> nativeQuad(const MaiOcrDetectedRegion& region) {
+    std::array<MaiOcrPoint, 4> result;
+    for (size_t i = 0; i < result.size(); ++i) result[i] = {region.quad[i].x, region.quad[i].y};
+    return result;
+}
+
+MaiOcrDetectedRegion detectedQuad(const std::array<MaiOcrPoint, 4>& quad) {
+    MaiOcrDetectedRegion result;
+    for (size_t i = 0; i < quad.size(); ++i) result.quad[i] = {quad[i].x, quad[i].y};
+    return result;
+}
+
+cv::Mat projectLine(const cv::Mat& bgr, const MaiOcrDetectedRegion& region, int width) {
+    const std::array<cv::Point2f, 4> destination{
+        cv::Point2f(0, 0), cv::Point2f(static_cast<float>(width - 1), 0),
+        cv::Point2f(static_cast<float>(width - 1), kRecognitionHeight - 1),
+        cv::Point2f(0, kRecognitionHeight - 1)};
+    const cv::Mat transform = cv::getPerspectiveTransform(region.quad.data(), destination.data());
+    if (!cv::checkRange(transform)) CV_Error(cv::Error::StsBadArg, "invalid OCR perspective transform");
+    cv::Mat crop;
+    cv::warpPerspective(bgr, crop, transform, cv::Size(width, kRecognitionHeight), cv::INTER_CUBIC,
+                        cv::BORDER_REPLICATE);
+    return crop;
+}
+
+// Only small windows around prospective boundaries are rectified. A complete
+// over-wide crop is never allocated. Shared whitespace cuts avoid overlap text
+// and ambiguous character stitching; an unsafe line stays explicitly partial.
+bool planWideFragments(const cv::Mat& bgr, const MaiOcrLineLayout& layout, size_t availableCalls,
+                       std::vector<MaiOcrDetectedRegion>& fragments) {
+    const size_t count = static_cast<size_t>(std::ceil(layout.recognitionWidth / kFragmentTargetWidth));
+    if (count > kMaxLineFragments || count > availableCalls) return false;
+    std::vector<double> cuts{0};
+    for (size_t i = 1; i < count; ++i) {
+        const double nominal = static_cast<double>(i) / count;
+        const double halfWindow = (kBoundarySearchWidth / 2.) / layout.recognitionWidth;
+        const double begin = nominal - halfWindow;
+        const double end = nominal + halfWindow;
+        const cv::Mat crop = projectLine(bgr, detectedQuad(maiOcrSliceLine(layout, begin, end)),
+                                        kBoundarySearchWidth);
+        cv::Mat gray;
+        cv::cvtColor(crop, gray, cv::COLOR_BGR2GRAY);
+        const int best = maiOcrFindWhitespaceCut(gray.data, gray.cols, gray.rows, static_cast<int>(gray.step));
+        if (best < 0) return false;
+        cuts.push_back(begin + (end - begin) * best / (gray.cols - 1));
+    }
+    cuts.push_back(1);
+    for (size_t i = 1; i < cuts.size(); ++i) {
+        const auto quad = maiOcrSliceLine(layout, cuts[i - 1], cuts[i]);
+        MaiOcrLineLayout fragment;
+        if (maiOcrMeasureLine(quad, fragment) != MAI_OCR_OK || fragment.recognitionWidth > kRecognitionMaxWidth)
+            return false;
+        fragments.push_back(detectedQuad(quad));
+    }
+    return true;
+}
+
 // minAreaRect 的点序依角度变化；进入透视变换前统一为 TL、TR、BR、BL。
 std::array<cv::Point2f, 4> orderedQuad(const cv::RotatedRect& rectangle) {
     std::array<cv::Point2f, 4> points;
     rectangle.points(points.data());
+    std::sort(points.begin(), points.end(),
+              [](const auto& a, const auto& b) { return a.x != b.x ? a.x < b.x : a.y < b.y; });
+    const auto left = std::minmax(points[0], points[1], [](const auto& a, const auto& b) { return a.y < b.y; });
+    const auto right = std::minmax(points[2], points[3], [](const auto& a, const auto& b) { return a.y < b.y; });
+    return {left.first, right.first, right.second, left.second};
+}
+
+// Recognition reads a vertical slice from its right edge. Published quads keep
+// the existing image-space TL/TR/BR/BL convention rather than that crop order.
+std::array<cv::Point2f, 4> outputQuad(std::array<cv::Point2f, 4> points) {
     std::sort(points.begin(), points.end(),
               [](const auto& a, const auto& b) { return a.x != b.x ? a.x < b.x : a.y < b.y; });
     const auto left = std::minmax(points[0], points[1], [](const auto& a, const auto& b) { return a.y < b.y; });
@@ -140,6 +213,100 @@ float rectangleScore(const cv::Mat& probability, const std::array<cv::Point2f, 4
     return static_cast<float>(cv::mean(probability(bounds), mask)[0]);
 }
 }  // namespace
+
+int maiOcrFindWhitespaceCut(const unsigned char* gray, int width, int height, int stride) {
+    if (!gray || width < 2 || width > kBoundarySearchWidth || height < 8 ||
+        height > kRecognitionHeight || stride < width) return -1;
+    constexpr int tolerance = 12;
+    const int margin = std::max(1, height / 12);
+    const auto marginMedian = [&](int first) {
+        std::array<int, 256> histogram{};
+        for (int y = first; y < first + margin; ++y)
+            for (int x = 0; x < width; ++x) ++histogram[gray[static_cast<size_t>(y) * stride + x]];
+        int remaining = width * margin / 2;
+        for (int value = 0; value < 256; ++value) {
+            remaining -= histogram[value];
+            if (remaining < 0) return value;
+        }
+        return 255;
+    };
+    const int top = marginMedian(0);
+    const int bottom = marginMedian(height - margin);
+    if (std::abs(top - bottom) > tolerance) return -1;
+    const int background = (top + bottom) / 2;
+    // Uniformity alone cannot distinguish a solid glyph stroke from a gap.
+    // Both independent margins must mostly agree on one local background,
+    // and the patch body must demonstrate contrasting ink. This is symmetric
+    // for light/dark themes; textured, marginless or flat ambiguous patches
+    // deliberately yield no safe cut instead of a confident partial glyph.
+    for (const int first : {0, height - margin}) {
+        int agreeing = 0;
+        for (int y = first; y < first + margin; ++y)
+            for (int x = 0; x < width; ++x)
+                if (std::abs(static_cast<int>(gray[static_cast<size_t>(y) * stride + x]) - background) <= tolerance)
+                    ++agreeing;
+        if (agreeing * 5 < width * margin * 4) return -1;
+    }
+    int ink = 0;
+    for (int y = margin; y < height - margin; ++y)
+        for (int x = 0; x < width; ++x)
+            if (std::abs(static_cast<int>(gray[static_cast<size_t>(y) * stride + x]) - background) >= 32) ++ink;
+    if (ink < height) return -1;
+    int best = -1;
+    int runBegin = -1;
+    for (int x = 0; x <= width; ++x) {
+        int minimum = 255;
+        int maximum = 0;
+        if (x < width) {
+            for (int y = 0; y < height; ++y) {
+                const int value = gray[static_cast<size_t>(y) * stride + x];
+                minimum = std::min(minimum, value);
+                maximum = std::max(maximum, value);
+            }
+        }
+        if (x < width && maximum - minimum <= 16 && minimum >= background - tolerance &&
+            maximum <= background + tolerance) {
+            if (runBegin < 0) runBegin = x;
+            continue;
+        }
+        if (runBegin >= 0 && x - runBegin >= 2) {
+            const int middle = (runBegin + x - 1) / 2;
+            if (best < 0 || std::abs(middle - width / 2) < std::abs(best - width / 2)) best = middle;
+        }
+        runBegin = -1;
+    }
+    return best;
+}
+
+MaiOcrStatus maiOcrMeasureLine(const std::array<MaiOcrPoint, 4>& quad, MaiOcrLineLayout& layout) {
+    layout = {};
+    for (const auto& point : quad)
+        if (!std::isfinite(point.x) || !std::isfinite(point.y)) return MAI_OCR_MODEL_ERROR;
+    const auto length = [](const MaiOcrPoint& a, const MaiOcrPoint& b) {
+        return std::hypot(static_cast<double>(a.x) - b.x, static_cast<double>(a.y) - b.y);
+    };
+    layout.quad = quad;
+    layout.width = std::max(length(quad[0], quad[1]), length(quad[2], quad[3]));
+    layout.height = std::max(length(quad[0], quad[3]), length(quad[1], quad[2]));
+    if (layout.width < 1 || layout.height < 1) return MAI_OCR_MODEL_ERROR;
+    if (layout.height >= layout.width * 1.5) {
+        std::rotate(layout.quad.begin(), layout.quad.begin() + 1, layout.quad.end());
+        std::swap(layout.width, layout.height);
+    }
+    layout.recognitionWidth = std::ceil(kRecognitionHeight * layout.width / layout.height);
+    return std::isfinite(layout.recognitionWidth) ? MAI_OCR_OK : MAI_OCR_MODEL_ERROR;
+}
+
+std::array<MaiOcrPoint, 4> maiOcrSliceLine(const MaiOcrLineLayout& layout, double begin, double end) {
+    const auto interpolate = [](const MaiOcrPoint& a, const MaiOcrPoint& b, double fraction) {
+        return MaiOcrPoint{static_cast<float>(a.x + (b.x - a.x) * fraction),
+                           static_cast<float>(a.y + (b.y - a.y) * fraction)};
+    };
+    return {interpolate(layout.quad[0], layout.quad[1], begin),
+            interpolate(layout.quad[0], layout.quad[1], end),
+            interpolate(layout.quad[3], layout.quad[2], end),
+            interpolate(layout.quad[3], layout.quad[2], begin)};
+}
 
 struct MaiOcrEngine {
 #if defined(_WIN32)
@@ -431,31 +598,20 @@ bool MaiOcrEngine::detect(const cv::Mat& bgr, const MaiOcrOptions* options,
 
 bool MaiOcrEngine::recognizeRegion(const cv::Mat& bgr, const MaiOcrDetectedRegion& region, const MaiOcrOptions* options,
                                    MaiOcrDecodedLine& line) {
-    auto source = region.quad;
-    double width = std::max(cv::norm(source[0] - source[1]), cv::norm(source[2] - source[3]));
-    double height = std::max(cv::norm(source[0] - source[3]), cv::norm(source[1] - source[2]));
-    if (!std::isfinite(width) || !std::isfinite(height) || width < 1 || height < 1)
+    MaiOcrLineLayout layout;
+    if (maiOcrMeasureLine(nativeQuad(region), layout) != MAI_OCR_OK)
         return fail(MAI_OCR_MODEL_ERROR, "invalid OCR crop geometry");
-    if (height >= width * 1.5) {
-        // 与官方 get_rotate_crop_image 一致，竖长文本逆时针旋转后进入同一识别会话。
-        std::rotate(source.begin(), source.begin() + 1, source.end());
-        std::swap(width, height);
+    if (layout.recognitionWidth > kRecognitionMaxWidth) {
+        char detail[256]{};
+        std::snprintf(detail, sizeof(detail),
+                      "OCR normalized text width %.0f exceeds %d at recognition height %d (quad %.3fx%.3f)",
+                      layout.recognitionWidth, kRecognitionMaxWidth, kRecognitionHeight, layout.width, layout.height);
+        return fail(MAI_OCR_LIMIT_EXCEEDED, detail);
     }
-    const double scaledWidth = std::ceil(kRecognitionHeight * width / height);
-    if (!std::isfinite(scaledWidth) || scaledWidth > kRecognitionMaxWidth)
-        return fail(MAI_OCR_LIMIT_EXCEEDED, "OCR text line exceeds recognition width limit");
-    const int resizedWidth = std::max(1, static_cast<int>(scaledWidth));
+    const int resizedWidth = std::max(1, static_cast<int>(layout.recognitionWidth));
     const int paddedWidth = std::max(kRecognitionMinWidth, resizedWidth);
-    const std::array<cv::Point2f, 4> destination{
-        cv::Point2f(0, 0), cv::Point2f(static_cast<float>(resizedWidth - 1), 0),
-        cv::Point2f(static_cast<float>(resizedWidth - 1), kRecognitionHeight - 1),
-        cv::Point2f(0, kRecognitionHeight - 1)};
-    const cv::Mat transform = cv::getPerspectiveTransform(source.data(), destination.data());
-    if (!cv::checkRange(transform)) return fail(MAI_OCR_MODEL_ERROR, "invalid OCR perspective transform");
-    cv::Mat crop;
     // 直接投影到识别尺寸，避免先分配一个与源图同大的透视裁剪。
-    cv::warpPerspective(bgr, crop, transform, cv::Size(resizedWidth, kRecognitionHeight), cv::INTER_CUBIC,
-                        cv::BORDER_REPLICATE);
+    const cv::Mat crop = projectLine(bgr, detectedQuad(layout.quad), resizedWidth);
     const size_t plane = static_cast<size_t>(paddedWidth) * kRecognitionHeight;
     std::vector<float> normalized(plane * 3, 0.f);
     for (int y = 0; y < kRecognitionHeight; ++y) {
@@ -588,26 +744,86 @@ MaiOcrStatus maiOcrRecognize(MaiOcrEngine* engine, const MaiOcrImage* image, con
         });
         std::vector<MaiOcrRecognizedRegion> recognized;
         size_t textBytes = 0;
-        for (const auto& region : detected) {
-            MaiOcrDecodedLine line;
-            if (!engine->recognizeRegion(bgr, region, options, line)) {
-                copyError(error, error_capacity, engine->message.c_str());
-                return engine->status;
+        size_t recognitionCalls = 0;
+        const auto recognitionStart = std::chrono::steady_clock::now();
+        for (size_t index = 0; index < detected.size(); ++index) {
+            if (isCanceled(options)) {
+                copyError(error, error_capacity, "OCR canceled");
+                return MAI_OCR_CANCELED;
             }
-            if (line.text.empty() || line.confidence < .5f) continue;
-            if (recognized.size() >= kMaxRegions || line.text.size() > kMaxTotalTextBytes - textBytes) {
-                copyError(error, error_capacity, "OCR result count or text byte limit exceeded");
+            if (std::chrono::steady_clock::now() - recognitionStart >= kRecognitionTimeLimit) {
+                copyError(error, error_capacity, "OCR recognition time limit exceeded");
                 return MAI_OCR_LIMIT_EXCEEDED;
             }
-            textBytes += line.text.size();
-            recognized.push_back({region.quad, std::move(line)});
+            const auto& region = detected[index];
+            MaiOcrLineLayout layout;
+            if (maiOcrMeasureLine(nativeQuad(region), layout) != MAI_OCR_OK) {
+                copyError(error, error_capacity, "invalid OCR crop geometry");
+                return MAI_OCR_MODEL_ERROR;
+            }
+            const bool wide = layout.recognitionWidth > kRecognitionMaxWidth;
+            std::vector<MaiOcrDetectedRegion> fragments;
+            if (wide) {
+                // Reserve ordinary inference capacity for later independent
+                // candidates. Only this specific recovery exhaustion is local;
+                // model/CTC/result limits never become partial success.
+                const size_t remaining = detected.size() - index - 1;
+                const size_t available = kMaxRecognitionCalls - recognitionCalls - remaining;
+                if (!planWideFragments(bgr, layout, available, fragments)) {
+                    ++owned.skipped_lines;
+                    continue;
+                }
+            } else {
+                fragments.push_back(region);
+            }
+            bool incomplete = false;
+            size_t lineCalls = 0;
+            for (const auto& fragment : fragments) {
+                if (isCanceled(options)) {
+                    copyError(error, error_capacity, "OCR canceled");
+                    return MAI_OCR_CANCELED;
+                }
+                if (recognitionCalls >= kMaxRecognitionCalls ||
+                    std::chrono::steady_clock::now() - recognitionStart >= kRecognitionTimeLimit) {
+                    copyError(error, error_capacity, "OCR recognition inference or time limit exceeded");
+                    return MAI_OCR_LIMIT_EXCEEDED;
+                }
+                MaiOcrDecodedLine line;
+                ++recognitionCalls;
+                ++lineCalls;
+                if (!engine->recognizeRegion(bgr, fragment, options, line)) {
+                    copyError(error, error_capacity, engine->message.c_str());
+                    return engine->status;
+                }
+                if (std::chrono::steady_clock::now() - recognitionStart >= kRecognitionTimeLimit) {
+                    copyError(error, error_capacity, "OCR recognition time limit exceeded");
+                    return MAI_OCR_LIMIT_EXCEEDED;
+                }
+                if (line.text.empty() || line.confidence < .5f) {
+                    incomplete = wide;
+                    continue;
+                }
+                if (recognized.size() >= kMaxRegions || line.text.size() > kMaxTotalTextBytes - textBytes) {
+                    copyError(error, error_capacity, "OCR result count or text byte limit exceeded");
+                    return MAI_OCR_LIMIT_EXCEEDED;
+                }
+                textBytes += line.text.size();
+                recognized.push_back({wide ? outputQuad(fragment.quad) : fragment.quad, std::move(line)});
+            }
+            if (lineCalls >= 2) ++owned.segmented_lines;
+            if (incomplete) ++owned.skipped_lines;
         }
         if (isCanceled(options)) {
             copyError(error, error_capacity, "OCR canceled");
             return MAI_OCR_CANCELED;
         }
+        if (std::chrono::steady_clock::now() - recognitionStart >= kRecognitionTimeLimit) {
+            copyError(error, error_capacity, "OCR recognition time limit exceeded");
+            return MAI_OCR_LIMIT_EXCEEDED;
+        }
         owned.width = image->width;
         owned.height = image->height;
+        owned.partial = owned.skipped_lines != 0;
         if (!recognized.empty()) {
             owned.regions = static_cast<MaiOcrRegion*>(std::calloc(recognized.size(), sizeof(MaiOcrRegion)));
             if (!owned.regions) {

@@ -26,6 +26,10 @@ struct DesktopOcrResult {
     int imageWidth = 0;
     int imageHeight = 0;
     std::vector<DesktopOcrBlock> blocks;
+    // These counts refer to detected source lines, not returned fragment blocks.
+    bool partial = false;
+    std::size_t skippedLines = 0;
+    std::size_t segmentedLines = 0;
 };
 
 struct DesktopOcrReadOptions {

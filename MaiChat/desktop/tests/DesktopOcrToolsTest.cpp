@@ -278,6 +278,11 @@ private slots:
         const QJsonObject result = QJsonDocument::fromJson(QByteArray::fromStdString(called.output())).object();
         QCOMPARE(result.value(QStringLiteral("image_width")).toInt(), image.width());
         QCOMPARE(result.value(QStringLiteral("image_height")).toInt(), image.height());
+        QCOMPARE(result.value(QStringLiteral("partial")).toBool(true), false);
+        QCOMPARE(result.value(QStringLiteral("skipped_lines")).toInt(-1), 0);
+        QCOMPARE(result.value(QStringLiteral("segmented_lines")).toInt(-1), 0);
+        QCOMPARE(result.value(QStringLiteral("recognition_height")).toInt(), 48);
+        QCOMPARE(result.value(QStringLiteral("max_recognition_width")).toInt(), 2048);
         QCOMPARE(result.value(QStringLiteral("space")).toString(), QStringLiteral("image"));
         QCOMPARE(result.value(QStringLiteral("space_id")).toString(), name);
         QCOMPARE(result.value(QStringLiteral("source_path")).toString(), name);
@@ -324,6 +329,74 @@ private slots:
         QCOMPARE(tool->execute(encoded.toStdString(), context).error().code(), MaiErrorCode::Canceled);
         unchanged.seek(0);
         QCOMPARE(unchanged.readAll(), originalBytes);
+    }
+
+    void wideLineRecoveryRetainsLabelsAndReportsToolMetadata() {
+        QTemporaryDir workspace;
+        QVERIFY(workspace.isValid());
+        QImage owned(2464, 1600, QImage::Format_RGB32);
+        owned.fill(Qt::white);
+        {
+            QPainter painter(&owned);
+            painter.setRenderHint(QPainter::TextAntialiasing);
+            painter.setPen(Qt::black);
+            QFont narrow(QStringLiteral("Consolas"));
+            narrow.setPixelSize(24);
+            painter.setFont(narrow);
+            painter.drawText(QPoint(32, 124), QStringLiteral("MAICHATOCR1234567890").repeated(8));
+            QFont label(QStringLiteral("Arial"));
+            label.setPixelSize(48);
+            painter.setFont(label);
+            painter.drawText(QPoint(32, 368), QStringLiteral("HELLO 12345"));
+        }
+        auto service = std::make_shared<DesktopOcrService>();
+        MaiToolRegistry registry;
+        registerDesktopOcrTools(registry, service);
+        MaiTool* tool = registry.find("ocr_image");
+        QVERIFY(tool != nullptr);
+        MaiToolContext context;
+        context.root = workspace.path().toUtf8().toStdString();
+        for (int divisor : {1, 2, 4}) {
+            const QImage raster = owned.scaled(owned.size() / divisor, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            const QString name = QStringLiteral("owned-wide-%1.png").arg(divisor);
+            const QString path = workspace.filePath(name);
+            QVERIFY(raster.save(path));
+            const auto ordinary = service->recognizeImageFile(path.toUtf8().toStdString());
+            QVERIFY2(ordinary.isOk(), ordinary.error().message().c_str());
+            QCOMPARE(ordinary.value().imageWidth, raster.width());
+            QCOMPARE(ordinary.value().imageHeight, raster.height());
+            QCOMPARE(ordinary.value().partial, ordinary.value().skippedLines != 0);
+            QVERIFY(ordinary.value().segmentedLines > 0 || ordinary.value().partial);
+            bool foundLabel = false;
+            for (const auto& block : ordinary.value().blocks) {
+                for (const auto& point : block.quad) {
+                    QVERIFY(std::isfinite(point.x) && std::isfinite(point.y));
+                    QVERIFY(point.x >= 0 && point.x <= raster.width());
+                    QVERIFY(point.y >= 0 && point.y <= raster.height());
+                }
+                if (block.text.find("HELLO") == std::string::npos) continue;
+                foundLabel = true;
+                float x = 0;
+                float y = 0;
+                for (const auto& point : block.quad) { x += point.x / 4; y += point.y / 4; }
+                QVERIFY(x * divisor > 30 && x * divisor < 420);
+                QVERIFY(y * divisor > 315 && y * divisor < 390);
+            }
+            QVERIFY(foundLabel);
+            const auto arguments = QJsonDocument(QJsonObject{{QStringLiteral("path"), name}})
+                .toJson(QJsonDocument::Compact);
+            const auto called = tool->execute(arguments.toStdString(), context);
+            QVERIFY2(!called.hasError(), called.error().message().c_str());
+            const auto json = QJsonDocument::fromJson(QByteArray::fromStdString(called.output())).object();
+            QCOMPARE(json.value(QStringLiteral("image_width")).toInt(), raster.width());
+            QCOMPARE(json.value(QStringLiteral("image_height")).toInt(), raster.height());
+            QCOMPARE(json.value(QStringLiteral("partial")).toBool(), ordinary.value().partial);
+            QCOMPARE(json.value(QStringLiteral("skipped_lines")).toInteger(), qint64(ordinary.value().skippedLines));
+            QCOMPARE(json.value(QStringLiteral("segmented_lines")).toInteger(), qint64(ordinary.value().segmentedLines));
+            QCOMPARE(json.value(QStringLiteral("recognition_height")).toInt(), 48);
+            QCOMPARE(json.value(QStringLiteral("max_recognition_width")).toInt(), 2048);
+            QCOMPARE(json.value(QStringLiteral("blocks")).toArray().size(), qsizetype(ordinary.value().blocks.size()));
+        }
     }
 
     void exifOrientationDefinesReturnedRasterDimensions() {

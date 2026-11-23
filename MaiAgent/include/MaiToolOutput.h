@@ -52,6 +52,22 @@ struct MaiToolOutputPage {
     bool textIsValidUtf8 = true;
 };
 
+// 模型可见的纯文本预览；原始 source 始终保持不变，不涉及存储或执行状态。
+// omittedSourceBytes 是头尾之间实际省略的源字节数，不是转义后文本长度的估计。
+// escapedBytes 只表示返回预览中实际展示了字节转义，不说明被省略部分是否合法。
+struct MaiToolOutputPreview {
+    std::string text;
+    std::size_t omittedSourceBytes = 0;
+    bool truncated = false;
+    bool escapedBytes = false;
+};
+
+// 无状态、无 I/O/JSON，可并发调用；返回独立文本，source 只在调用期间借用。
+// maximumBytes 是包括中间省略提示的渲染字节上限，可为零。
+// 完整 UTF-8 标量保持原样；非法字节、ASCII 控制字节（LF/CR/TAB 除外）逐字节展示为 \xHH。
+// 截断保留头尾，不切开标量或转义单元；tiny budget 的省略提示也不能越界。
+MaiToolOutputPreview maiPreviewToolOutput(std::string_view source, std::size_t maximumBytes);
+
 // 保留策略对两个标准后端一致；超出单条上限拒绝写入，绝不静默截断。
 // 会话及全局上限通过 created、id 升序淘汰最旧快照满足。
 constexpr std::size_t kMaiToolOutputMaxBytes = 16 * 1024 * 1024;

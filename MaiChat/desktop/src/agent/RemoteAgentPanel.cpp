@@ -462,6 +462,7 @@ public:
 
     void setTools(const QJsonArray& tools) {
         QStringList states;
+        QStringList names;
         QSet<QString> wanted;
         for (const auto& value : tools) {
             const QJsonObject tool = value.toObject();
@@ -469,6 +470,7 @@ public:
             wanted.insert(id);
             const QString state = tool.value(QStringLiteral("state")).toString();
             states.append(state);
+            names.append(tool.value(QStringLiteral("tool")).toString());
             RemoteToolDetailRow* row = rows_.value(id, nullptr);
             if (!row) {
                 row = new RemoteToolDetailRow;
@@ -483,7 +485,7 @@ public:
         }
         for (const QString& id : rows_.keys())
             if (!wanted.contains(id)) removeDetail(rows_.take(id));
-        setTitle(agentToolGroupTitle(states));
+        setTitle(agentToolGroupTitle(states, names));
         refreshDetails();
         updateGeometry();
     }
@@ -491,13 +493,15 @@ public:
     void refreshDetails() {
         if (presentation) {
             QStringList states;
+            QStringList tools;
             for (auto* row : rows_) {
                 const auto value = presentation(row->tool());
                 row->refresh(value);
                 states.append(value.value(QStringLiteral("state")).toString(
                     row->tool().value(QStringLiteral("state")).toString()));
+                tools.append(row->tool().value(QStringLiteral("tool")).toString());
             }
-            setTitle(agentToolGroupTitle(states));
+            setTitle(agentToolGroupTitle(states, tools));
         }
         refreshWidth(isExpanded());
     }

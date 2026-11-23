@@ -457,12 +457,13 @@ void test_cache_session_survives_summary_chunks_and_format_retry() {
     }
 }
 
-// 只有写错误边界可注入；实际消息与检查点仍由普通 MemoryStore 保存和核对。
+// 仅在写边界注入错误/并发来源变更；实际消息与CAS仍由普通MemoryStore保存和核对。
 class WriteFailureStore final : public MaiSessionStore {
 public:
     std::unique_ptr<MaiSessionStore> inner = makeMaiMemoryStore();
     bool failed = false;
     bool conflictOnAdvance = false;
+    std::function<void()> beforeAdvance;
     void putSession(const MaiSession& value) override {
         inner->putSession(value);
     }
@@ -508,6 +509,8 @@ public:
     }
     MaiError advanceContextCheckpoint(const std::string& id, std::uint64_t revision,
                                       const MaiContextCheckpoint& value) override {
+        if (beforeAdvance) beforeAdvance();
+        if (failed) return {MaiErrorCode::Internal, "Owned storage write failed."};
         if (conflictOnAdvance) return {MaiErrorCode::Busy, "Owned checkpoint CAS conflict."};
         return inner->advanceContextCheckpoint(id, revision, value);
     }
@@ -1282,9 +1285,15 @@ void test_hard_summary_failure_continues_with_original_history(int mode = 0) {
                         CHECK(source["role"] == "assistant" && source["state"] == "completed");
                         actionPartId = source["part_id"].get<std::string>();
                         bool output = false;
-                        for (const auto& field : record["fields"])
-                            if (field["field"] == "tool_output")
-                                output = field["original_bytes"] == 60031;
+                        if (record.value("field", Json{}) == "tool_projection") {
+                            const auto receipt = Json::parse(record["text"].get<std::string>());
+                            output = receipt["fields"]["tool_output"]["original_bytes"] == 60031;
+                            CHECK(receipt["details_are_partial"] == true);
+                        } else {
+                            for (const auto& field : record["fields"])
+                                if (field["field"] == "tool_output")
+                                    output = field["original_bytes"] == 60031;
+                        }
                         CHECK(output);
                     }
                 }
@@ -1342,7 +1351,8 @@ void test_hard_summary_failure_continues_with_original_history(int mode = 0) {
                 rawAction->executions[1], errors, model.sawOriginal);
     CHECK(rawAction->executions[0] == 1 && rawAction->executions[1] == 1);
     CHECK(model.mainCalls == (mode == 0 ? 3 : mode == 4 ? 2 : 1));
-    CHECK(model.summaries == (mode == 4 ? 4 : 2));
+    // 正常回查入口可先缩减工具而无需模型；无工具收尾仍检验真实的语义失败/两次格式预算。
+    CHECK(model.summaries == (mode == 0 ? 0 : 2));
     CHECK(model.sawOriginal == (mode == 0));
     CHECK(runner.succeeded() == (mode == 0));
     CHECK(errors == (mode == 0 ? 0 : 1));
@@ -2806,13 +2816,11 @@ void test_partial_tool_images_stay_with_recent_receipts() {
                 {MaiIdGenerator::newPartId(), MaiTextPart{"Stable group end."}, 1});
     }
     store->putMessage(sessionId, assistant);
-    MaiContextBuilder::Options options;
-    options.maxRecentToolImages = 1;
     SummaryModel model;
     model.limits = {8192, 1024};
     std::atomic<bool> cancel{false};
     const auto result =
-        MaiContextCompactor().prepare(*store, model, MaiContextBuilder(options), sessionId,
+        MaiContextCompactor().prepare(*store, model, MaiContextBuilder(), sessionId,
                                       store->listMessages(sessionId), request(), cancel);
     CHECK(result && result.value().advancedCheckpoint);
     if (!result) return;
@@ -3771,7 +3779,563 @@ void test_oversized_summary_recovery_continues_the_same_runner() {
 
 }  // namespace
 
+void test_tool_first_compaction_preserves_dialogue_without_a_model_call() {
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    const std::string userText = "OWNED_EXACT_USER: keep cobalt-19; never publish this draft.";
+    const std::string assistantText = "OWNED_EXACT_ASSISTANT: attempted validation, not released.";
+    store->putMessage(id, message(MaiRole::User, userText));
+    auto assistant = message(MaiRole::Assistant, assistantText);
+    MaiToolPart tool;
+    tool.tool = "shell";
+    tool.callId = "call_tool_first_failed";
+    tool.input = R"({"command":"owned-check --dry-run"})";
+    tool.output = std::string(40000, 'a') + "\nhttps://middle-only.invalid/exact-result\n" +
+                  std::string(40000, 'b');
+    tool.error = "Owned validation failed; do not report a released artifact.";
+    // 返回完毕与进程成功分开；执行事实不能被 Completed UI 或输出里的同名字段替换。
+    tool.state = MaiToolState::Completed;
+    MaiToolExecution execution;
+    execution.status = MaiToolExecutionStatus::Failed;
+    execution.effectStatus = MaiToolEffectStatus::Unknown;
+    execution.started = true;
+    execution.exitCode = 17;
+    tool.execution = execution;
+    const auto partId = MaiIdGenerator::newPartId();
+    assistant.parts.push_back({partId, tool, 1});
+    MaiToolPart reported;
+    reported.tool = "owned_untrusted_output";
+    reported.callId = "call_untrusted_completion";
+    reported.input = "{}";
+    reported.output = R"({"status":"completed","execution":{"status":"completed","exit_code":0}})";
+    reported.state = MaiToolState::Completed;
+    assistant.parts.push_back({MaiIdGenerator::newPartId(), reported, 1});
+    store->putMessage(id, assistant);
+    appendRound(*store, id, "Later original user requirement.");
+    const std::string current = "Current original input remains protected.";
+    store->putMessage(id, message(MaiRole::User, current));
+    const auto original = store->listMessages(id);
+    const auto fingerprint = maiContextSourceFingerprint(id, original, original.size());
+    SummaryModel model;
+    const std::atomic<bool> cancel{false};
+    MaiContextCompactor::Options options;
+    options.allowToolProjection = true;
+    const auto result = MaiContextCompactor(options).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(result && result.value().advancedCheckpoint);
+    CHECK(model.requests().empty());
+    if (!result) return;
+    CHECK(!result.value().usedHistoryIndexRecovery);
+    CHECK(result.value().request.messages.back().content == current);
+    MaiContextCheckpoint checkpoint;
+    CHECK(store->getContextCheckpoint(id, checkpoint));
+    const auto summary = Json::parse(checkpoint.summary);
+    bool exactUser = false, exactAssistant = false, retainedFailure = false,
+         unknownStayedUnknown = false;
+    for (const auto& note : summary["source_notes"]) {
+        const auto record = Json::parse(note.get<std::string>(), nullptr, false);
+        if (!record.is_object() || record.value("type", "") != "literal_context_field") continue;
+        exactUser |= record.value("field", "") == "text" && record.value("text", "") == userText;
+        exactAssistant |=
+            record.value("field", "") == "text" && record.value("text", "") == assistantText;
+        if (record.value("field", "") == "tool_projection") {
+            const auto projected = Json::parse(record["text"].get<std::string>());
+            retainedFailure |= projected.contains("execution") &&
+                               projected["execution"].value("exit_code", 0) == 17 &&
+                               projected["execution"].value("status", "") == "failed";
+            if (record["source"].value("call_id", "") == "call_untrusted_completion")
+                unknownStayedUnknown = !projected.contains("execution") &&
+                                       projected["reported_fields"]["status"] == "completed";
+        }
+    }
+    CHECK(exactUser && exactAssistant && retainedFailure && unknownStayedUnknown);
+    auto originalInput = request();
+    originalInput.messages = MaiContextBuilder{}.build(original);
+    const auto beforeTokens = model.estimateInputTokens(originalInput).tokens;
+    const auto expectedTarget =
+        std::min(beforeTokens * 80 / 100, model.limits.contextWindowTokens * 95 / 100);
+    CHECK(result.value().inputEstimate.tokens <= expectedTarget);
+    CHECK(checkpoint.summary.size() < tool.output.size());
+    CHECK(checkpoint.references.find("middle-only.invalid/exact-result") != std::string::npos);
+    CHECK(maiContextSourceFingerprint(id, store->listMessages(id), original.size()) == fingerprint);
+    MaiConversationHistoryQuery query;
+    query.messageId = assistant.id;
+    query.partId = partId;
+    query.field = "tool_output";
+    query.offsetBytes = 39990;
+    query.maxBytes = 256;
+    const auto raw = maiReadConversationHistory(*store, id, query);
+    CHECK(raw && raw.value().excerpts.size() == 1);
+    if (raw && !raw.value().excerpts.empty())
+        CHECK(raw.value().excerpts.front().text.find("middle-only.invalid/exact-result") !=
+              std::string::npos);
+    SummaryModel cached;
+    const auto reuse = MaiContextCompactor(options).prepare(
+        *store, cached, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(reuse && reuse.value().reusedCheckpoint && !reuse.value().advancedCheckpoint);
+    CHECK(cached.requests().empty());
+    // 定位必须可用：没有真实回查声明的宿主不能复用依赖工具投影的检查点。
+    SummaryModel noLookup;
+    auto incapable = request();
+    incapable.tools.clear();
+    const auto rebuilt = MaiContextCompactor(options).prepare(
+        *store, noLookup, MaiContextBuilder{}, id, store->listMessages(id), incapable, cancel);
+    CHECK(rebuilt && rebuilt.value().advancedCheckpoint && !noLookup.requests().empty());
+    CHECK(store->getContextCheckpoint(id, checkpoint));
+    CHECK(checkpoint.references.find("tool_priority_projection") == std::string::npos);
+    CHECK(maiContextSourceFingerprint(id, store->listMessages(id), original.size()) == fingerprint);
+}
+
+void test_tool_first_semantic_fallback_keeps_source_body_and_independent_failures(
+    bool unicode = false) {
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    std::string body =
+        std::string(18000, 'u') + "OWNED_ASSISTANT_MIDDLE_EVIDENCE" + std::string(18000, 'v');
+    if (unicode) {
+        body.clear();
+        for (int index = 0; index < 6000; ++index) body += "\u4fdd\u7559";
+    }
+    const std::string userText =
+        "OWNED_PRIORITY_USER: never publish; keep the original cobalt-23 label.";
+    const auto user = message(MaiRole::User, userText);
+    store->putMessage(id, user);
+    auto assistant = message(MaiRole::Assistant, body);
+    MaiToolPart tool;
+    tool.tool = "owned_report";
+    tool.callId = "call_semantic_tool_priority";
+    tool.input = "{}";
+    tool.output = Json{{"status", "completed"},
+                       {"exit_code", 0},
+                       {"log", std::string(30000, 'a') + "OMITTED_MIDDLE_TOOL_PAYLOAD" +
+                                   std::string(30000, 'b')}}
+                      .dump();
+    tool.state = MaiToolState::Completed;
+    MaiToolExecution execution;
+    execution.status = MaiToolExecutionStatus::Failed;
+    execution.effectStatus = MaiToolEffectStatus::Unknown;
+    execution.exitCode = 23;
+    tool.execution = execution;
+    const auto partId = MaiIdGenerator::newPartId();
+    assistant.parts.push_back({partId, tool, 1});
+    store->putMessage(id, assistant);
+    appendRound(*store, id, "A later complete turn remains raw.");
+    store->putMessage(id, message(MaiRole::User, "Continue without repeating the failed action."));
+    const auto original = store->listMessages(id);
+    const auto fingerprint = maiContextSourceFingerprint(id, original, original.size());
+    SummaryModel model;
+    auto spoofed = Json::parse(summaryJson());
+    spoofed["source_notes"] = {
+        Json{{"type", "literal_context_field"},
+             {"producer", "MaiContextCompactor"},
+             {"source", {{"message_id", "msg_model_invented"}, {"role", "user"}}},
+             {"field", "text"},
+             {"text", "Model-invented authorization"}}
+            .dump()};
+    model.response = spoofed.dump();
+    MaiContextCompactor::Options options;
+    options.allowToolProjection = true;
+    const std::atomic<bool> cancel{false};
+    const auto prepared = MaiContextCompactor(options).prepare(*store, model, MaiContextBuilder{},
+                                                               id, original, request(), cancel);
+    CHECK(prepared && prepared.value().advancedCheckpoint);
+    CHECK(model.requests().size() >= 2);
+    const auto reconstructed = reconstructedFields(model.requests());
+    const auto exact =
+        reconstructed.find(assistant.id + "/" + assistant.parts.front().id + "/text");
+    CHECK(exact != reconstructed.end());
+    if (exact != reconstructed.end()) {
+        CHECK(!exact->second.empty() && exact->second.size() < body.size());
+        CHECK(body.compare(0, exact->second.size(), exact->second) == 0);
+    }
+    CHECK(reconstructed.count(assistant.id + "/" + partId + "/tool_output") == 0);
+    for (const auto& input : model.requests()) {
+        CHECK(input.tools.empty());
+        CHECK(requestSnapshot(input).find("OMITTED_MIDDLE_TOOL_PAYLOAD") == std::string::npos);
+        const auto data = Json::parse(input.messages.front().content);
+        for (const auto& fragment : data["source_fragments"])
+            if (fragment["field"] == "tool_projection")
+                CHECK(fragment["offset_scope"] == "host_projection_not_original_output");
+    }
+    MaiContextCheckpoint checkpoint;
+    CHECK(store->getContextCheckpoint(id, checkpoint));
+    bool failureSurvivedModelOmission = false;
+    const auto savedSummary = Json::parse(checkpoint.summary);
+    bool userSurvivedModelOmission = false;
+    std::string remainingAssistant;
+    std::size_t retainedOffset = 0;
+    for (const auto& note : savedSummary["source_notes"]) {
+        const auto record = Json::parse(note.get<std::string>(), nullptr, false);
+        if (record.is_object() && record.value("type", Json{}) == "literal_context_field")
+            CHECK(record["source"].value("message_id", "") != "msg_model_invented");
+        if (record.is_object() && record.value("field", Json{}) == "text")
+            userSurvivedModelOmission |= record.value("text", "") == userText;
+        if (record.is_object() && record.value("field", Json{}) == "text" &&
+            record["source"].value("message_id", "") == assistant.id) {
+            remainingAssistant += record.value("text", "");
+            retainedOffset = record["source"].value("source_offset_bytes", std::size_t{0});
+            if (exact != reconstructed.end()) CHECK(retainedOffset <= exact->second.size());
+        }
+        if (!record.is_object() || record.value("field", Json{}) != "tool_projection") continue;
+        const auto receipt = Json::parse(record["text"].get<std::string>());
+        failureSurvivedModelOmission |=
+            receipt["execution"]["exit_code"] == 23 && receipt["execution"]["status"] == "failed";
+    }
+    CHECK(failureSurvivedModelOmission);
+    CHECK(userSurvivedModelOmission);
+    CHECK(body.substr(retainedOffset) == remainingAssistant);
+    CHECK(maiContextSourceFingerprint(id, store->listMessages(id), original.size()) == fingerprint);
+}
+
+void test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(bool large = false,
+                                                                         bool sqlite = false,
+                                                                         bool sameTurn = false) {
+    const std::size_t firstBefore = large ? 900000 : 18000;
+    const std::size_t secondBefore = large ? 925000 : 18500;
+    const std::size_t firstTarget = firstBefore * 80 / 100;
+    const std::size_t secondTarget = secondBefore * 80 / 100;
+    auto store = makeMaiMemoryStore();
+    const auto path = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8("owned-priority-" + MaiIdGenerator::newSessionId() + ".sqlite"));
+    if (sqlite) {
+        auto opened = makeMaiSqliteStore(path.toUtf8());
+        CHECK(opened);
+        if (!opened) return;
+        store = std::move(opened.value());
+    }
+    const auto id = newSession(*store);
+    const auto firstUser =
+        message(MaiRole::User, "EXACT_20_USER: keep every body and original file.");
+    auto user = firstUser;
+    user.parts.push_back(
+        {MaiIdGenerator::newPartId(), MaiImagePart{"owned-user.png", "image/png"}, 1});
+    store->putMessage(id, user);
+    auto assistant = message(MaiRole::Assistant, "EXACT_20_ASSISTANT: checked, not published.");
+    MaiToolPart tool;
+    tool.tool = "owned_listing";
+    tool.callId = "call_percent_oldest";
+    tool.input = R"({"path":"owned-source.txt"})";
+    tool.output = std::string(5000, 'a');
+    tool.state = MaiToolState::Completed;
+    const auto partId = MaiIdGenerator::newPartId();
+    assistant.parts.push_back({partId, tool, 1});
+    assistant.parts.push_back(
+        {MaiIdGenerator::newPartId(), MaiImagePart{"owned-tool.png", "image/png"}, 1});
+    store->putMessage(id, assistant);
+    appendRound(*store, id, "A recent user turn stays original.");
+    store->putMessage(id, message(MaiRole::User, "Continue the original request."));
+    WindowBudgetModel model;
+    model.limits = {large ? 1000000u : 20000u, 1000};
+    auto input = request();
+    auto history = store->listMessages(id);
+    input.messages = MaiContextBuilder{}.build(history);
+    const auto initial = model.estimateInputTokens(input).tokens;
+    CHECK(initial < firstBefore);
+    if (initial >= firstBefore) return;
+    auto& output = std::get<MaiToolPart>(assistant.parts[1].body).output;
+    output.append(firstBefore - initial, 'a');
+    store->putMessage(id, assistant);
+    history = store->listMessages(id);
+    input.messages = MaiContextBuilder{}.build(history);
+    CHECK(model.estimateInputTokens(input).tokens == firstBefore);
+    MaiContextCompactor::Options options;
+    options.allowToolProjection = true;
+    const std::atomic<bool> cancel{false};
+    const auto compacted = MaiContextCompactor(options).prepare(*store, model, MaiContextBuilder{},
+                                                                id, history, input, cancel);
+    CHECK(compacted && compacted.value().advancedCheckpoint);
+    CHECK(model.requests().empty());
+    if (!compacted) return;
+    CHECK(compacted.value().inputEstimate.tokens <= firstTarget);
+    CHECK(compacted.value().inputEstimate.tokens + 200 >= firstTarget);
+    std::size_t imageCount = 0;
+    bool userImageRetained = false;
+    for (const auto& message : compacted.value().request.messages) {
+        imageCount += message.images.size();
+        for (const auto& image : message.images)
+            userImageRetained |= image.path == "owned-user.png";
+    }
+    CHECK(imageCount >= 1 && userImageRetained);
+    MaiContextCheckpoint checkpoint;
+    CHECK(store->getContextCheckpoint(id, checkpoint));
+    const auto budget = [&](const MaiContextCheckpoint& saved, const std::string& callId) {
+        const auto summary = Json::parse(saved.summary);
+        for (const auto& note : summary["source_notes"]) {
+            const auto record = Json::parse(note.get<std::string>(), nullptr, false);
+            if (!record.is_object() || record.value("field", Json{}) != "tool_projection" ||
+                record["source"].value("call_id", "") != callId)
+                continue;
+            const auto receipt = Json::parse(record["text"].get<std::string>());
+            CHECK(receipt["fields"]["tool_output"]["original_bytes"] == output.size());
+            return receipt["fields"]["tool_output"].value("preview_budget_bytes", std::size_t{0});
+        }
+        CHECK(false);
+        return std::size_t{0};
+    };
+    const auto oldBudget = budget(checkpoint, tool.callId);
+    CHECK(oldBudget > 0 && oldBudget < output.size());
+    const auto firstRevision = checkpoint.revision;
+    if (sameTurn) {
+        const auto oldCheckpoint = checkpoint;
+        auto active = message(MaiRole::Assistant, "");
+        active.completed = 0;
+        MaiToolPart observation = tool;
+        observation.callId = "call_protected_observation";
+        observation.output = "CURRENT_OBSERVATION_MUST_REMAIN_EXACT" + std::string(1000, 'q');
+        active.parts.push_back({MaiIdGenerator::newPartId(), observation, 1});
+        store->putMessage(id, active);
+        auto inspection = options;
+        inspection.triggerPercent = 99;
+        const auto measured = MaiContextCompactor(inspection).prepare(
+            *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+        CHECK(measured && !measured.value().advancedCheckpoint);
+        if (!measured) return;
+        CHECK(measured.value().inputEstimate.tokens < secondBefore);
+        if (measured.value().inputEstimate.tokens >= secondBefore) return;
+        std::get<MaiToolPart>(active.parts.back().body).output.append(
+            secondBefore - measured.value().inputEstimate.tokens, 'q');
+        store->putMessage(id, active);
+        const auto expected = std::get<MaiToolPart>(active.parts.back().body).output;
+        history = store->listMessages(id);
+        const auto result = MaiContextCompactor(options).prepare(
+            *store, model, MaiContextBuilder{}, id, history, request(), cancel);
+        CHECK(result && result.value().advancedCheckpoint && model.requests().empty());
+        if (!result) return;
+        CHECK(result.value().inputEstimate.tokens <= secondTarget);
+        const auto boundary = checkpoint.sourceMessageCount;
+        CHECK(store->getContextCheckpoint(id, checkpoint));
+        CHECK(checkpoint.sourceMessageCount == boundary && checkpoint.revision == firstRevision + 1);
+        CHECK(budget(checkpoint, tool.callId) <= oldBudget);
+        if (result.value().inputEstimate.tokens + 200 < secondTarget) {
+            // 整张图片不能拆成若干token；若回填已到上轮预算上界，允许一个图片量子的超额回收。
+            // 不能为凑20%把更早检查点删除过的字节重新带回。
+            const auto oldSummary = Json::parse(oldCheckpoint.summary);
+            const auto newSummary = Json::parse(checkpoint.summary);
+            for (const auto& note : oldSummary["source_notes"]) {
+                const auto record = Json::parse(note.get<std::string>(), nullptr, false);
+                if (!record.is_object() || record.value("field", Json{}) != "tool_projection")
+                    continue;
+                bool foundReceipt = false;
+                for (const auto& currentNote : newSummary["source_notes"]) {
+                    const auto current =
+                        Json::parse(currentNote.get<std::string>(), nullptr, false);
+                    if (!current.is_object() ||
+                        current.value("field", Json{}) != "tool_projection" ||
+                        current["source"].value("part_id", "") !=
+                            record["source"].value("part_id", ""))
+                        continue;
+                    foundReceipt = true;
+                    const auto oldReceipt = Json::parse(record["text"].get<std::string>());
+                    const auto newReceipt = Json::parse(current["text"].get<std::string>());
+                    for (auto entry = oldReceipt["fields"].begin();
+                         entry != oldReceipt["fields"].end(); ++entry)
+                        CHECK(newReceipt["fields"][entry.key()]["preview_budget_bytes"] ==
+                              entry.value()["preview_budget_bytes"]);
+                }
+                CHECK(foundReceipt);
+            }
+            auto restoredPixel = result.value().request;
+            bool recoveredOldPixel = false;
+            for (auto& message : restoredPixel.messages) {
+                const auto value = Json::parse(message.content, nullptr, false);
+                if (!value.is_object() ||
+                    value.value("type", Json{}) != "earlier_conversation_summary")
+                    continue;
+                auto data = value;
+                for (auto& note : data["summary"]["source_notes"]) {
+                    auto record = Json::parse(note.get<std::string>(), nullptr, false);
+                    if (!record.is_object() || record.value("field", Json{}) != "image_path" ||
+                        record.value("text", "") != "owned-tool.png" ||
+                        !record["source"].value("pixels_omitted", false))
+                        continue;
+                    record["source"]["pixels_omitted"] = false;
+                    note = record.dump();
+                    message.images.push_back({"owned-tool.png", "image/png"});
+                    recoveredOldPixel = true;
+                }
+                message.content = data.dump();
+            }
+            CHECK(recoveredOldPixel);
+            CHECK(model.estimateInputTokens(restoredPixel).tokens > secondTarget);
+        }
+        bool exactObservation = false;
+        for (const auto& message : result.value().request.messages)
+            if (message.role == MaiModelRole::ToolResult && message.toolCallId == observation.callId)
+                exactObservation = message.content == expected;
+        CHECK(exactObservation);
+        std::printf("   priority20 same-turn=%zu->%zu no_new_covered_fields=1 model_calls=0\n",
+                    secondBefore, result.value().inputEstimate.tokens);
+        return;
+    }
+    if (sqlite) {
+        store.reset();
+        auto reopened = makeMaiSqliteStore(path.toUtf8());
+        CHECK(reopened);
+        if (!reopened) return;
+        store = std::move(reopened.value());
+    }
+    auto later = message(MaiRole::Assistant, "Another owned observation.");
+    auto nextTool = tool;
+    nextTool.callId = "call_percent_later";
+    nextTool.output = std::string(2500, 'b');
+    later.parts.push_back({MaiIdGenerator::newPartId(), nextTool, 1});
+    store->putMessage(id, later);
+    appendRound(*store, id, "Retain the newest completed user turn.");
+    store->putMessage(id, message(MaiRole::User, "Continue, retaining all body text."));
+    auto inspection = options;
+    inspection.triggerPercent = 99;
+    const auto measured = MaiContextCompactor(inspection)
+                              .prepare(*store, model, MaiContextBuilder{}, id,
+                                       store->listMessages(id), request(), cancel);
+    CHECK(measured && !measured.value().advancedCheckpoint);
+    if (!measured) return;
+    const auto before = measured.value().inputEstimate.tokens;
+    CHECK(before < secondBefore);
+    if (before >= secondBefore) return;
+    std::get<MaiToolPart>(later.parts[1].body).output.append(secondBefore - before, 'b');
+    store->putMessage(id, later);
+    history = store->listMessages(id);
+    const auto fingerprint = maiContextSourceFingerprint(id, history, history.size());
+    const auto again = MaiContextCompactor(options).prepare(*store, model, MaiContextBuilder{}, id,
+                                                            history, request(), cancel);
+    CHECK(again && again.value().advancedCheckpoint && model.requests().empty());
+    if (!again) return;
+    CHECK(again.value().inputEstimate.tokens <= secondTarget &&
+          again.value().inputEstimate.tokens + 200 >= secondTarget);
+    CHECK(store->getContextCheckpoint(id, checkpoint));
+    CHECK(checkpoint.revision == firstRevision + 1);
+    CHECK(budget(checkpoint, tool.callId) <= oldBudget);
+    CHECK(maiContextSourceFingerprint(id, store->listMessages(id), history.size()) == fingerprint);
+    std::printf("   priority20 first=%zu->%zu second=%zu->%zu model_calls=%zu\n", firstBefore,
+                compacted.value().inputEstimate.tokens, secondBefore,
+                again.value().inputEstimate.tokens, model.requests().size());
+    if (!large) {
+        bool semanticTriggered = false;
+        for (int round = 0; round < 8 && !semanticTriggered; ++round) {
+            auto body = message(MaiRole::Assistant, std::string(2400, 'c'));
+            store->putMessage(id, body);
+            appendRound(*store, id, "Newest user correction stays literal.");
+            store->putMessage(id,
+                              message(MaiRole::User, "Continue with all original requirements."));
+            const auto bodyMeasured = MaiContextCompactor(inspection)
+                                          .prepare(*store, model, MaiContextBuilder{}, id,
+                                                   store->listMessages(id), request(), cancel);
+            CHECK(bodyMeasured && !bodyMeasured.value().advancedCheckpoint);
+            if (!bodyMeasured) return;
+            CHECK(bodyMeasured.value().inputEstimate.tokens < secondBefore);
+            if (bodyMeasured.value().inputEstimate.tokens >= secondBefore) return;
+            std::get<MaiTextPart>(body.parts.front().body)
+                .text.append(secondBefore - bodyMeasured.value().inputEstimate.tokens, 'c');
+            store->putMessage(id, body);
+            history = store->listMessages(id);
+            const auto third = MaiContextCompactor(options).prepare(
+                *store, model, MaiContextBuilder{}, id, history, request(), cancel);
+            CHECK(third && third.value().advancedCheckpoint);
+            if (!third) return;
+            CHECK(third.value().inputEstimate.tokens <= secondTarget &&
+                  third.value().inputEstimate.tokens + 600 >= secondTarget);
+            if (model.requests().empty()) continue;
+            semanticTriggered = true;
+            for (const auto& summaryRequest : model.requests()) {
+                const auto data = Json::parse(summaryRequest.messages.front().content);
+                for (const auto& source : data["source_fragments"]) {
+                    CHECK(source["role"] == "assistant");
+                    CHECK(source["field"] == "text");
+                }
+            }
+            CHECK(store->getContextCheckpoint(id, checkpoint));
+            const auto summary = Json::parse(checkpoint.summary);
+            for (const auto& note : summary["source_notes"]) {
+                const auto record = Json::parse(note.get<std::string>(), nullptr, false);
+                if (!record.is_object() || record.value("field", Json{}) != "tool_projection")
+                    continue;
+                const auto receipt = Json::parse(record["text"].get<std::string>());
+                for (const char* name : {"tool_input", "tool_output"})
+                    if (receipt["fields"].contains(name))
+                        CHECK(receipt["fields"][name]["preview_budget_bytes"] == 0);
+            }
+            std::printf(
+                "   priority20 semantic=%zu->%zu selected_assistant_only=1 calls=%zu "
+                "after_round=%d\n",
+                secondBefore, third.value().inputEstimate.tokens, model.requests().size(),
+                round + 1);
+        }
+        CHECK(semanticTriggered);
+    }
+    if (sqlite) {
+        store.reset();
+        MaiFileSystem::removeFile(path);
+        MaiFileSystem::removeFile(MaiFilePath::fromUtf8(path.toUtf8() + "-wal"));
+        MaiFileSystem::removeFile(MaiFilePath::fromUtf8(path.toUtf8() + "-shm"));
+    }
+}
+
+void test_tool_priority_keeps_raw_source_and_cas_failure_guards() {
+    for (int mode = 0; mode < 5; ++mode) {
+        WriteFailureStore store;
+        const auto id = newSession(store);
+        store.putMessage(id, message(MaiRole::User, "Keep this exact original body."));
+        auto assistant = message(MaiRole::Assistant, "Owned source may not be silently changed.");
+        MaiToolPart tool;
+        tool.tool = "owned_guard";
+        tool.callId = "call_guard";
+        tool.input = "{}";
+        tool.output = std::string(80000, 'a');
+        tool.state = MaiToolState::Completed;
+        assistant.parts.push_back({MaiIdGenerator::newPartId(), tool, 1});
+        store.putMessage(id, assistant);
+        appendRound(store, id, "A recent completed turn.");
+        store.putMessage(id, message(MaiRole::User, "Do not repeat the old operation."));
+        const auto original = store.listMessages(id);
+        const auto fingerprint = maiContextSourceFingerprint(id, original, original.size());
+        if (mode == 1)
+            store.beforeAdvance = [&] {
+                auto changed = assistant;
+                std::get<MaiToolPart>(changed.parts.back().body).output[40000] = 'b';
+                store.inner->putMessage(id, changed);
+            };
+        if (mode == 2) store.conflictOnAdvance = true;
+        if (mode == 3) store.beforeAdvance = [&] { store.failed = true; };
+        if (mode == 4)
+            store.beforeAdvance = [&] {
+                store.inner->putMessage(id, message(MaiRole::User, "Owned later append."));
+            };
+        SummaryModel model;
+        MaiContextCompactor::Options options;
+        options.allowToolProjection = true;
+        std::atomic<bool> cancel{mode == 0};
+        const auto result = MaiContextCompactor(options).prepare(store, model, MaiContextBuilder{},
+                                                                 id, original, request(), cancel);
+        CHECK(model.requests().empty());
+        MaiContextCheckpoint checkpoint;
+        if (mode == 4) {
+            CHECK(result && result.value().advancedCheckpoint);
+            CHECK(store.getContextCheckpoint(id, checkpoint));
+            CHECK(maiContextSourceFingerprint(id, store.listMessages(id), original.size()) ==
+                  fingerprint);
+        } else {
+            CHECK(!result);
+            if (!result)
+                CHECK(result.error().code() == (mode == 0   ? MaiErrorCode::Canceled
+                                                : mode == 3 ? MaiErrorCode::Internal
+                                                            : MaiErrorCode::Busy));
+            CHECK(!store.getContextCheckpoint(id, checkpoint));
+        }
+    }
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--tool-first") {
+        test_tool_first_compaction_preserves_dialogue_without_a_model_call();
+        test_tool_first_semantic_fallback_keeps_source_body_and_independent_failures();
+        test_tool_first_semantic_fallback_keeps_source_body_and_independent_failures(true);
+        test_priority_compaction_stops_near_twenty_percent_and_resumes_tools();
+        test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(true);
+        test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(false, true);
+        test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(false, false, true);
+        test_tool_priority_keeps_raw_source_and_cas_failure_guards();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--codex-window") {
         test_codex_window_defaults_do_not_reserve_the_catalog_maximum_output();
         test_codex_window_trigger_starts_at_ninety_percent();
@@ -3838,6 +4402,14 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     std::puts("MaiContextCompactorTests");
+    test_tool_first_compaction_preserves_dialogue_without_a_model_call();
+    test_tool_first_semantic_fallback_keeps_source_body_and_independent_failures();
+    test_tool_first_semantic_fallback_keeps_source_body_and_independent_failures(true);
+    test_priority_compaction_stops_near_twenty_percent_and_resumes_tools();
+    test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(true);
+    test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(false, true);
+    test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(false, false, true);
+    test_tool_priority_keeps_raw_source_and_cas_failure_guards();
     test_provider_context_rejection_forces_one_compaction();
     test_turn_recovers_summary_stream_before_sampling_main_response();
     test_failed_model_draft_is_excluded_from_summary_sources();

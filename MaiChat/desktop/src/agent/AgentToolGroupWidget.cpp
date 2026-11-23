@@ -3,9 +3,26 @@
 #include "agent/AgentToolGroupWidget.h"
 
 #include <QPushButton>
+#include <QSet>
 #include <QVBoxLayout>
 
 #include "ui/UiZoom.h"
+
+namespace {
+bool isShellProcessTool(const QString& tool) {
+    // Match shell/shell_input and the desktop_process_* tools still registered
+    // by this public baseline. Keep the same exact names for stored history
+    // when the command-session tools replace the desktop process catalog.
+    // ssh_exec is explicitly built-in by product decision: libssh2 creates no
+    // local process. curl/openssl use in-process mai_*_execute entry points;
+    // other host tools, including desktop_browser/computer, also stay built-in.
+    static const QSet<QString> tools{QStringLiteral("shell"), QStringLiteral("shell_input"),
+                                    QStringLiteral("desktop_process_start"),
+                                    QStringLiteral("desktop_process_read"), QStringLiteral("desktop_process_write"),
+                                    QStringLiteral("desktop_process_stop")};
+    return tools.contains(tool);
+}
+}  // namespace
 
 QString agentToolStateText(const QString& state) {
     const QString value = state.trimmed().toLower();
@@ -17,7 +34,7 @@ QString agentToolStateText(const QString& state) {
     return QStringLiteral("状态未知");
 }
 
-QString agentToolGroupTitle(const QStringList& states) {
+QString agentToolGroupTitle(const QStringList& states, const QStringList& tools) {
     bool running = false;
     bool pending = false;
     bool failed = false;
@@ -41,7 +58,18 @@ QString agentToolGroupTitle(const QStringList& states) {
                           : canceled ? QStringLiteral("部分取消")
                           : unknown  ? QStringLiteral("状态未知")
                                      : QStringLiteral("已完成");
-    return QStringLiteral("工具调用 %1 次 · %2").arg(states.size()).arg(state);
+    const QString title = QStringLiteral("工具调用 %1 次 · %2").arg(states.size()).arg(state);
+    // A partial or older snapshot must not turn unknown names into built-ins.
+    if (tools.isEmpty() || tools.size() != states.size()) return title;
+    int shell = 0;
+    for (const QString& tool : tools) {
+        if (tool.trimmed().isEmpty()) return title;
+        shell += isShellProcessTool(tool) ? 1 : 0;
+    }
+    const int builtin = tools.size() - shell;
+    if (!shell) return QStringLiteral("内置工具调用 %1 次 · %2").arg(builtin).arg(state);
+    if (!builtin) return QStringLiteral("shell 调用 %1 次 · %2").arg(shell).arg(state);
+    return QStringLiteral("内置工具调用 %1 次 · shell 调用 %2 次 · %3").arg(builtin).arg(shell).arg(state);
 }
 
 AgentToolGroupWidget::AgentToolGroupWidget(const QString& id, QWidget* parent) : QFrame(parent), id_(id) {

@@ -2571,8 +2571,10 @@ void test_accepted_task_failure_queries_existing_task_without_resubmission() {
         CHECK(runner.succeeded());
         CHECK(observed->executions == 1);
         const auto history = store->listMessages(session.id);
-        CHECK(history.back().parts.size() == 3);
-        if (history.back().parts.size() != 3) continue;
+        const auto boundaries = std::count_if(
+            history.back().parts.begin(), history.back().parts.end(), maiIsResponseBoundaryPart);
+        CHECK(boundaries == 1 && history.back().parts.size() == 3 + boundaries);
+        if (history.back().parts.size() < 2) continue;
         const auto& precheck = std::get<MaiToolPart>(history.back().parts[0].body);
         const auto& result = std::get<MaiToolPart>(history.back().parts[1].body);
         CHECK(precheck.execution && result.execution);

@@ -10,7 +10,9 @@ class QPushButton;
 class QVBoxLayout;
 
 QString agentToolStateText(const QString& state);
-QString agentToolGroupTitle(const QStringList& states);
+// Names correspond to the same group as states. Older snapshots without names
+// keep their status-only summary rather than guessing an execution category.
+QString agentToolGroupTitle(const QStringList& states, const QStringList& tools = {});
 
 class AgentToolGroupWidget : public QFrame {
 public:

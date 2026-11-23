@@ -501,6 +501,7 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
         mDependencies.sessionAgent &&
         std::any_of(request.tools.begin(), request.tools.end(),
                     [](const MaiToolSpec& tool) { return tool.name == "session_history"; });
+    options.allowToolProjection = options.allowHistoryIndexRecovery;
     const auto prepared = MaiContextCompactor(options).prepare(
         *mDependencies.store, *mDependencies.model, *mDependencies.context, mContext.sessionId,
         sourceHistory, std::move(request), cancel, buildContext);
@@ -736,6 +737,28 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
             mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mContext.sessionId,
                                                mAssistant.id);
         calls.clear();
+    }
+    if (!mError && !cancel.load(std::memory_order_relaxed) && !continuationPublished &&
+        mResponseFirstPart != 0) {
+        // 原生Chat/local没有opaque载体；用空的非显示reasoning记录封住上一响应，
+        // 不能让后续调用并入先前已发送的tool_calls批次。它不是伪造的供应商状态。
+        MaiMessagePart boundary;
+        // 此ID在流开始前已预留，保证SQLite按ID重放时仍位于本响应正文/工具之前。
+        boundary.id = continuationPartId;
+        boundary.created = 0;
+        boundary.body = MaiReasoningPart{};
+        const auto boundaryId = boundary.id;
+        mAssistant.parts.insert(
+            mAssistant.parts.begin() + static_cast<std::ptrdiff_t>(mResponseFirstPart),
+            std::move(boundary));
+        mDependencies.store->putMessage(mContext.sessionId, mAssistant);
+        if (const auto error = mDependencies.store->lastWriteError()) {
+            mError = error;
+            calls.clear();
+        } else {
+            mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mContext.sessionId,
+                                            mAssistant.id, boundaryId, mContext.turnId);
+        }
     }
     return calls;
 }

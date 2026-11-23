@@ -48,7 +48,95 @@ bool validIdentity(const std::string& id) {
     return true;
 }
 
+bool previewEscapeRequired(std::string_view source, std::size_t offset, std::size_t length) {
+    if (length == 0) return true;
+    const auto byte = static_cast<std::uint8_t>(source[offset]);
+    return length == 1 &&
+           ((byte < 0x20 && byte != '\n' && byte != '\r' && byte != '\t') || byte == 0x7f);
+}
+
+struct MaiToolPreviewSlice {
+    std::string text;
+    std::size_t end = 0;
+    bool escaped = false;
+};
+
+MaiToolPreviewSlice previewPrefix(std::string_view source, std::size_t begin,
+                                  std::size_t maximumBytes) {
+    MaiToolPreviewSlice slice;
+    slice.end = begin;
+    while (slice.end < source.size()) {
+        const auto length = scalarBytes(source, slice.end);
+        const bool escape = previewEscapeRequired(source, slice.end, length);
+        const auto rendered = escape ? std::size_t{4} : length;
+        if (rendered > maximumBytes - slice.text.size()) break;
+        if (escape) {
+            static constexpr char hex[] = "0123456789ABCDEF";
+            const auto byte = static_cast<std::uint8_t>(source[slice.end]);
+            slice.text += "\\x";
+            slice.text += hex[byte >> 4];
+            slice.text += hex[byte & 0x0f];
+            slice.escaped = true;
+        } else {
+            slice.text.append(source.data() + slice.end, length);
+        }
+        slice.end += length == 0 ? 1 : length;
+    }
+    return slice;
+}
+
 }  // namespace
+
+MaiToolOutputPreview maiPreviewToolOutput(std::string_view source, std::size_t maximumBytes) {
+    MaiToolOutputPreview preview;
+    if (source.empty()) return preview;
+    if (maximumBytes == 0) {
+        preview.truncated = true;
+        preview.omittedSourceBytes = source.size();
+        return preview;
+    }
+    auto full = previewPrefix(source, 0, maximumBytes);
+    preview.text = std::move(full.text);
+    if (full.end == source.size()) {
+        preview.escapedBytes = full.escaped;
+        return preview;
+    }
+    preview.truncated = true;
+    const std::string_view marker = maximumBytes >= 40   ? "\n... [middle output omitted] ...\n"
+                                    : maximumBytes >= 12 ? "\n[...]\n"
+                                                         : "...";
+    const auto markerBytes = std::min(maximumBytes, marker.size());
+    const auto contentBudget = maximumBytes - markerBytes;
+    const auto head = previewPrefix(source, 0, contentBudget / 2);
+    const auto tailBudget = contentBudget - head.text.size();
+    std::size_t tailStart = source.size(), tailBytes = 0;
+    // 从末尾向前识别标量，非法序列仍逐字节处理；头尾只能在源单元边界交接。
+    // 因此省略数可直接用源位置相减，不把 \xHH 的显示长度当作源长度。
+    while (tailStart > head.end) {
+        auto begin = tailStart - 1;
+        while (begin > head.end && tailStart - begin < 4 &&
+               (static_cast<std::uint8_t>(source[begin]) & 0xc0) == 0x80)
+            --begin;
+        auto length = scalarBytes(source, begin);
+        if (length == 0 || begin + length != tailStart) {
+            begin = tailStart - 1;
+            length = scalarBytes(source, begin);
+        }
+        const bool escape = previewEscapeRequired(source, begin, length);
+        const auto rendered = escape ? std::size_t{4} : length;
+        if (rendered > tailBudget - tailBytes) break;
+        tailBytes += rendered;
+        tailStart = begin;
+    }
+    const auto tail = previewPrefix(source, tailStart, tailBudget);
+    preview.text.clear();
+    preview.text += head.text;
+    preview.text.append(marker.data(), markerBytes);
+    preview.text += tail.text;
+    preview.omittedSourceBytes = tailStart - head.end;
+    preview.escapedBytes = head.escaped || tail.escaped;
+    return preview;
+}
 
 MaiError maiValidateToolOutputRecord(const MaiToolOutputRecord& output) {
     if (!validIdentity(output.id) || !validIdentity(output.sessionId) ||

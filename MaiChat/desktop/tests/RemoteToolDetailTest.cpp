@@ -13,6 +13,7 @@
 #include <QtTest>
 
 #include "agent/RemoteAgentPanel.h"
+#include "agent/AgentToolGroupWidget.h"
 #include "agent/DesktopSessionSyncCoordinator.h"
 #include "markdown/MarkdownView.h"
 
@@ -56,7 +57,7 @@ struct Fixture {
     RemoteAgentPanel panel{nullptr, directory.filePath(QStringLiteral("outbox.json"))};
     QJsonObject current = owner();
     QList<Read> reads;
-    Fixture() {
+    explicit Fixture(bool renderInitial = true) {
         panel.resize(1000, 800);
         panel.setToolDetailScope(QStringLiteral("owned-account"), 7);
         panel.setCommandHandler([this](const QJsonObject& remote, const QJsonObject& command,
@@ -66,7 +67,7 @@ struct Fixture {
             done({});
         });
         panel.openSession(current);
-        snapshot(panel, current);
+        if (renderInitial) snapshot(panel, current);
         panel.show();
         QCoreApplication::processEvents();
     }
@@ -126,6 +127,9 @@ void deliver(RemoteAgentPanel& panel, const Read& read, const QJsonObject& resul
 class RemoteToolDetailTest final : public QObject {
     Q_OBJECT
 private slots:
+    void groupSummaryCategories_data();
+    void groupSummaryCategories();
+    void legacyGroupSummaryKeepsStatusPriority();
     void disclosureReadsOnlySelectedToolAndPagesOriginalSource();
     void expandedToolDetailsUseTheReadingColumn();
     void wrongBindingAndWrongPageDoNotConsumeTheCorrectRead();
@@ -140,6 +144,94 @@ private slots:
     void offlineCacheAndLegacyInlineRemainReadable();
     void busyAndInvalidUtf8PagesRemainExplicit();
 };
+
+void RemoteToolDetailTest::groupSummaryCategories_data() {
+    QTest::addColumn<QStringList>("tools");
+    QTest::addColumn<QStringList>("states");
+    QTest::addColumn<QString>("title");
+    QTest::newRow("pure-built-in")
+        << QStringList{"file_read", "curl", "openssl", "ssh_exec", "desktop_browser", "computer", "ffmpeg", "git"}
+        << QStringList(8, QStringLiteral("completed")) << QStringLiteral("内置工具调用 8 次 · 已完成");
+    QTest::newRow("ssh-exec-is-built-in")
+        << QStringList{"ssh_exec"} << QStringList{"completed"} << QStringLiteral("内置工具调用 1 次 · 已完成");
+    QTest::newRow("shell-input-session-is-shell")
+        << QStringList{"shell_input"} << QStringList{"completed"} << QStringLiteral("shell 调用 1 次 · 已完成");
+    QTest::newRow("active-shell-session-pair")
+        << QStringList{"shell", "shell_input"} << QStringList{"completed", "completed"}
+        << QStringLiteral("shell 调用 2 次 · 已完成");
+    // Public process tools and historical names share the shell category.
+    QTest::newRow("pure-shell-executors")
+        << QStringList{"shell", "desktop_process_start", "desktop_process_read", "desktop_process_write", "desktop_process_stop"}
+        << QStringList(5, QStringLiteral("completed")) << QStringLiteral("shell 调用 5 次 · 已完成");
+    QTest::newRow("mixed-completed")
+        << QStringList{"file_read", "curl", "openssl", "ssh_exec", "desktop_browser", "computer", "shell", "desktop_process_read"}
+        << QStringList(8, QStringLiteral("completed")) << QStringLiteral("内置工具调用 6 次 · shell 调用 2 次 · 已完成");
+    QTest::newRow("mixed-failure")
+        << QStringList{"ssh_exec", "curl", "shell"} << QStringList{"completed", "completed", "error"}
+        << QStringLiteral("内置工具调用 2 次 · shell 调用 1 次 · 有失败");
+    QTest::newRow("shell-name-prefix-is-not-a-family-match")
+        << QStringList{"desktop_process_status", "shell_extra"} << QStringList{"completed", "completed"}
+        << QStringLiteral("内置工具调用 2 次 · 已完成");
+    QTest::newRow("missing-name-keeps-legacy-summary")
+        << QStringList{""} << QStringList{"completed"} << QStringLiteral("工具调用 1 次 · 已完成");
+    QTest::newRow("partial-missing-name-keeps-legacy-summary")
+        << QStringList{"shell", ""} << QStringList{"completed", "completed"} << QStringLiteral("工具调用 2 次 · 已完成");
+}
+
+void RemoteToolDetailTest::groupSummaryCategories() {
+    QFETCH(QStringList, tools);
+    QFETCH(QStringList, states);
+    QFETCH(QString, title);
+    Fixture f(false);
+    QJsonArray parts;
+    for (int i = 0; i < tools.size(); ++i) {
+        auto tool = part();
+        tool.insert(QStringLiteral("id"), QStringLiteral("owned-category-%1").arg(i));
+        tool.insert(QStringLiteral("callId"), QStringLiteral("owned-category-call-%1").arg(i));
+        tool.insert(QStringLiteral("tool"), tools[i]);
+        tool.insert(QStringLiteral("state"), states[i]);
+        parts.append(tool);
+    }
+    const QJsonObject message{{QStringLiteral("id"), QStringLiteral("msg-visual-fragment")},
+                              {QStringLiteral("role"), QStringLiteral("assistant")},
+                              {QStringLiteral("parts"), parts}};
+    f.panel.receivePayload(f.current, QStringLiteral("history_page"),
+                           {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+    QAbstractButton* button = nullptr;
+    QTRY_VERIFY((button = f.groupButton()) != nullptr);
+    QCOMPARE(button->text(), QStringLiteral("⌘  %1  ›").arg(title));
+    button->click();
+    QCOMPARE(button->text(), QStringLiteral("⌘  %1  ⌄").arg(title));
+    QCOMPARE(f.reads.size(), 0);
+    button->click();
+    QCOMPARE(button->text(), QStringLiteral("⌘  %1  ›").arg(title));
+    f.panel.resize(560, 700);
+    QCoreApplication::processEvents();
+    QVERIFY(button->isVisible());
+    const QPoint position = button->mapTo(&f.panel, QPoint());
+    QVERIFY2(position.x() >= 0 && position.x() + button->width() <= f.panel.width(),
+             "A narrow panel must keep the entire category disclosure inside the reading area.");
+    const QString capture = qEnvironmentVariable("MAICHAT_TOOL_GROUP_CAPTURE_DIR");
+    if (!capture.isEmpty()) {
+        QVERIFY(QDir().mkpath(capture));
+        QVERIFY(f.panel.grab().save(QDir(capture).filePath(QString::fromLatin1(QTest::currentDataTag()) + QStringLiteral(".png"))));
+    }
+}
+
+void RemoteToolDetailTest::legacyGroupSummaryKeepsStatusPriority() {
+    QCOMPARE(agentToolGroupTitle({"completed", "error", "pending", "running"}), QStringLiteral("工具调用 4 次 · 运行中"));
+    QCOMPARE(agentToolGroupTitle({"completed", "error", "pending"}), QStringLiteral("工具调用 3 次 · 等待授权"));
+    QCOMPARE(agentToolGroupTitle({"canceled", "error"}), QStringLiteral("工具调用 2 次 · 有失败"));
+    QCOMPARE(agentToolGroupTitle({"completed", "canceled"}), QStringLiteral("工具调用 2 次 · 部分取消"));
+    QCOMPARE(agentToolGroupTitle({"canceled"}), QStringLiteral("工具调用 1 次 · 部分取消"));
+    QCOMPARE(agentToolGroupTitle({"completed", "unrecognized"}), QStringLiteral("工具调用 2 次 · 状态未知"));
+    QCOMPARE(agentToolGroupTitle({" Completed "}), QStringLiteral("工具调用 1 次 · 已完成"));
+    QCOMPARE(agentToolGroupTitle({"completed", "error"}, {"shell"}), QStringLiteral("工具调用 2 次 · 有失败"));
+    QCOMPARE(agentToolGroupTitle({"pending", "error"}, {"shell", "curl"}),
+             QStringLiteral("内置工具调用 1 次 · shell 调用 1 次 · 等待授权"));
+    QCOMPARE(agentToolGroupTitle({"running", "pending"}, {"shell", "desktop_process_stop"}),
+             QStringLiteral("shell 调用 2 次 · 运行中"));
+}
 
 void RemoteToolDetailTest::disclosureReadsOnlySelectedToolAndPagesOriginalSource() {
     Fixture f;
@@ -295,6 +387,7 @@ void RemoteToolDetailTest::busyRefreshLocksCurrentStateBeforeTheNextSnapshot() {
     auto* metadata = f.panel.findChild<QLabel*>(QStringLiteral("remoteAgentToolDetail"));
     QVERIFY(metadata && metadata->text().contains(QStringLiteral("已完成")));
     QVERIFY(f.groupButton()->text().contains(QStringLiteral("已完成")));
+    QVERIFY(f.groupButton()->text().contains(QStringLiteral("内置工具调用")));
 
     const Read input = f.read(QStringLiteral("input"));
     auto wrongState = page(input, QStringLiteral("WRONG_REFRESH_STATE"));

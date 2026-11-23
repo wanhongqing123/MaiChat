@@ -1,10 +1,10 @@
-// 文件作用：验证“MaiContextBuilderImage”的正确行为和边界条件。
-// 验证入口：testCurrentRequestKeepsOnlyRecentToolPixels、testSmallCurrentRequestKeepsEveryImage、
-// testVideoAttachmentUsesAFileReferenceInsteadOfImagePixels；检查可观察结果而非实现细节。
+// 文件作用：验证图片历史前缀稳定、工具配对及压缩边界；不调用真实模型或读取图片文件。
 #include <cstdio>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <json.hpp>
 
 #include "MaiContextBuilder.h"
 #include "MaiMessage.h"
@@ -19,6 +19,29 @@ static int failures = 0;
     } while (0)
 
 namespace {
+
+// 比较全部中立协议字段；仅比较图片数会漏掉标签、工具配对或 opaque continuation 被改写。
+nlohmann::json modelMessageSnapshot(const MaiModelMessage& message) {
+    using Json = nlohmann::json;
+    Json images = Json::array(), calls = Json::array();
+    for (const auto& image : message.images)
+        images.push_back({{"path", image.path}, {"mime", image.mimeType}});
+    for (const auto& call : message.invocations)
+        calls.push_back({{"id", call.id}, {"name", call.name}, {"arguments", call.arguments}});
+    Json continuation = nullptr;
+    if (message.continuation)
+        continuation = {{"format", message.continuation->format},
+                        {"provider", message.continuation->provider},
+                        {"model", message.continuation->model},
+                        {"payload", message.continuation->payload}};
+    return {{"role", static_cast<int>(message.role)},
+            {"content", message.content},
+            {"reasoning", message.reasoning},
+            {"images", images},
+            {"call_id", message.toolCallId},
+            {"calls", calls},
+            {"continuation", continuation}};
+}
 
 MaiMessage userMessage(const std::string& text, const std::string& imagePath) {
     MaiMessage message;
@@ -47,7 +70,129 @@ MaiMessage toolImages(const std::string& prefix, int count) {
     return message;
 }
 
-void testCurrentRequestKeepsOnlyRecentToolPixels() {
+void testImageRequestsOnlyAppendUntilCompaction() {
+    std::vector<MaiMessage> history;
+    auto first = userMessage("Original image request", "owned/first.jpg");
+    first.id = "msg_first";
+    first.parts.back().id = "prt_first";
+    first.parts.push_back({"prt_second", MaiImagePart{"owned/second.png", "image/png"}, 1});
+    history.push_back(first);
+    MaiContextBuilder builder;
+    auto previous = builder.build(history);
+    CHECK(previous.front().content.find(
+              "Image attachment 1 (id=prt_first, workspace_path=\"owned/first.jpg\").") !=
+          std::string::npos);
+    CHECK(previous.front().content.find("Image attachment 2 (id=prt_second,") != std::string::npos);
+    const auto appendAndCheck = [&] {
+        const auto current = builder.build(history);
+        CHECK(current.size() > previous.size());
+        for (std::size_t index = 0; index < previous.size() && index < current.size(); ++index) {
+            if (modelMessageSnapshot(previous[index]) != modelMessageSnapshot(current[index])) {
+                std::printf("Changed emitted prefix at model message %zu (source messages %zu)\n",
+                            index, history.size());
+                CHECK(false);
+                break;
+            }
+        }
+        previous = current;
+    };
+    history.push_back(toolImages("owned/step-", 0));
+    history.back().id = "msg_steps";
+    history.back().parts.push_back(
+        {"prt_response",
+         MaiReasoningPart{"", MaiModelContinuationState{"responses.output.v1", "owned-provider",
+                                                        "owned-model", "opaque-owned-response"}},
+         1});
+    // 一条仍在增长的 assistant 内连续截图，必须跨越原来的8张滑动窗口。
+    for (int index = 0; index < 10; ++index) {
+        MaiToolPart call;
+        call.tool = "screenshot";
+        call.callId = "call_step_" + std::to_string(index);
+        call.input = "{}";
+        call.output = "Owned screenshot ready.";
+        call.state = MaiToolState::Completed;
+        history.back().parts.push_back({"prt_call_" + std::to_string(index), call, 1});
+        history.back().parts.push_back(
+            {"prt_step_" + std::to_string(index),
+             MaiImagePart{"owned/step-" + std::to_string(index) + ".png", "image/png"}, 1});
+        appendAndCheck();
+    }
+    // 新用户轮次和超过12张用户图片都不能改写早期标签、路径或像素。
+    for (int index = 0; index < 14; ++index) {
+        auto user = userMessage("Another image", "owned/user-" + std::to_string(index) + ".jpg");
+        user.id = "msg_user_" + std::to_string(index);
+        user.parts.back().id = "prt_user_" + std::to_string(index);
+        history.push_back(user);
+        appendAndCheck();
+        history.push_back(userMessage("Text-only follow-up", {}));
+        appendAndCheck();
+    }
+    history.push_back(toolImages("owned/later-", 9));
+    appendAndCheck();
+    std::size_t pixels = 0;
+    for (const auto& message : previous) pixels += message.images.size();
+    CHECK(pixels == 35);
+    // 安全点输入组变化不应再成为选择旧图片的开关。
+    const auto grouped = builder.build(history, 0, 0, {}, false, {first.id});
+    CHECK(grouped.size() == previous.size());
+    for (std::size_t index = 0; index < grouped.size() && index < previous.size(); ++index)
+        CHECK(modelMessageSnapshot(grouped[index]) == modelMessageSnapshot(previous[index]));
+    CHECK(std::get<MaiImagePart>(history.front().parts.back().body).path == "owned/second.png");
+}
+
+void testOnlyCompactionBoundaryRemovesCoveredImageParts() {
+    std::vector<MaiMessage> history = {userMessage("Covered source", "owned/covered-user.jpg"),
+                                       toolImages("owned/covered-tool-", 2),
+                                       userMessage("Retained input", "owned/tail-user.jpg"),
+                                       toolImages("owned/tail-tool-", 1)};
+    for (std::size_t index = 0; index < history.size(); ++index)
+        history[index].id = "msg_boundary_" + std::to_string(index);
+    const auto paths = [](const std::vector<MaiModelMessage>& request) {
+        std::vector<std::string> result;
+        for (const auto& message : request)
+            for (const auto& image : message.images) result.push_back(image.path);
+        return result;
+    };
+    MaiContextBuilder builder;
+    CHECK(paths(builder.build(history)).size() == 5);
+    const auto complete = builder.build(history, 2);
+    CHECK((paths(complete) ==
+           std::vector<std::string>{"owned/tail-user.jpg", "owned/tail-tool-0.jpg"}));
+    const auto partial = builder.build(history, 1, 1);
+    CHECK((paths(partial) == std::vector<std::string>{"owned/covered-tool-1.jpg",
+                                                      "owned/tail-user.jpg",
+                                                      "owned/tail-tool-0.jpg"}));
+    history.push_back(userMessage("Later input must not clear the retained pixels", {}));
+    const auto later = builder.build(history, 2);
+    CHECK(later.size() > complete.size());
+    for (std::size_t index = 0; index < complete.size() && index < later.size(); ++index)
+        CHECK(modelMessageSnapshot(complete[index]) == modelMessageSnapshot(later[index]));
+    CHECK(paths(builder.build(history)).size() == 5);
+}
+
+void testMissingImagePathHasOnlyALocalStableNotice() {
+    MaiMessage user = userMessage("Incomplete attachment", {});
+    user.id = "msg_missing_path";
+    user.parts.push_back({"prt_missing_user", MaiImagePart{"", "image/png"}, 1});
+    MaiMessage assistant = toolImages("", 0);
+    assistant.id = "msg_missing_tool";
+    assistant.parts.push_back({"prt_missing_tool", MaiImagePart{"", "image/png"}, 1});
+    const auto original = MaiContextBuilder().build({user, assistant});
+    CHECK(original.size() == 2);
+    if (original.size() != 2) return;
+    for (const auto& message : original) CHECK(message.images.empty());
+    CHECK(original[0].content.find("Pixels are unavailable: no workspace path was recorded.") !=
+          std::string::npos);
+    const auto metadata = nlohmann::json::parse(original[1].content);
+    CHECK(metadata["pixel_status"] == "unavailable_no_workspace_path");
+    CHECK(metadata["workspace_path"] == "");
+    const auto later = MaiContextBuilder().build({user, assistant, userMessage("Continue", {})});
+    CHECK(later.size() == 3);
+    for (std::size_t index = 0; index < original.size() && index < later.size(); ++index)
+        CHECK(modelMessageSnapshot(original[index]) == modelMessageSnapshot(later[index]));
+}
+
+void testUncompactedRequestKeepsAllUserAndToolPixels() {
     const std::vector<MaiMessage> history = {
         userMessage("Earlier request", "old-user.jpg"), toolImages("old-tool-", 3),
         userMessage("Analyze this video", "current-user.jpg"), toolImages("frame-", 39)};
@@ -56,16 +201,18 @@ void testCurrentRequestKeepsOnlyRecentToolPixels() {
     for (const auto& message : request) {
         for (const auto& image : message.images) images.push_back(image.path);
     }
-    CHECK(images.size() == 9);
-    CHECK(images.front() == "current-user.jpg");
-    for (int index = 0; index < 8; ++index)
-        CHECK(images[index + 1] == "frame-" + std::to_string(index + 31) + ".jpg");
-    CHECK(request.front().role == MaiModelRole::System);
-    CHECK(request.front().content.find("Omitted 35 older image observations") != std::string::npos);
-    CHECK(request.front().content.find("view_image") == std::string::npos);
-    CHECK(request.front().content.find("Do not infer their visual contents") != std::string::npos);
-    CHECK(request[2].content.find("Analyze this video") != std::string::npos);
-    CHECK(request[2].content.find("current-user.jpg") != std::string::npos);
+    CHECK(images.size() == 44);
+    CHECK(images.front() == "old-user.jpg");
+    if (images.size() != 44) return;
+    for (int index = 0; index < 3; ++index)
+        CHECK(images[index + 1] == "old-tool-" + std::to_string(index) + ".jpg");
+    CHECK(images[4] == "current-user.jpg");
+    for (int index = 0; index < 39; ++index)
+        CHECK(images[index + 5] == "frame-" + std::to_string(index) + ".jpg");
+    CHECK(request.front().role == MaiModelRole::User);
+    for (const auto& item : request) CHECK(item.content.find("Omitted ") == std::string::npos);
+    CHECK(request[4].content.find("Analyze this video") != std::string::npos);
+    CHECK(request[4].content.find("current-user.jpg") != std::string::npos);
     CHECK(request.back().images.front().path == "frame-38.jpg");
 }
 
@@ -79,7 +226,7 @@ void testSmallCurrentRequestKeepsEveryImage() {
     CHECK(request.back().images.front().path == "frame-3.jpg");
 }
 
-void testNewUserTurnKeepsOldImageReceiptWithoutReinjectingPixels() {
+void testNewUserTurnKeepsOldImageReceiptAndPixels() {
     MaiMessage assistant;
     assistant.role = MaiRole::Assistant;
     MaiToolPart viewed;
@@ -99,14 +246,19 @@ void testNewUserTurnKeepsOldImageReceiptWithoutReinjectingPixels() {
     const auto request = MaiContextBuilder().build(history);
     bool keptReceipt = false;
     bool keptCall = false;
+    std::size_t pixelCount = 0;
     for (const auto& message : request) {
-        CHECK(message.images.empty());
+        for (const auto& image : message.images) {
+            ++pixelCount;
+            CHECK(image.path == "camera/photo.jpg");
+        }
         for (const auto& call : message.invocations)
             keptCall |= call.id == viewed.callId && call.arguments == viewed.input;
         keptReceipt |= message.role == MaiModelRole::ToolResult &&
                        message.toolCallId == viewed.callId && message.content == viewed.output;
     }
     CHECK(keptCall && keptReceipt);
+    CHECK(pixelCount == 1);
     CHECK(std::get<MaiToolPart>(history[1].parts[0].body).state == MaiToolState::Completed);
     CHECK(std::get<MaiImagePart>(history[1].parts[1].body).path == "camera/photo.jpg");
 }
@@ -141,14 +293,14 @@ void testCurrentImagesHaveExactPathAndAttachmentIdentity() {
     CHECK(request[0].content.find("gallery/child grass 2.jpg") != std::string::npos);
 }
 
-void testRecentPreviousImagePathsRemainAvailableWithoutOldPixels() {
-    MaiContextBuilder::Options options;
-    options.maxRecentUserImageReferences = 2;
+void testEveryPreviousImageKeepsItsPathAndPixels() {
     const std::vector<MaiMessage> history = {
         userMessage("first", "oldest.jpg"), userMessage("second", "recent-one.jpg"),
         userMessage("third", "recent-two.jpg"), userMessage("Use the last two", {})};
-    const auto request = MaiContextBuilder(options).build(history);
-    for (const auto& message : request) CHECK(message.images.empty());
+    const auto request = MaiContextBuilder().build(history);
+    std::size_t pixelCount = 0;
+    for (const auto& message : request) pixelCount += message.images.size();
+    CHECK(pixelCount == 3);
     bool sawOldest = false;
     bool sawFirstRecent = false;
     bool sawSecondRecent = false;
@@ -157,7 +309,7 @@ void testRecentPreviousImagePathsRemainAvailableWithoutOldPixels() {
         sawFirstRecent |= message.content.find("recent-one.jpg") != std::string::npos;
         sawSecondRecent |= message.content.find("recent-two.jpg") != std::string::npos;
     }
-    CHECK(!sawOldest);
+    CHECK(sawOldest);
     CHECK(sawFirstRecent);
     CHECK(sawSecondRecent);
 }
@@ -458,12 +610,15 @@ void testResponseContinuationContributesToInputBudget() {
 }  // namespace
 
 int main() {
-    testCurrentRequestKeepsOnlyRecentToolPixels();
+    testImageRequestsOnlyAppendUntilCompaction();
+    testOnlyCompactionBoundaryRemovesCoveredImageParts();
+    testMissingImagePathHasOnlyALocalStableNotice();
+    testUncompactedRequestKeepsAllUserAndToolPixels();
     testSmallCurrentRequestKeepsEveryImage();
-    testNewUserTurnKeepsOldImageReceiptWithoutReinjectingPixels();
+    testNewUserTurnKeepsOldImageReceiptAndPixels();
     testVideoAttachmentUsesAFileReferenceInsteadOfImagePixels();
     testCurrentImagesHaveExactPathAndAttachmentIdentity();
-    testRecentPreviousImagePathsRemainAvailableWithoutOldPixels();
+    testEveryPreviousImageKeepsItsPathAndPixels();
     testQuotedUserMediaUsesExactSourceMessage();
     testExplicitToolOutputBudgetKeepsItsExistingPolicy();
     testExplicitHistoryBudgetKeepsItsExistingPolicy();
