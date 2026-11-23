@@ -3,6 +3,8 @@
 #include <httplib.h>
 
 #include <QLabel>
+#include <QApplication>
+#include <QFont>
 #include <QLineEdit>
 #include <QCheckBox>
 #include <QBuffer>
@@ -16,7 +18,9 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QSignalSpy>
+#include <QScopeGuard>
 #include <QTest>
+#include <QTimer>
 #include <QWidget>
 #include <atomic>
 #include <chrono>
@@ -27,6 +31,9 @@
 #include <vector>
 
 #include "ui/LoginDialog.h"
+#include "ui/MainWindow.h"
+#include "app/RemoteIMApplication.h"
+#include "im/FakeRemoteIMClient.h"
 #include "auth/DesktopCurlAuthTransport.h"
 
 namespace {
@@ -466,6 +473,7 @@ private slots:
     void displaysServerQrAndSendsMatchingVerifier();
     void replacingQrCancelsPreviousRequest();
     void approvedQrUsesServerSignedCredential();
+    void approvedQrShowsMainWindow();
     void rejectsMismatchedServerCredential();
     void refreshesShortLivedAccessToken();
     void retriesCredentialAfterAccessIsRejected();
@@ -880,6 +888,35 @@ void LoginDialogTest::approvedQrUsesServerSignedCredential() {
     QVERIFY(server.verifierValid);
     QCOMPARE(auth.authenticatedUserId(), QStringLiteral("im-auth-test"));
     QCOMPARE(auth.imCredential().userSig, QStringLiteral("server-signed-user-sig"));
+}
+
+void LoginDialogTest::approvedQrShowsMainWindow() {
+    FakeQrServer server;
+    server.claimStatus = 200;
+    DesktopAuthClient auth(nullptr, server.url(), false);
+    LoginDialog dialog(&auth);
+    QTimer deadline;
+    deadline.setSingleShot(true);
+    connect(&deadline, &QTimer::timeout, &dialog, &QDialog::reject);
+    deadline.start(5000);
+    QTimer::singleShot(0, &dialog, &LoginDialog::start);
+    QCOMPARE(dialog.exec(), int(QDialog::Accepted));
+    deadline.stop();
+    QVERIFY(!dialog.isVisible());
+
+    // Login-only smoke tests missed an ABI mismatch in MainWindow's allocation
+    // of DesktopScreenCaptureControl. Exercise the actual post-login widgets,
+    // using owned HTTP/IM fixtures instead of real credentials or user data.
+    const QFont previousFont = QApplication::font();
+    const auto restoreFont = qScopeGuard([previousFont] { QApplication::setFont(previousFont); });
+    RemoteIMApplication remoteIM(auth.authenticatedUserId(), std::make_unique<FakeRemoteIMClient>());
+    MainWindow window(remoteIM);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QVERIFY(window.findChild<QWidget*>(QStringLiteral("contentStack")));
+    QVERIFY(window.findChild<QWidget*>(QStringLiteral("agentPage")));
+    if (qEnvironmentVariableIsSet("MAICHAT_CAPTURE_LOGIN_HANDOFF"))
+        QVERIFY(window.grab().save(qEnvironmentVariable("MAICHAT_CAPTURE_LOGIN_HANDOFF")));
 }
 
 void LoginDialogTest::rejectsMismatchedServerCredential() {

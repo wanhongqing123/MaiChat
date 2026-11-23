@@ -10,17 +10,11 @@ if(CMAKE_HOST_APPLE)
   endif()
 endif()
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 3.2.1 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 3.2.2 LANGUAGES C CXX)
 if(MSVC AND MSVC_VERSION LESS 1930)
   message(FATAL_ERROR "The source Qt 6 desktop build requires MSVC 2022 or later")
 endif()
-if(MSVC AND CMAKE_CL_SHOWINCLUDES_PREFIX MATCHES "^娉")
-  # Some CMake/VS2019 locale combinations double-decode /showIncludes. Ninja then
-  # records no header dependencies, so changing a public header leaves stale objects.
-  set(CMAKE_C_CL_SHOWINCLUDES_PREFIX "注意: 包含文件:  ")
-  set(CMAKE_CXX_CL_SHOWINCLUDES_PREFIX "注意: 包含文件:  ")
-  set(CMAKE_CL_SHOWINCLUDES_PREFIX "注意: 包含文件:  ")
-endif()
+include(cmake/MaiChatMsvcIncludes.cmake)
 if(APPLE)
   # Metal 使用 .m，桌面原生桥使用 .mm；先在宿主目录建立各自的语言规则。
   enable_language(OBJC OBJCXX)
@@ -2107,6 +2101,11 @@ endif()
 include(cmake/MaiNativeComponents.cmake)
 
 enable_testing()
+if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
+  add_test(NAME msvc_include_dependencies_test
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/MsvcIncludeDependenciesTest.py"
+      --cmake "${CMAKE_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}" --compiler "${CMAKE_CXX_COMPILER}")
+endif()
 
 # 移动模型入口的参数/审批适配不依赖平台 SDK，复用普通 MaiAgent 库做本机定点验证。
 add_executable(mobile_session_im_binding_tool_test

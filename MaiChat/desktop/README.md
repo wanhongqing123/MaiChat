@@ -51,6 +51,17 @@ the SDK AppID and UserSig come from that authenticated session.
 
 Set `MAICHAT_USE_FAKE_CLIENT=ON` only when developing the UI without a native SDK.
 
+Windows release validation must also cover the post-login window, rather than
+only `maichat --smoke` (which cancels the login dialog). From an MSVC developer
+environment, build `login_dialog_test` and run `approvedQrShowsMainWindow` through
+`scripts/run-tests-windows.ps1 -BuildDirectory <build> -TestRegex '^login_dialog_test$'
+-TestFunction approvedQrShowsMainWindow`, with an isolated test user profile.
+This uses owned local HTTP/IM fixtures and creates the actual main-window widgets.
+Run the registered `msvc_include_dependencies_test` as well: it checks that a
+transitive header-only change rebuilds both C and C++ consumers. The MSVC/Ninja
+compiler launcher normalizes localized include markers as bytes, so console and
+ANSI code-page differences cannot silently discard header dependencies.
+
 The bundled SDK files come from the domestic Tencent download host `im.sdk.qcloud.com`; see `vendor/tencent-im/README.md`.
 
 ## Remote desktop
