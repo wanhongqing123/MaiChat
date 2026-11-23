@@ -352,6 +352,55 @@ QString toolPrimaryArgument(const QString& tool, const QString& arguments) {
     return object.value(key).toString().simplified();
 }
 
+// 结构化参数转成多行文本：长字符串字段（命令、脚本、正文）直接显示原文，
+// 短字段用"键: 值"，嵌套结构用紧凑 JSON 并截断。解析失败退回原文。
+// 目的是让详情块可读：原始 JSON 的引号、转义换行和包装字段全部去掉。
+QString formatToolArguments(const QString& arguments) {
+    const QJsonDocument document = QJsonDocument::fromJson(arguments.toUtf8());
+    if (!document.isObject()) return arguments.trimmed();
+    const QJsonObject object = document.object();
+    if (object.isEmpty()) return QStringLiteral("{}");
+    QStringList lines;
+    for (const QString& key : object.keys()) {
+        const QJsonValue value = object.value(key);
+        if (value.isString()) {
+            const QString text = value.toString();
+            if (text.contains(QLatin1Char('\n')) || text.size() > 64)
+                lines << key + QStringLiteral(":\n") + text;
+            else
+                lines << key + QStringLiteral(": ") + text;
+            continue;
+        }
+        if (value.isDouble()) {
+            const double number = value.toDouble();
+            lines << key + QStringLiteral(": ") +
+                          (number == static_cast<double>(static_cast<qlonglong>(number))
+                               ? QString::number(static_cast<qlonglong>(number))
+                               : QString::number(number));
+        } else if (value.isBool()) {
+            lines << key + QStringLiteral(": ") + (value.toBool() ? QStringLiteral("true")
+                                                                  : QStringLiteral("false"));
+        } else if (value.isNull() || value.isUndefined()) {
+            lines << key + QStringLiteral(": null");
+        } else {
+            const QJsonDocument nested(value.isArray() ? QJsonDocument(value.toArray())
+                                                       : QJsonDocument(value.toObject()));
+            QString compact = QString::fromUtf8(nested.toJson(QJsonDocument::Compact));
+            if (compact.size() > 240) compact = compact.left(240) + QStringLiteral("…");
+            lines << key + QStringLiteral(": ") + compact;
+        }
+    }
+    return lines.join(QLatin1Char('\n'));
+}
+
+// token 数用紧凑表示：118000 → "118k"，12300 → "12.3k"，900 → "900"。
+QString formatTokenCount(std::size_t tokens) {
+    if (tokens >= 10000)
+        return QStringLiteral("%1k").arg(
+            tokens / 1000.0, 0, 'f', tokens >= 100000 ? 0 : 1);
+    return QString::number(static_cast<qlonglong>(tokens));
+}
+
 QString toolActionText(const QString& tool, const QString& argument, MaiToolState state, bool waitingForUser) {
     QString action;
     if (waitingForUser) {
@@ -1036,7 +1085,7 @@ public:
         head->addWidget(expand_);
         column->addLayout(head);
 
-        detail_ = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkSoft);
+        detail_ = makeLabel(QString(), UiZoom::TextRole::Detail, kInk);
         detail_->setObjectName(QStringLiteral("agentToolDetail"));
         detail_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
         detail_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
@@ -1047,9 +1096,11 @@ public:
         detailFont.setFamily(QStringLiteral("Menlo"));
         detail_->setFont(detailFont);
         detail_->setStyleSheet(
-            UiZoom::scaleQss(QStringLiteral("QLabel#agentToolDetail{background:#f7f8fa;border:1px solid %1;"
-                                            "border-radius:7px;color:%2;padding:9px;}")
-                                 .arg(kLine, kInkSoft)));
+            // 详情块必须与窗口底色有明确区分：浅蓝灰底 + 可见边框，不能融进背景。
+            UiZoom::scaleQss(QStringLiteral("QLabel#agentToolDetail{background:#f4f6fb;"
+                                            "border:1px solid #c9d2e0;"
+                                            "border-radius:7px;color:%1;padding:9px;}")
+                                 .arg(kInk)));
         detail_->hide();
         column->addWidget(detail_);
 
@@ -1224,7 +1275,7 @@ public:
             rendered = paidGenerationDetail(tool_, arguments_);
             if (!text.trimmed().isEmpty()) rendered += QStringLiteral("\n\n") + text.trimmed();
         } else {
-            rendered = arguments_.trimmed();
+            rendered = formatToolArguments(arguments_);
             if (!text.trimmed().isEmpty()) rendered += QStringLiteral("\n\n") + text.trimmed();
         }
         constexpr int kMaxDetailCharacters = 12000;
@@ -3785,6 +3836,12 @@ bool AgentChatPanel::appendResolvedMediaCard(const QString& messageId, const QSt
         const bool video = type == QStringLiteral("video");
         const QSize previewSize = video ? QSize(240, 135) : QSize(220, 180);
         auto* preview = new QFrame(card);
+        // 媒体预览必须有可见边界：白底截图贴在白色聊天背景上会完全隐形，
+        // 用户分不清哪里是图片。浅灰底 + 中等深度边框保证任何浅色图都有轮廓。
+        preview->setObjectName(QStringLiteral("agentMediaPreview"));
+        preview->setStyleSheet(
+            QStringLiteral("QFrame#agentMediaPreview{background:#eef1f5;"
+                           "border:1px solid #c9d2e0;border-radius:8px;}"));
         preview->setFixedSize(previewSize);
         auto* cover = new QLabel(preview);
         if (video) {
@@ -4941,6 +4998,13 @@ void AgentChatPanel::refreshContextSize() {
                     status->windowTokens));
                 text = QStringLiteral("上次上下文已用%1%2%").arg(status->after.exact ? QString() : QStringLiteral("约"))
                     .arg(percent);
+                text += QStringLiteral(" · 输入%1%2 / %3 tokens")
+                            .arg(status->after.exact ? QString() : QStringLiteral("约"))
+                            .arg(formatTokenCount(status->after.tokens))
+                            .arg(formatTokenCount(status->windowTokens));
+                if (status->outputTokens != 0)
+                    text += QStringLiteral(" · 输出 %1 tokens")
+                                .arg(formatTokenCount(status->outputTokens));
             } else if (status->checkpointRevision != 0) text = QStringLiteral("较早对话已整理");
             break;
     }

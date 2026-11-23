@@ -119,7 +119,8 @@ ImagePreviewDialog::ImagePreviewDialog(const QPixmap& image, QWidget* parent) : 
     setSizeGripEnabled(true);
     // 只改变显示衬底，原图和其透明像素保持不变；不透明图片继续使用原暗色画布。
     const bool transparent = hasTransparentPixels(image_);
-    canvasColor_ = transparent ? QColor(Qt::white) : QColor(8, 9, 11);
+    // 纯白衬底会让白底透明图与背景融合；改用浅灰保证任何图片都有轮廓。
+    canvasColor_ = transparent ? QColor(0xe9, 0xeb, 0xef) : QColor(8, 9, 11);
     setStyleSheet(QStringLiteral("QDialog { background: %1; } QLabel { color: %2; }")
                       .arg(canvasColor_.name(), transparent ? QStringLiteral("#0f172a") : QStringLiteral("#ffffff")));
 
