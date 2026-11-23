@@ -31,6 +31,7 @@
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QProgressBar>
 #include <QLocale>
 #include <QMenu>
 #include <QMessageBox>
@@ -1469,6 +1470,7 @@ struct AgentChatPanel::Runtime : AgentChatPanel::ConversationState {
 
     QLabel* title = nullptr;
     QLabel* contextSize = nullptr;
+    QProgressBar* contextUsageBar = nullptr;
     QLabel* compactionNotice = nullptr;
     QTimer* compactionNoticeTimer = nullptr;
     QString compactionNoticeSession;
@@ -1581,11 +1583,23 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     headRow->addWidget(runtime_->title, 1);
 
     // 使用 Core 的上次请求容量与整理阶段，不把界面分页加载的字数当成模型占用。
-    runtime_->contextSize = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkFaint);
+    // 上下文用量是用户高频关注的信息，不能再用 Metadata 淡色弱化；
+    // 详情正文色 + 加粗数字 + 变色进度条保证一眼可见。
+    runtime_->contextSize = makeLabel(QString(), UiZoom::TextRole::Detail, "#172033");
     runtime_->contextSize->setObjectName(QStringLiteral("agentContextStatus"));
+    runtime_->contextSize->setTextFormat(Qt::RichText);
     runtime_->contextSize->setWordWrap(false);
     runtime_->contextSize->setParent(head);
     runtime_->contextSize->hide();
+    auto* contextBar = new QProgressBar(head);
+    contextBar->setObjectName(QStringLiteral("agentContextUsageBar"));
+    contextBar->setRange(0, 100);
+    contextBar->setTextVisible(false);
+    contextBar->setFixedHeight(5);
+    contextBar->setFixedWidth(110);
+    contextBar->hide();
+    headRow->addWidget(contextBar);
+    runtime_->contextUsageBar = contextBar;
     headRow->addWidget(runtime_->contextSize);
     auto* moreButton = new QPushButton(QStringLiteral("⋯"));
     runtime_->moreButton = moreButton;
@@ -4985,6 +4999,7 @@ void AgentChatPanel::refreshContextSize() {
     refreshCompactionNotice(status ? &*status : nullptr);
     if (!status) { runtime_->contextSize->hide(); return; }
     QString text;
+    int usagePercent = -1;
     switch (status->phase) {
         case MaiContextPhase::Preparing: text = QStringLiteral("准备上下文…"); break;
         case MaiContextPhase::Summarizing: text = QStringLiteral("正在整理对话…"); break;
@@ -4996,15 +5011,27 @@ void AgentChatPanel::refreshContextSize() {
             else if (status->windowTokens != 0) {
                 const auto percent = static_cast<int>(std::min(100.0L, 100.0L * status->after.tokens /
                     status->windowTokens));
-                text = QStringLiteral("上次上下文已用%1%2%").arg(status->after.exact ? QString() : QStringLiteral("约"))
-                    .arg(percent);
-                text += QStringLiteral(" · 输入%1%2 / %3 tokens")
-                            .arg(status->after.exact ? QString() : QStringLiteral("约"))
+                usagePercent = percent;
+                // 百分比按占用档位变色：常规蓝、偏高橙、临压缩红；数字统一加粗深色。
+                const auto tone = percent >= 90 ? QStringLiteral("#dc2626")
+                                  : percent >= 70 ? QStringLiteral("#d97706")
+                                                  : QStringLiteral("#2563eb");
+                const auto ink = QStringLiteral("#172033");
+                text = QStringLiteral("<span style='color:%1;'>上次上下文已用</span>"
+                                       "<b style='color:%2;'>%3%4%</b>")
+                           .arg(ink, tone, status->after.exact ? QString() : QStringLiteral("约"))
+                           .arg(percent);
+                text += QStringLiteral("<span style='color:%1;'> · 输入</span>"
+                                       "<b style='color:%1;'>%2%3 / %4</b>"
+                                       "<span style='color:%1;'> tokens</span>")
+                            .arg(ink, status->after.exact ? QString() : QStringLiteral("约"))
                             .arg(formatTokenCount(status->after.tokens))
                             .arg(formatTokenCount(status->windowTokens));
                 if (status->outputTokens != 0)
-                    text += QStringLiteral(" · 输出 %1 tokens")
-                                .arg(formatTokenCount(status->outputTokens));
+                    text += QStringLiteral("<span style='color:%1;'> · 输出 </span>"
+                                           "<b style='color:%1;'>%2</b>"
+                                           "<span style='color:%1;'> tokens</span>")
+                                .arg(ink, formatTokenCount(status->outputTokens));
             } else if (status->checkpointRevision != 0) text = QStringLiteral("较早对话已整理");
             break;
     }
@@ -5033,6 +5060,23 @@ void AgentChatPanel::refreshContextSize() {
             .arg(qulonglong(status->requestBodyTruncatedTexts));
     }
     if (status->error) detail << QStringLiteral("整理未完成，原始记录保留。");
+    if (runtime_->contextUsageBar) {
+        if (usagePercent >= 0) {
+            const auto tone = usagePercent >= 90 ? QStringLiteral("#dc2626")
+                              : usagePercent >= 70 ? QStringLiteral("#d97706")
+                                                   : QStringLiteral("#2563eb");
+            runtime_->contextUsageBar->setStyleSheet(
+                QStringLiteral("QProgressBar#agentContextUsageBar{background:#e5e9f0;border:0;"
+                               "border-radius:2px;}"
+                               "QProgressBar#agentContextUsageBar::chunk{background:%1;"
+                               "border-radius:2px;}")
+                    .arg(tone));
+            runtime_->contextUsageBar->setValue(usagePercent);
+            runtime_->contextUsageBar->show();
+        } else {
+            runtime_->contextUsageBar->hide();
+        }
+    }
     runtime_->contextSize->setText(text);
     runtime_->contextSize->setToolTip(detail.join(QLatin1Char('\n')));
     runtime_->contextSize->setVisible(!text.isEmpty());
