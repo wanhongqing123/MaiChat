@@ -1422,6 +1422,8 @@ struct AgentChatPanel::Runtime : AgentChatPanel::ConversationState {
     QTimer* compactionNoticeTimer = nullptr;
     QString compactionNoticeSession;
     bool compactionNoticeActive = false;
+    // 最近一次已提示的请求体适配结果；同一结果不重复提示，切换会话时视为已读。
+    QString bodyNoticeKey;
     QPushButton* modelChip = nullptr;
     QPushButton* modelSection = nullptr;
     QLabel* modelSectionValue = nullptr;
@@ -4958,6 +4960,14 @@ void AgentChatPanel::refreshContextSize() {
     if (status->originalUserMessages != 0)
         detail << QStringLiteral("较早用户消息原文已纳入 %1 / %2 条；其余可从原始记录回查。")
             .arg(qulonglong(status->retainedUserMessages)).arg(qulonglong(status->originalUserMessages));
+    if (status->requestBodyReduced) {
+        text += text.isEmpty() ? QStringLiteral("请求已自动缩减") : QStringLiteral(" · 请求已缩减");
+        detail << QStringLiteral("请求体超过供应商上限（已知上限约 %1 KB），本次发送省略了 %2 张图片、缩短了 %3 段长文本；"
+                                 "原始消息、图片与工具输出均完整保留，可回查。")
+            .arg(qulonglong(status->requestBodyLimitBytes / 1024))
+            .arg(qulonglong(status->requestBodyOmittedImages))
+            .arg(qulonglong(status->requestBodyTruncatedTexts));
+    }
     if (status->error) detail << QStringLiteral("整理未完成，原始记录保留。");
     runtime_->contextSize->setText(text);
     runtime_->contextSize->setToolTip(detail.join(QLatin1Char('\n')));
@@ -4965,13 +4975,35 @@ void AgentChatPanel::refreshContextSize() {
 }
 
 void AgentChatPanel::refreshCompactionNotice(const MaiContextStatus* status) {
+    const auto bodyKey = [](const MaiContextStatus* value) {
+        if (!value || !value->requestBodyReduced) return QString();
+        return QStringLiteral("%1/%2/%3").arg(qulonglong(value->requestBodyBytes))
+            .arg(qulonglong(value->requestBodyOmittedImages))
+            .arg(qulonglong(value->requestBodyTruncatedTexts));
+    };
     if (runtime_->compactionNoticeSession != runtime_->sessionId || !status) {
         runtime_->compactionNoticeTimer->stop();
         runtime_->compactionNotice->hide();
         runtime_->compactionNoticeActive = false;
         runtime_->compactionNoticeSession = runtime_->sessionId;
+        // 打开会话时已持久化的结果不是新事件，不重复提示。
+        runtime_->bodyNoticeKey = bodyKey(status);
     }
     if (!status) return;
+    if (const auto key = bodyKey(status); !key.isEmpty() && key != runtime_->bodyNoticeKey) {
+        runtime_->bodyNoticeKey = key;
+        QStringList parts;
+        if (status->requestBodyOmittedImages != 0)
+            parts << QStringLiteral("省略 %1 张图片").arg(qulonglong(status->requestBodyOmittedImages));
+        if (status->requestBodyTruncatedTexts != 0)
+            parts << QStringLiteral("缩短 %1 段长文本").arg(qulonglong(status->requestBodyTruncatedTexts));
+        runtime_->compactionNotice->setText(
+            QStringLiteral("请求体超过供应商上限，本次已%1后发送；原始记录完整保留。")
+                .arg(parts.isEmpty() ? QStringLiteral("缩减内容") : parts.join(QStringLiteral("、"))));
+        if (!runtime_->compactionNoticeActive) runtime_->compactionNoticeTimer->start();
+        runtime_->compactionNotice->show();
+        return;
+    }
     if (status->phase == MaiContextPhase::Summarizing) {
         runtime_->compactionNoticeTimer->stop();
         runtime_->compactionNoticeActive = true;

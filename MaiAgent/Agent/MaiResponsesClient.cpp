@@ -1225,7 +1225,9 @@ private:
         // 跨请求复用必须核对真实文件身份；生成期间改变或无法确认的来源不能缓存。
         // 长寿命客户端限制缓存条目，不能因历史附件无限增长。
         if (result && known && MaiFileSystem::regularFileInfo(path, after) && same(before, after)) {
-            if (mPreviewCache.size() >= 64) mPreviewCache.clear();
+            // 图片多的会话每次请求都重发全部历史图片；整表清空会让每次请求都重新转码。
+            // 条目只含文件元数据与路径，放宽上限并逐个淘汰。
+            if (mPreviewCache.size() >= 1024) mPreviewCache.erase(mPreviewCache.begin());
             mPreviewCache[key] = {after, result.value()};
         }
         return result;

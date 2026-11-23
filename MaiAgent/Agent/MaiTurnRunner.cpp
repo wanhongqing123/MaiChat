@@ -25,6 +25,7 @@
 #include "MaiIdGenerator.h"
 #include "MaiContextCompactor.h"
 #include "MaiModelRetry.h"
+#include "MaiRequestBodyFitter.h"
 #include "MaiToolCallValidation.h"
 #include "MaiToolOutput.h"
 
@@ -979,8 +980,8 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
     options.estimateMultiplier = mContextEstimateMultiplier;
     options.deferUntilHardLimit = mCompactionDeferred;
     options.force = mForceCompaction;
-    options.requestByteBudget = mRequestByteBudget;
-    if (mRequestByteBudget != 0) options.priorityReductionPercent = 50;
+    // 已学到的 413 上限只约束整理自己发出的摘要请求；主请求体在发送前单独适配。
+    options.requestByteBudget = maiLearnedRequestBodyLimit(mContext.model);
     options.onCompactionStarted = [this] {
         mDependencies.emitter->emitTurnPhase(mContext.sessionId, mContext.turnId,
                                              MaiTurnPhase::Compacting);
@@ -1082,9 +1083,13 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestWithRecovery(bool includeTo
     int retries = 0;
     int retryLimit = -1;
     bool contextRecoveryAttempted = false;
-    unsigned int bodyRecoveryAttempts = 0;
-    bool bodyRecoveryPending = false;
-    std::size_t rejectedBodyBytes = 0;
+    bool contextRecoveryPending = false;
+    // HTTP 413：每次被拒都收紧该模型的已知上限并重新适配请求副本，直到适配到最小请求。
+    // 次数上限只防止异常传输无限循环；0.7^24 已能把数十 MB 收敛到 KB 级。
+    constexpr unsigned int kMaxBodyAttempts = 24;
+    unsigned int bodyAttempts = 0;
+    bool bodyCompactionTried = false;
+    bool bodyCompactionPending = false;
     std::size_t rejectedInputTokens = 0;
     MaiError contextError;
     for (;;) {
@@ -1100,74 +1105,91 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestWithRecovery(bool includeTo
         const bool forced = mForceCompaction;
         auto built = buildRequest(mContext.model, false, includeTools, cancel, finalAnswerHint);
         mForceCompaction = forced && !built;
-        if (forced && built && bodyRecoveryPending) {
-            const auto bytes = mDependencies.model->requestBodyBytes(built.value());
-            if (!bytes) {
-                mError = bytes.error();
-                return {};
-            }
-            if (bytes.value() == 0 || bytes.value() >= rejectedBodyBytes) {
-                mError = {
-                    MaiErrorCode::RequestBodyTooLarge,
-                    "Request-body recovery could not reduce the encoded request. Original history "
-                    "is preserved; start a fresh conversation or send a smaller current image."};
-                return {};
-            }
-            bodyRecoveryPending = false;
-        } else if (forced && built &&
-                   mDependencies.model->estimateInputTokens(built.value()).tokens >=
-                       rejectedInputTokens) {
+        if (!built && bodyCompactionPending && built.error().code() != MaiErrorCode::Canceled) {
+            // 为请求体额外做的整理失败不能让本轮失败：退回普通准备，由适配步骤保证发送。
+            mForceCompaction = false;
+            built = buildRequest(mContext.model, false, includeTools, cancel, finalAnswerHint);
+        }
+        bodyCompactionPending = false;
+        if (contextRecoveryPending && built &&
+            mDependencies.model->estimateInputTokens(built.value()).tokens >=
+                rejectedInputTokens) {
             // 没有严格缩小就不能重新发送已被拒绝的请求，避免容量错误无限循环。
             mError = contextError;
             return {};
         }
+        contextRecoveryPending = false;
         std::vector<MaiToolInvocation> calls;
+        MaiRequestBodyFitResult fit;
         if (!built) {
             mError = built.error();
-            if (bodyRecoveryPending && (mError.code() == MaiErrorCode::InvalidInput ||
-                                        mError.code() == MaiErrorCode::Protocol))
-                mError = {mError.code(), "Request-body recovery stopped: " + mError.message() +
-                                             " Original history is preserved; start a fresh "
-                                             "conversation or send a smaller current image."};
-        } else
-            calls = requestCompletion(built.value(), cancel);
-        if (!mError) {
-            mRequestByteBudget = 0;
-            return calls;
-        }
-        if (built && mError.code() == MaiErrorCode::RequestBodyTooLarge &&
-            bodyRecoveryAttempts < 4) {
-            const auto bytes = mDependencies.model->requestBodyBytes(built.value());
-            if (!bytes) {
-                mError = bytes.error();
+        } else {
+            // 发送前按该模型已学到的请求体上限适配副本；上限未知时只测量不改写。
+            const auto limit = maiLearnedRequestBodyLimit(mContext.model);
+            auto fitted = limit == 0 ? MaiResult<MaiRequestBodyFitResult>{MaiRequestBodyFitResult{}}
+                                     : maiFitRequestBody(*mDependencies.model, built.value(),
+                                                         limit, cancel);
+            if (!fitted) {
+                mError = fitted.error();
                 return {};
             }
-            if (bytes.value() <= 1) {
-                mError = {MaiErrorCode::RequestBodyTooLarge,
-                          "The rejected request body cannot be measured safely. Original history "
-                          "is preserved; start a fresh conversation."};
-                return {};
+            fit = std::move(fitted.value());
+            if (limit == 0) {
+                // 复制而非移动：413/上下文超限恢复分支仍需读取 built。
+                fit.request = built.value();
+                fit.fits = true;
+            } else if (fit.reduced) {
+                MaiContextStatus status = mContextStatus.value_or(MaiContextStatus{});
+                if (!mContextStatus) status.phase = MaiContextPhase::Ready;
+                status.requestBodyReduced = true;
+                status.requestBodyBytes = fit.fittedBytes;
+                status.requestBodyLimitBytes = limit;
+                status.requestBodyOmittedImages = fit.omittedImages;
+                status.requestBodyTruncatedTexts = fit.truncatedTexts;
+                publishContextStatus(status);
             }
-            rejectedBodyBytes = bytes.value();
-            // 一半是整理目标，不是供应商已知硬限；保护尾部超过一半时仍允许实际缩小。
-            mRequestByteBudget = rejectedBodyBytes - 1;
-            ++bodyRecoveryAttempts;
-            bodyRecoveryPending = true;
-            mForceCompaction = true;
-            mCompactionDeferred = false;
-            mError = {};
-            continue;
+            calls = requestCompletion(fit.request, cancel);
         }
-        if (mError.code() == MaiErrorCode::RequestBodyTooLarge && bodyRecoveryAttempts >= 4) {
+        if (!mError) return calls;
+        if (built && mError.code() == MaiErrorCode::RequestBodyTooLarge) {
+            // 上限未知时 fit 未测量；此时补测一次实际被拒的副本。
+            const std::size_t rejected =
+                fit.fittedBytes != 0 ? fit.fittedBytes
+                                     : maiMeasureRequestBody(*mDependencies.model, fit.request);
+            const bool canShrink = !fit.exhausted || !bodyCompactionTried;
+            if (bodyAttempts < kMaxBodyAttempts && canShrink && rejected > 1 &&
+                !cancel.load(std::memory_order_relaxed)) {
+                // 前几次温和收紧以尽量保留当前附件；之后加快收敛。供应商明确写出上限时直接采用。
+                const unsigned int keepPercent = bodyAttempts < 3 ? 85 : 60;
+                ++bodyAttempts;
+                maiLearnRequestBodyRejection(mContext.model, rejected, mError.message(),
+                                             keepPercent);
+                if (fit.exhausted) {
+                    // 适配已到最小请求仍被拒：额外整理一次历史（失败也不终止本轮）。
+                    bodyCompactionTried = true;
+                    bodyCompactionPending = true;
+                    mForceCompaction = true;
+                    mCompactionDeferred = false;
+                }
+                mDependencies.emitter->emitTurnPhase(mContext.sessionId, mContext.turnId,
+                                                     MaiTurnPhase::Recovering);
+                mError = {};
+                continue;
+            }
+            // 只有供应商连最小请求（基础指令、工具声明与最小正文）也拒绝时才到这里。
             mError = {MaiErrorCode::RequestBodyTooLarge,
-                      "The provider still rejects the request body after four smaller attempts. "
-                      "Original history is preserved; start a fresh conversation or send a smaller "
-                      "current image."};
+                      "The provider's request-size limit is smaller than the minimal request this "
+                      "conversation can send (" +
+                          std::to_string(rejected) +
+                          " bytes after omitting images and shortening long text). The original "
+                          "conversation is fully preserved and nothing was deleted; retry, or check "
+                          "the provider or gateway request-body limit."};
             return {};
         }
         if (built && mError.code() == MaiErrorCode::ContextWindowExceeded &&
             !contextRecoveryAttempted) {
             contextRecoveryAttempted = true;
+            contextRecoveryPending = true;
             rejectedInputTokens = mDependencies.model->estimateInputTokens(built.value()).tokens;
             contextError = mError;
             mForceCompaction = true;

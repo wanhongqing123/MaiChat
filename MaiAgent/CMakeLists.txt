@@ -465,6 +465,7 @@ add_library(maiagent STATIC
   Agent/MaiContextCheckpoint.cpp
   Agent/MaiContextCheckpointRead.cpp
   Agent/MaiContextCompactor.cpp
+  Agent/MaiRequestBodyFitter.cpp
   Agent/MaiConversationHistory.cpp
   Agent/MaiToolDetail.cpp
   Agent/MaiToolOutput.cpp

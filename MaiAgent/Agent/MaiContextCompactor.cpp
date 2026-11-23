@@ -944,7 +944,8 @@ MaiResult<std::string> summarize(MaiModelClient& model, const MaiModelRequest& r
         if (byteBudget != 0) {
             const auto bytes = model.requestBodyBytes(attempt);
             if (!bytes) return bytes.error();
-            if (bytes.value() == 0 || bytes.value() > byteBudget) {
+            // 0 表示传输无法测量：不据此判定超限，交给真实发送结果决定。
+            if (bytes.value() != 0 && bytes.value() > byteBudget) {
                 if (rejectedBodyBytes) *rejectedBodyBytes = bytes.value();
                 return {MaiErrorCode::RequestBodyTooLarge,
                         "The summary request exceeds its encoded-body budget."};
@@ -1049,6 +1050,7 @@ MaiResult<std::string> summarizeSelectedFieldsOnce(
             std::size_t length = field.text.size() - offset;
             Json fragment;
             bool fits = false;
+            bool byteLimited = false;
             while (length != 0) {
                 fragment = field.source;
                 fragment["field"] = field.field;
@@ -1069,10 +1071,10 @@ MaiResult<std::string> summarizeSelectedFieldsOnce(
                     const auto bytes = model.requestBodyBytes(
                         summaryRequest(request, summary, batch, summaryOutput));
                     if (!bytes) return bytes.error();
-                    if (bytes.value() == 0)
-                        return {MaiErrorCode::RequestBodyTooLarge,
-                                "The summary transport cannot measure request bytes."};
-                    fits = bytes.value() <= byteBudget;
+                    // 摘要请求只含文本；无法测量时按 token 结果继续，不能因此中止整理。
+                    if (bytes.value() != 0) fits = bytes.value() <= byteBudget;
+                    // 记录“token 放得下、只被字节预算挡住”，失败时按请求体超限而非窗口不足上报。
+                    byteLimited = !fits;
                 }
                 if (fits) break;
                 batch.erase(batch.end() - 1);
@@ -1081,6 +1083,9 @@ MaiResult<std::string> summarizeSelectedFieldsOnce(
                 length = utf8Prefix(field.text, offset, length / 2);
             }
             if (!fits) {
+                if (batch.empty() && byteLimited)
+                    return {MaiErrorCode::RequestBodyTooLarge,
+                            "The summary request cannot fit the provider request-body limit."};
                 if (batch.empty())
                     return {MaiErrorCode::InvalidInput,
                             "The selected model cannot fit the summary instructions and preserved "
@@ -1273,28 +1278,10 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepareImpl(
     status.inputBudgetTokens = inputBudget;
     const std::size_t trigger =
         std::min(windowPercent(limits.contextWindowTokens, mOptions.triggerPercent), inputBudget);
-    MaiError bodyMeasureError;
+    // 容量判断只用 token 口径。请求体字节由发送前的独立适配步骤处理（见
+    // MaiRequestBodyFitter），不在候选搜索循环里反复完整编码请求与图片。
     const auto estimate = [&](const MaiModelRequest& value) {
-        const auto tokens =
-            scaledTokens(model.estimateInputTokens(value), mOptions.estimateMultiplier);
-        if (mOptions.requestByteBudget == 0) return tokens;
-        const auto bytes = model.requestBodyBytes(value);
-        if (!bytes || bytes.value() == 0) {
-            bodyMeasureError =
-                !bytes ? bytes.error()
-                       : MaiError{MaiErrorCode::RequestBodyTooLarge,
-                                  "The transport cannot measure the rejected request body. "
-                                  "Original history is preserved; start a fresh conversation."};
-            return std::numeric_limits<std::size_t>::max();
-        }
-        // 仅内部容量排序使用统一压力刻度；实际 token/usage 和持久计数仍独立保存。
-        const long double pressure = std::ceil(static_cast<long double>(bytes.value()) *
-                                               inputBudget / mOptions.requestByteBudget);
-        const auto bounded =
-            pressure >= static_cast<long double>(std::numeric_limits<std::size_t>::max())
-                ? std::numeric_limits<std::size_t>::max()
-                : static_cast<std::size_t>(pressure);
-        return std::max(tokens, bounded);
+        return scaledTokens(model.estimateInputTokens(value), mOptions.estimateMultiplier);
     };
     std::size_t target =
         allowToolProjection
@@ -1302,7 +1289,6 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepareImpl(
                        inputBudget)
             : std::min(windowPercent(limits.contextWindowTokens, mOptions.targetPercent),
                        inputBudget);
-    if (bodyMeasureError) return bodyMeasureError;
     if (trigger == 0 || target == 0)
         return {MaiErrorCode::InvalidInput, "The selected model has no usable context budget."};
     prepared.inputEstimate = model.estimateInputTokens(request);
@@ -1525,17 +1511,6 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepareImpl(
             next.references = dumpContextJson(references);
             compacted.messages = withCheckpoint(next);
         }
-        if (mOptions.requestByteBudget != 0) {
-            const auto bytes = model.requestBodyBytes(compacted);
-            if (!bytes) return bytes.error();
-            if (bytes.value() == 0 || bytes.value() > mOptions.requestByteBudget) {
-                if (capacityExceeded) *capacityExceeded = true;
-                return {MaiErrorCode::RequestBodyTooLarge,
-                        "The protected conversation still exceeds the request-body budget. "
-                        "Original history is preserved; start a fresh conversation or send a "
-                        "smaller current image."};
-            }
-        }
         if (estimate(compacted) > inputBudget || estimate(compacted) >= estimate(request)) {
             if (capacityExceeded) *capacityExceeded = true;
             return {MaiErrorCode::InvalidInput,
@@ -1571,12 +1546,21 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepareImpl(
     const auto deferOrFail = [&](const MaiError& error) -> MaiResult<MaiContextPreparation> {
         if (cancel.load(std::memory_order_relaxed))
             return {MaiErrorCode::Canceled, "Context summarization was canceled."};
+        // 摘要请求本身在重新分块后仍被 413 拒绝时，改用不调用模型的确定性索引或延后；
+        // 整理不能因供应商请求体上限而让本轮失败。最终请求体由发送前适配步骤保证。
+        const bool bodyLimited = error.code() == MaiErrorCode::RequestBodyTooLarge;
         // 缺终止事件虽然属于 Protocol，仍是可恢复传输失败；不能先走容量降级吞掉它。
-        if (mOptions.force || error.retryAdvice() || error.code() != MaiErrorCode::Protocol)
+        if (!bodyLimited &&
+            (mOptions.force || error.retryAdvice() || error.code() != MaiErrorCode::Protocol))
             return error;
         if (const MaiError sourceError = verifySource()) return sourceError;
         if (estimate(request) > inputBudget) {
-            if (!mOptions.allowHistoryIndexRecovery) return error;
+            if (!mOptions.allowHistoryIndexRecovery && !bodyLimited) return error;
+            if (!mOptions.allowHistoryIndexRecovery) {
+                prepared.deferredCompaction = true;
+                prepared.request = std::move(request);
+                return prepared;
+            }
             // 从不可变原来源和有效旧检查点重建，不能使用失败响应或此前成功的部分批次。
             bool capacityExceeded = false;
             auto recovered =
@@ -1593,7 +1577,12 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepareImpl(
                                         records),
                     true, &capacityExceeded);
                 if (recovered || !capacityExceeded) return recovered;
-                if (records == 0) return error;
+                if (records == 0) {
+                    if (!bodyLimited) return error;
+                    prepared.deferredCompaction = true;
+                    prepared.request = std::move(request);
+                    return prepared;
+                }
                 records /= 2;
             }
         }

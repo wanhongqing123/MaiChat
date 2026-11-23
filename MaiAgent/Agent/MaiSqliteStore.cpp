@@ -116,6 +116,13 @@ std::string turnStateJson(const MaiMessage& message) {
                                            {"history_index", value.historyIndexRecovery},
                                            {"error_code", maiErrorCodeToString(value.error.code())},
                                            {"error", value.error.message()}};
+            if (value.requestBodyReduced || value.requestBodyLimitBytes != 0)
+                state["outcome"]["context"]["request_body"] = {
+                    {"reduced", value.requestBodyReduced},
+                    {"bytes", value.requestBodyBytes},
+                    {"limit", value.requestBodyLimitBytes},
+                    {"omitted_images", value.requestBodyOmittedImages},
+                    {"truncated_texts", value.requestBodyTruncatedTexts}};
         }
     }
     return state.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
@@ -150,7 +157,8 @@ void restoreTurnState(const std::string& raw, MaiMessage& message) {
     for (auto code : {MaiErrorCode::Ok, MaiErrorCode::NotFound, MaiErrorCode::Busy,
                       MaiErrorCode::InvalidInput, MaiErrorCode::NotConfigured,
                       MaiErrorCode::Network, MaiErrorCode::RateLimited, MaiErrorCode::Protocol,
-                      MaiErrorCode::Canceled, MaiErrorCode::NotSupported, MaiErrorCode::Internal}) {
+                      MaiErrorCode::Canceled, MaiErrorCode::NotSupported, MaiErrorCode::Internal,
+                      MaiErrorCode::ContextWindowExceeded, MaiErrorCode::RequestBodyTooLarge}) {
         if (value["error_code"] == maiErrorCodeToString(code)) {
             outcome.error = {code, value["error"].get<std::string>()};
             knownCode = true;
@@ -193,11 +201,26 @@ void restoreTurnState(const std::string& raw, MaiMessage& message) {
             status.reusedCheckpoint = context["reused"].get<bool>();
             status.advancedCheckpoint = context["advanced"].get<bool>();
             status.historyIndexRecovery = context["history_index"].get<bool>();
+            // 旧记录没有 request_body；缺失或类型不符时保持默认值，不影响其余字段。
+            const auto body = context.value("request_body", nlohmann::json{});
+            if (body.is_object()) {
+                if (body.value("reduced", nlohmann::json{}).is_boolean())
+                    status.requestBodyReduced = body["reduced"].get<bool>();
+                const auto count = [&](const char* name) -> std::size_t {
+                    const auto field = body.value(name, nlohmann::json{});
+                    return field.is_number_unsigned() ? field.get<std::size_t>() : 0;
+                };
+                status.requestBodyBytes = count("bytes");
+                status.requestBodyLimitBytes = count("limit");
+                status.requestBodyOmittedImages = count("omitted_images");
+                status.requestBodyTruncatedTexts = count("truncated_texts");
+            }
             for (auto code :
                  {MaiErrorCode::Ok, MaiErrorCode::NotFound, MaiErrorCode::Busy,
                   MaiErrorCode::InvalidInput, MaiErrorCode::NotConfigured, MaiErrorCode::Network,
                   MaiErrorCode::RateLimited, MaiErrorCode::Protocol, MaiErrorCode::Canceled,
-                  MaiErrorCode::NotSupported, MaiErrorCode::Internal})
+                  MaiErrorCode::NotSupported, MaiErrorCode::Internal,
+                  MaiErrorCode::ContextWindowExceeded, MaiErrorCode::RequestBodyTooLarge})
                 if (context.value("error_code", std::string{}) == maiErrorCodeToString(code))
                     status.error = {code, context.value("error", std::string{})};
             if (knownPhase) outcome.context = std::move(status);
