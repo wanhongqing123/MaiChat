@@ -175,7 +175,8 @@ $repositoryRoot = (Resolve-Path (Join-Path $projectRoot '..\..')).Path
 # ZIP 和安装器只读取 staging；CMake 放在构建目录的静态库许可也必须显式带入。
 $licenseTargetDir = Join-Path $staging 'ThirdPartyLicenses'
 New-Item -ItemType Directory -Force $licenseTargetDir | Out-Null
-foreach ($licenseName in 'QUIRC_LICENSE', 'QPDF_LICENSE.txt', 'QPDF_NOTICE.md') {
+foreach ($licenseName in 'QUIRC_LICENSE', 'QPDF_LICENSE.txt', 'QPDF_NOTICE.md',
+    'CODEX_SHELL_LICENSE.txt', 'CODEX_SHELL_NOTICE.txt') {
     $licenseSource = Join-Path $exeDir "ThirdPartyLicenses\$licenseName"
     if (-not (Test-Path -LiteralPath $licenseSource -PathType Leaf)) {
         throw "第三方许可缺失：$licenseSource"

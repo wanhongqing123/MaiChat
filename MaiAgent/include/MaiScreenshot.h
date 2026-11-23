@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "MaiError.h"
+#include "MaiScreenshotAvailability.h"
 
 // 平台原生屏幕捕获的结果。像素在平台实现内编码成完整 PNG 文件，调用方不接触 D3D、DXGI、
 // ScreenCaptureKit 或界面框架。成功时 pngBytes 非空、width/height 是编码后图片的像素尺寸；失败时三者清空。
@@ -58,6 +59,13 @@ struct MaiScreenshotCaptureState {
     std::uint64_t deviceCreations = 0;
     std::uint64_t sessionStarts = 0;
     std::uint64_t framesReceived = 0;
+    // 新诊断字段追加在尾部，保留旧聚合初始化的字段顺序；所有二进制消费者仍须同源重编。
+    // 原生会话的终止锁存与对象持有是两件事；存在对象不表示流仍在交付帧。
+    bool failed = false;
+    bool nativeStreamPresent = false;
+    // 最近一次检查及最近拒绝的独立快照。健康检查/原生重建不覆盖拒绝证据；
+    // phase=Unknown 表示本进程还没有对应观察，其他平台可保持默认值。
+    MaiScreenshotAvailabilityHistory availability;
 };
 
 // 当前平台是否提供原生屏幕捕获。调用方只有在返回 true 时才应把 screenshot 工具暴露给模型；

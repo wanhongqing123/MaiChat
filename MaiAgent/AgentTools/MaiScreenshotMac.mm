@@ -226,6 +226,7 @@ struct StreamState {
     std::uint64_t generation = 0;
     std::uint64_t availabilityEpoch = 0;
     bool failed = false;
+    bool nativeStreamPresent = false;
     MaiError error;
     std::shared_ptr<const CapturedPixels> pixels;
 };
@@ -235,34 +236,38 @@ struct FrameStamp {
     std::uint64_t availabilityEpoch = 0;
 };
 
-struct DesktopAvailability {
-    bool guiSession = false;
-    bool onConsole = false;
-    bool loginDone = false;
-    bool frontmostKnown = false;
-    bool loginWindow = false;
-};
+using DesktopAvailability = MaiScreenshotAvailability;
 
 bool desktopCanCapture(const DesktopAvailability& value) {
-    return value.guiSession && value.onConsole && value.loginDone && value.frontmostKnown &&
-           !value.loginWindow;
+    return maiScreenshotDesktopCanCapture(value);
+}
+
+MaiScreenshotObservation observedBoolean(bool value) {
+    return value ? MaiScreenshotObservation::True : MaiScreenshotObservation::False;
+}
+
+MaiScreenshotObservation sessionBoolean(CFDictionaryRef session, CFStringRef key) {
+    const auto value = CFDictionaryGetValue(session, key);
+    if (!value || CFGetTypeID(value) != CFBooleanGetTypeID())
+        return MaiScreenshotObservation::Unknown;
+    return observedBoolean(CFBooleanGetValue(static_cast<CFBooleanRef>(value)));
 }
 
 DesktopAvailability readDesktopAvailability() {
     @autoreleasepool {
         DesktopAvailability value;
         CFDictionaryRef session = CGSessionCopyCurrentDictionary();
-        value.guiSession = session != nullptr;
+        value.guiSession = observedBoolean(session != nullptr);
         if (session) {
-            value.onConsole =
-                CFDictionaryGetValue(session, kCGSessionOnConsoleKey) == kCFBooleanTrue;
-            value.loginDone =
-                CFDictionaryGetValue(session, kCGSessionLoginDoneKey) == kCFBooleanTrue;
+            value.onConsole = sessionBoolean(session, kCGSessionOnConsoleKey);
+            value.loginDone = sessionBoolean(session, kCGSessionLoginDoneKey);
             CFRelease(session);
         }
         NSRunningApplication* frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
-        value.frontmostKnown = frontmost != nil;
-        value.loginWindow = [frontmost.bundleIdentifier isEqualToString:@"com.apple.loginwindow"];
+        value.frontmostKnown = observedBoolean(frontmost != nil);
+        if (frontmost)
+            value.loginWindow = observedBoolean(
+                [frontmost.bundleIdentifier isEqualToString:@"com.apple.loginwindow"]);
         return value;
     }
 }
@@ -279,11 +284,30 @@ void invalidateFrameLocked(StreamState& state) {
     state.pixels.reset();
 }
 
-void rejectDesktopLocked(StreamState& state, const MaiError& error) {
-    invalidateFrameLocked(state);
-    state.failed = true;
-    state.error = error;
-    state.counters.update([](auto& counts) { counts.capturing = false; });
+// 调用方持有 state.mutex；快照和拒绝锁存同时发布，不用后来的健康观察覆盖原拒绝证据。
+MaiError checkAvailabilityLocked(StreamState& state, const DesktopAvailability& observed,
+                                 MaiScreenshotCheckPhase phase) {
+    MaiScreenshotAvailabilitySnapshot snapshot;
+    snapshot.phase = phase;
+    snapshot.observed = observed;
+    snapshot.failed = state.failed;
+    snapshot.nativeStreamPresent = state.nativeStreamPresent;
+    MaiError error;
+    state.counters.update([&](auto& counts) {
+        snapshot.capturing = counts.capturing;
+        error = maiScreenshotAvailabilityError(snapshot);
+        if (error) {
+            invalidateFrameLocked(state);
+            state.failed = true;
+            snapshot.failed = true;
+            snapshot.capturing = false;
+            counts.capturing = false;
+            counts.failed = true;
+        }
+        error = maiRecordScreenshotAvailability(counts.availability, snapshot);
+        if (error) state.error = error;
+    });
+    return error;
 }
 
 // 帧回调不持有请求或取消函数。独立复制一份有界像素，避免长期占用 SCK 的 IOSurface 池。
@@ -306,10 +330,7 @@ void receiveFrame(const std::weak_ptr<StreamState>& weak, std::uint64_t generati
     std::unique_lock<std::mutex> lock(state->mutex);
     if (generation != state->generation || state->stopping.load()) return;
     // 这里只判断公开可观测的拒绝信号，不把这些属性宣称为完整的官方锁屏/撤权状态 API。
-    if (!desktopCanCapture(desktop)) {
-        rejectDesktopLocked(*state,
-                            MaiError::make(MaiErrorCode::NotConfigured,
-                                           "GUI session is unavailable for screen capture"));
+    if (checkAvailabilityLocked(*state, desktop, MaiScreenshotCheckPhase::Frame)) {
         lock.unlock();
         state->condition.notify_all();
         return;
@@ -323,7 +344,10 @@ void receiveFrame(const std::weak_ptr<StreamState>& weak, std::uint64_t generati
                 MaiError::make(MaiErrorCode::Busy, "screen stream has no current complete frame");
             // 同一 generation 的终止状态只能锁存；排队的软失效回调不能让迟到 Complete 复活它。
             state->failed = state->failed || status == SCFrameStatusStopped;
-            state->counters.update([](auto& counts) { counts.capturing = false; });
+            state->counters.update([&](auto& counts) {
+                counts.capturing = false;
+                counts.failed = state->failed;
+            });
         }
         lock.unlock();
         state->condition.notify_all();
@@ -334,7 +358,10 @@ void receiveFrame(const std::weak_ptr<StreamState>& weak, std::uint64_t generati
         invalidateFrameLocked(*state);
         state->failed = true;
         state->error = MaiError::make(MaiErrorCode::Protocol, message);
-        state->counters.update([](auto& counts) { counts.capturing = false; });
+        state->counters.update([](auto& counts) {
+            counts.capturing = false;
+            counts.failed = true;
+        });
         lock.unlock();
         state->condition.notify_all();
     };
@@ -387,7 +414,10 @@ void receiveFrame(const std::weak_ptr<StreamState>& weak, std::uint64_t generati
         invalidateFrameLocked(*state);
         state->failed = true;
         state->error = MaiError::make(MaiErrorCode::Internal, "cannot copy native screen frame");
-        state->counters.update([](auto& counts) { counts.capturing = false; });
+        state->counters.update([](auto& counts) {
+            counts.capturing = false;
+            counts.failed = true;
+        });
     }
     lock.unlock();
     state->condition.notify_all();
@@ -422,7 +452,10 @@ void receiveFrame(const std::weak_ptr<StreamState>& weak, std::uint64_t generati
         shared->failed = true;
         shared->error =
             MaiError::make(MaiErrorCode::Internal, errorText(error, "screen stream stopped"));
-        shared->counters.update([](auto& counts) { counts.capturing = false; });
+        shared->counters.update([](auto& counts) {
+            counts.capturing = false;
+            counts.failed = true;
+        });
     }
     shared->condition.notify_all();
 }
@@ -548,13 +581,17 @@ public:
         state_->condition.notify_all();
     }
     MaiError takeForDelivery(CaptureCommand& command, MaiScreenshot& image) {
-        if (!desktopCanCapture(readDesktopAvailability()) || !CGPreflightScreenCaptureAccess()) {
-            const auto error = MaiError::make(MaiErrorCode::NotConfigured,
-                                              "screen capture context became unavailable");
-            rejectContext(error);
-            return error;
-        }
+        auto observed = readDesktopAvailability();
+        // 桌面拒绝不等于权限拒绝；只在实际执行 preflight 时记录授权观察。
+        if (desktopCanCapture(observed))
+            observed.screenRecordingPermission = observedBoolean(CGPreflightScreenCaptureAccess());
         std::lock_guard<std::mutex> lock(state_->mutex);
+        const auto contextError =
+            checkAvailabilityLocked(*state_, observed, MaiScreenshotCheckPhase::Delivery);
+        if (contextError) {
+            state_->condition.notify_all();
+            return contextError;
+        }
         if (state_->stopping.load())
             return MaiError::make(MaiErrorCode::Canceled, "screen capture stopped");
         if (!frameStampIsCurrent(*state_, command.stamp))
@@ -564,12 +601,14 @@ public:
         image = std::move(command.image);
         return {};
     }
-    void rejectContext(const MaiError& error) {
+    MaiError checkAvailability(const DesktopAvailability& observed, MaiScreenshotCheckPhase phase) {
+        MaiError error;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            rejectDesktopLocked(*state_, error);
+            error = checkAvailabilityLocked(*state_, observed, phase);
         }
-        state_->condition.notify_all();
+        if (error) state_->condition.notify_all();
+        return error;
     }
     MaiError stop() {
         std::lock_guard<std::mutex> lock(stopMutex_);
@@ -679,8 +718,11 @@ private:
             invalidateFrameLocked(*state_);
             state_->error = {};
             state_->failed = false;
+            state_->counters.update([](auto& counts) {
+                counts.capturing = false;
+                counts.failed = false;
+            });
         }
-        state_->counters.update([](auto& counts) { counts.capturing = false; });
         if (!stream_) return {};
         NSError* ignored = nil;
         [stream_ removeStreamOutput:output_ type:SCStreamOutputTypeScreen error:&ignored];
@@ -692,6 +734,11 @@ private:
         const MaiError result = waitNative(completion, true);
         stream_ = nil;
         output_ = nil;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->nativeStreamPresent = false;
+            state_->counters.update([](auto& counts) { counts.nativeStreamPresent = false; });
+        }
         return result;
     }
     MaiError ensureNative(CaptureTarget& target, SCShareableContent* available) {
@@ -736,9 +783,14 @@ private:
             std::lock_guard<std::mutex> lock(state_->mutex);
             output_->generation = state_->generation;
         }
-        stream_ = [[SCStream alloc] initWithFilter:filter
-                                     configuration:configuration
-                                          delegate:output_];
+        stream_ =
+            [[SCStream alloc] initWithFilter:filter configuration:configuration delegate:output_];
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->nativeStreamPresent = stream_ != nil;
+            state_->counters.update(
+                [&](auto& counts) { counts.nativeStreamPresent = state_->nativeStreamPresent; });
+        }
         NSError* nativeError = nil;
         if (![stream_ addStreamOutput:output_
                                  type:SCStreamOutputTypeScreen
@@ -746,6 +798,7 @@ private:
                                 error:&nativeError]) {
             std::lock_guard<std::mutex> lock(state_->mutex);
             state_->failed = true;
+            state_->counters.update([](auto& counts) { counts.failed = true; });
             return MaiError::make(MaiErrorCode::Internal,
                                   errorText(nativeError, "cannot attach screen frame output"));
         }
@@ -757,6 +810,7 @@ private:
         if (started) {
             std::lock_guard<std::mutex> lock(state_->mutex);
             state_->failed = true;
+            state_->counters.update([](auto& counts) { counts.failed = true; });
             return started;
         }
         target_ = target;
@@ -769,12 +823,9 @@ private:
     MaiError process(const std::shared_ptr<CaptureCommand>& command, MaiScreenshot& image) {
         if (command->canceled.load() || state_->stopping.load())
             return MaiError::make(MaiErrorCode::Canceled, "screen capture canceled");
-        if (!desktopCanCapture(readDesktopAvailability())) {
-            const auto error = MaiError::make(MaiErrorCode::NotConfigured,
-                                              "GUI session is unavailable for screen capture");
-            rejectContext(error);
-            return error;
-        }
+        const auto contextError =
+            checkAvailability(readDesktopAvailability(), MaiScreenshotCheckPhase::Worker);
+        if (contextError) return contextError;
         CaptureTarget target;
         SCShareableContent* available = nil;
         MaiError error = resolve(*command, target, available);
@@ -930,13 +981,18 @@ public:
         if (!capture_) capture_ = std::make_shared<ResidentCapture>(counters);
         return capture_;
     }
-    void rejectContext(const MaiError& error) {
-        std::shared_ptr<ResidentCapture> current;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            current = capture_;
-        }
-        if (current) current->rejectContext(error);  // 不为拒绝或状态读取启动 worker。
+    MaiError checkAvailability(const DesktopAvailability& observed, MaiScreenshotCheckPhase phase) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // 不为拒绝或状态读取启动 worker；无 resident 时仍保存原始检查证据。
+        if (capture_) return capture_->checkAvailability(observed, phase);
+        MaiScreenshotAvailabilitySnapshot snapshot;
+        snapshot.phase = phase;
+        snapshot.observed = observed;
+        MaiError error;
+        counters.update([&](auto& counts) {
+            error = maiRecordScreenshotAvailability(counts.availability, snapshot);
+        });
+        return error;
     }
     MaiError stop() {
         std::lock_guard<std::mutex> serialize(stopMutex_);
@@ -998,19 +1054,14 @@ MaiError maiCaptureScreenshot(const MaiScreenshotRequest& request, MaiScreenshot
         !CGDisplayIsActive(static_cast<CGDirectDisplayID>(request.displayId)))
         return MaiError::make(MaiErrorCode::NotFound,
                               "requested display is not active or no longer exists");
-    if (!desktopCanCapture(readDesktopAvailability())) {
-        const auto error = MaiError::make(MaiErrorCode::NotConfigured,
-                                          "GUI session is unavailable for screen capture");
-        service.rejectContext(error);
-        return error;
-    }
-    if (!CGPreflightScreenCaptureAccess()) {
-        service.rejectContext(MaiError::make(MaiErrorCode::NotConfigured,
-                                             "screen recording permission is unavailable"));
+    auto observed = readDesktopAvailability();
+    if (!desktopCanCapture(observed))
+        return service.checkAvailability(observed, MaiScreenshotCheckPhase::Entry);
+    observed.screenRecordingPermission = observedBoolean(CGPreflightScreenCaptureAccess());
+    const auto contextError = service.checkAvailability(observed, MaiScreenshotCheckPhase::Entry);
+    if (contextError) {
         CGRequestScreenCaptureAccess();
-        return MaiError::make(
-            MaiErrorCode::NotConfigured,
-            "Allow Screen & System Audio Recording for MaiChat, restart it, and retry");
+        return contextError;
     }
     const auto worker = service.acquire(epoch);
     if (!worker) return MaiError::make(MaiErrorCode::Canceled, "screen capture stopped");

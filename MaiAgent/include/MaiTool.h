@@ -247,6 +247,10 @@ public:
     // 不保留参数引用、MaiToolContext 或取消指针；无需模型参数、工作目录或再次批准。
     // 返回错误表示资源清理失败；注册表继续其余工具，并由轮次发布明确失败事件。
     virtual MaiError onTurnFinished(const std::string& sessionId, const std::string& turnId);
+    // 真正删除会话或停止 Agent 时清理跨轮次资源；不在普通 finishTurn 调用。
+    // 与 execute 可并发，须幂等且不保留参数引用；默认无操作。
+    virtual MaiError onSessionClosed(const std::string& sessionId);
+    virtual MaiError onAgentShutdown();
 
     // 当前实际主模型是否支持该工具的结果契约，默认 true。
     // 注册表用同一查询过滤模型声明与按名调用；工具仍须在直接 execute 时执行相同能力检查。
@@ -285,6 +289,9 @@ public:
     // 单个回调返回错误或抛异常不跳过其余工具；返回首个错误，异常转为 Internal。
     // 注册完成后可由多个轮次并发调用，调用期间不得修改注册表。
     MaiError finishTurn(const std::string& sessionId, const std::string& turnId) const;
+    // 不因一个清理器失败而跳过其余工具；异常转成错误，析构调用方不得抛出。
+    MaiError closeSession(const std::string& sessionId) const;
+    MaiError shutdown() const;
 
 private:
     std::vector<std::unique_ptr<MaiTool>> mTools;

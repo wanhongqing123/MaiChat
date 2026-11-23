@@ -375,6 +375,7 @@ add_library(maiagent STATIC
   Agent/MaiError.cpp
   Agent/MaiSession.cpp
   Agent/MaiMessage.cpp
+  Agent/MaiSubAgent.cpp
   Agent/MaiSessionStore.cpp
   Agent/MaiIdGenerator.cpp
   Agent/MaiEventBus.cpp
@@ -441,7 +442,10 @@ add_library(maiagent STATIC
   AgentTools/MaiToolOutputTool.cpp
   AgentTools/MaiSubAgentTools.cpp
   AgentTools/MaiShellTool.cpp
+  AgentTools/MaiShellSessionManager.cpp
+  AgentTools/MaiShellEnvironment.cpp
   AgentTools/MaiScreenshotTool.cpp
+  AgentTools/MaiScreenshotAvailability.cpp
   AgentTools/MaiViewImageTool.cpp
   AgentTools/MaiPdfTool.cpp
   AgentTools/MaiPdfDocumentTools.cpp
@@ -459,6 +463,7 @@ add_library(maiagent STATIC
   Agent/MaiRoutedModelClient.cpp
   Agent/MaiCloudModelCatalog.cpp
   Agent/MaiContextCheckpoint.cpp
+  Agent/MaiContextCheckpointRead.cpp
   Agent/MaiContextCompactor.cpp
   Agent/MaiConversationHistory.cpp
   Agent/MaiToolDetail.cpp
@@ -628,6 +633,8 @@ if(MAIAGENT_BUILD_TESTS)
       MaiModelClientTests   # 流式解析 + 工具调用分片聚合
       MaiTurnRunnerTests    # 一轮对话的完整生命周期
       MaiToolTests          # 路径边界 + 内置工具
+      MaiContextCheckpointToolTests # Saved summary and reference inspection
+      MaiContextCheckpointReadTests # Ordinary saved checkpoint byte paging
       MaiLlamaToolsTests    # 本地推理生命周期、取消、参数与工作区边界
       MaiLlamaModelClientTests # 本地主模型的完整消息、原生工具模板、流式与取消
       MaiLlamaModelCapabilitiesTests # 实际 GGUF 矩阵/混合注意力元数据与后端拒绝边界
@@ -659,6 +666,7 @@ if(MAIAGENT_BUILD_TESTS)
       MaiQuestionTests      # 问答闸门 + question 工具：等不到答案时绝不能编一个
       MaiSubAgentTests      # 子 Agent：深度上限、数量上限、不能戳别人的会话
       MaiShellToolTests     # shell：审批粒度、超时、取消、输出上限
+      MaiScreenshotAvailabilityTests # Capture runtime state diagnostics
       MaiScreenshotToolTests  # screenshot：平台能力、审批、原生 PNG 捕获
       MaiViewImageToolTests   # view_image：路径边界、图片识别、多模态回灌
       MaiPdfToolTests         # generate_pdf：工作区边界、审批和产物验证
@@ -705,6 +713,9 @@ if(MAIAGENT_BUILD_TESTS)
   target_link_libraries(MaiLlamaModelCapabilitiesTests PRIVATE mai_llama)
   target_include_directories(MaiStoreTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
+  target_include_directories(MaiContextCheckpointReadTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
+  target_include_directories(MaiContextCheckpointToolTests PRIVATE ${MAI_OPENSSL_INCLUDE_DIR})
   target_include_directories(MaiContextImportTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
   target_include_directories(MaiContextImportPurgeTests PRIVATE

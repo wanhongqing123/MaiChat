@@ -43,9 +43,9 @@ QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools)
          QStringLiteral("打开网页、读取页面内容并操作网页。"), QStringLiteral("desktop_browser"),
          QStringLiteral("打开指定网页并找到下载入口，先不要下载。")},
         {QStringLiteral("终端与进程"), QStringLiteral("终"),
-         QStringLiteral("运行终端命令，启动、读取、输入和停止本会话管理的进程。"),
-         QStringLiteral("shell desktop_process_start desktop_process_read desktop_process_write desktop_process_stop"),
-         QStringLiteral("列出当前运行的进程名称和进程 ID。")},
+         QStringLiteral("运行短命令或长时间命令，使用命令会话 ID 补读输出、输入内容或停止。"),
+         QStringLiteral("shell shell_input"),
+         QStringLiteral("启动我指定的长时间命令；若返回会话 ID，使用 shell_input 补读输出，需要输入或停止时先确认。")},
         {QStringLiteral("SSH 远程命令"), QStringLiteral("连"),
          QStringLiteral("连接指定 SSH 主机执行命令；密码和主机指纹交给本机确认。"),
          QStringLiteral("ssh_exec"), QStringLiteral("连接我指定的主机查看系统版本，先确认主机、端口和用户名。")},
@@ -198,6 +198,12 @@ QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools)
             purpose = QStringLiteral("查看当前电脑屏幕，说明画面内容。");
             symbol = QStringLiteral("屏");
             goal = QStringLiteral("查看当前屏幕上的报错，说明报错内容。");
+        }
+        // A host exposing only the continuation tool can operate an existing
+        // command session, but cannot promise that a new command can start.
+        if (candidates.contains(QStringLiteral("shell_input")) && !names.contains(QStringLiteral("shell"))) {
+            purpose = QStringLiteral("补读本会话已有命令会话的输出，按要求输入内容或停止。");
+            goal = QStringLiteral("补读我指定的已有命令会话输出，先不要输入或停止。");
         }
         entries.append({group.name, symbol, purpose,
                         QStringLiteral("使用%1工具（%2）帮我%3").arg(group.name, names.first(), goal), names});

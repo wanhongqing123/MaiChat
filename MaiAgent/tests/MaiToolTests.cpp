@@ -20,7 +20,9 @@
 #include <string>
 #include <thread>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -29,6 +31,7 @@
 #include <json.hpp>
 
 #include "MaiFilePath.h"
+#include "MaiIdGenerator.h"
 #include "MaiFileSystem.h"
 #include "MaiEditTool.h"
 #include "MaiApplyPatchTool.h"
@@ -126,11 +129,15 @@ std::string args(const json& j) {
 
 // 新检索合同的回归使用系统文件 API，且只操作本用例拥有的临时目录。
 struct SearchWorkspace {
-    MaiFilePath root = MaiFileSystem::temporaryDirectory().append(MaiFilePath::fromUtf8(
-        "maiagent-search-regression-" + std::to_string(std::rand())));
+    MaiFilePath root = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8(MaiIdGenerator::generate("maiagent-search-regression-")));
 
-    SearchWorkspace() { CHECK(!MaiFileSystem::createDirectories(root).hasError()); }
-    ~SearchWorkspace() { MaiFileSystem::removeRecursively(root); }
+    SearchWorkspace() {
+        CHECK(!MaiFileSystem::createDirectories(root).hasError());
+    }
+    ~SearchWorkspace() {
+        MaiFileSystem::removeRecursively(root);
+    }
     void write(const std::string& name, const std::string& text) {
         CHECK(!MaiFileSystem::writeFile(root.append(MaiFilePath::fromUtf8(name)), text).hasError());
     }
@@ -151,13 +158,347 @@ json fileResultMetadata(const MaiToolResult& result) {
     return parsed.is_object() ? parsed : json::object();
 }
 
+void run_batch7_actual_repository_probe(const std::string& root) {
+    MaiToolContext context;
+    context.root = root;
+    context.sessionId = "ses_batch7_repository_probe";
+    auto glob = makeMaiGlobTool();
+    auto grep = makeMaiGrepTool();
+    auto read = makeMaiReadTool();
+    const auto run = [&](const char* label, MaiTool& tool, const json& request) {
+        const auto began = std::chrono::steady_clock::now();
+        const auto result = tool.execute(request.dump(), context);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - began)
+                                 .count();
+        const auto& text = result.hasError() ? result.error().message() : result.output();
+        const std::string marker = "[file_result]\n";
+        const auto at = text.rfind(marker);
+        auto metadata = at == std::string::npos
+                            ? json::object()
+                            : json::parse(text.substr(at + marker.size()), nullptr, false);
+        if (!metadata.is_object()) metadata = json::object();
+        json record = {{"probe", label},
+                       {"elapsed_ms", elapsed},
+                       {"error", maiErrorCodeToString(result.error().code())},
+                       {"tool_result_truncated", result.isTruncated()},
+                       {"metadata", metadata}};
+        if (result.execution())
+            record["execution_output_truncated"] = result.execution()->outputTruncated;
+        std::printf("%s\n", record.dump().c_str());
+    };
+    run("glob_MaiAgent_star", *glob, {{"path", "MaiAgent"}, {"pattern", "*"}, {"refresh", true}});
+    run("glob_MaiAgent_immediate", *glob,
+        {{"path", "MaiAgent"}, {"pattern", "*"}, {"recursive", false}, {"refresh", true}});
+    run("grep_repository_MaiFileSearch", *grep,
+        {{"path", "."},
+         {"pattern", "MaiFileSearch"},
+         {"mode", "literal"},
+         {"limit", 1},
+         {"refresh", true}});
+    run("read_header_40", *read, {{"path", "MaiAgent/include/MaiFileSearch.h"}, {"limit", 40}});
+    run("read_source_18", *read, {{"path", "MaiAgent/Agent/MaiFileSearch.cpp"}, {"limit", 18}});
+}
+
+void test_batch7_read_window_completion_is_distinct_from_eof() {
+    SearchWorkspace workspace;
+    std::string contents;
+    for (unsigned line = 0; line < 120; ++line) contents += "complete-line\n";
+    workspace.write("window.txt", contents);
+    auto tool = makeMaiReadTool();
+    for (const unsigned limit : {40u, 18u, 5u}) {
+        const auto result =
+            tool->execute(args({{"path", "window.txt"}, {"limit", limit}}), workspace.context());
+        CHECK(!result.hasError());
+        const auto metadata = fileResultMetadata(result);
+        CHECK(metadata.value("count", 0u) == limit && metadata.value("last_line_complete", false));
+        CHECK(!metadata.value("eof", true));
+        CHECK(metadata.value("complete", false));
+        CHECK(metadata.value("requested_range_complete", false));
+        CHECK(metadata.value("has_more", false));
+        CHECK(!metadata.value("output_truncated", true));
+        CHECK(!result.isTruncated());
+        CHECK(result.execution() && !result.execution()->outputTruncated);
+        CHECK(result.output().find("Output truncated") == std::string::npos);
+    }
+    workspace.write("long-line.txt", std::string(10000, 'a'));
+    const auto clipped = tool->execute(
+        args({{"path", "long-line.txt"}, {"limit", 1}, {"max_bytes", 4096}}), workspace.context());
+    const auto meta = fileResultMetadata(clipped);
+    CHECK(clipped.isTruncated() && !meta.value("requested_range_complete", true));
+    CHECK(meta.value("output_truncated", false));
+}
+
+void test_batch7_large_file_first_five_lines_remain_a_complete_window() {
+    SearchWorkspace workspace;
+    const auto path = workspace.root.append(MaiFilePath::fromUtf8("large-window.txt"));
+    constexpr std::uint64_t size = 209ull * 1024 * 1024;
+    std::string prefix;
+    for (unsigned line = 0; line < 1024; ++line) prefix += "complete-line\n";
+#if defined(_WIN32)
+    const HANDLE handle = ::CreateFileW(path.value().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(handle != INVALID_HANDLE_VALUE);
+    if (handle == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    CHECK(
+        ::WriteFile(handle, prefix.data(), static_cast<DWORD>(prefix.size()), &written, nullptr) &&
+        written == prefix.size());
+    LARGE_INTEGER end{};
+    end.QuadPart = size;
+    CHECK(::SetFilePointerEx(handle, end, nullptr, FILE_BEGIN));
+    CHECK(::SetEndOfFile(handle));
+    CHECK(::CloseHandle(handle));
+#else
+    const int descriptor = ::open(path.value().c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    CHECK(descriptor >= 0);
+    if (descriptor < 0) return;
+    CHECK(::write(descriptor, prefix.data(), prefix.size()) == static_cast<ssize_t>(prefix.size()));
+    CHECK(::ftruncate(descriptor, static_cast<off_t>(size)) == 0);
+    CHECK(::close(descriptor) == 0);
+#endif
+    auto read = makeMaiReadTool();
+    const auto result =
+        read->execute(args({{"path", "large-window.txt"}, {"limit", 5}}), workspace.context());
+    const auto metadata = fileResultMetadata(result);
+    CHECK(!result.hasError() && !result.isTruncated());
+    CHECK(metadata.value("requested_range_complete", false) && metadata.value("complete", false));
+    CHECK(metadata.value("count", 0) == 5 && metadata.value("last_line_complete", false));
+    CHECK(!metadata.value("eof", true) && metadata.value("has_more", false));
+    CHECK(metadata.value("total_bytes", std::uint64_t{0}) == size);
+    CHECK(metadata.value("read_bytes", std::uint64_t{999999}) <= 4096);
+    std::printf("batch7 large-read total=%llu read=%llu returned=%u truncated=%d\n",
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned long long>(metadata.value("read_bytes", std::uint64_t{0})),
+                metadata.value("count", 0u), result.isTruncated());
+}
+
+void test_batch7_listing_exclusions_and_replayed_search_phase() {
+    SearchWorkspace workspace;
+    workspace.write("top.txt", "needle\nneedle\n");
+    CHECK(
+        !MaiFileSystem::createDirectories(workspace.root.append(MaiFilePath::fromUtf8("nested"))));
+    CHECK(!MaiFileSystem::writeFile(workspace.root.append(MaiFilePath::fromUtf8("nested/deep.txt")),
+                                    "needle\n"));
+    for (const char* directory :
+         {"third_party", "vendor", "build", "build-release", "cmake-build-debug"}) {
+        CHECK(!MaiFileSystem::createDirectories(
+            workspace.root.append(MaiFilePath::fromUtf8(directory))));
+        CHECK(!MaiFileSystem::writeFile(workspace.root.append(MaiFilePath::fromUtf8(
+                                            std::string(directory) + "/dependency.txt")),
+                                        "needle\n"));
+    }
+    CHECK(!MaiFileSystem::createDirectories(
+        workspace.root.append(MaiFilePath::fromUtf8("dependency_repo"))));
+    CHECK(!MaiFileSystem::writeFile(
+        workspace.root.append(MaiFilePath::fromUtf8("dependency_repo/.git")),
+        "gitdir: owned-fixture"));
+    CHECK(!MaiFileSystem::writeFile(
+        workspace.root.append(MaiFilePath::fromUtf8("dependency_repo/dependency.txt")),
+        "needle\n"));
+    auto glob = makeMaiGlobTool();
+    auto result = glob->execute(args({{"path", "."}, {"pattern", "*"}, {"recursive", false}}),
+                                workspace.context());
+    CHECK(!result.hasError());
+    auto metadata = fileResultMetadata(result);
+    CHECK(metadata.value("count", 0) == 8);
+    CHECK(metadata.value("complete", false));
+    CHECK(metadata.value("count_unit", "") == "entries");
+    CHECK(metadata.contains("entries") && metadata["entries"].size() == 8);
+    bool sawDirectory = false;
+    for (const auto& entry : metadata.value("entries", json::array()))
+        sawDirectory = sawDirectory || (entry.value("path", "") == "nested" &&
+                                        entry.value("type", "") == "directory");
+    CHECK(sawDirectory);
+    result = glob->execute(args({{"path", "."}, {"pattern", "*"}, {"refresh", true}}),
+                           workspace.context());
+    metadata = fileResultMetadata(result);
+    CHECK(metadata.value("total_matches", 0) == 2);
+    CHECK(metadata.value("excluded_nested_repositories", 0) == 1);
+    CHECK(metadata.value("default_excludes", false));
+    const auto explicitRoot =
+        glob->execute(args({{"path", "dependency_repo"}, {"pattern", "*"}}), workspace.context());
+    CHECK(!explicitRoot.hasError());
+    CHECK(fileResultMetadata(explicitRoot).value("total_matches", 0) == 1);
+    CHECK(fileResultMetadata(explicitRoot).value("excluded_nested_repositories", 99) == 0);
+    result = glob->execute(
+        args({{"path", "."}, {"pattern", "*"}, {"include_ignored", true}, {"refresh", true}}),
+        workspace.context());
+    metadata = fileResultMetadata(result);
+    CHECK(metadata.value("total_matches", 0) == 8);
+    CHECK(!metadata.value("default_excludes", true));
+    CHECK(metadata.value("excluded_nested_repositories", 99) == 0);
+    auto grep = makeMaiGrepTool();
+    result = grep->execute(
+        args({{"path", "."}, {"pattern", "needle"}, {"mode", "literal"}, {"limit", 1}}),
+        workspace.context());
+    metadata = fileResultMetadata(result);
+    CHECK(!metadata.value("not_searched", true));
+    const auto next = metadata.value("next_cursor", "");
+    CHECK(!next.empty());
+    const auto query = args({{"path", "."},
+                             {"pattern", "needle"},
+                             {"mode", "literal"},
+                             {"limit", 1},
+                             {"cursor", next}});
+    const auto first = grep->execute(query, workspace.context());
+    const auto replay = grep->execute(query, workspace.context());
+    const auto replayMeta = fileResultMetadata(replay);
+    CHECK(!replay.hasError() && replayMeta.value("cache_reused", false));
+    CHECK(replayMeta.value("searched_files", 1) == 0);
+    CHECK(!replayMeta.value("not_searched", true));
+    CHECK(fileResultMetadata(first).value("count", 0) == replayMeta.value("count", 0));
+}
+
+void test_new_file_operations_and_approval_scopes() {
+    SearchWorkspace workspace;
+    workspace.write("source.txt", "source\n");
+    MaiToolRegistry registry;
+    registerMaiFileTools(registry);
+    auto* copy = registry.find("file_copy");
+    auto* move = registry.find("file_move");
+    auto* remove = registry.find("file_delete_directory");
+    auto* stat = registry.find("file_stat");
+    CHECK(copy && move && remove && stat);
+    if (!copy || !move || !remove || !stat) return;
+    const auto context = workspace.context();
+    CHECK(copy->requiresApproval("{}") && move->requiresApproval("{}"));
+    CHECK(remove->requiresApproval("{}") && !stat->requiresApproval("{}"));
+    const auto copyArgs = args({{"source", "source.txt"}, {"destination", "copy.txt"}});
+    const auto moveArgs = args({{"source", "copy.txt"}, {"destination", "moved.txt"}});
+    auto result = copy->execute(copyArgs, context);
+    CHECK(!result.hasError());
+    CHECK(MaiFileSystem::exists(workspace.root.append(MaiFilePath::fromUtf8("source.txt"))));
+    std::string contents;
+    CHECK(!MaiFileSystem::readFile(workspace.root.append(MaiFilePath::fromUtf8("copy.txt")),
+                                   contents));
+    CHECK(contents == "source\n");
+    CHECK(copy->execute(copyArgs, context).hasError());
+    CHECK(copy->execute(args({{"source", "source.txt"}, {"destination", "source.txt"}}), context)
+              .hasError());
+    const auto moveKeys = move->approvalKeys(moveArgs, context);
+    CHECK(moveKeys.size() == 2);
+    CHECK(!move->execute(moveArgs, context).hasError());
+    CHECK(!MaiFileSystem::exists(workspace.root.append(MaiFilePath::fromUtf8("copy.txt"))));
+    CHECK(MaiFileSystem::exists(workspace.root.append(MaiFilePath::fromUtf8("moved.txt"))));
+    result = stat->execute(args({{"path", "moved.txt"}}), context);
+    CHECK(!result.hasError());
+    auto meta = fileResultMetadata(result);
+    CHECK(meta.value("type", "") == "file");
+    CHECK(meta.value("size_bytes", 0) == 7);
+    CHECK(meta.value("modified_time_unit", "") == "unix_seconds");
+    const auto directory = workspace.root.append(MaiFilePath::fromUtf8("owned"));
+    CHECK(!MaiFileSystem::createDirectories(directory));
+    CHECK(!MaiFileSystem::writeFile(directory.append(MaiFilePath::fromUtf8("child")), "data"));
+    const auto emptyArgs = args({{"path", "owned"}});
+    const auto recursiveArgs = args({{"path", "owned"}, {"recursive", true}});
+    CHECK(remove->approvalKeys(emptyArgs, context) != remove->approvalKeys(recursiveArgs, context));
+    CHECK(remove->execute(emptyArgs, context).hasError());
+    CHECK(MaiFileSystem::exists(directory.append(MaiFilePath::fromUtf8("child"))));
+    CHECK(remove->execute(args({{"path", "."}, {"recursive", true}}), context).hasError());
+    result = stat->execute(args({{"path", "owned"}}), context);
+    meta = fileResultMetadata(result);
+    CHECK(meta.value("type", "") == "directory");
+    CHECK(meta.contains("size_bytes") && meta["size_bytes"].is_null());
+    CHECK(!remove->execute(recursiveArgs, context).hasError());
+    CHECK(!MaiFileSystem::exists(directory));
+    CHECK(!MaiFileSystem::createDirectories(directory));
+    remove->approvalKeys(emptyArgs, context);
+    CHECK(!remove->execute(emptyArgs, context).hasError());
+    CHECK(copy->execute(args({{"source", "missing"}, {"destination", "absent"}}), context)
+              .hasError());
+    CHECK(move->execute(args({{"source", "."}, {"destination", "absent"}}), context).hasError());
+}
+
+void test_file_mutation_rechecks_approval_identity_and_cache_eviction() {
+    SearchWorkspace workspace;
+    workspace.write("race.txt", "before\n");
+    auto move = makeMaiMoveFileTool();
+    const auto request = args({{"source", "race.txt"}, {"destination", "moved.txt"}});
+    move->approvalKeys(request, workspace.context());
+    CHECK(!MaiFileSystem::removeFile(workspace.root.append(MaiFilePath::fromUtf8("race.txt"))));
+    workspace.write("race.txt", "after\n");
+    CHECK(move->execute(request, workspace.context()).hasError());
+    CHECK(!MaiFileSystem::exists(workspace.root.append(MaiFilePath::fromUtf8("moved.txt"))));
+    move->approvalKeys(request, workspace.context());
+    for (int index = 0; index < 130; ++index)
+        move->approvalKeys(
+            args({{"source", "race.txt"}, {"destination", "target" + std::to_string(index)}}),
+            workspace.context());
+    CHECK(!MaiFileSystem::removeFile(workspace.root.append(MaiFilePath::fromUtf8("race.txt"))));
+    workspace.write("race.txt", "replacement\n");
+    // 未执行的审批快照不能被容量清理丢失；否则会按新身份执行已经批准的旧请求。
+    CHECK(move->execute(request, workspace.context()).hasError());
+    CHECK(MaiFileSystem::exists(workspace.root.append(MaiFilePath::fromUtf8("race.txt"))));
+    // 完全访问模式不调用 approvalKeys；同一工具实例中的其它会话必须仍可执行。
+    auto fullAccess = workspace.context();
+    fullAccess.sessionId = "ses_full_access_other";
+    CHECK(!move->execute(args({{"source", "race.txt"}, {"destination", "full-access.txt"}}),
+                         fullAccess)
+               .hasError());
+    auto remove = makeMaiDeleteDirectoryTool();
+    const auto owned = workspace.root.append(MaiFilePath::fromUtf8("owned"));
+    CHECK(!MaiFileSystem::createDirectories(owned));
+    const auto deletion = args({{"path", "owned"}});
+    remove->approvalKeys(deletion, workspace.context());
+    CHECK(!MaiFileSystem::deleteDirectory(owned).error);
+    CHECK(!MaiFileSystem::createDirectories(owned));
+    CHECK(remove->execute(deletion, workspace.context()).hasError());
+    CHECK(MaiFileSystem::exists(owned));
+}
+
+void test_file_capability_totals_and_precise_errors() {
+    SearchWorkspace workspace;
+    for (int index = 0; index < 7; ++index)
+        workspace.write("file" + std::to_string(index) + ".cpp",
+                        index < 3 ? "needle\nneedle\n" : "other\n");
+    auto glob = makeMaiGlobTool();
+    auto result = glob->execute(args({{"path", "."}, {"pattern", "**/*.cpp"}, {"limit", 3}}),
+                                workspace.context());
+    CHECK(!result.hasError());
+    auto meta = fileResultMetadata(result);
+    CHECK(meta.value("count", 0) == 3);
+    CHECK(meta.value("total_matches", 0) == 7);
+    CHECK(meta.value("total_matches_exact", false));
+    CHECK(meta.value("count_unit", "") == "files");
+    auto grep = makeMaiGrepTool();
+    result = grep->execute(args({{"pattern", "needle"}, {"mode", "literal"}, {"limit", 1}}),
+                           workspace.context());
+    meta = fileResultMetadata(result);
+    CHECK(meta.contains("total_matches") && meta["total_matches"].is_null());
+    CHECK(!meta.value("total_matches_exact", true));
+    result = grep->execute(
+        args({{"pattern", "needle"}, {"mode", "literal"}, {"summary_only", true}, {"limit", 1}}),
+        workspace.context());
+    CHECK(!result.hasError());
+    meta = fileResultMetadata(result);
+    CHECK(meta.value("total_matches", 0) == 6);
+    CHECK(meta.value("total_matching_files", 0) == 3);
+    CHECK(meta.value("total_matches_exact", false));
+    CHECK(result.output().find("No content matches") == std::string::npos);
+    CHECK(result.output().find("Summary: 6 matching lines in 3 files") != std::string::npos);
+    result = grep->execute(args({{"pattern", "needle"}, {"output_mode", "content"}}),
+                           workspace.context());
+    CHECK(result.hasError());
+    CHECK(result.error().message() == "output_mode must be lines, files or count");
+    auto read = makeMaiReadTool();
+    result = read->execute(args({{"path", "file0.cpp"}, {"limit", 1}}), workspace.context());
+    meta = fileResultMetadata(result);
+    CHECK(meta.value("total_bytes", 0) == 14);
+    CHECK(meta.value("total_bytes_exact", false));
+    MaiToolRegistry registry;
+    registerMaiFileTools(registry);
+    for (const char* name : {"file_copy", "file_move", "file_delete_directory", "file_stat"})
+        CHECK(registry.find(name) != nullptr);
+}
+
 void test_search_long_line_is_matched_before_display_clipping() {
     SearchWorkspace workspace;
     workspace.write("long.txt", std::string(480, 'x') + "OWNED_TAIL_NEEDLE\n");
     auto grep = makeMaiGrepTool();
-    const auto found = grep->execute(args({{"path", "long.txt"},
-                                          {"pattern", "OWNED_TAIL_NEEDLE"},
-                                          {"mode", "literal"}}), workspace.context());
+    const auto found = grep->execute(
+        args({{"path", "long.txt"}, {"pattern", "OWNED_TAIL_NEEDLE"}, {"mode", "literal"}}),
+        workspace.context());
     CHECK(!found.hasError());
     CHECK(found.output().find("long.txt:1:") != std::string::npos);
     CHECK(found.output().find("No content matches") == std::string::npos);
@@ -166,8 +507,8 @@ void test_search_long_line_is_matched_before_display_clipping() {
 
 void test_read_offset_reaches_beyond_the_old_eight_mebibyte_prefix() {
     SearchWorkspace workspace;
-    workspace.write("large.txt", std::string(8u * 1024 * 1024 + 17, 'x') +
-                                     "\nOWNED_AFTER_PREFIX\n");
+    workspace.write("large.txt",
+                    std::string(8u * 1024 * 1024 + 17, 'x') + "\nOWNED_AFTER_PREFIX\n");
     auto read = makeMaiReadTool();
     const auto found = read->execute(args({{"path", "large.txt"}, {"offset", 2}, {"limit", 1}}),
                                      workspace.context());
@@ -179,12 +520,11 @@ void test_read_offset_reaches_beyond_the_old_eight_mebibyte_prefix() {
 void test_search_continuation_and_unknown_arguments_are_not_silent_replays() {
     SearchWorkspace workspace;
     std::string contents;
-    for (int line = 1; line <= 260; ++line)
-        contents += "OWNED_HIT_" + std::to_string(line) + "\n";
+    for (int line = 1; line <= 260; ++line) contents += "OWNED_HIT_" + std::to_string(line) + "\n";
     workspace.write("hits.txt", contents);
     auto grep = makeMaiGrepTool();
-    json query = {{"path", "hits.txt"}, {"pattern", "OWNED_HIT_"},
-                  {"mode", "literal"}, {"limit", 100}};
+    json query = {
+        {"path", "hits.txt"}, {"pattern", "OWNED_HIT_"}, {"mode", "literal"}, {"limit", 100}};
     const auto first = grep->execute(args(query), workspace.context());
     const auto metadata = fileResultMetadata(first);
     CHECK(!first.hasError());
@@ -200,9 +540,9 @@ void test_search_continuation_and_unknown_arguments_are_not_silent_replays() {
         if (second.execution())
             CHECK(second.execution()->effectStatus == MaiToolEffectStatus::None);
     }
-    const auto unsupported = grep->execute(
-        args({{"path", "hits.txt"}, {"pattern", "OWNED_HIT_"}, {"offset", 200}}),
-        workspace.context());
+    const auto unsupported =
+        grep->execute(args({{"path", "hits.txt"}, {"pattern", "OWNED_HIT_"}, {"offset", 200}}),
+                      workspace.context());
     CHECK(unsupported.error().code() == MaiErrorCode::InvalidInput);
 }
 
@@ -260,27 +600,36 @@ void test_file_queries_reject_wrong_types_and_unsupported_arguments() {
     for (const auto& request : {json{{"path", "one.txt"}, {"max_bytes", true}},
                                 json{{"path", "one.txt"}, {"encoding", json::array()}},
                                 json{{"path", "one.txt"}, {"after", 3}}})
-        CHECK(makeMaiReadTool()->execute(args(request), context).error().code() == MaiErrorCode::InvalidInput);
-    CHECK(makeMaiGlobTool()->execute(args({{"query", "one"}, {"pattern", "*.txt"}}), context)
-              .error().code() == MaiErrorCode::InvalidInput);
-    CHECK(makeMaiGrepTool()->execute(args({{"pattern", "owned"}, {"limit", 1001}}), context)
-              .error().code() == MaiErrorCode::InvalidInput);
+        CHECK(makeMaiReadTool()->execute(args(request), context).error().code() ==
+              MaiErrorCode::InvalidInput);
+    CHECK(makeMaiGlobTool()
+              ->execute(args({{"query", "one"}, {"pattern", "*.txt"}}), context)
+              .error()
+              .code() == MaiErrorCode::InvalidInput);
+    CHECK(makeMaiGrepTool()
+              ->execute(args({{"pattern", "owned"}, {"limit", 1001}}), context)
+              .error()
+              .code() == MaiErrorCode::InvalidInput);
 }
 
 void test_search_context_does_not_repeat_long_paths_for_each_context_line() {
     SearchWorkspace workspace;
     std::string text;
     for (int line = 1; line <= 25; ++line)
-        text += (line == 12 ? "OWNED_CONTEXT_NEEDLE " : "owned context ") +
-                std::string(300, 'x') + "\n";
+        text += (line == 12 ? "OWNED_CONTEXT_NEEDLE " : "owned context ") + std::string(300, 'x') +
+                "\n";
     workspace.write("context.txt", text);
     const auto result = makeMaiGrepTool()->execute(args({{"path", "context.txt"},
-        {"pattern", "OWNED_CONTEXT_NEEDLE"}, {"mode", "literal"},
-        {"context_before", 10}, {"context_after", 10}}), workspace.context());
+                                                         {"pattern", "OWNED_CONTEXT_NEEDLE"},
+                                                         {"mode", "literal"},
+                                                         {"context_before", 10},
+                                                         {"context_after", 10}}),
+                                                   workspace.context());
     CHECK(!result.hasError());
     const auto first = result.output().find("context.txt");
     CHECK(first != std::string::npos);
-    CHECK(first == std::string::npos || result.output().find("context.txt", first + 1) == std::string::npos);
+    CHECK(first == std::string::npos ||
+          result.output().find("context.txt", first + 1) == std::string::npos);
     CHECK(result.output().find("  2- owned context") != std::string::npos);
     CHECK(result.output().find("context.txt:12: OWNED_CONTEXT_NEEDLE") != std::string::npos);
     CHECK(result.output().find("  22- owned context") != std::string::npos);
@@ -889,7 +1238,8 @@ void test_registry() {
             CHECK(parsed.contains("properties"));
             // 有参数的工具要声明必填条件；文件名定位可在 pattern/query 中选择一种。
             if (!parsed["properties"].empty())
-                CHECK(parsed.contains("required") || parsed.contains("oneOf") || parsed.contains("anyOf"));
+                CHECK(parsed.contains("required") || parsed.contains("oneOf") ||
+                      parsed.contains("anyOf"));
         }
     }
 
@@ -1159,7 +1509,23 @@ void test_tool_detail_utf8_and_invalid_queries() {
         f();                        \
     } while (0)
 
-int main() {
+int main(int argc, char* argv[]) {
+    if (argc == 3 && std::string(argv[1]) == "--batch7-repo-probe") {
+        run_batch7_actual_repository_probe(argv[2]);
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--batch7-feedback") {
+        RUN(test_batch7_read_window_completion_is_distinct_from_eof);
+        RUN(test_batch7_large_file_first_five_lines_remain_a_complete_window);
+        RUN(test_batch7_listing_exclusions_and_replayed_search_phase);
+        return failures == 0 ? 0 : 1;
+    }
+    RUN(test_batch7_read_window_completion_is_distinct_from_eof);
+    RUN(test_batch7_large_file_first_five_lines_remain_a_complete_window);
+    RUN(test_batch7_listing_exclusions_and_replayed_search_phase);
+    RUN(test_new_file_operations_and_approval_scopes);
+    RUN(test_file_mutation_rechecks_approval_identity_and_cache_eviction);
+    RUN(test_file_capability_totals_and_precise_errors);
     RUN(test_search_long_line_is_matched_before_display_clipping);
     RUN(test_read_offset_reaches_beyond_the_old_eight_mebibyte_prefix);
     RUN(test_search_continuation_and_unknown_arguments_are_not_silent_replays);

@@ -465,6 +465,7 @@ struct MaiAgent::Runtime {
                 next.id = MaiIdGenerator::newMessageId();
                 next.role = MaiRole::Assistant;
                 next.created = MaiTime::getCurrentTime();
+                next.turnId = turn->id;
                 store->putMessage(sessionId, next);
                 if (const MaiError error = store->lastWriteError()) {
                     turn->acceptingSteering = false;
@@ -535,6 +536,8 @@ struct MaiAgent::Runtime {
         assistant.id = MaiIdGenerator::newMessageId();
         assistant.role = MaiRole::Assistant;
         assistant.created = MaiTime::getCurrentTime();
+        assistant.turnId = assistant.id;
+        assistant.turnOutcome = MaiTurnOutcome{assistant.id};
         store->putMessage(sessionId, assistant);
         if (store->lastWriteError()) return {};
         std::vector<std::string> inputs;
@@ -689,6 +692,8 @@ MaiAgent::~MaiAgent() {
     mRuntime->specialistWake.notify_all();
     if (mRuntime->specialistWorker.joinable()) mRuntime->specialistWorker.join();
     mRuntime->stopActiveTurns();
+    // 先停止所有调用线程，再回收有独立生命周期的进程；普通轮次结束不触发此钩子。
+    if (mRuntime->tools) mRuntime->tools->shutdown();
 }
 
 void MaiAgent::pollSpecialistTasks() {
@@ -839,6 +844,14 @@ void MaiAgent::forwardSpecialistReply(const MaiSpecialistTask& task) {
     assistant.id = messageId;
     assistant.role = MaiRole::Assistant;
     if (assistant.created == 0) assistant.created = MaiTime::getCurrentTime();
+    if (mRuntime->model) {
+        assistant.turnId = assistant.id;
+        assistant.turnOutcome = MaiTurnOutcome{assistant.id};
+    } else {
+        // 无主模型的投递只是专业任务通知，其状态属于专业任务账本，不伪造普通轮次。
+        assistant.turnId.clear();
+        assistant.turnOutcome.reset();
+    }
     assistant.completed = 0;
     if (task.status == MaiSpecialistTaskStatus::Failed && !assistant.parts.empty()) {
         const auto* text = std::get_if<MaiTextPart>(&assistant.parts.front().body);
@@ -1091,11 +1104,20 @@ MaiError MaiAgent::closeSubAgent(const std::string& parentSessionId,
 }
 
 std::string MaiAgent::subAgentReport(const std::string& childSessionId) {
+    const auto outcome = getTurnOutcome(childSessionId);
+    if (outcome) {
+        if (outcome.value().status != MaiTurnStatus::Completed) return {};
+        MaiMessage message;
+        return mRuntime->store->getMessage(childSessionId, outcome.value().resultMessageId, message)
+                   ? message.text()
+                   : std::string{};
+    }
+    if (outcome.error().code() != MaiErrorCode::NotSupported) return {};
+    // 旧数据没有轮次记录，也只看最新 assistant，不能跳过空正文捡上一轮的答案。
     const std::vector<MaiMessage> messages = mRuntime->store->listMessages(childSessionId);
     for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
         if (it->role != MaiRole::Assistant) continue;
-        const std::string text = it->text();
-        if (!text.empty()) return text;
+        return it->text();
     }
     return std::string();
 }
@@ -1106,6 +1128,101 @@ bool MaiAgent::getSession(const std::string& id, MaiSession& out) const {
 
 std::vector<MaiMessage> MaiAgent::listMessages(const std::string& sessionId) const {
     return mRuntime->store->listMessages(sessionId);
+}
+
+MaiResult<MaiTurnOutcome> MaiAgent::getTurnOutcome(const std::string& sessionId,
+                                                   const std::string& turnId) const {
+    MaiSession session;
+    if (!mRuntime->store->getSession(sessionId, session)) {
+        if (const auto error = mRuntime->store->lastWriteError()) return error;
+        return {MaiErrorCode::NotFound, "Session not found."};
+    }
+    MaiMessage message;
+    const auto metadata = mRuntime->store->readTurnMetadata(sessionId, turnId);
+    if (metadata) {
+        if (const auto error = mRuntime->store->lastWriteError()) return error;
+        message = metadata.value();
+    } else if (metadata.error().code() != MaiErrorCode::NotSupported) {
+        return metadata.error();
+    } else if (!turnId.empty()) {
+        if (!mRuntime->store->getMessage(sessionId, turnId, message)) {
+            if (const auto error = mRuntime->store->lastWriteError()) return error;
+            return {MaiErrorCode::NotFound, "Turn not found in this session."};
+        }
+    } else {
+        std::string before;
+        for (;;) {
+            const auto page = mRuntime->store->listMessagesPage(sessionId, before, 32);
+            if (const auto error = mRuntime->store->lastWriteError()) return error;
+            for (const auto& candidate : page) {
+                if (candidate.role != MaiRole::Assistant || candidate.contextImportOrigin) continue;
+                message = candidate;
+                break;
+            }
+            if (!message.id.empty()) break;
+            if (page.size() < 32 || page.back().id == before)
+                return {MaiErrorCode::NotFound, "No recorded turn in this session."};
+            before = page.back().id;
+        }
+        if (!message.turnId.empty() && message.turnId != message.id) {
+            const auto initialId = message.turnId;
+            if (!mRuntime->store->getMessage(sessionId, initialId, message)) {
+                if (const auto error = mRuntime->store->lastWriteError()) return error;
+                return {MaiErrorCode::NotFound, "The originating turn is unavailable."};
+            }
+        }
+    }
+    if (message.role != MaiRole::Assistant || message.contextImportOrigin || !message.turnOutcome ||
+        message.turnOutcome->turnId != message.id)
+        return {MaiErrorCode::NotSupported, "This message has no recorded turn outcome."};
+    const auto& outcome = *message.turnOutcome;
+    const bool running = outcome.status == MaiTurnStatus::Running;
+    if ((running && outcome.completed != 0) || (!running && outcome.completed <= 0) ||
+        (outcome.status == MaiTurnStatus::Completed && outcome.error) ||
+        ((outcome.status == MaiTurnStatus::Failed ||
+          outcome.status == MaiTurnStatus::Interrupted) &&
+         !outcome.error))
+        return {MaiErrorCode::Protocol, "The recorded turn outcome is inconsistent."};
+    return *message.turnOutcome;
+}
+
+MaiResult<MaiTurnOutcome> MaiAgent::subAgentOutcome(const std::string& parentSessionId,
+                                                    const std::string& childSessionId) const {
+    MaiSession child;
+    if (!mRuntime->store->getSession(childSessionId, child)) {
+        if (const auto error = mRuntime->store->lastWriteError()) return error;
+        return {MaiErrorCode::NotFound, "Sub-agent not found."};
+    }
+    if (child.parentId != parentSessionId)
+        return {MaiErrorCode::InvalidInput, "That sub-agent belongs to another session."};
+    return getTurnOutcome(childSessionId);
+}
+
+MaiResult<std::string> MaiAgent::subAgentReportForTurn(const std::string& parentSessionId,
+                                                       const std::string& childSessionId,
+                                                       const std::string& turnId) const {
+    MaiSession child;
+    if (!mRuntime->store->getSession(childSessionId, child)) {
+        if (const auto error = mRuntime->store->lastWriteError()) return error;
+        return {MaiErrorCode::NotFound, "Sub-agent not found."};
+    }
+    if (parentSessionId.empty() || child.parentId != parentSessionId)
+        return {MaiErrorCode::InvalidInput, "That sub-agent belongs to another session."};
+    if (turnId.empty()) return {MaiErrorCode::InvalidInput, "A recorded turn ID is required."};
+    const auto outcome = getTurnOutcome(childSessionId, turnId);
+    if (!outcome) return outcome.error();
+    if (outcome.value().status == MaiTurnStatus::Running)
+        return {MaiErrorCode::Busy, "That turn is still running."};
+    if (outcome.value().status != MaiTurnStatus::Completed) return outcome.value().error;
+    MaiMessage message;
+    if (!mRuntime->store->getMessage(childSessionId, outcome.value().resultMessageId, message)) {
+        if (const auto error = mRuntime->store->lastWriteError()) return error;
+        return {MaiErrorCode::NotFound, "The recorded result message is unavailable."};
+    }
+    if (message.role != MaiRole::Assistant || message.contextImportOrigin ||
+        message.turnId != turnId)
+        return {MaiErrorCode::Protocol, "The result message does not belong to the recorded turn."};
+    return message.text();
 }
 
 MaiResult<MaiContextImportProgress> MaiAgent::beginContextImport(const MaiContextImportSpec& spec) {
@@ -1149,6 +1266,11 @@ bool MaiAgent::getMessage(const std::string& sessionId, const std::string& messa
 MaiResult<MaiConversationHistoryPage> MaiAgent::readHistory(
     const std::string& sessionId, const MaiConversationHistoryQuery& query) const {
     return maiReadConversationHistory(*mRuntime->store, sessionId, query);
+}
+
+MaiResult<MaiContextCheckpointPage> MaiAgent::readContextCheckpoint(
+    const std::string& sessionId, const MaiContextCheckpointReadQuery& query) const {
+    return maiReadContextCheckpoint(*mRuntime->store, sessionId, query);
 }
 
 MaiResult<MaiToolDetailPage> MaiAgent::readToolDetail(const std::string& sessionId,
@@ -1352,7 +1474,14 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 // 否则以后建一个同 id 的会话会白捡上一个的授权。
                 mRuntime->permissions->cancelSession(operation.sessionId);
                 mRuntime->permissions->forgetSession(operation.sessionId);
+                const MaiError cleanup = mRuntime->tools
+                                             ? mRuntime->tools->closeSession(operation.sessionId)
+                                             : MaiError{};
                 mRuntime->emitter.emitSession(MaiEventType::SessionDeleted, operation.sessionId);
+                if (cleanup)
+                    return MaiError(
+                        cleanup.code(),
+                        "session was deleted, but tool cleanup failed: " + cleanup.message());
                 return operation.sessionId;
 
             } else if constexpr (std::is_same_v<T, MaiClearMessages>) {
@@ -1727,6 +1856,8 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 assistant.id = MaiIdGenerator::newMessageId();
                 assistant.role = MaiRole::Assistant;
                 assistant.created = MaiTime::getCurrentTime();
+                assistant.turnId = assistant.id;
+                assistant.turnOutcome = MaiTurnOutcome{assistant.id};
                 mRuntime->store->putMessage(operation.sessionId, assistant);
                 mRuntime->emitter.emitMessage(MaiEventType::MessageUpdated, operation.sessionId,
                                               assistant.id);

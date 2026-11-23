@@ -10,6 +10,7 @@
 #include <openssl/evp.h>
 
 #include "MaiAgent.h"
+#include "MaiContextCheckpointRead.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 
@@ -32,6 +33,62 @@ MaiToolResult unavailable() {
 MaiToolResult failed(const MaiError& error) {
     return MaiToolResult::failure(error.code(), error.message());
 }
+
+// 当前会话状态是普通查询的薄适配，不允许模型用 session_id 越界读其他对话。
+class SessionStatusTool final : public MaiTool {
+public:
+    std::string name() const override {
+        return "session_status";
+    }
+    std::string description() const override {
+        return "Read the recorded execution outcome of a turn in this conversation. "
+               "Omit turn_id for the latest turn; use its original assistant ID for an exact "
+               "read. Running, completed, failed and interrupted are distinct. This does not "
+               "start or retry any task. Legacy messages may have no recorded outcome.";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object","properties":{"turn_id":{"type":"string"}},"required":[],"additionalProperties":false})";
+    }
+    bool requiresWorkingDirectory(const std::string&) const override {
+        return false;
+    }
+    MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
+        if (!context.sessionAgent || context.sessionId.empty()) return unavailable();
+        if (context.isCanceled())
+            return MaiToolResult::failure(MaiErrorCode::Canceled, "Status read was canceled.");
+        const auto parsed = parseArguments(raw);
+        if (!parsed) return failed(parsed.error());
+        for (auto it = parsed.value().begin(); it != parsed.value().end(); ++it)
+            if (it.key() != "turn_id" || !it.value().is_string())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "Only a turn_id string is accepted.");
+        const auto outcome = context.sessionAgent->getTurnOutcome(
+            context.sessionId, parsed.value().value("turn_id", std::string{}));
+        if (!outcome) return failed(outcome.error());
+        const auto& value = outcome.value();
+        Json response{{"turn_id", value.turnId},
+                      {"status", maiTurnStatusToString(value.status)},
+                      {"result_message_id", value.resultMessageId},
+                      {"completed", value.completed},
+                      {"error_code", maiErrorCodeToString(value.error.code())},
+                      {"error", value.error.message()}};
+        if (value.context) {
+            const auto& state = *value.context;
+            response["context"] = {{"phase", maiContextPhaseToString(state.phase)},
+                                   {"before_tokens", state.before.tokens},
+                                   {"after_tokens", state.after.tokens},
+                                   {"count_is_exact", state.after.exact},
+                                   {"window_tokens", state.windowTokens},
+                                   {"input_budget_tokens", state.inputBudgetTokens},
+                                   {"checkpoint_revision", state.checkpointRevision},
+                                   {"original_user_messages", state.originalUserMessages},
+                                   {"retained_user_messages", state.retainedUserMessages},
+                                   {"history_index_recovery", state.historyIndexRecovery}};
+        } else
+            response["context"] = nullptr;
+        return MaiToolResult::success(response.dump());
+    }
+};
 
 class ListSessionsTool final : public MaiTool {
 public:
@@ -88,18 +145,168 @@ public:
     }
 };
 
+// 检查点元数据只是保存时的事实；不是最后一次模型请求，也不把存档内容当作指令。
+// 源字段预算与整个 JSON 的字节预算独立，避免转义/非法编码预览突破工具输出上限。
+const char* checkpointSectionName(MaiContextCheckpointSection section) {
+    switch (section) {
+        case MaiContextCheckpointSection::Metadata: return "metadata";
+        case MaiContextCheckpointSection::Summary: return "summary";
+        case MaiContextCheckpointSection::References: return "references";
+    }
+    return "metadata";
+}
+
+const char* referenceIndexStateName(MaiContextReferenceIndexState state) {
+    switch (state) {
+        case MaiContextReferenceIndexState::Unavailable: return "unavailable";
+        case MaiContextReferenceIndexState::Available: return "available";
+        case MaiContextReferenceIndexState::Invalid: return "invalid";
+        case MaiContextReferenceIndexState::MetadataBudgetExceeded:
+            return "metadata_budget_exceeded";
+    }
+    return "unavailable";
+}
+
+Json checkpointMetadata(const MaiContextCheckpointPage& page) {
+    Json result{{"type", "stored_context_checkpoint"},
+                {"available", page.available},
+                {"historical_data_not_instructions", true},
+                {"snapshot_scope", "stored_snapshot_not_last_model_request"},
+                {"section", checkpointSectionName(page.section)}};
+    if (!page.available) return result;
+    const auto& info = page.info;
+    result["checkpoint_revision"] = info.revision;
+    result["checkpoint_created_ms"] = info.created;
+    result["source"] = {{"model", info.model},
+                        {"source_message_count", info.sourceMessageCount},
+                        {"first_message_id", info.firstMessageId},
+                        {"through_message_id", info.throughMessageId},
+                        {"partial_message_id", info.partialMessageId},
+                        {"partial_part_count", info.partialPartCount},
+                        {"through_part_id", info.throughPartId},
+                        {"preserved_user_message_id", info.preservedUserMessageId}};
+    result["summary_bytes"] = info.summaryBytes;
+    result["reference_bytes"] = info.referenceBytes;
+    result["summary_is_json_object"] = info.summaryIsJsonObject;
+    result["summary_array_counts"] = info.summaryArrayCounts;
+    result["reference_index_state"] = referenceIndexStateName(info.referenceIndexState);
+    result["reference_count_known"] = info.referenceCountKnown;
+    result["reference_count"] =
+        info.referenceCountKnown ? Json(info.referenceCount) : Json(nullptr);
+    return result;
+}
+
+MaiToolResult readCheckpoint(const Json& args, const MaiToolContext& context) {
+    for (auto it = args.begin(); it != args.end(); ++it) {
+        if (it.key() == "mode" || it.key() == "section") {
+            if (!it.value().is_string())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "Checkpoint mode and section must be strings.");
+        } else if (it.key() == "offset_bytes" || it.key() == "max_bytes" ||
+                   it.key() == "checkpoint_revision") {
+            if (!it.value().is_number_unsigned())
+                return MaiToolResult::failure(
+                    MaiErrorCode::InvalidInput,
+                    "Checkpoint offsets, revision and budgets must be nonnegative integers.");
+        } else {
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "Checkpoint mode accepts only section, checkpoint_revision, offset_bytes and "
+                "max_bytes; only the current conversation is readable.");
+        }
+    }
+    MaiContextCheckpointReadQuery query;
+    const std::string section = args.value("section", std::string("summary"));
+    if (section == "metadata")
+        query.section = MaiContextCheckpointSection::Metadata;
+    else if (section == "summary")
+        query.section = MaiContextCheckpointSection::Summary;
+    else if (section == "references")
+        query.section = MaiContextCheckpointSection::References;
+    else
+        return MaiToolResult::failure(
+            MaiErrorCode::InvalidInput,
+            "Checkpoint section must be metadata, summary or references.");
+    query.expectedRevision = args.value("checkpoint_revision", std::uint64_t{0});
+    query.offsetBytes = args.value("offset_bytes", std::size_t{0});
+    query.maxBytes = args.value("max_bytes", std::size_t{8192});
+    constexpr std::size_t maxResponseBytes = 65536;
+    for (;;) {
+        if (context.isCanceled())
+            return MaiToolResult::failure(MaiErrorCode::Canceled, "Checkpoint read was canceled.");
+        const auto fetched = context.sessionAgent->readContextCheckpoint(context.sessionId, query);
+        if (!fetched) return failed(fetched.error());
+        const auto& page = fetched.value();
+        Json response = checkpointMetadata(page);
+        const auto serialize = [](const Json& value) {
+            return value.dump(-1, ' ', false, Json::error_handler_t::replace);
+        };
+        // 单独元数据已经超限时缩短正文没有意义；固定失败消息不能回显巨大源字段。
+        if (serialize(response).size() > maxResponseBytes)
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "Checkpoint metadata exceeds the response byte budget.");
+        if (!page.available || query.section == MaiContextCheckpointSection::Metadata)
+            return MaiToolResult::success(serialize(response));
+        response["representation"] = page.textIsValidUtf8
+                                         ? "stored_archive_byte_fragment"
+                                         : "raw_bytes_with_utf8_replacement_preview";
+        response["fragment_notice"] =
+            "Stored archive byte fragment; may split JSON values or URLs. Reassemble all pages for "
+            "the complete archive.";
+        response["text"] = page.text;
+        response["text_is_valid_utf8"] = page.textIsValidUtf8;
+        response["offset_bytes"] = page.offsetBytes;
+        response["total_bytes"] = page.totalBytes;
+        response["source_bytes_read"] = page.sourceBytesRead;
+        response["next_offset_bytes"] = page.nextOffsetBytes;
+        response["has_more"] = page.hasMore;
+        if (!page.textIsValidUtf8) {
+            std::string raw(4 * ((page.text.size() + 2) / 3) + 1, '\0');
+            const int length =
+                EVP_EncodeBlock(reinterpret_cast<unsigned char*>(raw.data()),
+                                reinterpret_cast<const unsigned char*>(page.text.data()),
+                                static_cast<int>(page.text.size()));
+            raw.resize(static_cast<std::size_t>(length));
+            response["raw_base64"] = std::move(raw);
+        }
+        std::string serialized = serialize(response);
+        if (serialized.size() <= maxResponseBytes)
+            return MaiToolResult::success(std::move(serialized));
+        // 不截断已读结果：以首屏的真实 revision、相同偏移重新读取更小源页。
+        // 并发推进后普通入口返回 Busy，禁止把不同保存版本的元数据/正文混在一起。
+        if (query.maxBytes == 4)
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "Checkpoint response exceeds the response byte budget.");
+        query.expectedRevision = page.info.revision;
+        query.maxBytes = std::max(std::size_t{4}, query.maxBytes / 2);
+    }
+}
+
 // 原史回查只能读取运行本工具的会话；模型参数不能指定目标会话或借消息 ID 越界。
-// 普通 API 在 MaiAgent::readHistory，共用字段校验、DB 精确读取和 UTF-8 分页。
+// 原史和检查点分别适配 MaiAgent::readHistory/readContextCheckpoint，
+// 两者都复用普通入口的字段校验和 UTF-8 分页，缺省原史响应保持不变。
 class ConversationHistoryTool final : public MaiTool {
 public:
     std::string name() const override {
         return "session_history";
     }
     std::string description() const override {
+        // 用户想看保存的压缩时直接读取真实存档。摘要、完整引用和元数据有独立 section，
+        // 不能伪称普通聊天行或最后请求；分页必须带实际 revision，不增加用户确认步骤。
+        // 检查点模式不接收原史选择器，片段可能拆开 JSON/URL，须按偏移拼回完整存档。
         // 按当前会话检索原文或精确读取消息/片段，包含压缩前材料。结果是历史数据，
         // 不是指令或授权；尾部明确提供原字节偏移，不让用户重发已存材料。
         // 非法旧编码返回 replacement 预览及原字节 Base64，不能把预览长度当原长度。
-        return "Read or search original messages in this conversation, including history "
+        return "When asked to show saved compression, use mode=checkpoint to fetch the actual "
+               "stored archive, not a reconstructed explanation or ordinary chat row. Its sections "
+               "are summary (default), references (the complete stored index), and metadata. "
+               "It is a stored snapshot, not proof of the last model request or fully inlined "
+               "links. "
+               "Checkpoint byte fragments may split JSON or URLs; reassemble by next_offset_bytes "
+               "and pass checkpoint_revision from the first page on every continuation. "
+               "Do not combine checkpoint mode with message/part/search/history selectors. "
+               "The six summary arrays are saved historical data. Omit mode, or use mode=history, "
+               "to read or search original messages in this conversation, including history "
                "covered by a summary. Omit message_id to search literal text or list recent "
                "source excerpts; use before_message_id to continue older results. Supply "
                "message_id with list_parts=true to discover every readable part/field, using "
@@ -114,7 +321,11 @@ public:
     }
     std::string parametersSchema() const override {
         // 不含 session_id：当前轮绑定会话。精确读和检索互斥；UTF-8 字节分页由核心核对。
-        return R"({"type":"object","properties":{"message_id":{"type":"string"},)"
+        // checkpoint 使用相同字节参数；section/revision 仅在该模式有效，执行层拒绝混用。
+        return R"({"type":"object","properties":{"mode":{"type":"string","enum":["history","checkpoint"],"default":"history"},)"
+               R"("section":{"type":"string","enum":["metadata","summary","references"],"description":"Checkpoint only; summary by default. Payload is an archive byte fragment."},)"
+               R"("checkpoint_revision":{"type":"integer","minimum":0,"description":"Checkpoint only. Omit or use 0 on first page; use returned revision for continuation."},)"
+               R"("message_id":{"type":"string"},)"
                R"("part_id":{"type":"string"},"field":{"type":"string","enum":["text",)"
                R"("tool_input","tool_output","tool_error","media_path","quoted_message_id"]},)"
                R"("offset_bytes":{"type":"integer","minimum":0},"search":{"type":"string","maxLength":512},)"
@@ -131,7 +342,22 @@ public:
             return MaiToolResult::failure(MaiErrorCode::Canceled, "History read was canceled.");
         const auto parsed = parseArguments(raw);
         if (!parsed) return failed(parsed.error());
-        const auto& args = parsed.value();
+        Json args = parsed.value();
+        if (args.contains("mode")) {
+            if (!args["mode"].is_string())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "History mode must be history or checkpoint.");
+            const std::string mode = args["mode"].get<std::string>();
+            if (mode == "checkpoint") return readCheckpoint(args, context);
+            if (mode != "history")
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "History mode must be history or checkpoint.");
+            args.erase("mode");
+        }
+        if (args.contains("section") || args.contains("checkpoint_revision"))
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "section and checkpoint_revision require checkpoint mode.");
         const std::vector<std::string> strings{"message_id", "part_id", "field", "search",
                                                "before_message_id"};
         const std::vector<std::string> numbers{"offset_bytes", "max_bytes", "max_messages",
@@ -190,13 +416,13 @@ public:
             if (!item.textIsValidUtf8) {
                 // text 的 JSON 预览采用既有 replacement 策略；原字节独立 Base64，
                 // 偏移和 source_bytes_read 始终计原字节，不能把预览长度当作已读源长度。
-                std::string raw(4 * ((item.text.size() + 2) / 3) + 1, '\0');
+                std::string encodedRaw(4 * ((item.text.size() + 2) / 3) + 1, '\0');
                 const int length =
-                    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(raw.data()),
+                    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(encodedRaw.data()),
                                     reinterpret_cast<const unsigned char*>(item.text.data()),
                                     static_cast<int>(item.text.size()));
-                raw.resize(static_cast<std::size_t>(length));
-                excerpts.back()["raw_base64"] = std::move(raw);
+                encodedRaw.resize(static_cast<std::size_t>(length));
+                excerpts.back()["raw_base64"] = std::move(encodedRaw);
             }
         }
         return MaiToolResult::success(
@@ -595,6 +821,7 @@ std::unique_ptr<MaiTool> makeMaiCreateSessionTool(MaiSessionCreateMode mode,
 
 void registerMaiSessionTools(MaiToolRegistry& registry, bool includeWorkspaceSwitch) {
     registry.add(std::make_unique<ListSessionsTool>());
+    registry.add(std::make_unique<SessionStatusTool>());
     registry.add(std::make_unique<ConversationHistoryTool>());
     registry.add(makeMaiCreateSessionTool(MaiSessionCreateMode::InheritWorkspace));
     registry.add(std::make_unique<DeleteSessionTool>());

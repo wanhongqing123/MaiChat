@@ -1,0 +1,10 @@
+********* Start testing of RemoteToolDetailTest *********
+Config: Using QtTest library 6.12.0, Qt 6.12.0 (x86_64-little_endian-llp64 shared (dynamic) release build; by MSVC 2022), windows 11
+PASS   : RemoteToolDetailTest::initTestCase()
+FAIL!  : RemoteToolDetailTest::groupSummaryCategories(shell-input-session-is-shell) Compared values are not the same
+   Actual   (button->text())                           : "\u2318  \u5185\u7F6E\u5DE5\u5177\u8C03\u7528 1 \u6B21 \u00B7 \u5DF2\u5B8C\u6210  \u203A"
+   Expected (QStringLiteral("⌘  %1  ›").arg(title)): "\u2318  shell \u8C03\u7528 1 \u6B21 \u00B7 \u5DF2\u5B8C\u6210  \u203A"
+E:\OpenSource\MaiChat\MaiChat\desktop\tests\RemoteToolDetailTest.cpp(198) : failure location
+PASS   : RemoteToolDetailTest::cleanupTestCase()
+Totals: 2 passed, 1 failed, 0 skipped, 0 blacklisted, 1344ms
+********* Finished testing of RemoteToolDetailTest *********

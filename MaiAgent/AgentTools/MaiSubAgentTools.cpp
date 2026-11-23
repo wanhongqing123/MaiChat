@@ -70,9 +70,9 @@ public:
         // task_name 用于状态列表；prompt 必须自包含，子 Agent 看不到当前对话全文。
         return R"({"type":"object","properties":{)"
                R"("task_name":{"type":"string","description":"A short name for the task,)"
-                   R"( used when reporting status"},)"
+               R"( used when reporting status"},)"
                R"("prompt":{"type":"string","description":"The whole task. The sub-agent cannot se)"
-                   R"(e this conversation, so say everything it needs."}},)"
+               R"(e this conversation, so say everything it needs."}},)"
                R"("required":["task_name","prompt"]})";
     }
 
@@ -118,7 +118,7 @@ public:
         return R"({"type":"object","properties":{)"
                R"("agent_id":{"type":"string","description":"The id spawn_agent gave you"},)"
                R"("timeout_ms":{"type":"integer","description":"Give up waiting after this long,)"
-                   R"( default 120000, max 600000"}},)"
+               R"( default 120000, max 600000"}},)"
                R"("required":["agent_id"]})";
     }
 
@@ -132,6 +132,11 @@ public:
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                           "missing required parameter: agent_id");
         }
+        // 先核实归属，再等待；不存在与跨父会话均不能被解释成“仍在工作”。
+        const auto initialOutcome = context.subAgents->subAgentOutcome(context.sessionId, childId);
+        if (!initialOutcome && initialOutcome.error().code() != MaiErrorCode::NotSupported)
+            return MaiToolResult::failure(initialOutcome.error().code(),
+                                          initialOutcome.error().message());
         MaiMillis timeout = args.value("timeout_ms", kDefaultWaitMs);
         timeout = timeout < 1000 ? 1000 : (timeout > kMaxWaitMs ? kMaxWaitMs : timeout);
 
@@ -153,7 +158,30 @@ public:
                                           "and come back to it.");
         }
 
-        const std::string report = context.subAgents->subAgentReport(childId);
+        const auto outcome = context.subAgents->subAgentOutcome(context.sessionId, childId);
+        if (outcome) {
+            if (outcome.value().status == MaiTurnStatus::Failed ||
+                outcome.value().status == MaiTurnStatus::Interrupted)
+                return MaiToolResult::failure(outcome.value().error.code(),
+                                              outcome.value().error.message());
+            if (outcome.value().status == MaiTurnStatus::Running)
+                return MaiToolResult::success("Sub-agent is still working; wait again.");
+        } else if (outcome.error().code() != MaiErrorCode::NotSupported) {
+            return MaiToolResult::failure(outcome.error().code(), outcome.error().message());
+        }
+        const auto fixedReport =
+            outcome ? context.subAgents->subAgentReportForTurn(context.sessionId, childId,
+                                                               outcome.value().turnId)
+                    : MaiResult<std::string>(context.subAgents->subAgentReport(childId));
+        if (!fixedReport)
+            return MaiToolResult::failure(fixedReport.error().code(),
+                                          fixedReport.error().message());
+        const std::string& report = fixedReport.value();
+        if (!outcome)
+            return MaiToolResult::success(
+                "The execution outcome is unavailable for this legacy "
+                "sub-agent. Its last recorded report is:\n" +
+                clip(report));
         if (report.empty()) {
             return MaiToolResult::success("Sub-agent " + childId +
                                           " finished without saying anything.");

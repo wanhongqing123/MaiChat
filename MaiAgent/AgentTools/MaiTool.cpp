@@ -144,6 +144,12 @@ MaiError MaiTool::onTurnFinished(const std::string& sessionId, const std::string
     (void)turnId;
     return {};
 }
+MaiError MaiTool::onSessionClosed(const std::string&) {
+    return {};
+}
+MaiError MaiTool::onAgentShutdown() {
+    return {};
+}
 
 const char* maiSpecialistCapabilityStatusToString(MaiSpecialistCapabilityStatus status) {
     // 能力状态是给主模型的可执行性信号：available 已验证可用；
@@ -281,6 +287,31 @@ void registerMaiBuiltinTools(MaiToolRegistry& registry) {
     // **不支持就根本不注册，而不是注册一个总是失败的。** 摆出来的话模型会反复试，
     // 而它收到的「失败」听起来像临时故障，于是它换个写法再试一遍，一轮对话就耗在这上面了。
     // iOS 的沙箱不允许 exec，这是 App Store 的硬规矩（见 MaiProcess.h）。
-    if (maiIsProcessExecutionSupported()) registry.add(makeMaiShellTool());
+    if (maiIsProcessExecutionSupported()) registerMaiShellTools(registry);
     registry.add(makeMaiCurrentTimeTool());
+}
+
+MaiError MaiToolRegistry::closeSession(const std::string& sessionId) const {
+    MaiError firstError;
+    for (const auto& tool : mTools) {
+        try {
+            const auto error = tool->onSessionClosed(sessionId);
+            if (error && !firstError) firstError = error;
+        } catch (...) {
+            if (!firstError) firstError = {MaiErrorCode::Internal, "tool session cleanup failed"};
+        }
+    }
+    return firstError;
+}
+MaiError MaiToolRegistry::shutdown() const {
+    MaiError firstError;
+    for (const auto& tool : mTools) {
+        try {
+            const auto error = tool->onAgentShutdown();
+            if (error && !firstError) firstError = error;
+        } catch (...) {
+            if (!firstError) firstError = {MaiErrorCode::Internal, "tool shutdown cleanup failed"};
+        }
+    }
+    return firstError;
 }

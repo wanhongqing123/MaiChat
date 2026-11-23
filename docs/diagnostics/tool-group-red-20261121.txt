@@ -1,0 +1,36 @@
+********* Start testing of RemoteToolDetailTest *********
+Config: Using QtTest library 6.12.0, Qt 6.12.0 (x86_64-little_endian-llp64 shared (dynamic) release build; by MSVC 2022), windows 11
+PASS   : RemoteToolDetailTest::initTestCase()
+FAIL!  : RemoteToolDetailTest::groupSummaryCategories(pure-built-in) Compared values are not the same
+   Actual   (button->text())                           : "\u2318  \u5DE5\u5177\u8C03\u7528 8 \u6B21 \u00B7 \u5DF2\u5B8C\u6210 \u00B7 \u5185\u7F6E  \u203A"
+   Expected (QStringLiteral("⌘  %1  ›").arg(title)): "\u2318  \u5185\u7F6E\u5DE5\u5177\u8C03\u7528 8 \u6B21 \u00B7 \u5DF2\u5B8C\u6210  \u203A"
+E:\OpenSource\MaiChat\MaiChat\desktop\tests\RemoteToolDetailTest.cpp(196) : failure location
+FAIL!  : RemoteToolDetailTest::groupSummaryCategories(ssh-exec-is-command-executor) Compared values are not the same
+   Actual   (button->text())                           : "\u2318  \u5DE5\u5177\u8C03\u7528 1 \u6B21 \u00B7 \u5DF2\u5B8C\u6210 \u00B7 \u5185\u7F6E  \u203A"
+   Expected (QStringLiteral("⌘  %1  ›").arg(title)): "\u2318  shell \u8C03\u7528 1 \u6B21 \u00B7 \u5DF2\u5B8C\u6210  \u203A"
+E:\OpenSource\MaiChat\MaiChat\desktop\tests\RemoteToolDetailTest.cpp(196) : failure location
+FAIL!  : RemoteToolDetailTest::groupSummaryCategories(pure-shell-executors) Compared values are not the same
+   Actual   (button->text())                           : "\u2318  \u5DE5\u5177\u8C03\u7528 6 \u6B21 \u00B7 \u5DF2\u5B8C\u6210 \u00B7 \u5185\u7F6E 1 / \u5916\u90E8\u8FDB\u7A0B 5  \u203A"
+   Expected (QStringLiteral("⌘  %1  ›").arg(title)): "\u2318  shell \u8C03\u7528 6 \u6B21 \u00B7 \u5DF2\u5B8C\u6210  \u203A"
+E:\OpenSource\MaiChat\MaiChat\desktop\tests\RemoteToolDetailTest.cpp(196) : failure location
+FAIL!  : RemoteToolDetailTest::groupSummaryCategories(mixed-completed) Compared values are not the same
+   Actual   (button->text())                           : "\u2318  \u5DE5\u5177\u8C03\u7528 8 \u6B21 \u00B7 \u5DF2\u5B8C\u6210 \u00B7 \u5185\u7F6E 7 / \u5916\u90E8\u8FDB\u7A0B 1  \u203A"
+   Expected (QStringLiteral("⌘  %1  ›").arg(title)): "\u2318  \u5185\u7F6E\u5DE5\u5177\u8C03\u7528 6 \u6B21 \u00B7 shell \u8C03\u7528 2 \u6B21 \u00B7 \u5DF2\u5B8C\u6210  \u203A"
+E:\OpenSource\MaiChat\MaiChat\desktop\tests\RemoteToolDetailTest.cpp(196) : failure location
+FAIL!  : RemoteToolDetailTest::groupSummaryCategories(mixed-failure) Compared values are not the same
+   Actual   (button->text())                           : "\u2318  \u5DE5\u5177\u8C03\u7528 3 \u6B21 \u00B7 \u6709\u5931\u8D25 \u00B7 \u5185\u7F6E 2 / \u5916\u90E8\u8FDB\u7A0B 1  \u203A"
+   Expected (QStringLiteral("⌘  %1  ›").arg(title)): "\u2318  \u5185\u7F6E\u5DE5\u5177\u8C03\u7528 1 \u6B21 \u00B7 shell \u8C03\u7528 2 \u6B21 \u00B7 \u6709\u5931\u8D25  \u203A"
+E:\OpenSource\MaiChat\MaiChat\desktop\tests\RemoteToolDetailTest.cpp(196) : failure location
+FAIL!  : RemoteToolDetailTest::groupSummaryCategories(shell-name-prefix-is-not-a-family-match) Compared values are not the same
+   Actual   (button->text())                           : "\u2318  \u5DE5\u5177\u8C03\u7528 2 \u6B21 \u00B7 \u5DF2\u5B8C\u6210 \u00B7 \u5185\u7F6E  \u203A"
+   Expected (QStringLiteral("⌘  %1  ›").arg(title)): "\u2318  \u5185\u7F6E\u5DE5\u5177\u8C03\u7528 2 \u6B21 \u00B7 \u5DF2\u5B8C\u6210  \u203A"
+E:\OpenSource\MaiChat\MaiChat\desktop\tests\RemoteToolDetailTest.cpp(196) : failure location
+PASS   : RemoteToolDetailTest::groupSummaryCategories(missing-name-keeps-legacy-summary)
+PASS   : RemoteToolDetailTest::groupSummaryCategories(partial-missing-name-keeps-legacy-summary)
+FAIL!  : RemoteToolDetailTest::legacyGroupSummaryKeepsStatusPriority() Compared values are not the same
+   Actual   (agentToolGroupTitle({"pending", "error"}, {"shell", "curl"}))                    : "\u5DE5\u5177\u8C03\u7528 2 \u6B21 \u00B7 \u7B49\u5F85\u6388\u6743 \u00B7 \u5185\u7F6E 1 / \u5916\u90E8\u8FDB\u7A0B 1"
+   Expected (QStringLiteral("内置工具调用 1 次 · shell 调用 1 次 · 等待授权")): "\u5185\u7F6E\u5DE5\u5177\u8C03\u7528 1 \u6B21 \u00B7 shell \u8C03\u7528 1 \u6B21 \u00B7 \u7B49\u5F85\u6388\u6743"
+E:\OpenSource\MaiChat\MaiChat\desktop\tests\RemoteToolDetailTest.cpp(225) : failure location
+PASS   : RemoteToolDetailTest::cleanupTestCase()
+Totals: 4 passed, 7 failed, 0 skipped, 0 blacklisted, 749ms
+********* Finished testing of RemoteToolDetailTest *********

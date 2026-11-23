@@ -14,12 +14,15 @@
 #include <QFuture>
 #include <QFutureWatcher>
 #include <QImage>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QListWidget>
 #include <QMenu>
 #include <QMimeData>
 #include <QPushButton>
 #include <QPointer>
+#include <QRegularExpression>
 #include <QSemaphore>
 #include <QScrollBar>
 #include <QScrollArea>
@@ -46,8 +49,15 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <variant>
+
+#if defined(Q_OS_WIN)
+#include <qt_windows.h>
+#else
+#include <signal.h>
+#endif
 
 #include "MaiSqliteStore.h"
 #include "MaiIMHistoryFormat.h"
@@ -642,8 +652,8 @@ class AgentPanelSessionTest : public QObject {
     Q_OBJECT
 
 private slots:
-    void qrCodeToolProducesOneImageLiveAndAfterReplay_data();
-    void qrCodeToolProducesOneImageLiveAndAfterReplay();
+    void contextStatusIsVisibleAndIsolated_data();
+    void contextStatusIsVisibleAndIsolated();
     void newSessionAvoidsFilesystemRoot();
     void emptySessionShowsWelcomeAndFirstMessageHidesIt();
     void welcomeToolRowsExplainEveryCategoryAndWrapAtNarrowWidths();
@@ -655,6 +665,9 @@ private slots:
     void welcomeToolRowsUseModelIdsInsteadOfStatusLabels();
     void newSessionUsesAppWorkspaceInsteadOfProcessDirectory();
     void toolGroupCategoriesStayWithinTheirOwnGroup();
+    void shellSessionSurvivesAnOrdinaryTurnAndContinuesThroughApproval();
+    void qrCodeToolProducesOneImageLiveAndAfterReplay_data();
+    void qrCodeToolProducesOneImageLiveAndAfterReplay();
     void newSessionOffersWorkspaceChoice();
     void chosenWorkspaceKeepsCurrentSession();
     void explicitNewSessionUsesChosenDirectory();
@@ -907,6 +920,12 @@ void AgentPanelSessionTest::welcomeToolRowsHideInternalGenerationAndCoverPublicR
     QVERIFY(listed.contains(QStringLiteral("maichat_play_local_music")));
     QVERIFY(listed.contains(QStringLiteral("maichat_cloud_drive_upload_media")));
     QVERIFY(listed.contains(QStringLiteral("maichat_cloud_drive_download_media")));
+    QVERIFY(listed.contains(QStringLiteral("shell")));
+    QVERIFY(listed.contains(QStringLiteral("shell_input")));
+    for (const char* name : {"desktop_process_start", "desktop_process_read", "desktop_process_write", "desktop_process_stop"}) {
+        QVERIFY2(!tools->find(name), name);
+        QVERIFY2(!listed.contains(QString::fromLatin1(name)), name);
+    }
     QVERIFY(controller.agent().listMessages(panel.sessionId().toStdString()).empty());
 
     // This fixture registers the real cloud/media families. Exercise their long
@@ -4412,6 +4431,151 @@ void AgentPanelSessionTest::conversationUsesAvailableWidth() {
              UiZoom::s(48));
 }
 
+void AgentPanelSessionTest::shellSessionSurvivesAnOrdinaryTurnAndContinuesThroughApproval() {
+    const QString executable = qEnvironmentVariable("MAICHAT_SHELL_CHILD_FIXTURE");
+    if (executable.isEmpty()) QSKIP("Set MAICHAT_SHELL_CHILD_FIXTURE to the owned MaiShellToolTests executable.");
+    QVERIFY(QFileInfo(executable).isFile());
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    class ShellSessionModel final : public MaiModelClient {
+    public:
+        explicit ShellSessionModel(QString executable) : executable_(std::move(executable)) {}
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink, const std::atomic<bool>&) override {
+            const int call = calls_++;
+            QJsonObject input;
+            QString tool;
+            QString id;
+            if (call == 0) {
+                tool = QStringLiteral("shell");
+                id = QStringLiteral("owned-shell-start");
+                // A quoted executable alone is cmd/POSIX syntax; keep this
+                // owned native fixture independent of the Windows default shell.
+                input = {{QStringLiteral("command"), QStringLiteral("\"%1\" --capture-child-session")
+                              .arg(QDir::toNativeSeparators(executable_))},
+                         {QStringLiteral("yield_time_ms"), 1000}, {QStringLiteral("timeout_ms"), 30000},
+                         {QStringLiteral("login"), false}};
+#if defined(Q_OS_WIN)
+                input.insert(QStringLiteral("shell"), QStringLiteral("cmd"));
+#endif
+            } else if (call == 1) {
+                for (const auto& message : request.messages) {
+                    if (message.role != MaiModelRole::ToolResult || message.toolCallId != "owned-shell-start") continue;
+                    const auto snapshot = QJsonDocument::fromJson(QByteArray::fromStdString(message.content)).object();
+                    session_ = snapshot.value(QStringLiteral("session_id")).toString();
+                }
+                if (session_.isEmpty()) return MaiError::make(MaiErrorCode::Protocol, "Owned shell returned no session ID");
+                if (sink.onText) sink.onText("Owned shell is ready for the next Agent turn.");
+                return {};
+            } else if (call == 2 || call == 3) {
+                tool = QStringLiteral("shell_input");
+                id = call == 2 ? QStringLiteral("owned-shell-write") : QStringLiteral("owned-shell-stop");
+                input = {{QStringLiteral("session_id"), session_}, {QStringLiteral("yield_time_ms"), 1000}};
+                if (call == 2) input.insert(QStringLiteral("chars"), QStringLiteral("write-marker\n"));
+                else input.insert(QStringLiteral("terminate"), true);
+            } else {
+                if (sink.onText) sink.onText("Owned stdin reached the original process, then the process stopped.");
+                return {};
+            }
+            if (sink.onToolCall) sink.onToolCall({id.toStdString(), tool.toStdString(),
+                QJsonDocument(input).toJson(QJsonDocument::Compact).toStdString()});
+            return {};
+        }
+        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    private:
+        QString executable_;
+        QString session_;
+        int calls_ = 0;
+    };
+    AgentController controller(std::make_unique<ShellSessionModel>(executable), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 800);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(storage.path(), QStringLiteral("Owned shell continuation"));
+    panel.openSession(session);
+    const auto allowButton = [&]() -> QPushButton* {
+        for (auto* button : panel.findChildren<QPushButton*>())
+            if (button->isVisible() && (button->text() == QStringLiteral("允许") ||
+                                      button->text() == QStringLiteral("允许并记住"))) return button;
+        return nullptr;
+    };
+    const auto toolPart = [&](const std::string& callId) {
+        for (const auto& message : controller.agent().listMessages(session.toStdString()))
+            for (const auto& part : message.parts)
+                if (const auto* tool = std::get_if<MaiToolPart>(&part.body); tool && tool->callId == callId)
+                    return *tool;
+        return MaiToolPart{};
+    };
+    const auto snapshot = [](const MaiToolPart& tool) {
+        const std::string marker = "[shell_result]\n";
+        const auto footer = tool.output.rfind(marker);
+        const auto json = footer == std::string::npos ? tool.output : tool.output.substr(footer + marker.size());
+        return QJsonDocument::fromJson(QByteArray::fromStdString(json)).object();
+    };
+    const auto isRunning = [](quint64 pid) {
+#if defined(Q_OS_WIN)
+        const HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, DWORD(pid));
+        if (!process) return false;
+        const bool alive = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+        CloseHandle(process);
+        return alive;
+#else
+        return pid && ::kill(pid_t(pid), 0) == 0;
+#endif
+    };
+    QVERIFY(controller.sendPrompt(session, QStringLiteral("Start the owned interactive child.")));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.agent().listPendingPermissions().size(), std::size_t(1), 5000);
+    QTRY_VERIFY(allowButton());
+    allowButton()->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 10000);
+    const auto start = toolPart("owned-shell-start");
+    QCOMPARE(start.state, MaiToolState::Completed);
+    const auto started = snapshot(start);
+    const QString processSession = started.value(QStringLiteral("session_id")).toString();
+    QVERIFY(!processSession.isEmpty());
+    QCOMPARE(started.value(QStringLiteral("state")).toString(), QStringLiteral("running"));
+    const auto pidMatch = QRegularExpression(QStringLiteral("native-pid=(\\d+)")).match(
+        started.value(QStringLiteral("output")).toString());
+    QVERIFY(pidMatch.hasMatch());
+    const quint64 pid = pidMatch.captured(1).toULongLong();
+    QVERIFY(isRunning(pid));
+    auto* first = panel.findChild<QPushButton*>(QStringLiteral("agentToolGroupDisclosure"));
+    QVERIFY(first);
+    QTRY_COMPARE(first->text(), QStringLiteral("⌘  shell 调用 1 次 · 已完成  ›"));
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("shell-session-turn-one-owned")));
+
+    QVERIFY(controller.sendPrompt(session, QStringLiteral("Write to the same child, then stop it.")));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.agent().listPendingPermissions().size(), std::size_t(1), 5000);
+    const auto writePermission = controller.agent().listPendingPermissions().front().id;
+    QVERIFY(!QFile::exists(storage.filePath(QStringLiteral("stdin-write-marker"))));
+    QTRY_VERIFY(allowButton());
+    allowButton()->click();
+    QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(storage.filePath(QStringLiteral("stdin-write-marker"))), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(controller.agent().listPendingPermissions().size(), std::size_t(1), 5000);
+    QTRY_VERIFY(controller.agent().listPendingPermissions().front().id != writePermission);
+    QTRY_VERIFY(allowButton());
+    allowButton()->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 10000);
+    const auto write = toolPart("owned-shell-write");
+    const auto stop = toolPart("owned-shell-stop");
+    QCOMPARE(write.state, MaiToolState::Completed);
+    QCOMPARE(stop.state, MaiToolState::Completed);
+    QCOMPARE(snapshot(write).value(QStringLiteral("session_id")).toString(), processSession);
+    QVERIFY(write.output.find("native-input:write-marker") != std::string::npos);
+    QCOMPARE(snapshot(stop).value(QStringLiteral("session_id")).toString(), processSession);
+    QCOMPARE(snapshot(stop).value(QStringLiteral("state")).toString(), QStringLiteral("completed"));
+    QVERIFY(snapshot(stop).value(QStringLiteral("terminated")).toBool());
+    QTRY_VERIFY_WITH_TIMEOUT(!isRunning(pid), 5000);
+    int calls = 0;
+    for (auto* button : panel.findChildren<QPushButton*>(QStringLiteral("agentToolGroupDisclosure"))) {
+        const auto count = QRegularExpression(QStringLiteral("shell 调用 (\\d+) 次 · 已完成")).match(button->text());
+        QVERIFY2(count.hasMatch(), qPrintable(button->text()));
+        calls += count.captured(1).toInt();
+    }
+    QCOMPARE(calls, 3);
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("shell-session-turn-two-owned")));
+}
+
 void AgentPanelSessionTest::toolGroupCategoriesStayWithinTheirOwnGroup() {
     QTemporaryDir storage;
     QVERIFY(storage.isValid());
@@ -5021,6 +5185,146 @@ void AgentPanelSessionTest::quoteActionFollowsStreamedOwnerAfterSessionRestore()
     QVERIFY(captureAgentFixture(panel, QStringLiteral("quote-after-owner")));
 }
 
+void AgentPanelSessionTest::contextStatusIsVisibleAndIsolated_data() {
+    QTest::addColumn<bool>("summaryFails");
+    QTest::addColumn<bool>("summaryThrows");
+    QTest::addColumn<bool>("sourceIndex");
+    QTest::addColumn<bool>("missingTerminalUpdate");
+    QTest::newRow("ready") << false << false << false << false;
+    QTest::newRow("failed") << true << false << false << false;
+    QTest::newRow("exception") << false << true << false << false;
+    QTest::newRow("source-index") << false << false << true << false;
+    QTest::newRow("terminal-update-unavailable") << true << false << false << true;
+}
+
+void AgentPanelSessionTest::contextStatusIsVisibleAndIsolated() {
+    QFETCH(bool, summaryFails);
+    QFETCH(bool, summaryThrows);
+    QFETCH(bool, sourceIndex);
+    QFETCH(bool, missingTerminalUpdate);
+    struct State { std::atomic<bool> summarizing{false}, release{false}; std::atomic<int> calls{0}; };
+    class ContextModel final : public MaiModelClient {
+    public:
+        std::shared_ptr<State> state;
+        bool fail;
+        bool raise;
+        bool indexOnly;
+        ContextModel(std::shared_ptr<State> value, bool failing, bool throwing, bool sourceOnly)
+            : state(std::move(value)), fail(failing), raise(throwing), indexOnly(sourceOnly) {}
+        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+        MaiModelContextLimits contextLimits(const std::string&) const override { return {8192, 2048}; }
+        MaiModelTokenEstimate estimateInputTokens(const MaiModelRequest& request) const override {
+            // 这是本地受控模型的固定词表计数，仅用于复现 UI 阶段；真实容量计数由 Core 套件验证。
+            std::size_t count = (request.baseInstructions.empty() ? 16 : 512) + request.tools.size();
+            for (const auto& part : request.messages) count += part.content.size() / 4 + 16;
+            return {count, false};
+        }
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                        const std::atomic<bool>& cancel) override {
+            if (request.baseInstructions.find("Summarize earlier conversation") == 0) {
+                state->summarizing = true;
+                while (!state->release && !cancel) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (cancel) return {MaiErrorCode::Canceled, "Owned context fixture canceled."};
+                if (raise) throw std::runtime_error("Owned context fixture exception.");
+                if (fail) return {MaiErrorCode::Network, "Owned summary fixture unavailable."};
+                if (indexOnly) {
+                    if (sink.onText) sink.onText("Owned invalid summary data.");
+                    return {};
+                }
+                if (sink.onText) sink.onText(R"({"goals":["Continue owned task"],"constraints":[],"decisions":[],"progress":[],"open_questions":[],"source_notes":[]})");
+            } else if (sink.onText) {
+                const auto answer = state->calls++ == 0 ? std::string(32000, 'x') : "Owned final answer.";
+                sink.onText(answer);
+            }
+            return {};
+        }
+    };
+    auto state = std::make_shared<State>();
+    QTemporaryDir directory;
+    AgentController controller(std::make_unique<ContextModel>(state, summaryFails, summaryThrows, sourceIndex), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(760, 540);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel, 2000));
+    const auto session = controller.createSession(directory.path());
+    panel.openSession(session);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    auto* status = panel.findChild<QLabel*>(QStringLiteral("agentContextStatus"));
+    auto* notice = panel.findChild<QLabel*>(QStringLiteral("agentCompactionNotice"));
+    QVERIFY(editor && send && status && notice);
+    QVERIFY(!notice->isVisible());
+    editor->setPlainText(QStringLiteral("OWNED: keep the draft private and preserve label cobalt."));
+    QTest::mouseClick(send, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(state->calls.load() == 1, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(send->isEnabled(), 5000);
+    const auto firstTurn = controller.agent().getTurnOutcome(session.toStdString());
+    QVERIFY(firstTurn);
+    QVERIFY(!notice->isVisible()); // 普通准备不冒充一次压缩。
+    editor->setPlainText(QStringLiteral("Continue the owned task."));
+    QTest::mouseClick(send, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(state->summarizing.load(), 5000);
+    QTRY_VERIFY(status->isVisible() && status->text().contains(QStringLiteral("正在整理")));
+    QTRY_VERIFY(notice->isVisible() && notice->text().contains(QStringLiteral("正在压缩上下文")));
+    QVERIFY(captureAgentFixture(panel, summaryFails ? QStringLiteral("context-failure-start") : QStringLiteral("context-start")));
+    const auto other = controller.createSession(directory.path());
+    panel.openSession(other);
+    QTRY_VERIFY(!status->isVisible());
+    QTRY_VERIFY(!notice->isVisible());
+    panel.openSession(session);
+    QTRY_VERIFY(status->isVisible() && status->text().contains(QStringLiteral("正在整理")));
+    QTRY_VERIFY(notice->isVisible() && notice->text().contains(QStringLiteral("正在压缩上下文")));
+    if (missingTerminalUpdate) {
+        // 模拟已观察到轮次错误、但最终上下文状态没有成功交付。不能一直显示整理中。
+        MaiEvent terminalError;
+        terminalError.type = MaiEventType::SessionError;
+        terminalError.sessionId = session.toStdString();
+        terminalError.turnId = controller.agent().activeTurnId(terminalError.sessionId);
+        terminalError.detail = "Owned terminal context state unavailable.";
+        QObject::disconnect(&controller, nullptr, &controller, nullptr);
+        state->release = true;
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+        auto staleError = terminalError;
+        staleError.turnId = firstTurn.value().turnId;
+        QVERIFY(QMetaObject::invokeMethod(&controller, "onEventQueued", Qt::DirectConnection,
+                                          Q_ARG(MaiEvent, staleError)));
+        QVERIFY(status->text().contains(QStringLiteral("正在整理")));
+        QVERIFY(QMetaObject::invokeMethod(&controller, "onEventQueued", Qt::DirectConnection,
+                                          Q_ARG(MaiEvent, terminalError)));
+        QTRY_VERIFY(status->text().contains(QStringLiteral("未完成")));
+        QTRY_VERIFY(notice->text().contains(QStringLiteral("压缩未完成")));
+        QVERIFY(captureAgentFixture(panel, QStringLiteral("context-terminal-unavailable")));
+        return; // 只处理自造已失败轮次的丢失/迟到通知，不产生外部模型请求。
+    }
+    state->release = true;
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+    const auto recorded = controller.agent().getTurnOutcome(session.toStdString());
+    QVERIFY(recorded && recorded.value().context);
+    QCOMPARE(recorded.value().context->historyIndexRecovery, sourceIndex);
+    QTRY_VERIFY_WITH_TIMEOUT(status->text().contains(summaryFails || summaryThrows ? QStringLiteral("未完成")
+        : sourceIndex ? QStringLiteral("摘要不完整") : QStringLiteral("上下文")), 5000);
+    if (!summaryFails && !summaryThrows) QVERIFY(status->toolTip().contains(QStringLiteral("用户消息原文")));
+    if (sourceIndex) QVERIFY(status->toolTip().contains(QStringLiteral("来源索引")));
+    QTRY_VERIFY(notice->isVisible());
+    QVERIFY(notice->text().contains(summaryFails || summaryThrows ? QStringLiteral("压缩未完成")
+        : sourceIndex ? QStringLiteral("摘要不完整") : QStringLiteral("已压缩")));
+    QVERIFY(captureAgentFixture(panel, sourceIndex ? QStringLiteral("context-source-index") : summaryThrows ? QStringLiteral("context-exception")
+        : summaryFails ? QStringLiteral("context-failed") : QStringLiteral("context-ready")));
+    if (!summaryFails && !summaryThrows && !sourceIndex) {
+        QTRY_VERIFY_WITH_TIMEOUT(!notice->isVisible(), 6000);
+        editor->setPlainText(QStringLiteral("One more owned request using the saved summary."));
+        QTest::mouseClick(send, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(state->calls.load() == 3, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+        QCoreApplication::processEvents();
+        const auto reused = controller.agent().getTurnOutcome(session.toStdString());
+        QVERIFY(reused && reused.value().context && reused.value().context->reusedCheckpoint);
+        QVERIFY(!reused.value().context->advancedCheckpoint);
+        QVERIFY(!notice->isVisible());
+    }
+}
+
 void AgentPanelSessionTest::qrCodeToolProducesOneImageLiveAndAfterReplay_data() {
     QTest::addColumn<bool>("deliver");
     QTest::addColumn<bool>("copyImage");
@@ -5088,6 +5392,7 @@ void AgentPanelSessionTest::qrCodeToolProducesOneImageLiveAndAfterReplay() {
     };
     QTemporaryDir workspace;
     QVERIFY(workspace.isValid());
+    // macOS temporary directories may map /var to /private/var; match the canonical tool output.
     const QString workspacePath = QFileInfo(workspace.path()).canonicalFilePath();
     QVERIFY(!workspacePath.isEmpty());
     auto model = std::make_unique<OwnedQrModel>(workspacePath, deliver, copyImage);
@@ -5138,7 +5443,8 @@ void AgentPanelSessionTest::qrCodeToolProducesOneImageLiveAndAfterReplay() {
     };
     const QString evidenceTag = QString::fromLatin1(QTest::currentDataTag());
     if (deliver) {
-        // Wait for the queued delivery UI event before assessing duplicate cards.
+        // Wait for the actual delivery caption: worker completion alone does not
+        // mean Qt has processed the event that could create a duplicate card.
         const auto captionVisible = [&] {
             for (const auto* label : panel->findChildren<QLabel*>())
                 if (label->isVisible() && label->text() == QStringLiteral("Owned QR delivery caption")) return true;
@@ -5146,6 +5452,7 @@ void AgentPanelSessionTest::qrCodeToolProducesOneImageLiveAndAfterReplay() {
         };
         QTRY_VERIFY_WITH_TIMEOUT(captionVisible(), 5000);
     }
+    QTRY_COMPARE(imageCount(), expectedImages);
     QVERIFY(captureAgentFixture(*panel, QStringLiteral("owned-qr-live-") + evidenceTag));
     QCOMPARE(imageCount(), expectedImages);
     for (int index = 0; index < 3; ++index) {

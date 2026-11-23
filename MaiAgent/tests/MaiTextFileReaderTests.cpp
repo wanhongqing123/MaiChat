@@ -548,8 +548,42 @@ void test_one_page_reuses_one_handle_and_reads_real_eof(Fixture& fixture) {
     if (first) {
         CHECK(first.value().io.openOperations == 1);
         CHECK(first.value().io.readOperations == 1);
-        CHECK(first.value().io.bytesRead == 64 * 1024);
+        CHECK(first.value().io.bytesRead <= 4096);
         CHECK(!first.value().eof);
+    }
+    const auto shortPath = fixture.write("short-page-io.txt", "first\n" + std::string(41972, 'x'));
+    const auto shortFirst = MaiTextFileReader::read(shortPath, options);
+    CHECK(shortFirst && shortFirst.value().io.bytesRead <= 4096);
+    if (shortFirst && shortFirst.value().nextCursor) {
+        options.limit = 500;
+        options.maxOutputBytes = 8192;
+        options.cursor = shortFirst.value().nextCursor;
+        const auto next = MaiTextFileReader::read(shortPath, options);
+        CHECK(next && !next.value().lines.empty());
+        if (next) CHECK(next.value().lines.front().number == 2);
+        const auto replay = MaiTextFileReader::read(shortPath, options);
+        CHECK(replay && next &&
+              replay.value().lines.front().text == next.value().lines.front().text);
+    }
+    // ????????? 4KiB ??????????????????????????
+    const auto lateLegacy = fixture.write("late-legacy.txt", std::string(5000, 'a') + "\xd6\xd0\n");
+    options = {};
+    CHECK(!MaiTextFileReader::read(lateLegacy, options));
+    options.encoding = "gb18030";
+    const auto explicitLegacy = MaiTextFileReader::read(lateLegacy, options);
+    CHECK(explicitLegacy && explicitLegacy.value().eof);
+    MaiTextFileReadOptions manyLines;
+    manyLines.limit = 500;
+    const auto shortMany = MaiTextFileReader::read(shortPath, manyLines);
+    CHECK(shortMany && shortMany.value().eof && shortMany.value().lines.size() == 2);
+    if (shortFirst && shortMany) {
+        CHECK(shortFirst.value().snapshot.bytes == 41978);
+        CHECK(shortFirst.value().lines.front().text == "first");
+        CHECK(shortFirst.value().io.bytesRead < shortMany.value().io.bytesRead);
+        std::printf("reader-perf 41978B limit1=%llu limit500=%llu total=%llu\n",
+                    static_cast<unsigned long long>(shortFirst.value().io.bytesRead),
+                    static_cast<unsigned long long>(shortMany.value().io.bytesRead),
+                    static_cast<unsigned long long>(shortFirst.value().snapshot.bytes));
     }
     options = {};
     options.offset = 2;
@@ -578,7 +612,7 @@ void test_one_page_reuses_one_handle_and_reads_real_eof(Fixture& fixture) {
     if (exact) {
         CHECK(exact.value().eof);
         CHECK(exact.value().io.openOperations == 1);
-        CHECK(exact.value().io.readOperations == 2);
+        CHECK(exact.value().io.readOperations <= 3);
         CHECK(exact.value().io.bytesRead == 65536);
     }
 #if defined(__linux__) && !defined(__ANDROID__)

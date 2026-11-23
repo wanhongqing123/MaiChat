@@ -84,6 +84,7 @@ struct BrowserSession {
     QString allowedHost;
     std::string snapshotId;
     std::string observedUrl;
+    std::string mode = "headless";
     std::map<std::string, std::string> observedLabels;
     int port = 0;
     bool ready = false;
@@ -96,10 +97,14 @@ void runBrowser(const std::shared_ptr<BrowserSession>& session) {
     QProcess process;
     process.setProcessChannelMode(QProcess::MergedChannels);
     process.setProgram(session->program);
-    process.setArguments({QStringLiteral("--no-first-run"), QStringLiteral("--no-default-browser-check"),
+    QStringList arguments{QStringLiteral("--no-first-run"), QStringLiteral("--no-default-browser-check"),
                           QStringLiteral("--disable-sync"), QStringLiteral("--remote-debugging-port=0"),
-                          QStringLiteral("--user-data-dir=") + session->profile->path(), QStringLiteral("--new-window"),
-                          QStringLiteral("about:blank")});
+                          QStringLiteral("--user-data-dir=") + session->profile->path()};
+    // Background DOM/CDP work should not create a window. Sites needing a visible browser can
+    // explicitly request windowed; never spoof the UA or silently change the selected mode.
+    arguments << (session->mode == "headless" ? QStringLiteral("--headless=new") : QStringLiteral("--new-window"));
+    arguments << QStringLiteral("about:blank");
+    process.setArguments(arguments);
     process.start();
     bool started = process.waitForStarted(5000);
     int port = 0;
@@ -284,12 +289,17 @@ std::string snapshotScript(const std::string& nonce) {
 
 std::string actionScript(const std::string& action, const std::string& url, const std::string& id,
                          const std::string& label, const std::string& text) {
-    return "(() => {if(document.visibilityState!=='visible')return 'hidden';"
+    // Document visibility is affected by OS occlusion, independent of DOM actionability.
+    // Keep URL/id/label binding; inspect the actual element after scrolling instead.
+    return "(() => {"
            "if(location.href!==" +
            Json(url).dump() +
            ")return 'stale';"
            "const id=" +
            Json(id).dump() + ",expected=" + Json(label).dump() + ",action=" + Json(action).dump() +
+           ";"
+           "const url=" +
+           Json(url).dump() +
            ";"
            "const e=Array.from(document.querySelectorAll('[data-maichat-agent-id]'))"
            ".find(item=>item.getAttribute('data-maichat-agent-id')===id);"
@@ -297,7 +307,16 @@ std::string actionScript(const std::string& action, const std::string& url, cons
            "e.innerText||e.getAttribute('placeholder')||e.getAttribute('name')||"
            "e.getAttribute('title')||e.tagName.toLowerCase()).trim().slice(0,160);"
            "if(actual!==expected)return 'stale';"
-           "if(action==='click'){setTimeout(()=>e.click(),0);return 'dispatched'}"
+           "const actionable=()=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+           "const label=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder')||"
+           "e.getAttribute('name')||e.getAttribute('title')||e.tagName.toLowerCase()).trim().slice(0,160);"
+           "return location.href===url&&e.isConnected&&e.getAttribute('data-maichat-agent-id')===id&&"
+           "label===expected&&r.width>0&&r.height>0&&s.display!=='none'&&"
+           "s.visibility==='visible'&&!e.disabled&&!e.closest('[inert]')&&"
+           "e.getAttribute('aria-disabled')!=='true'};"
+           "e.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});"
+           "if(!actionable())return 'not_actionable';"
+           "if(action==='click'){setTimeout(()=>{if(actionable())e.click()},0);return 'dispatched'}"
            "const type=(e.getAttribute('type')||'text').toLowerCase();"
            "if((e.tagName!=='INPUT'&&e.tagName!=='TEXTAREA')||"
            "['password','hidden','file','checkbox','radio','submit'].includes(type)||"
@@ -341,7 +360,14 @@ DesktopBrowserManager::~DesktopBrowserManager() {
 
 MaiError DesktopBrowserManager::open(const std::string& sessionId, const std::string& rawUrl,
                                      std::function<bool()> isCanceled) {
+    return open(sessionId, rawUrl, std::string("headless"), std::move(isCanceled));
+}
+
+MaiError DesktopBrowserManager::open(const std::string& sessionId, const std::string& rawUrl, const std::string& mode,
+                                     std::function<bool()> isCanceled) {
     if (canceled(isCanceled)) return {MaiErrorCode::Canceled, "browser operation canceled"};
+    if (mode != "headless" && mode != "windowed")
+        return {MaiErrorCode::InvalidInput, "mode must be headless or windowed"};
     QString host;
     if (sessionId.empty() || !allowedUrl(rawUrl, &host))
         return {MaiErrorCode::InvalidInput, "open needs a Session and HTTP(S) URL without credentials"};
@@ -354,6 +380,7 @@ MaiError DesktopBrowserManager::open(const std::string& sessionId, const std::st
     session->owner = sessionId;
     session->program = program;
     session->allowedHost = host;
+    session->mode = mode;
     session->profile =
         std::make_unique<QTemporaryDir>(QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation))
                                             .filePath(QStringLiteral("MaiChatAgentBrowser-XXXXXX")));
@@ -428,6 +455,12 @@ MaiError DesktopBrowserManager::open(const std::string& sessionId, const std::st
 }
 
 MaiResult<std::string> DesktopBrowserManager::observe(const std::string& sessionId, std::function<bool()> isCanceled) {
+    return observe(sessionId, 0, std::move(isCanceled));
+}
+
+MaiResult<std::string> DesktopBrowserManager::observe(const std::string& sessionId, int waitMs,
+                                                      std::function<bool()> isCanceled) {
+    if (waitMs < 0 || waitMs > 5000) return {MaiErrorCode::InvalidInput, "wait_ms must be an integer from 0 to 5000"};
     if (canceled(isCanceled)) return {MaiErrorCode::Canceled, "browser operation canceled"};
     const auto session = impl_->find(sessionId);
     if (!session) return {MaiErrorCode::NotFound, "this Session has no Agent browser"};
@@ -436,18 +469,53 @@ MaiResult<std::string> DesktopBrowserManager::observe(const std::string& session
         std::lock_guard<std::mutex> lock(session->mutex);
         if (!session->running) return {MaiErrorCode::Busy, "browser has stopped"};
     }
+    // Invalidate before any asynchronous wait: an error or canceled observation must not leave
+    // actions bound to an older document. Occlusion itself is only returned metadata.
+    session->snapshotId.clear();
+    session->observedUrl.clear();
+    session->observedLabels.clear();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs);
+    const auto deadlineReached = [&] { return waitMs > 0 && std::chrono::steady_clock::now() >= deadline; };
     const std::string nonce = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
-    const auto result = evaluate(session->pageSocket, snapshotScript(nonce), isCanceled);
-    if (!result) return result.error();
-    Json snapshot = Json::parse(result.value(), nullptr, false);
-    if (!snapshot.is_object() || !snapshot.value("url", Json{}).is_string() ||
-        !snapshot.value("elements", Json{}).is_array())
-        return {MaiErrorCode::Protocol, "browser snapshot is invalid"};
+    Json snapshot;
+    for (;;) {
+        const auto result = evaluate(session->pageSocket, snapshotScript(nonce),
+                                     [&] { return canceled(isCanceled) || deadlineReached(); });
+        if (!result) {
+            if (!canceled(isCanceled) && deadlineReached() && snapshot.is_object()) break;
+            if (!canceled(isCanceled) && deadlineReached())
+                return {MaiErrorCode::Busy, "observation deadline expired; call observe again"};
+            return result.error();
+        }
+        snapshot = Json::parse(result.value(), nullptr, false);
+        if (!snapshot.is_object() || !snapshot.value("url", Json{}).is_string() ||
+            !snapshot.value("elements", Json{}).is_array())
+            return {MaiErrorCode::Protocol, "browser snapshot is invalid"};
+        QString currentHost;
+        const std::string currentUrl = snapshot["url"].get<std::string>();
+        if (currentUrl != "about:blank" &&
+            (!allowedUrl(currentUrl, &currentHost) || currentHost != session->allowedHost))
+            return {MaiErrorCode::NotSupported, "page left the selected host; open its current URL before acting"};
+        if (waitMs == 0 || (currentUrl != "about:blank" && snapshot.value("state", "") == "complete") ||
+            deadlineReached())
+            break;
+        // Small cancellable waits avoid tool-call polling and never activate the browser window.
+        for (int delay = 0; delay < 40 && !deadlineReached(); delay += 10) {
+            if (canceled(isCanceled)) return {MaiErrorCode::Canceled, "browser observation canceled"};
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (deadlineReached()) break;
+    }
+    if (canceled(isCanceled)) return {MaiErrorCode::Canceled, "browser observation canceled"};
     const std::string url = snapshot["url"].get<std::string>();
-    if (url == "about:blank" || snapshot.value("state", "") == "loading")
-        return Json{{"state", "loading"}, {"url", url}}.dump();
-    if (snapshot.value("visibility", "") != "visible")
-        return {MaiErrorCode::Busy, "Agent browser tab is not visible; show it before continuing"};
+    const std::string readyState = snapshot.value("state", "");
+    snapshot["ready_state"] = readyState;
+    snapshot["state"] = url != "about:blank" && readyState == "complete" ? "ready" : "loading";
+    snapshot["snapshot_id"] = nonce;
+    snapshot["mode"] = session->mode;
+    if (snapshot["state"] == "loading") snapshot["elements"] = Json::array();
+    // A transient about:blank is observable but never grants access to a different host.
+    if (url == "about:blank") return snapshot.dump();
     QString pageHost;
     if (!allowedUrl(url, &pageHost) || pageHost != session->allowedHost)
         return {MaiErrorCode::NotSupported, "page left the selected host; open its current URL before acting"};
@@ -459,8 +527,6 @@ MaiResult<std::string> DesktopBrowserManager::observe(const std::string& session
             element.value("label", Json{}).is_string())
             session->observedLabels[element["id"].get<std::string>()] = element["label"].get<std::string>();
     }
-    snapshot["state"] = "ready";
-    snapshot["snapshot_id"] = nonce;
     return snapshot.dump();
 }
 
@@ -500,14 +566,18 @@ MaiError DesktopBrowserManager::screenshot(const std::string& sessionId, const s
     const auto actual = evaluate(session->pageSocket, "location.href", isCanceled);
     if (!actual) return actual.error();
     if (actual.value() != expectedUrl) return {MaiErrorCode::InvalidInput, "page URL changed; observe again"};
-    const auto visibility = evaluate(session->pageSocket, "document.visibilityState", isCanceled);
-    if (!visibility) return visibility.error();
-    if (visibility.value() != "visible") return {MaiErrorCode::Busy, "Agent browser tab is not visible"};
+    // captureScreenshot reads the renderer, not pixels from a foreground desktop window.
+    // Hidden/occluded pages remain valid; URL and approved-host identity still gate capture.
     const auto captured = cdp(session->pageSocket, "Page.captureScreenshot",
                               Json{{"format", "png"}, {"captureBeyondViewport", false}}, isCanceled);
     if (!captured) return captured.error();
     if (!captured.value().value("data", Json{}).is_string())
         return {MaiErrorCode::Protocol, "browser screenshot data is missing"};
+    // Navigation may race the renderer capture. Discard such pixels before writing a file.
+    const auto after = evaluate(session->pageSocket, "location.href", isCanceled);
+    if (!after) return after.error();
+    if (after.value() != expectedUrl)
+        return {MaiErrorCode::InvalidInput, "page URL changed during screenshot; observe again"};
     const QByteArray encoded = QByteArray::fromStdString(captured.value()["data"].get<std::string>());
     const QByteArray png = QByteArray::fromBase64(encoded);
     if (png.size() < 8 || png.size() > 20 * 1024 * 1024 || png.left(8) != QByteArray("\x89PNG\r\n\x1a\n", 8))
@@ -546,18 +616,23 @@ public:
         return "desktop_browser";
     }
     std::string description() const override {
-        return "Operate one visible, isolated Chrome/Edge page owned by the current Desktop "
-               "Session. open starts a fresh browser profile; observe returns bounded page text "
+        return "Operate one isolated Chrome/Edge page owned by the current Desktop "
+               "Session. open starts a fresh headless profile by default; mode=windowed shows a browser "
+               "when a site needs it. observe accepts wait_ms=0..5000 and returns bounded page text "
                "and elements; screenshot returns a PNG. For click/type, use the exact URL, "
                "snapshot_id, element_id and label from observe, then observe again to verify. "
                "Passwords/OTP inputs are excluded. Only the approved host can be observed or "
-               "acted on. This does not control the user's existing browser profile. open, "
+               "acted on. Loading snapshots allow screenshots but no element actions. Window "
+               "occlusion does not block observations. This does not control the user's existing browser profile. "
+               "open, "
                "screenshot, click and type follow the Agent approval policy.";
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{)"
                R"("action":{"type":"string","enum":["open","observe","screenshot","click","type","close"]},)"
                R"("url":{"type":"string","maxLength":2048},)"
+               R"("mode":{"type":"string","enum":["headless","windowed"],"default":"headless"},)"
+               R"("wait_ms":{"type":"integer","minimum":0,"maximum":5000,"default":0},)"
                R"("expected_url":{"type":"string","maxLength":2048},)"
                R"("snapshot_id":{"type":"string"},"element_id":{"type":"string"},)"
                R"("expected_label":{"type":"string"},)"
@@ -590,17 +665,28 @@ public:
         };
         const std::string action = args["action"].get<std::string>();
         if (action == "open") {
-            if (!exact({"action", "url"}) || !args.value("url", Json{}).is_string())
+            if (!exact({"action", "url", "mode"}) || !args.value("url", Json{}).is_string() ||
+                (args.contains("mode") && !args["mode"].is_string()))
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "open needs a URL");
             const std::string url = args["url"].get<std::string>();
-            const MaiError opened = manager_->open(context.sessionId, url, [&context] { return context.isCanceled(); });
+            const std::string mode = args.value("mode", std::string("headless"));
+            const MaiError opened =
+                manager_->open(context.sessionId, url, mode, [&context] { return context.isCanceled(); });
             if (opened) return MaiToolResult::failure(opened.code(), opened.message());
-            return MaiToolResult::success(
-                Json{{"state", "loading"}, {"url", url}, {"next_step", "Call observe after the page loads."}}.dump());
+            return MaiToolResult::success(Json{{"state", "loading"},
+                                               {"url", url},
+                                               {"mode", mode},
+                                               {"next_step", "Call observe; wait_ms optionally waits for readiness."}}
+                                              .dump());
         }
         if (action == "observe") {
-            if (!exact({"action"})) return MaiToolResult::failure(MaiErrorCode::InvalidInput, "observe has no options");
-            const auto observed = manager_->observe(context.sessionId, [&context] { return context.isCanceled(); });
+            if (!exact({"action", "wait_ms"}) ||
+                (args.contains("wait_ms") &&
+                 (!args["wait_ms"].is_number_integer() || args["wait_ms"] < 0 || args["wait_ms"] > 5000)))
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "observe wait_ms must be an integer from 0 to 5000");
+            const auto observed = manager_->observe(context.sessionId, args.value("wait_ms", 0),
+                                                    [&context] { return context.isCanceled(); });
             if (!observed) return MaiToolResult::failure(observed.error().code(), observed.error().message());
             return MaiToolResult::success(observed.value());
         }

@@ -25,6 +25,7 @@
 #include "MaiIdGenerator.h"
 #include "MaiContextBuilder.h"
 #include "MaiSessionStore.h"
+#include "MaiAgent.h"
 #include "MaiMemoryStore.h"
 #include "MaiSqliteStore.h"
 #include "MaiTime.h"
@@ -1614,8 +1615,333 @@ void test_session_effort_survives_reopen_and_v9_migration() {
 
 }  // namespace
 
-int main() {
+void test_turn_outcomes_survive_storage_and_recover_without_replay() {
+    TempDir temp;
+    const auto path = temp.file("turn-outcomes.db");
+    for (int kind = 0; kind != 2; ++kind) {
+        auto opened = kind == 0 ? MaiResult<std::unique_ptr<MaiSessionStore>>(makeMaiMemoryStore())
+                                : makeMaiSqliteStore(path);
+        CHECK(opened.isOk());
+        if (!opened) continue;
+        auto store = std::move(opened.value());
+        store->putSession(makeSession("ses_turn", "owned", 1));
+        MaiMessage initial;
+        initial.id = "msg_turn_initial";
+        initial.role = MaiRole::Assistant;
+        initial.created = 1;
+        initial.turnId = initial.id;
+        initial.turnOutcome = MaiTurnOutcome{initial.id, MaiTurnStatus::Running, {}, 0, {}};
+        initial.parts.push_back({"prt_context_body", MaiTextPart{"owned body stays unchanged"}, 1});
+        store->putMessage("ses_turn", initial);
+        MaiContextStatus context;
+        context.phase = MaiContextPhase::Summarizing;
+        context.before = {7900, false};
+        context.windowTokens = 8192;
+        context.inputBudgetTokens = 7782;
+        CHECK(!store->updateTurnContext("ses_turn", initial.id, context));
+        MaiMessage read;
+        CHECK(store->getMessage("ses_turn", initial.id, read));
+        CHECK(read.turnOutcome.has_value());
+        CHECK(read.turnId == initial.id);
+        CHECK(read.text() == "owned body stays unchanged");
+        CHECK(read.turnOutcome && read.turnOutcome->context);
+        const auto metadata = store->readTurnMetadata("ses_turn", initial.id);
+        CHECK(metadata.isOk());
+        if (metadata) {
+            CHECK(metadata.value().parts.empty());
+            CHECK(metadata.value().turnOutcome && metadata.value().turnOutcome->context);
+        }
+        const auto page = store->listMessagesPage("ses_turn", {}, 5);
+        CHECK(page.size() == 1);
+        if (!page.empty()) CHECK(page[0].turnOutcome.has_value());
+        // 文本请求中断也须有终态，不依赖存在 Pending/Running 工具；不产生模型重放。
+        store->recoverInterruptedTools("owned process interruption", 10);
+        CHECK(store->getMessage("ses_turn", initial.id, read));
+        CHECK(read.turnOutcome.has_value());
+        if (read.turnOutcome) {
+            CHECK(read.turnOutcome->status == MaiTurnStatus::Interrupted);
+            CHECK(read.turnOutcome->completed == 10);
+            CHECK(read.turnOutcome->error.code() == MaiErrorCode::Canceled);
+            CHECK(read.turnOutcome->context.has_value());
+            if (read.turnOutcome->context) {
+                CHECK(read.turnOutcome->context->phase == MaiContextPhase::Interrupted);
+                CHECK(read.turnOutcome->context->windowTokens == 8192);
+            }
+        }
+        initial.completed = 12;
+        initial.turnOutcome = MaiTurnOutcome{initial.id,
+                                             MaiTurnStatus::Failed,
+                                             "msg_turn_tail",
+                                             12,
+                                             {MaiErrorCode::Network, "owned failed response"}};
+        context.phase = MaiContextPhase::Ready;
+        context.after = {1000, false};
+        context.originalUserMessages = 4;
+        context.retainedUserMessages = 3;
+        initial.turnOutcome->context = context;
+        store->putMessage("ses_turn", initial);
+        MaiMessage tail;
+        tail.id = "msg_turn_tail";
+        tail.role = MaiRole::Assistant;
+        tail.created = 3;
+        tail.completed = 12;
+        tail.turnId = initial.id;
+        store->putMessage("ses_turn", tail);
+        if (kind == 1) {
+            store.reset();
+            auto reopened = makeMaiSqliteStore(path);
+            CHECK(reopened.isOk());
+            if (!reopened) continue;
+            store = std::move(reopened.value());
+        }
+        CHECK(store->getMessage("ses_turn", initial.id, read));
+        CHECK(read.turnOutcome.has_value());
+        if (read.turnOutcome) {
+            CHECK(read.turnOutcome->status == MaiTurnStatus::Failed);
+            CHECK(read.turnOutcome->resultMessageId == tail.id);
+            CHECK(read.turnOutcome->error.code() == MaiErrorCode::Network);
+            CHECK(read.turnOutcome->error.message() == "owned failed response");
+            CHECK(read.turnOutcome->context.has_value());
+            if (read.turnOutcome->context) {
+                CHECK(read.turnOutcome->context->phase == MaiContextPhase::Ready);
+                CHECK(read.turnOutcome->context->after.tokens == 1000);
+                CHECK(read.turnOutcome->context->retainedUserMessages == 3);
+            }
+        }
+        CHECK(store->getMessage("ses_turn", tail.id, read));
+        CHECK(read.turnId == initial.id);
+        CHECK(!read.turnOutcome);
+        // 恢复导入顺序不等于消息时序；最新未知 assistant 不能因随后写入旧消息而被跳过。
+        MaiMessage unknown;
+        unknown.id = "msg_z_unknown";
+        unknown.role = MaiRole::Assistant;
+        store->putMessage("ses_turn", unknown);
+        auto older = initial;
+        older.id = "msg_a_older";
+        older.parts.clear();
+        older.turnId = older.id;
+        older.turnOutcome->turnId = older.id;
+        store->putMessage("ses_turn", older);
+        const auto latestMetadata = store->readTurnMetadata("ses_turn", {});
+        CHECK(latestMetadata.isOk());
+        if (latestMetadata) CHECK(latestMetadata.value().id == unknown.id);
+        CHECK(!store->lastWriteError());
+    }
+}
+
+void test_v13_turn_migration_keeps_legacy_outcomes_unknown() {
+    TempDir temp;
+    const auto path = temp.file("v13-turns.db");
+    {
+        auto opened = makeMaiSqliteStore(path);
+        CHECK(opened.isOk());
+        if (!opened) return;
+        opened.value()->putSession(makeSession("ses_legacy", "owned", 1));
+        MaiMessage message;
+        message.id = "msg_legacy";
+        message.role = MaiRole::Assistant;
+        message.completed = 7;
+        message.parts.push_back({"prt_legacy", MaiTextPart{"owned original"}, 1});
+        opened.value()->putMessage("ses_legacy", message);
+    }
+    sqlite3* database = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+    if (!database) return;
+    // 构造真实缺列的 v13；不能拿已有新列、只降低版本号来代替迁移验收。
+    CHECK(sqlite3_exec(database,
+                       "ALTER TABLE messages DROP COLUMN turn_state;PRAGMA user_version=13;",
+                       nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(database);
+    {
+        auto migrated = makeMaiSqliteStore(path);
+        CHECK(migrated.isOk());
+        if (!migrated) return;
+        MaiMessage message;
+        CHECK(migrated.value()->getMessage("ses_legacy", "msg_legacy", message));
+        CHECK(message.text() == "owned original");
+        CHECK(message.completed == 7);
+        CHECK(message.turnId.empty());
+        CHECK(!message.turnOutcome);
+    }
+    // 列已存在但版本号较旧时同样安全，不重复 ALTER 或删除原史。
+    CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+    CHECK(sqlite3_exec(database, "PRAGMA user_version=13;", nullptr, nullptr, nullptr) ==
+          SQLITE_OK);
+    sqlite3_close(database);
+    CHECK(makeMaiSqliteStore(path).isOk());
+}
+
+void test_turn_metadata_does_not_hide_a_failed_terminal_write() {
+    TempDir temp;
+    const auto path = temp.file("turn-write-failure.db");
+    auto opened = makeMaiSqliteStore(path);
+    CHECK(opened.isOk());
+    if (!opened) return;
+    auto* store = opened.value().get();
+    MaiAgent agent(std::move(opened.value()), nullptr);
+    const auto session = agent.submit(MaiCreateSession{"", "owned", ""});
+    CHECK(session.isOk());
+    if (!session) return;
+    MaiMessage initial;
+    initial.id = "msg_owned_failed_write";
+    initial.role = MaiRole::Assistant;
+    initial.turnId = initial.id;
+    initial.turnOutcome = MaiTurnOutcome{initial.id};
+    store->putMessage(session.value(), initial);
+    sqlite3* database = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+    CHECK(sqlite3_exec(database,
+                       "CREATE TRIGGER reject_owned_write BEFORE INSERT ON messages "
+                       "BEGIN SELECT RAISE(FAIL,'owned write failure'); END;",
+                       nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(database);
+    store->putMessage(session.value(), initial);
+    CHECK(store->lastWriteError().hasError());
+    CHECK(store->readTurnMetadata(session.value(), {}).isOk());
+    const auto result = agent.getTurnOutcome(session.value());
+    CHECK(!result);
+    CHECK(result.error().code() == MaiErrorCode::Internal);
+}
+
+void test_fixed_tool_model_output() {
+    TempDir temp;
+    const auto path = temp.file("fixed-model-output.db");
+    for (int backend = 0; backend != 2; ++backend) {
+        auto opened = backend == 0
+                          ? MaiResult<std::unique_ptr<MaiSessionStore>>(makeMaiMemoryStore())
+                          : makeMaiSqliteStore(path);
+        CHECK(opened);
+        if (!opened) continue;
+        auto store = std::move(opened.value());
+        const std::string session = "ses_fixed";
+        store->putSession(makeSession(session, "owned", 1));
+        store->putSession(makeSession("ses_other", "owned", 1));
+        MaiMessage message;
+        message.id = "msg_fixed";
+        message.role = MaiRole::Assistant;
+        MaiToolPart tool;
+        tool.tool = "owned";
+        tool.callId = "call_fixed";
+        tool.output = "Original returned bytes";
+        tool.state = MaiToolState::Completed;
+        tool.modelOutputVersion = 1;
+        message.parts.push_back({"prt_fixed", tool, 1});
+        MaiToolPart legacy = tool;
+        legacy.modelOutputVersion = 0;
+        message.parts.push_back({"prt_legacy", legacy, 1});
+        store->putMessage(session, message);
+        MaiToolModelOutputKey key{session, message.id, "prt_fixed", "owned-model",
+                                  "owned-source-v1"};
+        std::string fixed = "Fixed wrapper including ";
+        fixed.push_back(0);
+        fixed += " embedded byte";
+        CHECK(store->getToolModelOutput(key).error().code() == MaiErrorCode::NotFound);
+        auto saved = store->saveToolModelOutput(key, fixed);
+        CHECK(saved && saved.value() == fixed);
+        auto duplicate = store->saveToolModelOutput(key, "Later smaller wrapper");
+        CHECK(duplicate && duplicate.value() == fixed);
+        auto read = store->getToolModelOutput(key);
+        CHECK(read && read.value() == fixed);
+        auto wrong = key;
+        wrong.sessionId = "ses_other";
+        CHECK(!store->saveToolModelOutput(wrong, "Cross-session"));
+        CHECK(store->getToolModelOutput(wrong).error().code() == MaiErrorCode::NotFound);
+        wrong = key;
+        wrong.model = "other-model";
+        CHECK(store->getToolModelOutput(wrong).error().code() == MaiErrorCode::NotFound);
+        wrong = key;
+        wrong.sourceFingerprint = "changed-source";
+        CHECK(store->getToolModelOutput(wrong).error().code() == MaiErrorCode::NotFound);
+        auto contested = key;
+        contested.sourceFingerprint = "concurrent-source";
+        std::vector<std::string> winners(8);
+        std::vector<std::thread> writers;
+        for (std::size_t index = 0; index < winners.size(); ++index)
+            writers.emplace_back([&, index] {
+                const auto result =
+                    store->saveToolModelOutput(contested, "candidate-" + std::to_string(index));
+                if (result) winners[index] = result.value();
+            });
+        for (auto& writer : writers) writer.join();
+        CHECK(!winners.front().empty());
+        for (const auto& winner : winners) CHECK(winner == winners.front());
+        // 原始快照会按 64 MiB 会话配额淘汰；已发送正文属于独立的不可变记录。
+        MaiToolOutputRecord capture;
+        capture.sessionId = session;
+        capture.messageId = message.id;
+        capture.partId = "prt_fixed";
+        capture.callId = tool.callId;
+        capture.text.assign(kMaiToolOutputMaxBytes, 'x');
+        for (int index = 0; index != 5; ++index) {
+            capture.id = "out_fixed_eviction_" + std::to_string(index);
+            capture.created = 100 + index;
+            CHECK(!store->putToolOutput(capture));
+        }
+        MaiToolOutputQuery query;
+        query.outputId = "out_fixed_eviction_0";
+        CHECK(store->readToolOutput(session, query).error().code() == MaiErrorCode::NotFound);
+        read = store->getToolModelOutput(key);
+        CHECK(read && read.value() == fixed);
+        // Ordinary part updates append a sibling without rewriting the fixed sidecar.
+        message.parts.push_back({"prt_later", MaiTextPart{"Later observation"}, 2});
+        store->putMessage(session, message);
+        if (backend != 0) {
+            store.reset();
+            auto reopened = makeMaiSqliteStore(path);
+            CHECK(reopened);
+            if (!reopened) continue;
+            store = std::move(reopened.value());
+        }
+        read = store->getToolModelOutput(key);
+        CHECK(read && read.value() == fixed);
+        MaiMessage restored;
+        CHECK(store->getMessage(session, message.id, restored));
+        CHECK(restored.parts.size() == 3);
+        if (restored.parts.size() == 3) {
+            // SQLite 按稳定片段 ID 重放，内存后端保留插入顺序；归属必须按 ID 核对。
+            bool foundFixed = false, foundLegacy = false;
+            for (const auto& part : restored.parts) {
+                if (part.id != "prt_fixed" && part.id != "prt_legacy") continue;
+                const auto* restoredTool = std::get_if<MaiToolPart>(&part.body);
+                CHECK(restoredTool);
+                if (!restoredTool) continue;
+                if (part.id == "prt_fixed") {
+                    foundFixed = true;
+                    CHECK(restoredTool->modelOutputVersion == 1);
+                    CHECK(restoredTool->output == tool.output);
+                    CHECK(!restoredTool->execution);
+                } else {
+                    foundLegacy = true;
+                    CHECK(restoredTool->modelOutputVersion == 0);
+                }
+            }
+            CHECK(foundFixed && foundLegacy);
+        }
+        CHECK(store->clearMessages(session));
+        CHECK(store->getToolModelOutput(key).error().code() == MaiErrorCode::NotFound);
+        store->putMessage(session, message);
+        saved = store->saveToolModelOutput(key, "New after clear");
+        CHECK(saved && saved.value() == "New after clear");
+        message.parts.erase(message.parts.begin());
+        store->putMessage(session, message);
+        CHECK(store->getToolModelOutput(key).error().code() == MaiErrorCode::NotFound);
+        message.parts.insert(message.parts.begin(), {"prt_fixed", tool, 1});
+        store->putMessage(session, message);
+        saved = store->saveToolModelOutput(key, "New after part removal");
+        CHECK(saved && saved.value() == "New after part removal");
+        CHECK(store->removeSession(session));
+        CHECK(store->getToolModelOutput(key).error().code() == MaiErrorCode::NotFound);
+    }
+}
+
+int main(int argc, char** argv) {
+    test_fixed_tool_model_output();
+    if (argc == 2 && std::string(argv[1]) == "--fixed-model-output") return failures ? 1 : 0;
     test_model_draft_survives_reopen_without_becoming_model_history();
+    test_turn_outcomes_survive_storage_and_recover_without_replay();
+    test_v13_turn_migration_keeps_legacy_outcomes_unknown();
+    test_turn_metadata_does_not_hide_a_failed_terminal_write();
+    if (argc == 2 && std::string(argv[1]) == "--turn-outcomes") return failures ? 1 : 0;
     test_continuation_fingerprint_preserves_legacy_hashes();
     std::printf("-> contract: memory store\n");
     {

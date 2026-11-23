@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,7 +32,8 @@ struct MaiFileSearchBudget {
 // include/exclude 为根目录相对的 glob；无斜杠时按最后一段匹配。
 // 支持 *, **, ?, [] 和有界 {a,b} 备选；**/ 可以匹配零层目录。exclude 优先于 include。
 // 花括号必须配对且每个备选非空；查询、include、exclude 的无效规则均返回 InvalidInput。
-// 默认剪枝版本控制元数据、依赖和常见构建目录；includeHidden 控制点号开头的项。
+// 默认剪枝版本控制元数据、依赖、常见构建目录及嵌套仓库/子模块；includeHidden 控制点号开头的项。
+// 显式 root 不受自身目录名或仓库身份排除；非递归列举保留依赖/子仓库目录入口。
 // gitignore 读取搜索根及其子目录的 .gitignore，支持顺序覆盖、!、/ 和目录规则；
 // 不读取根之外的父级、全局 git 配置或 .git/info/exclude，也不重新进入已忽略的父目录。
 struct MaiFileSearchFilter {
@@ -66,6 +68,9 @@ struct MaiFileNameSearchOptions {
     MaiFileSearchFilter filter;
     MaiFileSearchBudget budget;
     std::string cursor;
+    // 默认保持递归文件搜索；false 返回 root 的直接普通文件和目录，不进入子目录。
+    // 独立绑定快照/游标范围，不把无斜杠 glob 的既有 basename 语义悄悄改为列表。
+    bool recursive = true;
 };
 
 // pattern 的默认含义是字面串；兼容旧工具的正则调用应显式设置 isRegex。
@@ -89,6 +94,9 @@ struct MaiFileContentSearchOptions {
     std::size_t contextAfter = 0;
     std::size_t pageSize = 200;
     std::size_t maxLineDisplayBytes = 400;
+    // 显式只聚合统计：不输出明细，不因 pageSize 停止，仍受本次工作预算约束。
+    // 未完成可沿 cursor 继续；Files 模式也扫描全部行以区分行数和文件数。
+    bool summaryOnly = false;
     MaiFileSearchFilter filter;
     MaiFileSearchBudget budget;
     std::string cursor;
@@ -103,6 +111,8 @@ struct MaiFileSearchIssue {
 struct MaiFileNameMatch {
     std::string path;
     std::int64_t score = 0;
+    // 仅 recursive=false 可以返回目录；目录身份同样在分页重放时校验。
+    bool isDirectory = false;
 };
 
 struct MaiFileSearchLine {
@@ -147,9 +157,23 @@ struct MaiFileSearchPage {
     std::size_t searchedFiles = 0;
     std::uint64_t readBytes = 0;
     std::size_t matchedLines = 0;
+    // 总数绑定冻结查询范围；未覆盖内容返回 null，下界只累计真正消费的命中。
+    // 递归 name/Files 的单位为不同文件；浅层 name 为文件或目录条目；Lines/Count 为命中行。
+    // 页重放保留原统计，不重复累计；目录枚举完成不代表内容已经搜索完成。
+    std::optional<std::size_t> totalMatches;
+    std::size_t totalMatchesLowerBound = 0;
+    std::optional<std::size_t> totalMatchingFiles;
+    std::size_t totalMatchingFilesLowerBound = 0;
     std::vector<MaiFileSearchIssue> issues;
     std::vector<MaiFileNameMatch> files;
     std::vector<MaiFileContentMatch> matches;
+    // 内容查询是否已尝试读取/扫描文件。保存到分页快照，重放不会因本次 I/O 为零而变回 false。
+    // 对文件名查询无意义；完整空语料也可能为 false，调用方须同时看覆盖范围和 issues。
+    bool contentSearchStarted = false;
+    // 默认查询范围排除的嵌套仓库数量；最多保留 8 个、各 256 UTF-8 字节的路径供说明。
+    // 这是过滤范围而不是读取失败，不设置 partial；缓存重放保留同一快照的统计。
+    std::size_t excludedNestedRepositories = 0;
+    std::vector<std::string> excludedNestedRepositoryPaths;
 };
 
 // 线程安全的同步服务；内部互斥量串行化同一实例的调用。等待期间也轮询取消和时间预算。

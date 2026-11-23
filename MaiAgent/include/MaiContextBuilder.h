@@ -2,6 +2,7 @@
 // 对外类型：MaiContextBuilder；线程、失败和生命周期以类型附近注释为准。
 #pragma once
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,12 @@ public:
     MaiContextBuilder();
     explicit MaiContextBuilder(Options options);
 
+    // 可选的宿主工具结果投影。只作用于模型副本，完整 history 与执行事实保持不变。
+    // 精确提供源消息/片段，不按可能重复的 callId 猜来源。回调仅同步借用，不被保存；
+    // 调用方负责其线程/存储预算。启用时由回调承担工具正文预算，不再叠加 maxToolResultBytes。
+    using ToolOutputProjector =
+        std::function<std::string(const MaiMessage&, const MaiMessagePart&, const MaiToolPart&)>;
+
     // firstMessage 为已成功摘要覆盖的源前缀长度，默认 0；firstPart 只跳过其 assistant
     // 稳定片段前缀。preservedUserMessageId 允许把部分 assistant 的当前 user 原文保留在前。
     // 越界/试图裁 user parts 返回空列表。引用仍在完整 history 中解析；未覆盖的图片全部保留。
@@ -49,11 +56,12 @@ public:
     // currentUserMessageIds 是本次安全点消费的显式补充组，和默认最新输入按 ID 合并去重。
     // 压缩边界前仍需保留的补充输入按此集合恢复，调用方在接收阶段限制组预算。
     // 它不是图片选择开关；未压缩历史的图片不随当前输入组变化而改写或消失。
-    std::vector<MaiModelMessage> build(
-        const std::vector<MaiMessage>& history, std::size_t firstMessage = 0,
-        std::size_t firstPart = 0, const std::string& preservedUserMessageId = {},
-        bool preserveReasoning = false,
-        const std::vector<std::string>& currentUserMessageIds = {}) const;
+    std::vector<MaiModelMessage> build(const std::vector<MaiMessage>& history,
+                                       std::size_t firstMessage = 0, std::size_t firstPart = 0,
+                                       const std::string& preservedUserMessageId = {},
+                                       bool preserveReasoning = false,
+                                       const std::vector<std::string>& currentUserMessageIds = {},
+                                       const ToolOutputProjector& toolOutputProjector = {}) const;
 
 private:
     Options mOptions;

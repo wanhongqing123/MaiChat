@@ -149,6 +149,9 @@ private:
     void checkpointStreamedParts(bool force);
     void fillStreamedPart(const std::string& partId, const std::string& buffer);
     void finish(const std::atomic<bool>& cancel);
+    // 工具清理与普通消息收尾结束后保存整轮终态；分段结束不提前完成原始轮次。
+    void finishOutcome(const std::atomic<bool>& cancel, bool cleanupFailed);
+    void publishContextStatus(const MaiContextStatus& status);
 
     Dependencies mDependencies;
     MaiTurnContext mContext;
@@ -177,6 +180,7 @@ private:
     std::size_t mRequestByteBudget = 0;
 
     MaiError mError;
+    std::optional<MaiContextStatus> mContextStatus;
     bool mHasVisibleText = false;
 
     // 这一轮里已经被拒绝过的 (工具名, 参数)。模型被拒之后经常原样再调一次，

@@ -14,6 +14,12 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 
@@ -350,6 +356,136 @@ void test_remove_recursively() {
     CHECK(!fs::exists(tree));
 }
 
+void test_safe_file_operations_normal_api() {
+    std::printf("-> test_safe_file_operations_normal_api\n");
+    TempDir temp;
+    const auto source = temp.path("source.bin");
+    const auto copied = temp.path("copied.bin");
+    const auto moved = temp.path("moved.bin");
+    const std::string content = std::string("binary\0bytes", 12) + std::string(150000, 'x');
+    CHECK(!MaiFileSystem::writeFile(source, content));
+    const auto info = MaiFileSystem::stat(source);
+    CHECK(info && !info.value().isDirectory && info.value().sizeKnown &&
+          info.value().bytes == content.size());
+    CHECK(MaiFileSystem::copyFile(source, copied, "stale").hasError());
+    CHECK(!MaiFileSystem::exists(copied));
+    CHECK(MaiFileSystem::copyFile(source, copied, {}, [] { return true; }).code() ==
+          MaiErrorCode::Canceled);
+    CHECK(!MaiFileSystem::exists(copied));
+    CHECK(!MaiFileSystem::copyFile(source, copied, info ? info.value().identity : "invalid"));
+    std::string contents;
+    CHECK(!MaiFileSystem::readFile(copied, contents) && contents == content);
+    CHECK(MaiFileSystem::copyFile(source, copied).hasError());
+    CHECK(MaiFileSystem::moveFile(source, copied).hasError());
+    CHECK(MaiFileSystem::moveFile(source, source).hasError());
+    CHECK(MaiFileSystem::moveFile(copied, moved, {}, [] { return true; }).code() ==
+          MaiErrorCode::Canceled);
+    CHECK(MaiFileSystem::exists(copied) && !MaiFileSystem::exists(moved));
+    CHECK(!MaiFileSystem::moveFile(copied, moved));
+    CHECK(!MaiFileSystem::exists(copied) && MaiFileSystem::exists(moved));
+    CHECK(!MaiFileSystem::writeFile(temp.path("empty"), ""));
+    const auto unicode = MaiFilePath::fromUtf8(temp.root.u8string())
+                             .append(fromUtf8("\u6587\u4ef6.bin"));
+    CHECK(!MaiFileSystem::copyFile(temp.path("empty"), unicode));
+    const auto emptyInfo = MaiFileSystem::stat(unicode);
+    CHECK(emptyInfo && emptyInfo.value().sizeKnown && emptyInfo.value().bytes == 0);
+    CHECK(!MaiFileSystem::moveFile(unicode, temp.path("empty-moved")));
+    const auto owned = temp.path("owned");
+    CHECK(!MaiFileSystem::createDirectories(owned.append(fromUtf8("nested"))));
+    CHECK(!MaiFileSystem::writeFile(owned.append(fromUtf8("nested/file")), "data"));
+    const auto directoryInfo = MaiFileSystem::stat(owned);
+    CHECK(directoryInfo && directoryInfo.value().isDirectory && !directoryInfo.value().sizeKnown);
+    CHECK(MaiFileSystem::copyFile(owned, temp.path("bad-copy")).hasError());
+    CHECK(MaiFileSystem::moveFile(owned, temp.path("bad-move")).hasError());
+    CHECK(MaiFileSystem::deleteDirectory(owned).error.hasError());
+    MaiDirectoryDeleteOptions deletion;
+    deletion.recursive = true;
+    deletion.pathAllowed = [&](const MaiFilePath& path) { return path == owned; };
+    auto deleted = MaiFileSystem::deleteDirectory(owned, deletion);
+    CHECK(deleted.error.hasError() && !deleted.removedFiles && !deleted.removedDirectories);
+    CHECK(MaiFileSystem::exists(owned.append(fromUtf8("nested/file"))));
+    deletion.pathAllowed = {};
+    deletion.isCanceled = [] { return true; };
+    deleted = MaiFileSystem::deleteDirectory(owned, deletion);
+    CHECK(deleted.error.code() == MaiErrorCode::Canceled);
+    deletion.isCanceled = {};
+    deletion.expectedIdentity = "stale";
+    CHECK(MaiFileSystem::deleteDirectory(owned, deletion).error.hasError());
+    deletion.expectedIdentity = directoryInfo ? directoryInfo.value().identity : "invalid";
+    deleted = MaiFileSystem::deleteDirectory(owned, deletion);
+    CHECK(!deleted.error && deleted.removedFiles == 1 && deleted.removedDirectories == 2);
+    CHECK(!MaiFileSystem::exists(owned));
+    CHECK(!MaiFileSystem::stat(temp.path("missing")));
+    MaiFileSystem::walk(MaiFilePath::fromUtf8(temp.root.u8string()), [](const MaiFileEntry& item) {
+        CHECK(item.path.baseName().toUtf8().find(".mai-copy-") != 0);
+        return MaiWalkAction::Continue;
+    });
+
+    const auto partial = temp.path("partial");
+    CHECK(!MaiFileSystem::createDirectories(partial));
+    CHECK(!MaiFileSystem::writeFile(partial.append(fromUtf8("one")), "data"));
+    CHECK(!MaiFileSystem::writeFile(partial.append(fromUtf8("two")), "data"));
+    MaiDirectoryDeleteOptions partialOptions;
+    partialOptions.recursive = true;
+    std::string firstChild;
+    partialOptions.pathAllowed = [&](const MaiFilePath& path) {
+        if (path == partial) return true;
+        if (firstChild.empty()) firstChild = path.toUtf8();
+        return path.toUtf8() == firstChild;
+    };
+    const auto partialResult = MaiFileSystem::deleteDirectory(partial, partialOptions);
+    CHECK(partialResult.error.hasError() && partialResult.removedFiles == 1);
+    CHECK(partialResult.removedDirectories == 0 && MaiFileSystem::exists(partial));
+
+    // 平台允许创建链接时，验证递归不会跟随到相邻目录；不能创建时明确报告边界。
+    CHECK(!MaiFileSystem::createDirectories(temp.path("outside")));
+    CHECK(!MaiFileSystem::writeFile(temp.path("outside/keep"), "retained"));
+    CHECK(!MaiFileSystem::createDirectories(temp.path("linked")));
+    // 原生SDK仅构造链接样例，删除与拒绝跟随由被测普通核心处理。
+#if defined(_WIN32)
+    const bool linked = ::CreateSymbolicLinkW(temp.path("linked/escape").value().c_str(),
+                                              temp.path("outside").value().c_str(),
+                                              SYMBOLIC_LINK_FLAG_DIRECTORY |
+                                                  SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0;
+#else
+    const bool linked = ::symlink(temp.path("outside").value().c_str(),
+                                  temp.path("linked/escape").value().c_str()) == 0;
+#endif
+    if (linked) {
+        deletion.expectedIdentity.clear();
+        deleted = MaiFileSystem::deleteDirectory(temp.path("linked"), deletion);
+        CHECK(deleted.error.hasError());
+        CHECK(MaiFileSystem::exists(temp.path("outside/keep")));
+        CHECK(!MaiFileSystem::stat(temp.path("linked/escape")));
+        CHECK(MaiFileSystem::isSymbolicLink(temp.path("linked/escape/")));
+        CHECK(!MaiFileSystem::stat(temp.path("linked/escape/")));
+        CHECK(
+            MaiFileSystem::deleteDirectory(temp.path("linked/escape/"), deletion).error.hasError());
+        CHECK(MaiFileSystem::exists(temp.path("outside/keep")));
+    } else
+        std::printf("SKIP native directory symlink fixture unavailable\n");
+}
+
+void test_directory_delete_rejects_unc_roots_before_io() {
+#if defined(_WIN32)
+    std::printf("-> test_directory_delete_rejects_unc_roots_before_io\n");
+    for (const char* root : {"//unreachable.invalid/share", "//unreachable.invalid/share/",
+                             "//?/UNC/unreachable.invalid/share/"}) {
+        MaiDirectoryDeleteOptions options;
+        options.recursive = true;
+        unsigned callbacks = 0;
+        options.isCanceled = [&] {
+            ++callbacks;
+            return true;
+        };
+        const auto result = MaiFileSystem::deleteDirectory(fromUtf8(root), options);
+        CHECK(result.error.code() == MaiErrorCode::InvalidInput);
+        CHECK(callbacks == 0);
+        CHECK(result.removedFiles == 0 && result.removedDirectories == 0);
+    }
+#endif
+}
+
 void test_publish_new_file_without_overwrite() {
     std::printf("-> test_publish_new_file_without_overwrite\n");
     TempDir temp;
@@ -394,6 +530,8 @@ int main() {
     test_resolve();
     test_remove_recursively();
     test_publish_new_file_without_overwrite();
+    test_safe_file_operations_normal_api();
+    test_directory_delete_rejects_unc_roots_before_io();
 
     if (failures) {
         std::printf("\n%d checks failed\n", failures);

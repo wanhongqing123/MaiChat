@@ -57,7 +57,14 @@ struct MaiAppStorageSummary {
     std::uint64_t eligibleBytes = 0, eligibleFiles = 0;
     std::uint64_t excludedRecentFiles = 0, excludedRecentBytes = 0;
     std::uint64_t excludedProtectedFiles = 0, excludedPolicyFiles = 0;
+    // 达到遍历预算或发生扫描错误时为 true；候选上限单独由 Preview::limited 表示。
     bool truncated = false;
+    // 新字段追加在原字段之后，保留旧聚合初始化顺序；二进制消费者必须同源重编。
+    // 枚举或普通文件元信息读取失败时，统计只能作为已观察到的下界，不能宣称精确零值。
+    std::uint64_t scanErrorCount = 0;
+    // 与对应 excluded*Files 使用同一互斥分类的文件内容字节总量；扫描未完成时也只是下界。
+    // 合格、最近、保护和策略排除的字节相加，等于本次已统计的 bytes。
+    std::uint64_t excludedProtectedBytes = 0, excludedPolicyBytes = 0;
 };
 
 struct MaiAppStoragePreview {
@@ -89,6 +96,11 @@ public:
 
     MaiResult<MaiAppStoragePreview> preview(const MaiAppStorageSelection& selection,
                                             const MaiAppStorageContext& context);
+    // 读取同一个十分钟快照，供普通界面和工具分页使用，不重扫、不刷新期限或消耗执行资格。
+    // 与 cleanup 校验相同的实例、会话、解析后根目录和工作区保护完整性；新预览、成功消费或
+    // 过期后旧 ID 失效。返回值是快照副本，修改副本不会改变实际执行集合或文件身份检查。
+    MaiResult<MaiAppStoragePreview> readPreview(const std::string& previewId,
+                                                const MaiAppStorageContext& context);
     MaiResult<MaiAppStorageCleanup> cleanup(const std::string& previewId,
                                             const MaiAppStorageContext& context);
 

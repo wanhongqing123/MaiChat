@@ -257,3 +257,7 @@ MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& resul
 }
 
 #endif  // MAI_PROCESS_EXECUTION_SUPPORTED
+
+std::string maiProcessOutputText(const std::string& bytes, bool) {
+    return bytes;
+}

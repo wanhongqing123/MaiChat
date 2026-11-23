@@ -142,6 +142,10 @@ bool maiIsProcessExecutionSupported() {
     return true;
 }
 
+std::string maiProcessOutputText(const std::string& bytes, bool truncated) {
+    return normalizeOutputUtf8(bytes, truncated);
+}
+
 MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& result) {
     maiAssertBlockingAllowed("maiRunProcess");
     result = MaiProcessResult{};

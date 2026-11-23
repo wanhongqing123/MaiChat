@@ -14,6 +14,10 @@ std::unique_ptr<MaiTool> makeMaiCreateFileTool();
 std::unique_ptr<MaiTool> makeMaiCreateDirectoryTool();
 std::unique_ptr<MaiTool> makeMaiDeleteFileTool();
 std::unique_ptr<MaiTool> makeMaiWriteTool();
+std::unique_ptr<MaiTool> makeMaiMoveFileTool();
+std::unique_ptr<MaiTool> makeMaiCopyFileTool();
+std::unique_ptr<MaiTool> makeMaiDeleteDirectoryTool();
+std::unique_ptr<MaiTool> makeMaiStatTool();
 std::unique_ptr<MaiTool> makeMaiGlobTool();
 std::unique_ptr<MaiTool> makeMaiGrepTool();
 

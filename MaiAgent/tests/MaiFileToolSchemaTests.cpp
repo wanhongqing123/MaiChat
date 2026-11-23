@@ -99,6 +99,7 @@ void testQwenGlobArguments() {
         {"limit", 17},
         {"cursor", "owned-continuation"},
         {"refresh", true},
+        {"recursive", false},
     };
     checkQwenCall(parameters, tool->name(), pattern);
 
@@ -109,6 +110,23 @@ void testQwenGlobArguments() {
     query["include_ignored"] = true;
     query["refresh"] = false;
     checkQwenCall(parameters, tool->name(), query);
+}
+
+void testQwenNewFileCapabilityArguments() {
+    const auto grep = makeMaiGrepTool();
+    checkQwenCall(
+        makeQwenParameters(*grep), grep->name(),
+        {{"pattern", "needle"}, {"summary_only", true}, {"output_mode", "count"}, {"limit", 1}});
+    for (const bool moving : {false, true}) {
+        const auto tool = moving ? makeMaiMoveFileTool() : makeMaiCopyFileTool();
+        checkQwenCall(makeQwenParameters(*tool), tool->name(),
+                      {{"source", "source.bin"}, {"destination", "target.bin"}});
+    }
+    const auto remove = makeMaiDeleteDirectoryTool();
+    checkQwenCall(makeQwenParameters(*remove), remove->name(),
+                  {{"path", "owned"}, {"recursive", true}});
+    const auto stat = makeMaiStatTool();
+    checkQwenCall(makeQwenParameters(*stat), stat->name(), {{"path", "owned"}});
 }
 
 void testNativeGlobRejectsInvalidChoice() {
@@ -129,6 +147,7 @@ void testNativeGlobRejectsInvalidChoice() {
 int main() {
     try {
         testQwenGlobArguments();
+        testQwenNewFileCapabilityArguments();
         testNativeGlobRejectsInvalidChoice();
     } catch (const std::exception& error) {
         std::printf("FAIL unexpected exception: %s\n", error.what());

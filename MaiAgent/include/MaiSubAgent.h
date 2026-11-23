@@ -8,6 +8,7 @@
 
 #include "MaiError.h"
 #include "MaiTime.h"
+#include "MaiTurnOutcome.h"
 
 // 子 Agent：让一个会话去起另一个会话干活，自己接着干别的。
 //
@@ -87,7 +88,17 @@ public:
     virtual MaiError closeSubAgent(const std::string& parentSessionId,
                                    const std::string& childSessionId) = 0;
 
-    // 这个子 Agent 最后说的那段正文。等完之后拿它当"结论"回给父。
-    // 没有就返回空串。
+    // 兼容旧宿主的最新报告。MaiAgent 不跨失败/空回复寻找早前成功答案；空串仍可能
+    // 是失败、未知或没有正文，不能据此判断终态。新工具用下方的类型化、指定轮次入口。
     virtual std::string subAgentReport(const std::string& childSessionId) = 0;
+
+    // 查询当前子会话最新轮次的持久结果。先校验直接父子关系，不读其他树的结果。
+    // 默认 NotSupported，旧宿主不被迫伪造成功状态；执行失败本身包含在成功读取的值中。
+    virtual MaiResult<MaiTurnOutcome> subAgentOutcome(const std::string& parentSessionId,
+                                                      const std::string& childSessionId) const;
+    // 按已捕获的 turnId 读取正文，不能再次查询“最新”而读到并发启动的下一轮。
+    // 读取成功不承诺结果非空；旧宿主默认 NotSupported，不退化为无轮次身份的报告。
+    virtual MaiResult<std::string> subAgentReportForTurn(const std::string& parentSessionId,
+                                                         const std::string& childSessionId,
+                                                         const std::string& turnId) const;
 };

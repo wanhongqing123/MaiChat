@@ -43,6 +43,31 @@ struct MaiRegularFileInfo {
     std::string identity;
 };
 
+// 当前节点的元数据；不递归统计目录。identity 仅供同进程复核原生节点身份。
+// sizeKnown=false 表示 bytes 不适用，不能把目录大小解释成递归内容总量。
+struct MaiFileInfo {
+    bool isDirectory = false;
+    bool sizeKnown = false;
+    std::uint64_t bytes = 0;
+    std::int64_t modified = 0;
+    std::string identity;
+};
+
+// 删除不是事务；取消、拒绝访问或并发变化失败时，返回已经移除的节点数量。
+// 默认只删除空目录；递归时拒绝链接、junction 和特殊文件。回调仅同步借用。
+// 宿主负责拒绝自己的会话根及其祖先，pathAllowed 每次访问前复核真实范围。
+struct MaiDirectoryDeleteOptions {
+    bool recursive = false;
+    std::string expectedIdentity;
+    std::function<bool()> isCanceled;
+    std::function<bool(const MaiFilePath&)> pathAllowed;
+};
+struct MaiDirectoryDeleteResult {
+    MaiError error;
+    std::size_t removedFiles = 0;
+    std::size_t removedDirectories = 0;
+};
+
 // 本次句柄的实际系统 I/O 统计，供诊断普通代码中的分页/块读取开销。
 // bytesRead 只计系统返回的字节，不以文件元数据大小或历史缓存页冒充本次读取量。
 struct MaiFileReadStats {
@@ -98,6 +123,9 @@ public:
     // 不跟随最后一段链接，只接受磁盘普通文件。失败不改 out；调用方还须检查父目录边界。
     static bool regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo& out);
 
+    // 不跟随最后一级链接，仅接受普通文件和目录；错误保留原生原因，不伪造零值。
+    static MaiResult<MaiFileInfo> stat(const MaiFilePath& path);
+
     // ── 读写 ────────────────────────────────────────────────────
     // 整个读进来。maxBytes 为 0 表示不限；
     // 超过就读到上限为止并把 truncated 置位——工具层要据此告诉模型"你看到的不是全部"。
@@ -129,6 +157,22 @@ public:
     // Android 宿主通过 Java 文件接口完成此操作，适用于 App 私有工作区内、
     // 所有发布者都使用同一宿主桥接的场景；不保证与绕过桥接的写入者跨进程无覆盖竞争。
     static MaiError publishNewFile(const MaiFilePath& source, const MaiFilePath& destination);
+
+    // 普通文件移动/复制；不覆盖、不创建父目录、不跟随末段链接。
+    // moveFile 仅同文件系统，跨卷返回 NotSupported，绝不暗中复制后删除。
+    // copyFile 写目标目录内私有临时文件，完整校验后无覆盖发布；失败清理自身临时产物。
+    // expectedIdentity 非空时必须与源快照一致，供批准后复核；回调只同步借用。
+    // 取消在提交前生效，提交后报告真实变更；阻塞线程，调用方负责父目录授权。
+    static MaiError moveFile(const MaiFilePath& source, const MaiFilePath& destination,
+                             const std::string& expectedIdentity = {},
+                             const std::function<bool()>& isCanceled = {});
+    static MaiError copyFile(const MaiFilePath& source, const MaiFilePath& destination,
+                             const std::string& expectedIdentity = {},
+                             const std::function<bool()>& isCanceled = {});
+
+    // 默认只删空目录；拒绝文件系统根和末段链接。与模型工具复用同一错误返回核心。
+    static MaiDirectoryDeleteResult deleteDirectory(const MaiFilePath& path,
+                                                    const MaiDirectoryDeleteOptions& options = {});
 
     // ── 目录 ────────────────────────────────────────────────────
     // 逐级创建，已存在不算错。

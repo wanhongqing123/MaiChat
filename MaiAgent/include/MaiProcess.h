@@ -92,6 +92,10 @@ struct MaiProcessResult {
 // 「失败」听起来像临时故障，于是它换个写法再试一遍。
 bool maiIsProcessExecutionSupported();
 
+// 文本预览共用现有 Windows UTF-8 优先/OEM 后备规则；POSIX 保留字节。
+// 不用于原始快照持久化。尾部可能不完整时设 truncated，避免整段 UTF-8 被误转码。
+std::string maiProcessOutputText(const std::string& bytes, bool truncated);
+
 // 跑一个命令。启动失败（程序不存在、工作目录不存在）返回带错误码的 MaiError；
 // 平台压根不支持时返回 NotSupported。
 // **命令自己跑失败不算错误**——那是正常结果，看 exitCode。

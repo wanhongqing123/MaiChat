@@ -17,6 +17,16 @@
 #include "MaiSpecialistTask.h"
 #include "MaiToolOutput.h"
 
+// 固定模型工具正文的来源身份。调用方以完整原工具字段及版本计算 sourceFingerprint；
+// 后端只核对会话/消息/工具片段真实归属，不从模型正文或补读句柄推断身份。
+struct MaiToolModelOutputKey {
+    std::string sessionId;
+    std::string messageId;
+    std::string partId;
+    std::string model;
+    std::string sourceFingerprint;
+};
+
 // 持久化接口。
 //
 // 和领域模型分开：MaiSession / MaiMessage 是纯数据，它们不该知道持久化的存在。反过来放在一个头里，
@@ -40,6 +50,14 @@ public:
     virtual bool clearMessages(const std::string& sessionId) = 0;
 
     virtual void putMessage(const std::string& sessionId, const MaiMessage& message) = 0;
+    // 只更新已有 Running 初始 assistant 的上下文元数据，不覆盖正文或重写整批工具片段。
+    // 内建后端在同一锁内核对归属并更新；旧自定义后端默认 NotSupported，不伪造持久成功。
+    virtual MaiError updateTurnContext(const std::string& sessionId, const std::string& turnId,
+                                       const MaiContextStatus& status);
+    // 只读轮次元数据，不加载 parts；空 ID 定位最近真实 assistant，再解析其初始 turnId。
+    // 新的无记录消息不能跳过。明确 ID 不自动解析分段。旧后端默认 NotSupported。
+    virtual MaiResult<MaiMessage> readTurnMetadata(const std::string& sessionId,
+                                                   const std::string& turnId) const;
     virtual std::vector<MaiMessage> listMessages(const std::string& sessionId) const = 0;
 
     // 暂存批次在 commit 前对普通读取与模型不可见。seq 从 0 连续递增，完整相同重试幂等。
@@ -67,6 +85,15 @@ public:
     // 自定义后端默认 NotSupported；不得把失败误报为可恢复的输出句柄。
     virtual MaiError putToolOutput(const MaiToolOutputRecord& output);
 
+    // 固定完整模型正文（含补读参数），不覆盖原工具片段。可与普通读写并发调用。
+    // get 缺失/归属失效返回 NotFound；save 在锁/事务内 insert-if-absent，返回最终已有
+    // 或新存入的完整字节。并发输家必须使用返回值，不能继续发送自己的候选。
+    // 不受原始 tool_outputs 载荷淘汰影响；清空消息/删除会话同步清理。结果归调用方。
+    // 这些普通 API 不解析/裁短 content，默认自定义后端明确 NotSupported。
+    virtual MaiResult<std::string> getToolModelOutput(const MaiToolModelOutputKey& key) const;
+    virtual MaiResult<std::string> saveToolModelOutput(const MaiToolModelOutputKey& key,
+                                                       const std::string& content);
+
     // 仅读取 sessionId 内的不可变快照，允许与普通写入并发，返回值归调用方持有。
     // 不存在、已淘汰、跨会话或原始工具归属已失效时返回 NotFound。
     // 分页预算、UTF-8 边界与结束游标按 MaiToolOutputQuery/Page 契约；不载入全文。
@@ -90,7 +117,8 @@ public:
                                                      std::size_t limit) const = 0;
 
     // 进程重启时，上次遗留的 Pending/Running 工具调用已没有执行线程。
-    // 原子地把这些工具标为 Error，并给所属的未完成消息补 completed 时间。
+    // 原子地把这些工具标为 Error，并给所属的未完成消息补 completed 时间；
+    // 核心记录的遗留 Running 轮次（包括无工具的文本请求）标为 Interrupted。
     // 只修改符合条件的记录，不向调用方加载其他会话的完整消息；无匹配项是空操作。
     // error 是回灌给模型及界面的真实错误文本，调用方负责提供；允许与普通读并发。
     // 原 output 保留；Pending 的执行事实为 NotStarted/None，Running 则为 Unknown/Unknown，

@@ -13,6 +13,7 @@
 
 #include "MaiError.h"
 #include "MaiModelContinuationState.h"
+#include "MaiModelTokenEstimate.h"
 
 // ── 中立的模型抽象 ──────────────────────────────────────────────
 // 这里的结构**不是** OpenAI 的线格式，是我们自己的中间表示。
@@ -104,6 +105,10 @@ struct MaiModelMessage {
     // 原成功 response 的续接状态。wire 匹配来源后使用它替代本消息的显示投影，
     // 不能同时再次编码 content/invocations；不同 provider/model 不得收到该状态。
     std::optional<MaiModelContinuationState> continuation;
+    // 仅供宿主固定工具结果表示的精确来源；不参与供应商线格式或模型输入正文。
+    // 不能用可能重复的 toolCallId 替代这两个稳定身份。
+    std::string sourceMessageId;
+    std::string sourcePartId;
 };
 
 // 一个工具对模型的完整声明。模型靠它决定什么时候调、怎么调。
@@ -169,13 +174,6 @@ struct MaiModelContextLimits {
     // 可指定更保守的运行时余量策略，
     // 因为其真实输出上限由“窗口减实际输入”动态决定，不能预留整个窗口而拒绝所有输入。
     std::size_t defaultOutputReserveTokens = 0;
-};
-
-// 本地估算与供应商 usage 分开，避免把 UTF-8 字节或启发式结果当成实际计费 token。
-// exact=false 时 tokens 仅用于提前压缩；不能保证包含供应商模板/媒体成本的精确窗口校验。
-struct MaiModelTokenEstimate {
-    std::size_t tokens = 0;
-    bool exact = false;
 };
 
 struct MaiModelUsage {

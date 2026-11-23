@@ -126,12 +126,54 @@ void genuinelyPublicVideoToolsKeepTheirExistingCard() {
     }
     CHECK(!named(entries, QStringLiteral("AI 问答")));
 }
+
+void shellSessionsShareOneTerminalCard() {
+    const auto entries = desktopStarterCatalog(specs({"shell", "shell_input"}));
+    const auto* terminal = named(entries, QStringLiteral("终端与进程"));
+    CHECK(terminal);
+    CHECK(entries.size() == 1);
+    if (!terminal) return;
+    CHECK(terminal->toolNames == (QStringList{QStringLiteral("shell"), QStringLiteral("shell_input")}));
+    CHECK(terminal->purpose.contains(QStringLiteral("会话")));
+    CHECK(terminal->purpose.contains(QStringLiteral("补读")));
+    CHECK(terminal->purpose.contains(QStringLiteral("输入")));
+    CHECK(terminal->purpose.contains(QStringLiteral("停止")));
+    CHECK(terminal->example.contains(QStringLiteral("长时间")));
+    CHECK(terminal->example.contains(QStringLiteral("shell_input")));
+}
+
+void retiredProcessNamesAreNotTerminalFamilyMembers() {
+    // Synthetic retired declarations exercise the catalog's family boundary;
+    // production registration is independently checked in AgentPanelSessionTest.
+    const auto entries = desktopStarterCatalog(specs({"shell", "shell_input", "desktop_process_start",
+        "desktop_process_read", "desktop_process_write", "desktop_process_stop"}));
+    const auto* terminal = named(entries, QStringLiteral("终端与进程"));
+    CHECK(terminal);
+    if (!terminal) return;
+    for (const auto* name : {"desktop_process_start", "desktop_process_read", "desktop_process_write", "desktop_process_stop"})
+        CHECK(!terminal->toolNames.contains(QString::fromLatin1(name)));
+}
+
+void shellInputAloneDescribesAnExistingSession() {
+    const auto entries = desktopStarterCatalog(specs({"shell_input"}));
+    const auto* terminal = named(entries, QStringLiteral("终端与进程"));
+    CHECK(terminal);
+    CHECK(entries.size() == 1);
+    if (!terminal) return;
+    CHECK(terminal->toolNames == QStringList{QStringLiteral("shell_input")});
+    CHECK(terminal->purpose.contains(QStringLiteral("已有")));
+    CHECK(terminal->example.contains(QStringLiteral("已有")));
+    CHECK(terminal->example.contains(QStringLiteral("shell_input")));
+}
 }  // namespace
 
 int main() {
     screenAndInputHaveOneTruthfulCard();
     eachCallUsesOnlyItsPublicDeclarations();
     genuinelyPublicVideoToolsKeepTheirExistingCard();
+    shellSessionsShareOneTerminalCard();
+    retiredProcessNamesAreNotTerminalFamilyMembers();
+    shellInputAloneDescribesAnExistingSession();
     std::printf("starter catalog checks: %d, failures: %d\n", checks, failures);
     return failures ? 1 : 0;
 }

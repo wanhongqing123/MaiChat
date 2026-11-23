@@ -5,23 +5,28 @@
 #include "MaiCloudModelCatalog.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <chrono>
 #include <exception>
 #include <future>
 #include "MaiThread.h"
 #include <map>
+#include <limits>
 #include <tuple>
 #include <utility>
 #include <vector>
 
 #include <json.hpp>
+#include <openssl/evp.h>
 
 #include "MaiIdGenerator.h"
 #include "MaiContextCompactor.h"
 #include "MaiModelRetry.h"
 #include "MaiToolCallValidation.h"
+#include "MaiToolOutput.h"
 
 namespace {
 
@@ -144,6 +149,348 @@ std::optional<MaiToolExecution> acceptedTaskExecution(const MaiToolInvocation& c
 using MaiObservedToolCall = std::tuple<std::string, std::string, MaiToolState, std::string>;
 using MaiObservedToolBatch = std::vector<MaiObservedToolCall>;
 
+using Json = nlohmann::json;
+constexpr std::size_t kContextToolBytes = 64 * 1024;
+constexpr std::size_t kContextToolsBytes = 256 * 1024;
+constexpr std::size_t kContextToolsMaximumBytes = 4 * 1024 * 1024;
+constexpr std::size_t kContextToolEnvelopeBytes = 512;
+
+struct ContextToolCapture {
+    std::string id;
+    std::string messageId;
+    std::string partId;
+    std::string callId;
+    std::size_t bytes = 0;
+};
+
+struct ContextToolProjection {
+    std::string content;
+    std::string callId;
+    std::size_t budget = 0;
+};
+
+// ID 绑定原字节和精确归属；相同原史重建请求时不反复保存重复的大快照。
+// 这只是不可变记录身份，不是访问授权；读取仍由 Store 核对所属会话。
+std::string contextToolOutputId(const std::string& sessionId, const MaiMessage& message,
+                                const MaiMessagePart& part, const MaiToolPart& tool,
+                                bool fullSource = false) {
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest(EVP_MD_CTX_new(),
+                                                                   EVP_MD_CTX_free);
+    if (!digest || EVP_DigestInit_ex(digest.get(), EVP_sha256(), nullptr) != 1) return {};
+    const std::string sourceTruncated =
+        tool.execution && tool.execution->outputTruncated ? "1" : "0";
+    for (const auto value : {std::string_view(sessionId), std::string_view(message.id),
+                             std::string_view(part.id), std::string_view(tool.callId),
+                             std::string_view(tool.output), std::string_view(sourceTruncated)}) {
+        const auto length = std::to_string(value.size()) + ":";
+        if (EVP_DigestUpdate(digest.get(), length.data(), length.size()) != 1 ||
+            EVP_DigestUpdate(digest.get(), value.data(), value.size()) != 1)
+            return {};
+    }
+    if (fullSource) {
+        for (const auto& value :
+             {tool.tool, tool.input, tool.error, std::to_string(static_cast<int>(tool.state)),
+              std::to_string(tool.modelOutputVersion),
+              tool.execution ? maiSerializeToolExecution(*tool.execution) : std::string{}}) {
+            const auto length = std::to_string(value.size()) + ":";
+            if (EVP_DigestUpdate(digest.get(), length.data(), length.size()) != 1 ||
+                EVP_DigestUpdate(digest.get(), value.data(), value.size()) != 1)
+                return {};
+        }
+    }
+    std::array<unsigned char, EVP_MAX_MD_SIZE> bytes{};
+    unsigned int length = 0;
+    if (EVP_DigestFinal_ex(digest.get(), bytes.data(), &length) != 1) return {};
+    constexpr char hex[] = "0123456789abcdef";
+    std::string id = "out_ctx_";
+    for (unsigned int index = 0; index < length; ++index) {
+        id += hex[bytes[index] >> 4];
+        id += hex[bytes[index] & 15];
+    }
+    return id;
+}
+
+bool readableContextCapture(MaiSessionStore& store, const std::string& sessionId,
+                            const ContextToolCapture& capture) {
+    MaiToolOutputQuery query;
+    query.outputId = capture.id;
+    query.maxBytes = 4;
+    const auto page = store.readToolOutput(sessionId, query);
+    return page && page.value().messageId == capture.messageId &&
+           page.value().partId == capture.partId && page.value().callId == capture.callId &&
+           page.value().totalBytes == capture.bytes;
+}
+
+using ContextToolSource = std::pair<std::string, std::string>;
+
+std::vector<std::size_t> contextToolBudgets(MaiModelClient& model, const MaiModelRequest& prototype,
+                                            const std::vector<MaiModelMessage>& messages,
+                                            double multiplier,
+                                            const std::set<ContextToolSource>& fresh,
+                                            const std::set<ContextToolSource>& fixed) {
+    MaiModelRequest baseline = prototype;
+    baseline.messages = messages;
+    std::size_t count = 0, fixedBytes = 0;
+    for (auto& message : baseline.messages) {
+        if (message.role != MaiModelRole::ToolResult) continue;
+        const ContextToolSource source{message.sourceMessageId, message.sourcePartId};
+        if (fresh.count(source)) {
+            ++count;
+            message.content.clear();
+        } else if (fixed.count(source)) {
+            fixedBytes += message.content.size();
+        }
+    }
+    const auto limits = model.contextLimits(prototype.model);
+    const auto aggregate =
+        limits.contextWindowTokens == 0 ? kContextToolsBytes : kContextToolsMaximumBytes;
+    std::size_t remaining = fixedBytes < aggregate ? aggregate - fixedBytes : 0;
+    if (limits.contextWindowTokens != 0) {
+        const auto window = limits.contextWindowTokens;
+        const auto reserve = prototype.maxOutputTokens != 0 ? prototype.maxOutputTokens
+                                                            : limits.defaultOutputReserveTokens;
+        const auto effective = window / 100 * 95 + (window % 100) * 95 / 100;
+        const auto inputBudget = reserve < window ? std::min(effective, window - reserve) : 0;
+        const auto estimate = model.estimateInputTokens(baseline);
+        const double factor =
+            !estimate.exact && std::isfinite(multiplier) ? std::max(1.0, multiplier) : 1.0;
+        const double available =
+            std::max(0.0, static_cast<double>(inputBudget) - estimate.tokens * factor);
+        remaining = static_cast<std::size_t>(std::min<double>(remaining, available / factor));
+    }
+    std::vector<std::size_t> result;
+    for (const auto& message : messages) {
+        if (message.role != MaiModelRole::ToolResult) continue;
+        if (!fresh.count({message.sourceMessageId, message.sourcePartId})) {
+            result.push_back(message.content.size());
+            continue;
+        }
+        auto budget = std::min(remaining / count--, kContextToolBytes);
+        if (message.content.size() > budget && budget < kContextToolEnvelopeBytes) budget = 0;
+        result.push_back(budget);
+        remaining -= std::min(remaining, std::min(message.content.size(), budget));
+    }
+    return result;
+}
+
+std::string dumpProjection(const Json& value) {
+    return value.dump(-1, ' ', false, Json::error_handler_t::replace);
+}
+
+Json contextStructuredFields(const std::string& raw, std::size_t budget) {
+    Json fields = Json::object();
+    // 不为提取几个索引给任意巨型 JSON 再分配整棵对象树；大于此范围仍可按原始句柄读取。
+    if (raw.size() > 1024 * 1024) return fields;
+    const auto value = Json::parse(raw, nullptr, false);
+    if (!value.is_object()) return fields;
+    for (const char* key : {"preview_id",
+                            "task_id",
+                            "conversation_id",
+                            "session_id",
+                            "output_id",
+                            "status",
+                            "state",
+                            "output_path",
+                            "path",
+                            "url",
+                            "count",
+                            "total_matches",
+                            "total_matching_files",
+                            "partial",
+                            "skipped_lines",
+                            "segmented_lines",
+                            "image_width",
+                            "image_height",
+                            "recognition_height",
+                            "max_recognition_width",
+                            "has_more",
+                            "next_cursor",
+                            "next_offset",
+                            "detail_total_count",
+                            "detail_total_bytes",
+                            "detail_returned_count",
+                            "detail_returned_bytes",
+                            "exit_status",
+                            "exit_status_scope",
+                            "pipeline_stage_status",
+                            "initial_pipeline_policy",
+                            "output_streams",
+                            "timed_out",
+                            "canceled",
+                            "terminated",
+                            "has_more_output",
+                            "discarded_bytes",
+                            "total_output_bytes",
+                            "not_searched",
+                            "content_search_started",
+                            "next_offset_bytes",
+                            "offset_bytes",
+                            "total_bytes",
+                            "source_bytes_read",
+                            "text_is_valid_utf8",
+                            "summary",
+                            "removed_files",
+                            "reclaimed_bytes",
+                            "skipped_files",
+                            "dry_run",
+                            "truncated",
+                            "scan_truncated",
+                            "scan_complete",
+                            "eligible_totals_exact",
+                            "cleanup_candidates_complete",
+                            "cleanup_limited"}) {
+        const auto found = value.find(key);
+        if (found == value.end()) continue;
+        if (dumpProjection(*found).size() <= std::min<std::size_t>(2048, budget / 4))
+            fields[key] = *found;
+    }
+    return fields;
+}
+
+// 保证模型收到有效 JSON；原始 JSON 的控制字段放在独立的有界副本中，不混成执行事实。
+std::string fitContextProjection(Json value, const std::string& raw, std::size_t budget) {
+    value["preview_text"] = "";
+    value["preview_omitted_bytes"] = raw.size();
+    if (dumpProjection(value).size() + 64 > budget) value.erase("note");
+    while (dumpProjection(value).size() + 64 > budget && value.contains("structured_fields") &&
+           !value["structured_fields"].empty()) {
+        auto& fields = value["structured_fields"];
+        auto last = fields.end();
+        fields.erase(--last);
+    }
+    if (dumpProjection(value).size() + 32 > budget) value.erase("original_output_id");
+    if (dumpProjection(value).size() + 32 > budget) value.erase("source");
+    const auto overhead = dumpProjection(value).size();
+    std::size_t previewBytes = overhead + 32 < budget ? (budget - overhead - 32) / 2 : 0;
+    for (;;) {
+        const auto preview = maiPreviewToolOutput(raw, previewBytes);
+        value["preview_text"] = preview.text;
+        value["preview_omitted_bytes"] = preview.omittedSourceBytes;
+        const auto result = dumpProjection(value);
+        if (result.size() <= budget) return result;
+        if (previewBytes == 0) {
+            value.erase("structured_fields");
+            value.erase("source");
+            value.erase("original_output_id");
+            value.erase("note");
+            value.erase("budget_bytes");
+            if (dumpProjection(value).size() > budget)
+                return dumpProjection(Json{{"context_projection_truncated", true},
+                                           {"capture_available", false},
+                                           {"capture_complete", false},
+                                           {"original_bytes", raw.size()},
+                                           {"preview_text", ""}});
+            return dumpProjection(value);
+        }
+        previewBytes /= 2;
+    }
+}
+
+std::string projectContextToolOutput(MaiSessionStore& store, const std::string& sessionId,
+                                     const MaiMessage& message, const MaiMessagePart& part,
+                                     const MaiToolPart& tool, std::size_t budget, bool canRead,
+                                     std::map<std::string, ContextToolCapture>& captures,
+                                     bool retain = false) {
+    if (tool.output.size() <= budget) return tool.output;
+    const bool sourceTruncated = tool.execution && tool.execution->outputTruncated;
+    ContextToolCapture capture{contextToolOutputId(sessionId, message, part, tool), message.id,
+                               part.id, tool.callId,
+                               std::min(tool.output.size(), kMaiToolOutputMaxBytes)};
+    bool available = !capture.id.empty() && readableContextCapture(store, sessionId, capture);
+    if (retain && !available && !capture.id.empty()) {
+        MaiToolOutputRecord record;
+        record.id = capture.id;
+        record.sessionId = sessionId;
+        record.messageId = message.id;
+        record.partId = part.id;
+        record.callId = tool.callId;
+        record.text.assign(tool.output, 0, capture.bytes);
+        record.truncated = sourceTruncated || capture.bytes != tool.output.size();
+        record.created = MaiTime::getCurrentTime();
+        const auto saved = store.putToolOutput(record);
+        available = !saved && readableContextCapture(store, sessionId, capture);
+    }
+    Json result{
+        {"context_projection_truncated", true},
+        {"original_bytes", tool.output.size()},
+        {"retained_bytes", available ? capture.bytes : 0},
+        {"capture_available", available},
+        {"capture_complete", available && !sourceTruncated && capture.bytes == tool.output.size()},
+        {"budget_bytes", budget},
+        {"structured_fields", contextStructuredFields(tool.output, budget)}};
+    if (tool.execution && !tool.execution->outputId.empty() &&
+        tool.execution->outputId.size() <= 128)
+        result["original_output_id"] = tool.execution->outputId;
+    if (available) {
+        result["output_id"] = capture.id;
+        captures[capture.id] = capture;
+        if (canRead && budget >= 1024) {
+            // 补读还要携带归属/游标与可能的 Base64；不能把整份上下文余量都给原始页字节。
+            const auto pageBytes = std::clamp<std::size_t>((budget - 768) / 8, 4, 4096);
+            result["recovery_tool"] = "tool_output_read";
+            result["recovery_args"] = {{"output_id", capture.id}, {"max_bytes", pageBytes}};
+            result["note"] =
+                "Context preview only. Read retained detail with recovery_args; do not repeat the "
+                "operation for output.";
+        } else {
+            result["recovery_status"] =
+                canRead ? "context_allowance_too_small" : "host_access_only";
+        }
+    } else {
+        result["capture_error"] = "retention_unavailable";
+        result["source"] = {{"message_id", message.id}, {"part_id", part.id}};
+        result["note"] =
+            "Context preview only. Retention is unavailable; original returned text remains in "
+            "conversation history.";
+    }
+    return fitContextProjection(std::move(result), tool.output, budget);
+}
+
+void validateContextCaptures(MaiSessionStore& store, const std::string& sessionId,
+                             std::vector<MaiModelMessage>& messages,
+                             const std::map<std::string, ContextToolCapture>& captures,
+                             const std::map<std::size_t, ContextToolProjection>& generated) {
+    // 多条大输出可能触发原始保留配额淘汰。全部创建后再核对，不能交付已失效句柄。
+    std::size_t ordinal = 0;
+    for (auto& message : messages) {
+        if (message.role != MaiModelRole::ToolResult) continue;
+        const auto origin = generated.find(ordinal++);
+        // 原始工具数据可能有同名字段；只校验本次按精确位置生成、call 和字节都一致的投影。
+        if (origin == generated.end() || origin->second.callId != message.toolCallId ||
+            origin->second.content != message.content)
+            continue;
+        auto value = Json::parse(message.content, nullptr, false);
+        if (!value.is_object() || value.value("context_projection_truncated", Json{}) != true ||
+            !value.value("output_id", Json{}).is_string())
+            continue;
+        const auto found = captures.find(value["output_id"].get<std::string>());
+        if (found == captures.end() || readableContextCapture(store, sessionId, found->second))
+            continue;
+        value.erase("output_id");
+        value.erase("recovery_tool");
+        value.erase("recovery_args");
+        value["capture_available"] = false;
+        value["capture_complete"] = false;
+        value["retained_bytes"] = 0;
+        value["capture_error"] = "retention_evicted";
+        value["note"] =
+            "Context preview only. The retained handle expired; original returned text remains in "
+            "conversation history.";
+        value["source"] = {{"message_id", found->second.messageId},
+                           {"part_id", found->second.partId}};
+        const auto budget = origin->second.budget;
+        if (dumpProjection(value).size() > budget) {
+            value["preview_text"] = "";
+            value["preview_omitted_bytes"] = value.value("original_bytes", std::size_t{0});
+            value.erase("structured_fields");
+        }
+        if (dumpProjection(value).size() > budget) value.erase("note");
+        if (dumpProjection(value).size() > budget) value.erase("source");
+        if (dumpProjection(value).size() > budget) value.erase("original_output_id");
+        message.content = dumpProjection(value);
+    }
+}
+
 MaiObservedToolBatch observeToolBatch(const std::vector<MaiMessagePart>& parts,
                                       std::size_t firstPart) {
     MaiObservedToolBatch batch;
@@ -160,7 +507,10 @@ MaiObservedToolBatch observeToolBatch(const std::vector<MaiMessagePart>& parts,
 MaiTurnRunner::MaiTurnRunner(Dependencies dependencies, std::string sessionId, MaiMessage assistant)
     : mDependencies(std::move(dependencies)),
       mContext{std::move(sessionId), assistant.id, {}, {}, {}},
-      mAssistant(std::move(assistant)) {}
+      mAssistant(std::move(assistant)) {
+    mAssistant.turnId = mContext.turnId;
+    mAssistant.turnOutcome = MaiTurnOutcome{mContext.turnId};
+}
 
 void MaiTurnRunner::run(const std::atomic<bool>& cancel) {
     // 所有出口共用一次收尾。先封闭输入闸门，再清理工具资源，避免清理阻塞期间
@@ -212,6 +562,70 @@ void MaiTurnRunner::run(const std::atomic<bool>& cancel) {
             unexpected("unexpected error notification failure");
         }
     }
+    try {
+        finishOutcome(cancel, cleanupError.hasError());
+    } catch (const std::exception& error) {
+        unexpected(std::string("unexpected turn outcome failure: ") + error.what());
+    } catch (...) {
+        unexpected("unexpected turn outcome failure");
+    }
+}
+
+void MaiTurnRunner::finishOutcome(const std::atomic<bool>& cancel, bool cleanupFailed) {
+    MaiMessage initial;
+    if (mAssistant.id == mContext.turnId) {
+        initial = mAssistant;
+    } else if (!mDependencies.store->getMessage(mContext.sessionId, mContext.turnId, initial)) {
+        mError = {MaiErrorCode::Internal, "The originating turn message is unavailable."};
+        return;
+    }
+    if (const auto error = mDependencies.store->lastWriteError()) {
+        mError = error;
+        return;
+    }
+    const bool interrupted =
+        !cleanupFailed && (mError.code() == MaiErrorCode::Canceled ||
+                           (!mError && cancel.load(std::memory_order_relaxed)));
+    MaiTurnOutcome outcome;
+    outcome.turnId = mContext.turnId;
+    outcome.status = interrupted ? MaiTurnStatus::Interrupted
+                     : mError    ? MaiTurnStatus::Failed
+                                 : MaiTurnStatus::Completed;
+    outcome.resultMessageId = mAssistant.id;
+    outcome.completed = MaiTime::getCurrentTime();
+    outcome.context = mContextStatus;
+    if (outcome.context && (outcome.context->phase == MaiContextPhase::Preparing ||
+                            outcome.context->phase == MaiContextPhase::Summarizing)) {
+        outcome.context->phase =
+            interrupted ? MaiContextPhase::Interrupted : MaiContextPhase::Failed;
+        outcome.context->error =
+            mError ? mError : MaiError{MaiErrorCode::Canceled, "Context preparation stopped."};
+    }
+    outcome.error =
+        interrupted ? MaiError{MaiErrorCode::Canceled, "The turn was interrupted."} : mError;
+    if (interrupted && !mError) mError = outcome.error;
+    if (cleanupFailed && outcome.error.code() == MaiErrorCode::Canceled)
+        outcome.error = {MaiErrorCode::Internal, mError.message()};
+    initial.turnId = mContext.turnId;
+    initial.turnOutcome = std::move(outcome);
+    mDependencies.store->putMessage(mContext.sessionId, initial);
+    if (const auto error = mDependencies.store->lastWriteError()) {
+        mError = error;
+        return;
+    }
+    // 与普通 API 读取同一持久事实；不把事件本身当作可恢复的结果存储。
+    mDependencies.emitter->emitTurnOutcome(mContext.sessionId, mContext.turnId,
+                                           initial.turnOutcome->context);
+}
+
+void MaiTurnRunner::publishContextStatus(const MaiContextStatus& status) {
+    mContextStatus = status;
+    if (mAssistant.id == mContext.turnId) {
+        if (!mAssistant.turnOutcome) mAssistant.turnOutcome = MaiTurnOutcome{mContext.turnId};
+        mAssistant.turnOutcome->context = status;
+    }
+    if (mDependencies.store->updateTurnContext(mContext.sessionId, mContext.turnId, status)) return;
+    mDependencies.emitter->emitContextStatus(mContext.sessionId, mContext.turnId, status);
 }
 
 bool MaiTurnRunner::succeeded() const {
@@ -231,7 +645,11 @@ bool MaiTurnRunner::advanceSteering(bool closeIfEmpty) {
         mError = advanced.error();
         return false;
     }
-    if (advanced.value()) mCurrentUserMessageIds = std::move(currentUserMessageIds);
+    if (advanced.value()) {
+        mCurrentUserMessageIds = std::move(currentUserMessageIds);
+        mAssistant.turnId = mContext.turnId;
+        if (mAssistant.id != mContext.turnId) mAssistant.turnOutcome.reset();
+    }
     return advanced.value();
 }
 
@@ -400,7 +818,8 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
     }
     const bool preserveReasoning = capability && capability->provider == "glm";
     const auto buildHistory = [&](std::size_t firstMessage, std::size_t firstPart,
-                                  const std::string& preservedUserMessageId) {
+                                  const std::string& preservedUserMessageId,
+                                  const MaiContextBuilder::ToolOutputProjector& projector) {
         auto modelHistory = history;
         if (firstPart != 0) {
             // 数字边界来自持久快照，内存片段的到达顺序可能不同。按已覆盖 ID 集合分区，
@@ -426,7 +845,7 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
         if (mDependencies.specialistReply.empty())
             return mDependencies.context->build(modelHistory, firstMessage, firstPart,
                                                 preservedUserMessageId, preserveReasoning,
-                                                mCurrentUserMessageIds);
+                                                mCurrentUserMessageIds, projector);
         // 子模型回复应排在本轮工具调用之前。若每次迭代都把它追加在工具结果之后，
         // 主模型会把旧回复误认为用户刚刚发来的最新输入。
         std::vector<MaiMessage> earlier;
@@ -441,7 +860,8 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
             else
                 continuation.push_back(message);
         }
-        auto messages = mDependencies.context->build(earlier, 0, 0, {}, preserveReasoning);
+        auto messages =
+            mDependencies.context->build(earlier, 0, 0, {}, preserveReasoning, {}, projector);
         MaiModelMessage instruction;
         instruction.role = MaiModelRole::System;
         instruction.content =
@@ -469,26 +889,93 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
         // steer 产生新 assistant 段时，旧专业回复仍固定在本轮最初分段之前，
         // 不能越过新的用户指令重新变成“最新输入”。
         const auto current = mDependencies.context->build(continuation, 0, 0, {}, preserveReasoning,
-                                                          mCurrentUserMessageIds);
+                                                          mCurrentUserMessageIds, projector);
         messages.insert(messages.end(), current.begin(), current.end());
         return messages;
     };
     request.workingDirectory = mContext.workingDirectory;
+    if (includeTools && mDependencies.tools && !mDependencies.tools->isEmpty())
+        request.tools = mDependencies.tools->specs(mContext.model);
+    // prepare 接管 request 后仍会同步调用此闭包；独立原型保留真实型号/工具/基础指令，
+    // 不能从已移动对象计算窗口或误判补读工具不存在。
+    const MaiModelRequest projectionPrototype = request;
+    struct ModelOutputSource {
+        const MaiMessage* message;
+        const MaiMessagePart* part;
+        const MaiToolPart* tool;
+        MaiToolModelOutputKey key;
+    };
+    std::map<ContextToolSource, ModelOutputSource> sources;
+    std::map<ContextToolSource, std::string> frozen;
+    std::map<ContextToolSource, std::size_t> candidateBudgets;
+    std::set<ContextToolSource> fresh, fixed;
+    // 使用后端已接受的原始快照，保证 SQLite 的 UTF-8 规范化与重开后来源身份一致。
+    // 当前已完成工具在发出结果前已落库，未落库来源不能获得固定表示。
+    for (const auto& source : sourceHistory) {
+        for (const auto& part : source.parts) {
+            const auto* tool = std::get_if<MaiToolPart>(&part.body);
+            if (!tool || tool->modelOutputVersion != 1) continue;
+            const ContextToolSource identity{source.id, part.id};
+            MaiToolModelOutputKey key{
+                mContext.sessionId, source.id, part.id, request.model,
+                contextToolOutputId(mContext.sessionId, source, part, *tool, true)};
+            if (key.sourceFingerprint.empty())
+                return {MaiErrorCode::Internal, "Cannot identify the original tool output source."};
+            const auto saved = mDependencies.store->getToolModelOutput(key);
+            if (!saved && saved.error().code() == MaiErrorCode::NotSupported) continue;
+            if (!saved && saved.error().code() != MaiErrorCode::NotFound) return saved.error();
+            sources.emplace(identity, ModelOutputSource{&source, &part, tool, std::move(key)});
+            if (saved) {
+                frozen.emplace(identity, saved.value());
+                fixed.insert(identity);
+            } else {
+                fresh.insert(identity);
+            }
+        }
+    }
+    const bool canRead =
+        std::any_of(projectionPrototype.tools.begin(), projectionPrototype.tools.end(),
+                    [](const MaiToolSpec& tool) { return tool.name == "tool_output_read"; });
     const auto buildContext = [&](std::size_t firstMessage, std::size_t firstPart,
                                   const std::string& preservedUserMessageId) {
-        auto messages = buildHistory(firstMessage, firstPart, preservedUserMessageId);
-        if (requireFinalAnswer || finalAnswerHint) {
+        const auto addFinalHint = [&](std::vector<MaiModelMessage>& messages) {
+            if (!requireFinalAnswer && !finalAnswerHint) return;
             MaiModelMessage instruction;
             instruction.role = MaiModelRole::System;
             instruction.content = finalAnswerHint ? finalAnswerHint : kFinalAnswerHint;
             messages.push_back(std::move(instruction));
+        };
+        auto messages = buildHistory(firstMessage, firstPart, preservedUserMessageId, {});
+        addFinalHint(messages);
+        for (auto& message : messages) {
+            const auto found = frozen.find({message.sourceMessageId, message.sourcePartId});
+            if (message.role == MaiModelRole::ToolResult && found != frozen.end())
+                message.content = found->second;
+        }
+        // 已发送表示保持原样，只在首次发送的新结果之间分配剩余预算。
+        const auto budgets = contextToolBudgets(*mDependencies.model, projectionPrototype, messages,
+                                                mContextEstimateMultiplier, fresh, fixed);
+        std::size_t ordinal = 0;
+        std::map<std::string, ContextToolCapture> captures;
+        for (auto& message : messages) {
+            if (message.role != MaiModelRole::ToolResult) continue;
+            const auto budget = budgets[ordinal++];
+            const ContextToolSource identity{message.sourceMessageId, message.sourcePartId};
+            if (!fresh.count(identity)) continue;
+            candidateBudgets[identity] = budget;
+            if (budget == 0) continue;
+            const auto& source = sources.at(identity);
+            // 候选阶段只读；原始补读快照和固定表示在最终准备成功后保存。
+            message.content =
+                projectContextToolOutput(*mDependencies.store, mContext.sessionId, *source.message,
+                                         *source.part, *source.tool, budget, canRead, captures);
+            if (message.content.empty()) message.content = "(no output)";
         }
         return messages;
     };
 
-    if (includeTools && mDependencies.tools && !mDependencies.tools->isEmpty())
-        request.tools = mDependencies.tools->specs(mContext.model);
     MaiContextCompactor::Options options;
+    options.onStatus = [this](const MaiContextStatus& status) { publishContextStatus(status); };
     options.estimateMultiplier = mContextEstimateMultiplier;
     options.deferUntilHardLimit = mCompactionDeferred;
     options.force = mForceCompaction;
@@ -504,10 +991,84 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
         std::any_of(request.tools.begin(), request.tools.end(),
                     [](const MaiToolSpec& tool) { return tool.name == "session_history"; });
     options.allowToolProjection = options.allowHistoryIndexRecovery;
-    const auto prepared = MaiContextCompactor(options).prepare(
+    auto prepared = MaiContextCompactor(options).prepare(
         *mDependencies.store, *mDependencies.model, *mDependencies.context, mContext.sessionId,
         sourceHistory, std::move(request), cancel, buildContext);
     if (!prepared) return prepared.error();
+    // 此时才持久化真正将要发送的完整表示，丢弃的压缩候选不产生副作用。
+    auto& finalRequest = prepared.value().request;
+    std::map<std::string, ContextToolCapture> captures;
+    std::map<std::size_t, ContextToolProjection> generated;
+    std::size_t ordinal = 0;
+    for (auto& message : finalRequest.messages) {
+        if (message.role != MaiModelRole::ToolResult) continue;
+        const auto position = ordinal++;
+        const ContextToolSource identity{message.sourceMessageId, message.sourcePartId};
+        if (!fresh.count(identity)) continue;
+        const auto budget = candidateBudgets.at(identity);
+        if (budget == 0)
+            return {MaiErrorCode::InvalidInput,
+                        "No safe context budget remains for a new tool result; original results are retained."};
+        const auto& source = sources.at(identity);
+        message.content =
+            projectContextToolOutput(*mDependencies.store, mContext.sessionId, *source.message,
+                                     *source.part, *source.tool, budget, canRead, captures, true);
+        if (message.content.empty()) message.content = "(no output)";
+        if (source.tool->output.size() > budget)
+            generated[position] = {message.content, message.toolCallId, budget};
+    }
+    validateContextCaptures(*mDependencies.store, mContext.sessionId, finalRequest.messages,
+                            captures, generated);
+    const auto finalLimits = mDependencies.model->contextLimits(prepared.value().request.model);
+    const auto aggregateLimit =
+        finalLimits.contextWindowTokens == 0 ? kContextToolsBytes : kContextToolsMaximumBytes;
+    std::size_t toolBytes = 0;
+    for (const auto& message : prepared.value().request.messages) {
+        if (message.role != MaiModelRole::ToolResult) continue;
+        const ContextToolSource identity{message.sourceMessageId, message.sourcePartId};
+        if (!sources.count(identity)) continue;  // 旧记录及不支持固定表示的后端沿用原文。
+        if ((fresh.count(identity) && message.content.size() > kContextToolBytes) ||
+            message.content.size() > aggregateLimit - toolBytes)
+            return MaiError(
+                MaiErrorCode::InvalidInput,
+                "Tool results exceed the safe context budget and mandatory recovery references "
+                "cannot fit. Original results remain in conversation history. Compact or narrow "
+                "the context; do not repeat side effects just to recover output.");
+        toolBytes += message.content.size();
+    }
+    if (toolBytes != 0 && finalLimits.contextWindowTokens != 0) {
+        // 检查点摘要在 buildContext 外拼入；最终必须按完整请求核对 token 口径，
+        // 不能拿更早的字节分配目标冒充模型容量，也不能误拒绝合法的大窗口历史。
+        const auto window = finalLimits.contextWindowTokens;
+        const auto reserve = prepared.value().request.maxOutputTokens != 0
+                                 ? prepared.value().request.maxOutputTokens
+                                 : finalLimits.defaultOutputReserveTokens;
+        const auto effective = window / 100 * 95 + (window % 100) * 95 / 100;
+        const auto inputBudget = reserve < window ? std::min(effective, window - reserve) : 0;
+        const auto estimate = mDependencies.model->estimateInputTokens(prepared.value().request);
+        const double factor = !estimate.exact && std::isfinite(mContextEstimateMultiplier)
+                                  ? std::max(1.0, mContextEstimateMultiplier)
+                                  : 1.0;
+        if (static_cast<double>(estimate.tokens) * factor > inputBudget)
+            return MaiError(
+                MaiErrorCode::InvalidInput,
+                "The complete request exceeds the selected model's safe input capacity. "
+                "Original messages and tool results were retained; no user text was removed.");
+    }
+    if (cancel.load(std::memory_order_relaxed))
+        return {MaiErrorCode::Canceled, "Canceled before publishing model tool output."};
+    for (const auto& message : finalRequest.messages) {
+        if (message.role != MaiModelRole::ToolResult) continue;
+        const ContextToolSource identity{message.sourceMessageId, message.sourcePartId};
+        if (!fresh.count(identity)) continue;
+        const auto saved =
+            mDependencies.store->saveToolModelOutput(sources.at(identity).key, message.content);
+        if (!saved) return saved.error();
+        if (saved.value() != message.content)
+            return {
+                MaiErrorCode::Busy,
+                "Another request fixed a different tool output representation; rebuild context."};
+    }
     if (prepared.value().advancedCheckpoint)
         mCompactionDeferred = false;
     else if (prepared.value().deferredCompaction)
@@ -892,6 +1453,7 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         part.id = MaiIdGenerator::newPartId();
         part.created = MaiTime::getCurrentTime();
         MaiToolPart body;
+        body.modelOutputVersion = 1;
         body.tool = call.name;
         body.callId = call.id;
         body.input = call.arguments;
@@ -1059,6 +1621,7 @@ void MaiTurnRunner::executeParallelTools(const std::vector<MaiToolInvocation>& c
         part.id = MaiIdGenerator::newPartId();
         part.created = MaiTime::getCurrentTime();
         MaiToolPart tool;
+        tool.modelOutputVersion = 1;
         tool.tool = calls[i].name;
         tool.callId = calls[i].id;
         tool.input = calls[i].arguments;

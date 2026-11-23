@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <memory>
@@ -30,6 +31,15 @@ constexpr std::uint64_t kMegabyte = 1024 * 1024;
 constexpr std::uint64_t kMaximumTextBytes = 256 * 1024;
 constexpr std::uint64_t kMaximumHeaderBytes = 64 * 1024;
 constexpr std::size_t kMaximumLogBytes = 16 * 1024;
+constexpr std::size_t kMaximumFormFields = 12;
+constexpr const char* kSupportedArguments =
+    "Supported: one HTTP(S) URL/--url, -X/--request, -H/--header, -d/--data "
+    "(literal or @workspace-file), -T/--upload-file, -F/--form (name=value or "
+    "name=@workspace-file), --form-string, -A/--user-agent, -b/--cookie (string or "
+    "workspace file), -c/--cookie-jar (new workspace file), -L/--location, "
+    "--max-redirs (0..5), -I/--head, --compressed, -s/--silent, -i/--include, "
+    "-v/--verbose, -S/--show-error. Redirects require -L; cross-origin hops drop "
+    "custom headers, user-agent and explicit cookies. Verbose/include keep structured output.";
 std::mutex sCurlCommandMutex;
 
 struct TemporaryFiles {
@@ -40,7 +50,9 @@ struct TemporaryFiles {
 };
 
 bool isHttpUrl(const std::string& text) {
-    if (text.empty() || text.size() > 8192 || text.find_first_of("{}[]") != std::string::npos)
+    if (text.empty() || text.size() > 8192 || text.find_first_of("{}[]") != std::string::npos ||
+        std::any_of(text.begin(), text.end(),
+                    [](unsigned char ch) { return ch <= 32 || ch == 127; }))
         return false;
     CURLU* parsed = curl_url();
     if (!parsed) return false;
@@ -63,10 +75,70 @@ bool isHttpUrl(const std::string& text) {
 }
 
 bool validHeader(const std::string& header) {
-    if (header.empty() || header.size() > 4096 || header.find(':') == std::string::npos)
+    const std::size_t colon = header.find(':');
+    if (header.empty() || header.size() > 4096 || colon == std::string::npos || colon == 0 ||
+        header.front() == '@')
         return false;
+    for (std::size_t index = 0; index < colon; ++index) {
+        const unsigned char ch = header[index];
+        if (!std::isalnum(ch) && std::string("!#$%&'*+-.^_`|~").find(ch) == std::string::npos)
+            return false;
+    }
     return std::none_of(header.begin(), header.end(),
                         [](unsigned char ch) { return ch == '\r' || ch == '\n' || ch == 0; });
+}
+
+bool hasControls(const std::string& value) {
+    return std::any_of(value.begin(), value.end(),
+                       [](unsigned char ch) { return ch < 32 || ch == 127; });
+}
+
+// 间接文件引用仍受宿主授权和工作区边界双重约束，不能被 CLI 再解释为 stdin。
+std::string workspacePath(const MaiToolContext& context, const std::string& value) {
+    if (value.empty() || value == "-" || value.size() > 8192 || hasControls(value)) return {};
+    const std::string resolved = context.resolvePath(value);
+    return resolved.empty() ? std::string{} : maiResolvePathWithinRoot(context.root, resolved);
+}
+
+bool boundedFile(const std::string& path, std::uint64_t maximum, std::uint64_t& size) {
+    return !path.empty() && MaiFileSystem::fileSize(MaiFilePath::fromUtf8(path), size) &&
+           size <= maximum;
+}
+
+// 用 libcurl 自身解析相对 Location 和 origin；协议限制不能阻止自定义凭据头跨域。
+std::string resolvedRedirect(const std::string& base, const std::string& location) {
+    CURLU* parsed = curl_url();
+    if (!parsed) return {};
+    char* destination = nullptr;
+    std::string result;
+    if (curl_url_set(parsed, CURLUPART_URL, base.c_str(), 0) == CURLUE_OK &&
+        curl_url_set(parsed, CURLUPART_URL, location.c_str(), 0) == CURLUE_OK &&
+        curl_url_get(parsed, CURLUPART_URL, &destination, 0) == CURLUE_OK)
+        result = destination;
+    curl_free(destination);
+    curl_url_cleanup(parsed);
+    return isHttpUrl(result) ? result : std::string{};
+}
+
+std::string urlOrigin(const std::string& url) {
+    CURLU* parsed = curl_url();
+    if (!parsed) return {};
+    std::string origin;
+    if (curl_url_set(parsed, CURLUPART_URL, url.c_str(), 0) == CURLUE_OK) {
+        for (CURLUPart part : {CURLUPART_SCHEME, CURLUPART_HOST, CURLUPART_PORT}) {
+            char* value = nullptr;
+            if (curl_url_get(parsed, part, &value, CURLU_DEFAULT_PORT) != CURLUE_OK) {
+                origin.clear();
+                break;
+            }
+            origin += std::string(value) + "\n";
+            curl_free(value);
+        }
+    }
+    curl_url_cleanup(parsed);
+    std::transform(origin.begin(), origin.end(), origin.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return origin;
 }
 
 int checkCanceled(void* opaque) {
@@ -165,11 +237,11 @@ public:
                "connectivity, HTTP status and headers using the vendored in-process curl. "
                "For web search use web_search; for article extraction use web_fetch. Do not use "
                "curl to scrape search-engine result pages or bypass anti-bot challenges. Supported "
-               "arguments: one HTTP(S) URL, -X/--request, -H/--header, -d/--data (literal text), "
-               "-T/--upload-file (workspace file), -I/--head and --compressed. Other CLI "
-               "options are rejected. Use output_path for a new downloaded file; otherwise "
+               "arguments are bounded and listed below. Use output_path for a new downloaded file; "
+               "otherwise "
                "a bounded response body is returned. Set text_only=true to extract readable "
-               "text from HTML. Approval follows the Agent policy; full access does not prompt.";
+               "text from HTML. Approval follows the Agent policy; full access does not prompt. " +
+               std::string(kSupportedArguments);
     }
     std::string parametersSchema() const override {
         // arguments 是受限 curl 参数列表；output_path 指向新下载文件，text_only
@@ -213,10 +285,19 @@ public:
                                           "curl size or timeout is out of range");
 
         std::vector<std::string> options;
+        std::vector<std::string> customHeaders;
+        std::vector<std::string> cookieOptions;
+        std::vector<std::string> bodyOptions;
         std::string url;
         std::string method;
+        std::string cookieJar;
         bool hasData = false;
         bool hasUpload = false;
+        bool hasHead = false;
+        bool follow = false;
+        int maximumRedirects = 5;
+        std::size_t formFields = 0;
+        std::uint64_t formBytes = 0;
         const Json& arguments = request["arguments"];
         for (std::size_t index = 0; index < arguments.size(); ++index) {
             if (!arguments[index].is_string())
@@ -227,14 +308,18 @@ public:
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "invalid curl argument");
             if (option == "--url" || option == "-X" || option == "--request" || option == "-H" ||
                 option == "--header" || option == "-d" || option == "--data" || option == "-T" ||
-                option == "--upload-file") {
+                option == "--upload-file" || option == "-F" || option == "--form" ||
+                option == "--form-string" || option == "-A" || option == "--user-agent" ||
+                option == "-b" || option == "--cookie" || option == "-c" ||
+                option == "--cookie-jar" || option == "--max-redirs") {
                 if (++index >= arguments.size() || !arguments[index].is_string())
                     return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                                   "curl option needs one string value");
                 const std::string value = arguments[index].get<std::string>();
-                if (value.empty() || value.find('\0') != std::string::npos)
-                    return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                                  "curl option value is empty");
+                if (value.find('\0') != std::string::npos || value.size() > kMaximumTextBytes)
+                    return MaiToolResult::failure(
+                        MaiErrorCode::InvalidInput,
+                        "curl option value contains NUL or exceeds 256 KiB");
                 if (option == "--url") {
                     if (!url.empty())
                         return MaiToolResult::failure(MaiErrorCode::InvalidInput,
@@ -247,23 +332,33 @@ public:
                         return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                                       "unsupported HTTP method");
                     method = value;
-                    options.insert(options.end(), {"--request", value});
                 } else if (option == "-H" || option == "--header") {
                     if (!validHeader(value))
                         return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                                       "invalid HTTP header");
-                    options.insert(options.end(), {"--header", value});
+                    customHeaders.insert(customHeaders.end(), {"--header", value});
                 } else if (option == "-d" || option == "--data") {
                     if (hasData || value.size() > 256 * 1024)
                         return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                                       "literal request body is too large");
                     hasData = true;
-                    options.insert(options.end(), {"--data-raw", value});
-                } else {
+                    if (!value.empty() && value.front() == '@') {
+                        const std::string source = workspacePath(context, value.substr(1));
+                        std::uint64_t size = 0;
+                        if (!boundedFile(source, kMaximumTextBytes, size))
+                            return MaiToolResult::failure(
+                                MaiErrorCode::InvalidInput,
+                                "data file is outside workspace, inaccessible or exceeds 256 KiB");
+                        // 保留文件引用，二进制与换行由 curl 读取，不将文件内容复制进 argv。
+                        bodyOptions.insert(bodyOptions.end(), {"--data-binary", "@" + source});
+                    } else {
+                        bodyOptions.insert(bodyOptions.end(), {"--data-raw", value});
+                    }
+                } else if (option == "-T" || option == "--upload-file") {
                     if (hasUpload)
                         return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                                       "only one upload file is allowed");
-                    const std::string source = context.resolvePath(value);
+                    const std::string source = workspacePath(context, value);
                     std::uint64_t size = 0;
                     if (source.empty() ||
                         !MaiFileSystem::fileSize(MaiFilePath::fromUtf8(source), size) ||
@@ -271,21 +366,113 @@ public:
                         return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                                       "upload file is inaccessible or too large");
                     hasUpload = true;
-                    options.insert(options.end(), {"--upload-file", source});
+                    bodyOptions.insert(bodyOptions.end(), {"--upload-file", source});
+                } else if (option == "-F" || option == "--form" || option == "--form-string") {
+                    const std::size_t equals = value.find('=');
+                    if (++formFields > kMaximumFormFields || equals == std::string::npos ||
+                        equals == 0 || equals > 128 || hasControls(value) ||
+                        !std::all_of(value.begin(), value.begin() + equals, [](unsigned char ch) {
+                            return std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.' ||
+                                   ch == '[' || ch == ']';
+                        }))
+                        return MaiToolResult::failure(
+                            MaiErrorCode::InvalidInput,
+                            "form requires name=value or name=@file; at most 12 fields");
+                    const std::string field = value.substr(0, equals + 1);
+                    const std::string content = value.substr(equals + 1);
+                    if (option != "--form-string" && !content.empty() && content.front() == '@') {
+                        const std::string source = workspacePath(context, content.substr(1));
+                        std::uint64_t size = 0;
+                        // 不开放 curl multipart 的逗号列表和分号参数，避免隐藏的文件读取。
+                        if (source.find_first_of(",;\"") != std::string::npos ||
+                            !boundedFile(source, static_cast<std::uint64_t>(maximumMb) * kMegabyte,
+                                         size))
+                            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                                          "form file is inaccessible, too large or "
+                                                          "uses unsupported multipart parameters");
+                        formBytes += size;
+                        bodyOptions.insert(bodyOptions.end(),
+                                           {"--form", field + "@\"" + source + "\""});
+                    } else {
+                        if (option != "--form-string" && !content.empty() && content.front() == '<')
+                            return MaiToolResult::failure(
+                                MaiErrorCode::InvalidInput,
+                                "form file contents via < are unsupported; use @file or "
+                                "--form-string");
+                        formBytes += content.size();
+                        bodyOptions.insert(bodyOptions.end(), {"--form-string", value});
+                    }
+                    if (formBytes > static_cast<std::uint64_t>(maximumMb) * kMegabyte)
+                        return MaiToolResult::failure(
+                            MaiErrorCode::InvalidInput,
+                            "combined multipart body exceeds max_size_mb");
+                } else if (option == "-A" || option == "--user-agent") {
+                    if (value.size() > 1024 || hasControls(value))
+                        return MaiToolResult::failure(
+                            MaiErrorCode::InvalidInput,
+                            "user-agent must be at most 1024 bytes without controls");
+                    customHeaders.insert(customHeaders.end(), {"--user-agent", value});
+                } else if (option == "-b" || option == "--cookie") {
+                    if (!cookieOptions.empty() || value.empty() || value.size() > 4096 ||
+                        hasControls(value))
+                        return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                                      "cookie requires one bounded string or "
+                                                      "workspace file without controls");
+                    std::string cookie = value;
+                    if (value.find('=') == std::string::npos) {
+                        cookie = workspacePath(context, value);
+                        std::uint64_t size = 0;
+                        if (!boundedFile(cookie, kMaximumTextBytes, size))
+                            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                                          "cookie file is outside workspace, "
+                                                          "inaccessible or exceeds 256 KiB");
+                    }
+                    cookieOptions = {"--cookie", cookie};
+                } else if (option == "-c" || option == "--cookie-jar") {
+                    if (!cookieJar.empty())
+                        return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                                      "only one cookie jar is allowed");
+                    cookieJar = workspacePath(context, value);
+                    if (cookieJar.empty() ||
+                        MaiFileSystem::exists(MaiFilePath::fromUtf8(cookieJar)))
+                        return MaiToolResult::failure(
+                            MaiErrorCode::InvalidInput,
+                            "cookie jar requires a new authorized workspace path");
+                } else {
+                    if (value.size() != 1 || value.front() < '0' || value.front() > '5')
+                        return MaiToolResult::failure(
+                            MaiErrorCode::InvalidInput,
+                            "--max-redirs must be an integer from 0 to 5");
+                    maximumRedirects = value.front() - '0';
                 }
             } else if (option == "-I" || option == "--head" || option == "--compressed") {
+                if (option != "--compressed") hasHead = true;
                 options.push_back(option == "-I" ? "--head" : option);
+            } else if (option == "-L" || option == "--location") {
+                follow = true;
+            } else if (option == "--silent" || option == "--include" || option == "--verbose" ||
+                       option == "--show-error" ||
+                       (option.size() > 1 && option.size() <= 16 && option.front() == '-' &&
+                        option.find_first_not_of("sSivL", 1) == std::string::npos)) {
+                // JSON 已分别提供状态、头与响应体；不打开原生 verbose 的凭据转储。
+                if (option.find('L') != std::string::npos) follow = true;
             } else if (option[0] != '-' && url.empty()) {
                 url = option;
             } else {
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                              "unsupported curl CLI argument: " + option);
+                                              "unsupported curl CLI argument at index " +
+                                                  std::to_string(index) + ". " +
+                                                  kSupportedArguments);
             }
         }
-        if (!isHttpUrl(url) || (hasData && hasUpload) ||
-            (method == "HEAD" && (hasData || hasUpload)))
+        if (!isHttpUrl(url) || (hasData && hasUpload) || (formFields && (hasData || hasUpload)) ||
+            ((method == "HEAD" || hasHead) && (hasData || hasUpload || formFields)))
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                           "invalid URL or incompatible curl options");
+        if (method == "HEAD" && !hasHead) {
+            hasHead = true;
+            options.push_back("--head");
+        }
         const std::string requested = request.value("output_path", std::string{});
         if (!requested.empty() && MaiFilePath::fromUtf8(requested).isAbsolute())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
@@ -303,6 +490,15 @@ public:
         if (MaiFileSystem::createEmptyFile(temporary) || MaiFileSystem::createEmptyFile(headers))
             return MaiToolResult::failure(MaiErrorCode::Internal,
                                           "cannot create curl output files");
+        const MaiFilePath cookieTemporary =
+            MaiFilePath::fromUtf8(workspacePath(context, ".mai-curl-" + id + ".cookies"));
+        const bool keepCookies = follow || !cookieJar.empty();
+        if (keepCookies) {
+            if (cookieTemporary.isEmpty() || MaiFileSystem::createEmptyFile(cookieTemporary))
+                return MaiToolResult::failure(MaiErrorCode::Internal,
+                                              "cannot create private curl cookie jar");
+            cleanup.paths.push_back(cookieTemporary);
+        }
         const std::uint64_t maximumOutput = requested.empty()
                                                 ? kMaximumTextBytes
                                                 : static_cast<std::uint64_t>(maximumMb) * kMegabyte;
@@ -314,8 +510,8 @@ public:
                                             "=http,https",
                                             "--proto-redir",
                                             "=http,https",
-                                            "--max-time",
-                                            std::to_string(timeout),
+                                            "--max-redirs",
+                                            "5",
                                             "--connect-timeout",
                                             "10",
                                             "--max-filesize",
@@ -334,48 +530,121 @@ public:
             command.push_back("--ca-native");
         }
 #endif
-        command.insert(command.end(), options.begin(), options.end());
-        command.push_back(url);
-        std::vector<char*> argv;
-        argv.reserve(command.size() + 1);
-        for (std::string& option : command) argv.push_back(option.data());
-        argv.push_back(nullptr);
-
         std::unique_ptr<FILE, decltype(&std::fclose)> errors(std::tmpfile(), std::fclose);
         if (!errors)
             return MaiToolResult::failure(MaiErrorCode::Internal,
                                           "cannot create curl diagnostic stream");
         maiAssertBlockingAllowed("curl");
         int exitStatus = 0;
-        {
-            std::lock_guard<std::mutex> lock(sCurlCommandMutex);
-            mai_curl_set_cancel_check(checkCanceled, const_cast<MaiToolContext*>(&context));
-            mai_curl_set_error_file(errors.get());
-            exitStatus = mai_curl_execute(static_cast<int>(command.size()), argv.data());
-            mai_curl_set_error_file(nullptr);
-            mai_curl_set_cancel_check(nullptr, nullptr);
+        ResponseHeaders response;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+        bool loadPreviousCookies = false;
+        for (int redirects = 0;; ++redirects) {
+            const double remaining =
+                std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0 || context.isCanceled()) {
+                exitStatus =
+                    context.isCanceled() ? CURLE_ABORTED_BY_CALLBACK : CURLE_OPERATION_TIMEDOUT;
+                break;
+            }
+            std::vector<std::string> hop = command;
+            hop.insert(hop.end(), {"--max-time", std::to_string(remaining)});
+            hop.insert(hop.end(), options.begin(), options.end());
+            hop.insert(hop.end(), customHeaders.begin(), customHeaders.end());
+            hop.insert(hop.end(), cookieOptions.begin(), cookieOptions.end());
+            hop.insert(hop.end(), bodyOptions.begin(), bodyOptions.end());
+            if (!method.empty()) hop.insert(hop.end(), {"--request", method});
+            if (keepCookies) {
+                if (loadPreviousCookies)
+                    hop.insert(hop.end(), {"--cookie", cookieTemporary.toUtf8()});
+                hop.insert(hop.end(), {"--cookie-jar", cookieTemporary.toUtf8()});
+            }
+            hop.push_back(url);
+            std::vector<char*> argv;
+            argv.reserve(hop.size() + 1);
+            for (std::string& option : hop) argv.push_back(option.data());
+            argv.push_back(nullptr);
+            {
+                std::lock_guard<std::mutex> lock(sCurlCommandMutex);
+                mai_curl_set_cancel_check(checkCanceled, const_cast<MaiToolContext*>(&context));
+                mai_curl_set_error_file(errors.get());
+                exitStatus = mai_curl_execute(static_cast<int>(hop.size()), argv.data());
+                mai_curl_set_error_file(nullptr);
+                mai_curl_set_cancel_check(nullptr, nullptr);
+            }
+            if (exitStatus != 0) break;
+            std::string headerBytes;
+            bool headerTruncated = false;
+            const MaiError headerError = MaiFileSystem::readFile(
+                headers, headerBytes, kMaximumHeaderBytes, &headerTruncated);
+            response = headerError ? ResponseHeaders{} : parseResponseHeaders(headerBytes);
+            if (headerError || headerTruncated || response.status == 0)
+                return MaiToolResult::failure(MaiErrorCode::Protocol,
+                                              "curl returned no complete HTTP status");
+            if (keepCookies) {
+                std::uint64_t bytes = 0;
+                if (!boundedFile(cookieTemporary.toUtf8(), kMaximumTextBytes, bytes))
+                    return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                                  "curl cookie jar exceeds 256 KiB");
+            }
+            const std::string location = response.fields.value("location", std::string{});
+            if (!follow || location.empty() ||
+                (response.status != 301 && response.status != 302 && response.status != 303 &&
+                 response.status != 307 && response.status != 308))
+                break;
+            if (redirects >= maximumRedirects) {
+                exitStatus = CURLE_TOO_MANY_REDIRECTS;
+                break;
+            }
+            const std::string next = resolvedRedirect(url, location);
+            if (next.empty())
+                return MaiToolResult::failure(
+                    MaiErrorCode::InvalidInput,
+                    "redirect destination must be a valid HTTP(S) URL without credentials");
+            const std::string previousOrigin = urlOrigin(url);
+            const std::string nextOrigin = urlOrigin(next);
+            loadPreviousCookies = !previousOrigin.empty() && previousOrigin == nextOrigin;
+            if (!loadPreviousCookies) {
+                // 任意自定义头均可能含凭据，跨 origin 后永久移除，包括返回原站点的后续跳转。
+                customHeaders.clear();
+                cookieOptions.clear();
+            }
+            if ((response.status == 303 && method != "HEAD" && !hasHead) ||
+                ((response.status == 301 || response.status == 302) && !hasUpload)) {
+                bodyOptions.clear();
+                // 与原生 curl -X 一致：显式方法跨跳转保留；只有推导出的 POST 变为 GET。
+            }
+            url = next;
         }
         bool logTruncated = false;
-        const std::string log = readLog(errors.get(), logTruncated);
+        readLog(errors.get(), logTruncated);
         if (context.isCanceled())
             return MaiToolResult::failure(MaiErrorCode::Canceled, "curl was canceled");
         if (exitStatus != 0)
             return MaiToolResult::failure(
                 MaiErrorCode::Network,
-                Json{
-                    {"exit_status", exitStatus}, {"log_tail", log}, {"log_truncated", logTruncated}}
+                Json{// stderr 可含 URL、代理或 cookie 警告，不将其作为模型可见诊断返回。
+                     {"exit_status", exitStatus},
+                     {"log_tail", "curl transfer failed; raw diagnostics withheld"},
+                     {"log_truncated", logTruncated}}
                     .dump());
-
-        std::string headerBytes;
-        bool headerTruncated = false;
-        const MaiError headerError =
-            MaiFileSystem::readFile(headers, headerBytes, kMaximumHeaderBytes, &headerTruncated);
-        const ResponseHeaders response =
-            headerError ? ResponseHeaders{} : parseResponseHeaders(headerBytes);
         const int httpStatus = response.status;
-        if (headerError || headerTruncated || httpStatus == 0)
-            return MaiToolResult::failure(MaiErrorCode::Protocol,
-                                          "curl returned no complete HTTP status");
+        if (hasHead) {
+            // curl --head 会把原始头也写入 body 文件；只向模型交付过滤后的结构化头。
+            if (MaiFileSystem::writeFile(temporary, {}))
+                return MaiToolResult::failure(MaiErrorCode::Internal,
+                                              "cannot finalize structured HEAD response");
+        }
+        if (!cookieJar.empty()) {
+            const MaiFilePath destination = MaiFilePath::fromUtf8(cookieJar);
+            const MaiError directoryError = MaiFileSystem::createDirectories(destination.dirName());
+            if (directoryError)
+                return MaiToolResult::failure(directoryError.code(),
+                                              "cannot create cookie jar directory");
+            const MaiError published = MaiFileSystem::publishNewFile(cookieTemporary, destination);
+            if (published)
+                return MaiToolResult::failure(published.code(), "cannot publish new cookie jar");
+        }
         std::uint64_t received = 0;
         if (!MaiFileSystem::fileSize(temporary, received) || received > maximumOutput)
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,

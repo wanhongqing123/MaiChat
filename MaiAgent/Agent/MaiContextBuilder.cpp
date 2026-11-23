@@ -94,7 +94,8 @@ MaiContextBuilder::MaiContextBuilder(Options options) : mOptions(std::move(optio
 std::vector<MaiModelMessage> MaiContextBuilder::build(
     const std::vector<MaiMessage>& history, std::size_t firstMessage, std::size_t firstPart,
     const std::string& preservedUserMessageId, bool preserveReasoning,
-    const std::vector<std::string>& currentUserMessageIds) const {
+    const std::vector<std::string>& currentUserMessageIds,
+    const ToolOutputProjector& toolOutputProjector) const {
     std::vector<MaiModelMessage> out;
     if (firstMessage > history.size()) return out;
     if (firstPart != 0 &&
@@ -255,6 +256,18 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
                 toolResult.role = MaiModelRole::ToolResult;
                 toolResult.toolCallId = toolPart->callId;
                 toolResult.content = toolPart->output.empty() ? "(no output)" : toolPart->output;
+                toolResult.sourceMessageId = message.id;
+                const auto source =
+                    std::find_if(message.parts.begin(), message.parts.end(),
+                                 [toolPart](const MaiMessagePart& part) {
+                                     return std::get_if<MaiToolPart>(&part.body) == toolPart;
+                                 });
+                if (source != message.parts.end()) toolResult.sourcePartId = source->id;
+                if (toolOutputProjector) {
+                    if (source != message.parts.end())
+                        toolResult.content = toolOutputProjector(message, *source, *toolPart);
+                    if (toolResult.content.empty()) toolResult.content = "(no output)";
+                }
                 out.push_back(std::move(toolResult));
             }
             // 执行事实来自宿主/工具的独立字段，原始输出中的同名自述字段不可信。
@@ -377,7 +390,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
     for (std::size_t index = 0; index < out.size(); ++index) {
         MaiModelMessage& message = out[index];
         const std::size_t limit = message.role == MaiModelRole::ToolResult
-                                      ? mOptions.maxToolResultBytes
+                                      ? (toolOutputProjector ? 0 : mOptions.maxToolResultBytes)
                                   : index == latestUser ? mOptions.maxHistoryTextBytes
                                                         : mOptions.maxOlderMessageBytes;
         message.content =

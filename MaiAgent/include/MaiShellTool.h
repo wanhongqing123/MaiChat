@@ -6,6 +6,8 @@
 
 #include "MaiTool.h"
 
+class MaiShellSessionManager;
+
 // shell：跑一条命令。
 //
 // **平台不一定支持**（iOS 的沙箱不允许 exec）。注册之前先问
@@ -14,3 +16,7 @@
 // 只做执行前分类，不是操作系统沙箱，也不授予访问文件或启动进程的权限。
 bool maiShellCommandRequiresApproval(const std::string& command);
 std::unique_ptr<MaiTool> makeMaiShellTool();
+// 成对注册共享普通 manager；独立工厂保留给已有普通测试/宿主调用。
+std::unique_ptr<MaiTool> makeMaiShellTool(std::shared_ptr<MaiShellSessionManager> manager);
+std::unique_ptr<MaiTool> makeMaiShellInputTool(std::shared_ptr<MaiShellSessionManager> manager);
+void registerMaiShellTools(MaiToolRegistry& registry);

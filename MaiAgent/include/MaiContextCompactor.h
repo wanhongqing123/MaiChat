@@ -9,6 +9,7 @@
 
 #include "MaiContextBuilder.h"
 #include "MaiContextCheckpoint.h"
+#include "MaiContextStatus.h"
 #include "MaiError.h"
 #include "MaiModelClient.h"
 #include "MaiSessionStore.h"
@@ -24,6 +25,7 @@ struct MaiContextPreparation {
     // 本次请求含宿主生成的部分来源索引（新建或复用），不是模型已成功理解的语义摘要。
     // 调用方须保证 request 的真实工具能力可精确读取本会话原史；不会删除或改写原消息。
     bool usedHistoryIndexRecovery = false;
+    MaiContextStatus status;
 };
 
 // 普通 C++ 摘要入口，直接调用同一个供应商客户端，不依赖工具协议或服务端代理。
@@ -78,6 +80,10 @@ public:
         // HTTP 413 恢复专用的实际编码请求体预算；0 保持普通 token 策略。
         // 不向模型或计费 usage 把字节伪装成 token；候选必须同时满足两种容量。
         std::size_t requestByteBudget = 0;
+        // 在 prepare 的调用线程、模型流回调之外交付进度。不得抛异常；需要异步处理须
+        // 复制快照，不能保留引用。开始/完成/延后/失败均有状态，容量未知保持 0。
+        std::function<void(const MaiContextStatus&)> onStatus;
+
     };
 
     // 特殊宿主可注入“从消息/片段边界构建原文并保留指定 user”的同线程回调。
@@ -99,5 +105,10 @@ public:
                                              const BuildContext& buildContext = {}) const;
 
 private:
+    MaiResult<MaiContextPreparation> prepareImpl(
+        MaiSessionStore& store, MaiModelClient& model, const MaiContextBuilder& builder,
+        const std::string& sessionId, const std::vector<MaiMessage>& history,
+        MaiModelRequest request, const std::atomic<bool>& cancel, const BuildContext& buildContext,
+        MaiContextStatus& status) const;
     Options mOptions;
 };

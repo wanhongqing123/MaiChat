@@ -68,6 +68,144 @@ fs::path Fixture::native() const {
     return mPath;
 }
 
+void test_immediate_entries_include_typed_directories_without_descending() {
+    Fixture fixture;
+    fixture.write("top.txt", "top\n");
+    fixture.write("nested/deep.txt", "deep\n");
+    for (unsigned index = 0; index < 40; ++index)
+        fixture.write("third_party/file" + std::to_string(index) + ".txt", "vendor\n");
+    fixture.write("build-release/object", "generated\n");
+    MaiFileSearch service;
+    MaiFileNameSearchOptions options;
+    options.root = fixture.path();
+    options.query = "*";
+    options.recursive = false;
+    options.pageSize = 1;
+    options.budget.maxEntries = 8;
+    auto page = service.findFiles(options);
+    CHECK(!page.error && !page.partial && page.visitedEntries == 4);
+    CHECK(page.totalMatches && *page.totalMatches == 4);
+    CHECK(page.totalMatchingFiles && *page.totalMatchingFiles == 1);
+    std::size_t directories = 0, files = 0;
+    std::string nestedCursor;
+    for (;;) {
+        for (const auto& entry : page.files) {
+            if (entry.isDirectory)
+                ++directories;
+            else
+                ++files;
+            if (entry.path == "nested") nestedCursor = options.cursor;
+            CHECK(entry.path.find('/') == std::string::npos);
+        }
+        if (!page.hasMore) break;
+        options.cursor = page.nextCursor;
+        page = service.findFiles(options);
+        CHECK(!page.error && !page.partial && page.visitedEntries == 0);
+    }
+    CHECK(directories == 3 && files == 1);
+    CHECK(!nestedCursor.empty());
+    fixture.write("nested/added.txt", "new\n");
+    options.cursor = nestedCursor;
+    CHECK(service.findFiles(options).error.code() == MaiErrorCode::InvalidInput);
+}
+
+void test_enumeration_budget_keeps_work_metrics_and_content_phase_honest() {
+    Fixture fixture;
+    fixture.write("one.txt", "needle\n");
+    fixture.write("two.txt", "needle\n");
+    MaiFileSearch service;
+    MaiFileSearchCallbacks callbacks;
+    const auto root = fixture.path();
+    callbacks.pathAllowed = [root](const MaiFilePath& path) {
+        if (path != root) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return true;
+    };
+    MaiFileNameSearchOptions names;
+    names.root = root;
+    names.query = "*";
+    names.budget.maxMilliseconds = 2;
+    const auto namePage = service.findFiles(names, callbacks);
+    CHECK(namePage.partial && namePage.visitedEntries > 0);
+    CHECK(!namePage.totalMatches);
+    MaiFileContentSearchOptions content;
+    content.root = root;
+    content.pattern = "needle";
+    content.budget.maxMilliseconds = 2;
+    content.refresh = true;
+    const auto first = service.searchText(content, callbacks);
+    CHECK(first.partial && first.visitedEntries > 0 && first.searchedFiles == 0);
+    CHECK(!first.contentSearchStarted && first.matches.empty() && !first.totalMatches);
+}
+
+void test_totals_units_aggregation_budgets_and_replay() {
+    Fixture fixture;
+    fixture.write("one.cpp", "needle needle\nneedle\n");
+    fixture.write("two.cpp", "needle\n");
+    fixture.write("three.cpp", "needle\nneedle\nneedle\n");
+    MaiFileSearch search;
+    MaiFileNameSearchOptions names;
+    names.root = fixture.path();
+    names.query = "**/*.cpp";
+    names.pageSize = 1;
+    auto page = search.findFiles(names);
+    CHECK(page.files.size() == 1 && page.hasMore);
+    CHECK(page.totalMatches && *page.totalMatches == 3);
+    names.budget.maxEntries = 1;
+    names.refresh = true;
+    page = search.findFiles(names);
+    CHECK(page.partial && !page.totalMatches);
+    MaiFileContentSearchOptions options;
+    options.root = fixture.path();
+    options.pattern = "needle";
+    options.pageSize = 1;
+    for (auto mode : {MaiFileContentSearchMode::Lines, MaiFileContentSearchMode::Files,
+                      MaiFileContentSearchMode::Count}) {
+        options.mode = mode;
+        options.cursor.clear();
+        options.summaryOnly = false;
+        auto first = search.searchText(options);
+        CHECK(first.hasMore && !first.totalMatches);
+        const auto cursor = first.nextCursor;
+        options.cursor = cursor;
+        auto next = search.searchText(options);
+        auto replay = search.searchText(options);
+        CHECK(next.totalMatchesLowerBound == replay.totalMatchesLowerBound);
+        CHECK(replay.readBytes == 0 && replay.searchedFiles == 0);
+        while (next.hasMore) {
+            options.cursor = next.nextCursor;
+            next = search.searchText(options);
+        }
+        CHECK(next.totalMatches &&
+              *next.totalMatches == (mode == MaiFileContentSearchMode::Files ? 3u : 6u));
+        CHECK(next.totalMatchingFiles && *next.totalMatchingFiles == 3);
+        options.cursor.clear();
+        options.summaryOnly = true;
+        next = search.searchText(options);
+        CHECK(next.matches.empty() && !next.hasMore);
+        CHECK(next.totalMatches &&
+              *next.totalMatches == (mode == MaiFileContentSearchMode::Files ? 3u : 6u));
+        CHECK(next.totalMatchingFiles && *next.totalMatchingFiles == 3);
+    }
+    options.mode = MaiFileContentSearchMode::Lines;
+    options.budget.maxFiles = 1;
+    options.cursor.clear();
+    page = search.searchText(options);
+    CHECK(page.partial && page.hasMore && !page.totalMatches);
+    CHECK(page.totalMatchesLowerBound > 0 && page.totalMatchesLowerBound < 6);
+    while (page.hasMore) {
+        options.cursor = page.nextCursor;
+        page = search.searchText(options);
+    }
+    CHECK(page.totalMatches && *page.totalMatches == 6);
+    fixture.write("invalid.cpp", std::string("\xff", 1));
+    options.cursor.clear();
+    options.refresh = true;
+    options.budget.maxFiles = 100;
+    page = search.searchText(options);
+    CHECK(page.partial && !page.hasMore && !page.totalMatches);
+    CHECK(page.totalMatchesLowerBound == 6);
+}
+
 void test_full_line_literal_regex_and_context() {
     Fixture fixture;
     fixture.write("long.txt", "before\n" + std::string(480, 'x') + "NEEDLE" +
@@ -669,6 +807,9 @@ void test_regex_subset_agrees_with_ecmascript_for_short_text() {
 }  // namespace
 
 int main() {
+    test_immediate_entries_include_typed_directories_without_descending();
+    test_enumeration_budget_keeps_work_metrics_and_content_phase_honest();
+    test_totals_units_aggregation_budgets_and_replay();
     test_full_line_literal_regex_and_context();
     test_name_paging_ranking_filters_and_freshness();
     test_content_continuation_modes_and_budget();

@@ -114,6 +114,7 @@ size_t discardResponse(char*, size_t size, size_t count, void*) {
 struct Server {
     httplib::Server server;
     std::thread worker;
+    std::atomic<int> loopRequests{0};
     int port = 0;
 
     Server() {
@@ -130,9 +131,60 @@ struct Server {
         server.Get("/missing", [](const httplib::Request&, httplib::Response& response) {
             response.status = 404;
         });
+        server.Get("/redirect", [](const httplib::Request&, httplib::Response& response) {
+            response.set_redirect("/ok");
+        });
+        server.Get("/long-redirect", [](const httplib::Request&, httplib::Response& response) {
+            response.set_redirect("/long-asset?owned_rpc=" + std::string(4608, 'a'));
+        });
+        server.Get("/long-asset", [](const httplib::Request& request, httplib::Response& response) {
+            response.status = request.get_param_value("owned_rpc").size() == 4608 ? 200 : 400;
+            response.set_content("owned-release-asset", "application/octet-stream");
+        });
+        server.Get("/loop", [this](const httplib::Request&, httplib::Response& response) {
+            ++loopRequests;
+            response.set_redirect("/loop");
+        });
+        server.Get("/bad-proto", [](const httplib::Request&, httplib::Response& response) {
+            response.set_redirect("file:///unavailable");
+        });
+        server.Get("/same", [](const httplib::Request&, httplib::Response& response) {
+            response.set_redirect("/credentials");
+        });
+        server.Get("/cross", [this](const httplib::Request&, httplib::Response& response) {
+            response.set_redirect("http://localhost:" + std::to_string(port) + "/credentials");
+        });
+        server.Get("/credentials", [](const httplib::Request& request,
+                                      httplib::Response& response) {
+            response.set_header("Set-Cookie", "fixture=private; Path=/");
+            response.set_content(nlohmann::json{{"cookie", request.get_header_value("Cookie")},
+                                                {"secret", request.get_header_value("X-Api-Key")},
+                                                {"agent", request.get_header_value("User-Agent")}}
+                                     .dump(),
+                                 "application/json");
+        });
+        server.Post("/multipart", [](const httplib::Request& request, httplib::Response& response) {
+            response.set_content(nlohmann::json{{"file", request.get_file_value("upload").content},
+                                                {"title", request.get_file_value("title").content}}
+                                     .dump(),
+                                 "application/json");
+        });
         server.Post("/echo", [](const httplib::Request& request, httplib::Response& response) {
             response.set_content(request.body, "text/plain");
         });
+        for (int status : {303, 307}) {
+            server.Post("/redirect" + std::to_string(status),
+                        [status](const httplib::Request&, httplib::Response& response) {
+                            response.set_redirect("/echo-method", status);
+                        });
+        }
+        const auto echoMethod = [](const httplib::Request& request, httplib::Response& response) {
+            response.set_content(
+                nlohmann::json{{"method", request.method}, {"body", request.body}}.dump(),
+                "application/json");
+        };
+        server.Get("/echo-method", echoMethod);
+        server.Post("/echo-method", echoMethod);
         server.Put("/upload", [](const httplib::Request& request, httplib::Response& response) {
             response.set_content(std::to_string(request.body.size()), "text/plain");
         });
@@ -402,6 +454,171 @@ int main() {
         CHECK(nlohmann::json::parse(posted.output()).value("body", std::string{}) == "hello");
     const MaiFilePath upload = root.append(MaiFilePath::fromUtf8("input.bin"));
     CHECK(!MaiFileSystem::writeFile(upload, std::string(4096, 'u')));
+    // 同一个本地 fixture 覆盖新参数的真实请求，并验证跨主机重定向不转发凭据。
+    const auto call = [&](std::vector<std::string> arguments) {
+        return tool->execute(nlohmann::json{{"arguments", arguments}, {"timeout_s", 5}}.dump(),
+                             context);
+    };
+    const auto bodyOf = [](const MaiToolResult& value) {
+        return value.hasError()
+                   ? std::string{}
+                   : nlohmann::json::parse(value.output()).value("body", std::string{});
+    };
+    const auto redirect = call({server.url("/redirect")});
+    CHECK(!redirect.hasError());
+    CHECK(nlohmann::json::parse(redirect.output()).value("status", 0) == 302);
+    CHECK(bodyOf(call({"-L", server.url("/redirect")})) == "embedded curl");
+    const auto longRedirect = call({server.url("/long-redirect")});
+    CHECK(!longRedirect.hasError());
+    if (!longRedirect.hasError()) {
+        const auto result = nlohmann::json::parse(longRedirect.output());
+        CHECK(result.value("status", 0) == 302);
+        CHECK(result.value("body", std::string{}).empty());
+        CHECK(result["headers"].value("location", std::string{}).size() > 4608);
+    }
+    const auto longFollow = call({"-L", server.url("/long-redirect")});
+    CHECK(!longFollow.hasError());
+    CHECK(bodyOf(longFollow) == "owned-release-asset");
+    const auto longDownload =
+        tool->execute(nlohmann::json{{"arguments", {"-L", server.url("/long-redirect")}},
+                                     {"output_path", "long-asset.bin"}}
+                          .dump(),
+                      context);
+    CHECK(!longDownload.hasError());
+    std::string asset;
+    CHECK(!MaiFileSystem::readFile(root.append(MaiFilePath::fromUtf8("long-asset.bin")), asset));
+    CHECK(asset == "owned-release-asset");
+    std::printf("curl-long-redirect query_bytes=4608 default_status=302 follow_and_download=200\n");
+    const auto loop = call({"-L", server.url("/loop")});
+    CHECK(loop.hasError());
+    CHECK(toolCurlStatus(loop) == CURLE_TOO_MANY_REDIRECTS);
+    CHECK(server.loopRequests.load() == 6);
+    CHECK(bodyOf(call({"-L", "--max-redirs", "1", server.url("/redirect")})) == "embedded curl");
+    CHECK(toolCurlStatus(call({"-L", "--max-redirs", "0", server.url("/redirect")})) ==
+          CURLE_TOO_MANY_REDIRECTS);
+    CHECK(call({"-L", server.url("/bad-proto")}).hasError());
+    CHECK(call({"-L", "--max-redirs", "6", server.url("/ok")}).hasError());
+    const std::string payload = "{\"message\":\"local fixture\"}\n";
+    CHECK(!MaiFileSystem::writeFile(root.append(MaiFilePath::fromUtf8("payload.json")), payload));
+    CHECK(bodyOf(call({"-d", "@payload.json", server.url("/echo")})) == payload);
+    for (const bool explicitMethod : {false, true}) {
+        std::vector<std::string> arguments{"-L", "-d", "@payload.json"};
+        if (explicitMethod) arguments.insert(arguments.end(), {"-X", "POST"});
+        arguments.push_back(server.url("/redirect303"));
+        const auto redirected = call(arguments);
+        CHECK(!redirected.hasError());
+        if (!redirected.hasError()) {
+            const auto fields = nlohmann::json::parse(bodyOf(redirected));
+            CHECK(fields.value("method", std::string{}) == (explicitMethod ? "POST" : "GET"));
+            CHECK(fields.value("body", std::string{}).empty());
+        }
+    }
+    const auto preserved = call({"-L", "-d", "@payload.json", server.url("/redirect307")});
+    CHECK(!preserved.hasError());
+    if (!preserved.hasError()) {
+        const auto fields = nlohmann::json::parse(bodyOf(preserved));
+        CHECK(fields.value("method", std::string{}) == "POST");
+        CHECK(fields.value("body", std::string{}) == payload);
+    }
+    const auto multipart =
+        call({"-F", "upload=@input.bin", "-F", "title=example", server.url("/multipart")});
+    CHECK(!multipart.hasError());
+    if (!multipart.hasError()) {
+        const auto fields = nlohmann::json::parse(bodyOf(multipart));
+        CHECK(fields.value("file", std::string{}) == std::string(4096, 'u'));
+        CHECK(fields.value("title", std::string{}) == "example");
+    }
+    const auto cookies = call({"-s", "-i", "-v", "-A", "MaiFixture/1", "-b", "fixture=local-secret",
+                               "-c", "cookies.txt", server.url("/credentials")});
+    CHECK(!cookies.hasError());
+    if (!cookies.hasError()) {
+        const auto fields = nlohmann::json::parse(bodyOf(cookies));
+        CHECK(fields.value("cookie", std::string{}) == "fixture=local-secret");
+        CHECK(fields.value("agent", std::string{}) == "MaiFixture/1");
+        CHECK(!nlohmann::json::parse(cookies.output())["headers"].contains("set-cookie"));
+    }
+    CHECK(MaiFileSystem::exists(root.append(MaiFilePath::fromUtf8("cookies.txt"))));
+    const auto fileCookies = call({"-b", "cookies.txt", server.url("/credentials")});
+    CHECK(!fileCookies.hasError());
+    if (!fileCookies.hasError())
+        CHECK(nlohmann::json::parse(bodyOf(fileCookies)).value("cookie", std::string{}) ==
+              "fixture=private");
+    for (const auto& arguments : std::vector<std::vector<std::string>>{
+             {"-I", server.url("/credentials")}, {"-X", "HEAD", server.url("/credentials")}}) {
+        const auto head = call(arguments);
+        CHECK(!head.hasError());
+        CHECK(bodyOf(head).empty());
+        CHECK(head.output().find("fixture=private") == std::string::npos);
+    }
+    const auto same = call({"-L", "-H", "X-Api-Key: private-fixture", "-b", "fixture=local-secret",
+                            server.url("/same")});
+    CHECK(!same.hasError());
+    if (!same.hasError()) {
+        const auto fields = nlohmann::json::parse(bodyOf(same));
+        CHECK(fields.value("secret", std::string{}) == "private-fixture");
+        CHECK(fields.value("cookie", std::string{}) == "fixture=local-secret");
+    }
+    const auto cross = call({"-L", "-H", "X-Api-Key: private-fixture", "-b", "fixture=local-secret",
+                             server.url("/cross")});
+    CHECK(!cross.hasError());
+    if (!cross.hasError()) {
+        const auto fields = nlohmann::json::parse(bodyOf(cross));
+        CHECK(fields.value("secret", std::string{}) == "");
+        CHECK(fields.value("cookie", std::string{}) == "");
+    }
+    for (const auto& arguments : std::vector<std::vector<std::string>>{
+             {"-d", "@../outside", server.url("/echo")},
+             {"-F", "upload=@../outside", server.url("/multipart")},
+             {"-F", "upload=@input.bin;headers=@payload.json", server.url("/multipart")},
+             {"-b", "../outside", server.url("/ok")},
+             {"-c", "../outside", server.url("/ok")},
+             {"-c", "cookies.txt", server.url("/ok")},
+             {"-A", std::string(1025, 'a'), server.url("/ok")},
+             {"-H", "@C:/outside", server.url("/ok")},
+             {"-A", "agent\r\nInjected: bad", server.url("/ok")},
+             {"-b", std::string("secret=one\0two", 14), server.url("/ok")},
+             {"-k", server.url("/ok")}})
+        CHECK(call(arguments).hasError());
+    std::vector<std::string> tooManyFields;
+    for (int index = 0; index < 13; ++index) {
+        tooManyFields.push_back("-F");
+        tooManyFields.push_back("title=example");
+    }
+    tooManyFields.push_back(server.url("/multipart"));
+    CHECK(call(tooManyFields).hasError());
+    const auto unsupported = call({"--unknown-secret-fixture", server.url("/ok")});
+    CHECK(unsupported.hasError());
+    CHECK(unsupported.error().message().find("Supported:") != std::string::npos);
+    CHECK(unsupported.error().message().find("unknown-secret-fixture") == std::string::npos);
+    const auto failedCookies =
+        call({"-Lv", "-b", "fixture=diagnostic-secret", server.url("/loop")});
+    CHECK(failedCookies.hasError());
+    CHECK(failedCookies.error().message().find("diagnostic-secret") == std::string::npos);
+    CHECK(!MaiFileSystem::writeFile(root.append(MaiFilePath::fromUtf8("oversize.json")),
+                                    std::string(256 * 1024 + 1, 'x')));
+    CHECK(call({"-d", "@oversize.json", server.url("/echo")}).hasError());
+    CHECK(call({"-b", "oversize.json", server.url("/credentials")}).hasError());
+    CHECK(!MaiFileSystem::writeFile(root.append(MaiFilePath::fromUtf8("large.bin")),
+                                    std::string(1024 * 1024 + 1, 'x')));
+    CHECK(tool->execute(nlohmann::json{{"arguments",
+                                        {"-F", "upload=@large.bin", server.url("/multipart")}},
+                                       {"max_size_mb", 1}}
+                            .dump(),
+                        context)
+              .hasError());
+    const MaiFilePath outside = root.dirName().append(
+        MaiFilePath::fromUtf8(MaiIdGenerator::generate("curl-owned-outside-")));
+    CHECK(!MaiFileSystem::writeFile(outside, "owned outside-workspace fixture"));
+    // 外部文件确实存在；即使宿主允许更宽范围，间接网络上传仍必须留在工作区。
+    MaiToolContext broader = context;
+    broader.allowOutsideWorkingDirectory = true;
+    for (const auto& arguments : std::vector<std::vector<std::string>>{
+             {"-d", "@" + outside.toUtf8(), server.url("/echo")},
+             {"-F", "upload=@" + outside.toUtf8(), server.url("/multipart")},
+             {"-b", outside.toUtf8(), server.url("/credentials")},
+             {"-c", outside.toUtf8() + ".jar", server.url("/credentials")}})
+        CHECK(tool->execute(nlohmann::json{{"arguments", arguments}}.dump(), broader).hasError());
+    CHECK(!MaiFileSystem::removeFile(outside));
     const auto uploaded = tool->execute(
         nlohmann::json{{"arguments", {"--upload-file", "input.bin", server.url("/upload")}}}.dump(),
         context);

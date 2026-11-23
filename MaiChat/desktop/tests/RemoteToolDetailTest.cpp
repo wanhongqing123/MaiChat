@@ -159,7 +159,7 @@ void RemoteToolDetailTest::groupSummaryCategories_data() {
     QTest::newRow("active-shell-session-pair")
         << QStringList{"shell", "shell_input"} << QStringList{"completed", "completed"}
         << QStringLiteral("shell 调用 2 次 · 已完成");
-    // Public process tools and historical names share the shell category.
+    // Retired process tool names still occur in persisted transcripts.
     QTest::newRow("pure-shell-executors")
         << QStringList{"shell", "desktop_process_start", "desktop_process_read", "desktop_process_write", "desktop_process_stop"}
         << QStringList(5, QStringLiteral("completed")) << QStringLiteral("shell 调用 5 次 · 已完成");

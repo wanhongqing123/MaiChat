@@ -197,10 +197,12 @@ bool pathGlob(const std::string& pattern, const std::string& path, bool caseSens
 }
 
 bool defaultExcluded(const std::string& name) {
-    static const std::array<const char*, 11> names = {
-        ".git", ".hg",   ".svn", "node_modules", "__pycache__", ".venv",
-        "venv", "build", "dist", "target",       ".cache"};
-    return std::find(names.begin(), names.end(), name) != names.end();
+    static const std::array<const char*, 15> names = {
+        ".git", ".hg",    ".svn",   "node_modules", "__pycache__", ".venv",  "venv",   "build",
+        "dist", "target", ".cache", "third_party",  "third-party", "vendor", "vendors"};
+    return std::find(names.begin(), names.end(), name) != names.end() ||
+           name.compare(0, 6, "build-") == 0 || name.compare(0, 6, "build_") == 0 ||
+           name.compare(0, 12, "cmake-build-") == 0;
 }
 
 bool sameInfo(const MaiRegularFileInfo& first, const MaiRegularFileInfo& second) {
@@ -220,6 +222,7 @@ struct IndexedFile {
     MaiFilePath path;
     std::string relative;
     MaiRegularFileInfo info;
+    bool isDirectory = false;
 };
 
 struct TreeSnapshot {
@@ -250,7 +253,7 @@ bool ignoredBy(const IgnoreRule& rule, const std::string& path, bool directory) 
 
 TreeSnapshot collectTree(const MaiFilePath& root, const MaiFileSearchFilter& filter,
                          const MaiFileSearchBudget& budget, const MaiFileSearchCallbacks& callbacks,
-                         const Clock::time_point& start) {
+                         const Clock::time_point& start, bool recursive = true) {
     TreeSnapshot tree;
     tree.root = root;
     std::map<std::string, std::vector<IgnoreRule>> ignoreFiles;
@@ -334,6 +337,13 @@ TreeSnapshot collectTree(const MaiFilePath& root, const MaiFileSearchFilter& fil
                 return MaiWalkAction::Stop;
             }
             ++tree.observations.visitedEntries;
+            // 范围排除先于昂贵的真实路径/文件身份查询；排除项既不返回也不下钻。
+            // 递归搜索剪枝依赖目录；浅层列举保留目录名称，但仍不进入其内容。
+            if ((!filter.includeHidden && !entry.nameUtf8.empty() &&
+                 entry.nameUtf8.front() == '.') ||
+                (entry.isDirectory && recursive && filter.useDefaultExcludes &&
+                 defaultExcluded(entry.nameUtf8)))
+                return entry.isDirectory ? MaiWalkAction::SkipDirectory : MaiWalkAction::Continue;
             const auto resolved = MaiFileSystem::resolve(entry.path);
             const auto relative = entry.path.toGenericUtf8().substr(
                 rootText.size() + (rootText.empty() || rootText.back() != '/' ? 1 : 0));
@@ -342,17 +352,40 @@ TreeSnapshot collectTree(const MaiFilePath& root, const MaiFileSearchFilter& fil
                 addIssue(tree.observations, "path_denied_or_symlink", relative);
                 return entry.isDirectory ? MaiWalkAction::SkipDirectory : MaiWalkAction::Continue;
             }
+            // 子仓库/子模块是独立语料。默认递归范围不自动纳入整份上游源码；
+            // 显式将其设为 root 或关闭默认排除仍可检索，浅层列举保留其目录入口。
+            if (recursive && filter.useDefaultExcludes && entry.isDirectory) {
+                const auto marker = entry.path.append(MaiFilePath::fromUtf8(".git"));
+                if (MaiFileSystem::isSymbolicLink(marker) || MaiFileSystem::exists(marker)) {
+                    ++tree.observations.excludedNestedRepositories;
+                    if (tree.observations.excludedNestedRepositoryPaths.size() < 8) {
+                        std::string display = relative;
+                        if (display.size() > 256) {
+                            std::size_t end = 256;
+                            while (end && (static_cast<unsigned char>(display[end]) & 0xc0) == 0x80)
+                                --end;
+                            display.resize(end);
+                        }
+                        tree.observations.excludedNestedRepositoryPaths.push_back(
+                            std::move(display));
+                    }
+                    return MaiWalkAction::SkipDirectory;
+                }
+            }
             MaiRegularFileInfo info;
             if (!entry.isDirectory) {
                 if (!MaiFileSystem::regularFileInfo(entry.path, info)) {
                     addIssue(tree.observations, "not_regular_or_unreadable", relative);
                     return MaiWalkAction::Continue;
                 }
+            } else if (!recursive) {
+                const auto directory = MaiFileSystem::stat(entry.path);
+                if (!directory || !directory.value().isDirectory) {
+                    addIssue(tree.observations, "directory_metadata_unreadable", relative);
+                    return MaiWalkAction::SkipDirectory;
+                }
+                info = {0, directory.value().modified, directory.value().identity};
             }
-            if ((!filter.includeHidden && !entry.nameUtf8.empty() &&
-                 entry.nameUtf8.front() == '.') ||
-                (filter.useDefaultExcludes && entry.isDirectory && defaultExcluded(entry.nameUtf8)))
-                return entry.isDirectory ? MaiWalkAction::SkipDirectory : MaiWalkAction::Continue;
             std::vector<std::string> ancestors{std::string{}};
             const auto parent = parentName(relative);
             for (std::size_t separator = 0; separator < parent.size(); ++separator)
@@ -370,7 +403,7 @@ TreeSnapshot collectTree(const MaiFilePath& root, const MaiFileSearchFilter& fil
                 if (pathGlob(pattern, relative, true)) ignored = true;
             if (ignored)
                 return entry.isDirectory ? MaiWalkAction::SkipDirectory : MaiWalkAction::Continue;
-            if (entry.isDirectory) return MaiWalkAction::Continue;
+            if (entry.isDirectory && recursive) return MaiWalkAction::Continue;
             if (!filter.includeGlobs.empty() &&
                 std::none_of(
                     filter.includeGlobs.begin(), filter.includeGlobs.end(),
@@ -384,8 +417,8 @@ TreeSnapshot collectTree(const MaiFilePath& root, const MaiFileSearchFilter& fil
                 return MaiWalkAction::Stop;
             }
             tree.bytes += bytes;
-            tree.files.push_back({entry.path, relative, info});
-            return MaiWalkAction::Continue;
+            tree.files.push_back({entry.path, relative, info, entry.isDirectory});
+            return entry.isDirectory ? MaiWalkAction::SkipDirectory : MaiWalkAction::Continue;
         },
         [&](const MaiFilePath& path, const MaiError&) {
             const auto display = path.toGenericUtf8();
@@ -426,12 +459,13 @@ void appendKey(std::string& output, const std::string& value) {
 }
 
 std::string commonKey(const MaiFilePath& root, const MaiFileSearchFilter& filter,
-                      const MaiFileSearchBudget& budget) {
+                      const MaiFileSearchBudget& budget, bool recursive = true) {
     std::string key;
     appendKey(key, root.toGenericUtf8());
     appendKey(key, std::to_string(filter.includeHidden) +
                        std::to_string(filter.useDefaultExcludes) +
                        std::to_string(filter.respectGitIgnore));
+    appendKey(key, recursive ? "recursive" : "immediate_files");
     for (const auto& pattern : filter.includeGlobs) appendKey(key, "i" + pattern);
     for (const auto& pattern : filter.excludeGlobs) appendKey(key, "e" + pattern);
     appendKey(key, std::to_string(budget.maxEntries));
@@ -1014,6 +1048,7 @@ std::size_t pageBytes(const MaiFileSearchPage& page) {
             for (const auto& line : *context) bytes += line.text.size() + 64;
     }
     for (const auto& issue : page.issues) bytes += issue.path.size() + issue.reason.size() + 64;
+    for (const auto& path : page.excludedNestedRepositoryPaths) bytes += path.capacity() + 32;
     return bytes;
 }
 
@@ -1075,6 +1110,9 @@ struct MaiFileSearch::Impl {
         std::size_t filePosition = 0;
         std::size_t linePosition = 0;
         std::size_t fileMatches = 0;
+        std::size_t totalMatchedLines = 0;
+        std::size_t totalMatchingFiles = 0;
+        bool contentSearchStarted = false;
         std::string currentText;
         std::vector<TextPosition> currentLines;
         std::map<std::size_t, MaiFileSearchPage> pages;
@@ -1201,6 +1239,8 @@ bool MaiFileSearch::Impl::validatePage(const Session& session,
         if (isCanceled(callbacks) || expired(start, budget)) {
             page.canceled = isCanceled(callbacks);
             addIssue(page, page.canceled ? "canceled" : "time_budget_validating_page");
+            page.totalMatches.reset();
+            page.totalMatchingFiles.reset();
             page.files.clear();
             page.matches.clear();
             page.nextCursor.clear();
@@ -1215,11 +1255,24 @@ bool MaiFileSearch::Impl::validatePage(const Session& session,
         MaiRegularFileInfo info;
         if (found == session.tree->files.end() || found->relative != path) return false;
         const auto resolved = MaiFileSystem::resolve(found->path);
-        if (!isInside(session.tree->root, resolved) || MaiFileSystem::isSymbolicLink(found->path) ||
-            (callbacks.pathAllowed && !callbacks.pathAllowed(resolved)) ||
-            !MaiFileSystem::regularFileInfo(found->path, info) || !sameInfo(info, found->info)) {
+        const bool allowed = isInside(session.tree->root, resolved) &&
+                             !MaiFileSystem::isSymbolicLink(found->path) &&
+                             (!callbacks.pathAllowed || callbacks.pathAllowed(resolved));
+        bool identityMatches = false;
+        if (allowed && found->isDirectory) {
+            const auto directory = MaiFileSystem::stat(found->path);
+            if (directory && directory.value().isDirectory) {
+                info = {0, directory.value().modified, directory.value().identity};
+                identityMatches = sameInfo(info, found->info);
+            }
+        } else if (allowed)
+            identityMatches =
+                MaiFileSystem::regularFileInfo(found->path, info) && sameInfo(info, found->info);
+        if (!allowed || !identityMatches) {
             page.error = {MaiErrorCode::InvalidInput,
                           "Search result source changed or access was denied; refresh the search"};
+            page.totalMatches.reset();
+            page.totalMatchingFiles.reset();
             page.files.clear();
             page.matches.clear();
             page.nextCursor.clear();
@@ -1243,6 +1296,8 @@ void MaiFileSearch::Impl::save(Session& session, std::size_t pageNumber, MaiFile
     const auto id = session.id;
     if (!prune(id)) {
         addIssue(page, "cache_capacity");
+        page.totalMatches.reset();
+        page.totalMatchingFiles.reset();
         page.nextCursor.clear();
         page.hasMore = false;
         sessions.erase(id);
@@ -1282,7 +1337,7 @@ MaiFileSearchPage MaiFileSearch::findFiles(const MaiFileNameSearchOptions& optio
         page.error = {MaiErrorCode::InvalidInput, "Search root is missing, inaccessible or denied"};
         return page;
     }
-    auto corpusKey = commonKey(root, options.filter, options.budget);
+    auto corpusKey = commonKey(root, options.filter, options.budget, options.recursive);
     appendKey(corpusKey, options.scopeKey);
     auto key = corpusKey;
     appendKey(key, options.query);
@@ -1300,7 +1355,7 @@ MaiFileSearchPage MaiFileSearch::findFiles(const MaiFileNameSearchOptions& optio
     reused = static_cast<bool>(tree);
     if (!tree) {
         tree = std::make_shared<TreeSnapshot>(
-            collectTree(root, options.filter, options.budget, callbacks, start));
+            collectTree(root, options.filter, options.budget, callbacks, start, options.recursive));
         tree->corpusKey = corpusKey;
     }
     if (tree->observations.canceled) return tree->observations;
@@ -1319,6 +1374,9 @@ MaiFileSearchPage MaiFileSearch::findFiles(const MaiFileNameSearchOptions& optio
             return page;
         }
     } else {
+        // 排名不能丢掉已经做过的枚举工作；预算在收集阶段用尽时仍报告真实覆盖情况。
+        page = tree->observations;
+        if (reused) page.visitedEntries = 0;
         const auto scalarQuery = unicodeScalars(options.query, options.caseSensitive);
         Impl::Session fresh;
         fresh.id = mImpl->newId();
@@ -1335,7 +1393,7 @@ MaiFileSearchPage MaiFileSearch::findFiles(const MaiFileNameSearchOptions& optio
                                    ? fuzzyScore(scalarQuery, file.relative, options.caseSensitive)
                                : pathGlob(options.query, file.relative, options.caseSensitive) ? 0
                                                                                                : -1;
-            if (score >= 0) fresh.names.push_back({file.relative, score});
+            if (score >= 0) fresh.names.push_back({file.relative, score, file.isDirectory});
         }
         std::sort(fresh.names.begin(), fresh.names.end(),
                   [](const MaiFileNameMatch& first, const MaiFileNameMatch& second) {
@@ -1368,6 +1426,14 @@ MaiFileSearchPage MaiFileSearch::findFiles(const MaiFileNameSearchOptions& optio
         outputBytes += match.path.size() + 48;
         page.files.push_back(match);
         ++session->namePosition;
+    }
+    page.totalMatchesLowerBound = session->names.size();
+    page.totalMatchingFilesLowerBound = static_cast<std::size_t>(
+        std::count_if(session->names.begin(), session->names.end(),
+                      [](const MaiFileNameMatch& match) { return !match.isDirectory; }));
+    if (!page.partial && !page.canceled && !page.error) {
+        page.totalMatches = session->names.size();
+        page.totalMatchingFiles = page.totalMatchingFilesLowerBound;
     }
     page.hasMore = session->namePosition < session->names.size();
     page.cacheReused = !options.cursor.empty() || reused;
@@ -1444,7 +1510,8 @@ MaiFileSearchPage MaiFileSearch::searchText(const MaiFileContentSearchOptions& o
                        std::to_string(options.pageSize) + ":" +
                        std::to_string(options.contextBefore) + ":" +
                        std::to_string(options.contextAfter) + ":" +
-                       std::to_string(options.maxLineDisplayBytes));
+                       std::to_string(options.maxLineDisplayBytes) + ":" +
+                       std::to_string(options.summaryOnly));
     Impl::Session* session = nullptr;
     std::size_t pageNumber = 0;
     bool reused = false;
@@ -1488,6 +1555,9 @@ MaiFileSearchPage MaiFileSearch::searchText(const MaiFileContentSearchOptions& o
     // 取消时恢复原进度，重放旧游标不会丢掉本次已读取而未交付的行。
     const auto oldFile = session->filePosition, oldLine = session->linePosition,
                oldMatches = session->fileMatches;
+    const auto oldTotalLines = session->totalMatchedLines;
+    const auto oldTotalFiles = session->totalMatchingFiles;
+    const auto oldSearchStarted = session->contentSearchStarted;
     const auto oldText = session->currentText;
     const auto oldLines = session->currentLines;
     page = session->tree->observations;
@@ -1503,6 +1573,7 @@ MaiFileSearchPage MaiFileSearch::searchText(const MaiFileContentSearchOptions& o
         }
     }
     page.cacheReused = !options.cursor.empty() || reused;
+    page.contentSearchStarted = session->contentSearchStarted;
     std::uint64_t regexSteps = 0;
     std::size_t outputBytes = metadataReserve(options.budget);
     const auto needle = folded(options.pattern, options.caseSensitive);
@@ -1555,6 +1626,8 @@ MaiFileSearchPage MaiFileSearch::searchText(const MaiFileContentSearchOptions& o
                 addIssue(page, "read_budget");
                 break;
             }
+            session->contentSearchStarted = true;
+            page.contentSearchStarted = true;
             std::string bytes;
             bool truncated = false;
             const auto error =
@@ -1684,8 +1757,9 @@ MaiFileSearchPage MaiFileSearch::searchText(const MaiFileContentSearchOptions& o
                 ++session->linePosition;
                 continue;
             }
-            if (options.mode == MaiFileContentSearchMode::Count) {
-                ++session->fileMatches;
+            if (options.summaryOnly || options.mode == MaiFileContentSearchMode::Count) {
+                if (session->fileMatches++ == 0) ++session->totalMatchingFiles;
+                ++session->totalMatchedLines;
                 ++page.matchedLines;
                 ++session->linePosition;
                 continue;
@@ -1754,6 +1828,8 @@ MaiFileSearchPage MaiFileSearch::searchText(const MaiFileContentSearchOptions& o
             outputBytes += bytes;
             page.matches.push_back(std::move(match));
             ++page.matchedLines;
+            if (session->fileMatches++ == 0) ++session->totalMatchingFiles;
+            ++session->totalMatchedLines;
             ++session->linePosition;
             if (options.mode == MaiFileContentSearchMode::Files) {
                 session->linePosition = session->currentLines.size();
@@ -1772,7 +1848,8 @@ MaiFileSearchPage MaiFileSearch::searchText(const MaiFileContentSearchOptions& o
             continue;
         }
         if (session->linePosition == session->currentLines.size() && !stopPage) {
-            if (options.mode == MaiFileContentSearchMode::Count && session->fileMatches) {
+            if (!options.summaryOnly && options.mode == MaiFileContentSearchMode::Count &&
+                session->fileMatches) {
                 const auto bytes = file.relative.size() + 160;
                 if (page.matches.size() >= options.pageSize ||
                     (!page.matches.empty() &&
@@ -1802,6 +1879,9 @@ MaiFileSearchPage MaiFileSearch::searchText(const MaiFileContentSearchOptions& o
         session->filePosition = oldFile;
         session->linePosition = oldLine;
         session->fileMatches = oldMatches;
+        session->totalMatchedLines = oldTotalLines;
+        session->totalMatchingFiles = oldTotalFiles;
+        session->contentSearchStarted = oldSearchStarted;
         session->currentText = oldText;
         session->currentLines = oldLines;
         mImpl->prune();
@@ -1811,12 +1891,23 @@ MaiFileSearchPage MaiFileSearch::searchText(const MaiFileContentSearchOptions& o
         session->filePosition = oldFile;
         session->linePosition = oldLine;
         session->fileMatches = oldMatches;
+        session->totalMatchedLines = oldTotalLines;
+        session->totalMatchingFiles = oldTotalFiles;
+        session->contentSearchStarted = oldSearchStarted;
         session->currentText = oldText;
         session->currentLines = oldLines;
         mImpl->prune();
         return page;
     }
     page.hasMore = session->filePosition < session->tree->files.size();
+    page.totalMatchesLowerBound = options.mode == MaiFileContentSearchMode::Files
+                                      ? session->totalMatchingFiles
+                                      : session->totalMatchedLines;
+    page.totalMatchingFilesLowerBound = session->totalMatchingFiles;
+    if (!page.hasMore && !page.partial) {
+        page.totalMatches = page.totalMatchesLowerBound;
+        page.totalMatchingFiles = page.totalMatchingFilesLowerBound;
+    }
     // 当前文件最多受 maxFileBytes 限制；分页缓存及目录索引也计入淘汰预算。
     boundIssues(page, options.budget);
     session->skippedIssues.clear();

@@ -3,6 +3,8 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cwchar>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -121,7 +123,12 @@ bool MaiFileSystem::isDirectory(const MaiFilePath& path) {
 
 bool MaiFileSystem::isSymbolicLink(const MaiFilePath& path) {
     if (path.isEmpty()) return false;
-    const DWORD attributes = ::GetFileAttributesW(path.value().c_str());
+    auto native = path.value();
+    while (native.size() > 1 && MaiFilePath::isSeparator(native.back())) {
+        if (native.size() == 3 && native[1] == L':') break;
+        native.pop_back();
+    }
+    const DWORD attributes = ::GetFileAttributesW(native.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES &&
            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 }
@@ -377,6 +384,289 @@ MaiError MaiFileSystem::publishNewFile(const MaiFilePath& source, const MaiFileP
     if (::MoveFileExW(source.value().c_str(), destination.value().c_str(), MOVEFILE_WRITE_THROUGH))
         return {};
     return lastErrorAs("cannot publish file");
+}
+
+namespace {
+class MaiOwnedWindowsHandle {
+public:
+    explicit MaiOwnedWindowsHandle(HANDLE handle);
+    ~MaiOwnedWindowsHandle();
+    HANDLE get() const;
+
+private:
+    HANDLE mHandle;
+};
+MaiOwnedWindowsHandle::MaiOwnedWindowsHandle(HANDLE handle) : mHandle(handle) {}
+MaiOwnedWindowsHandle::~MaiOwnedWindowsHandle() {
+    if (mHandle != INVALID_HANDLE_VALUE) ::CloseHandle(mHandle);
+}
+HANDLE MaiOwnedWindowsHandle::get() const {
+    return mHandle;
+}
+
+MaiResult<MaiFileInfo> objectInfo(HANDLE handle) {
+    BY_HANDLE_FILE_INFORMATION data{};
+    FILE_BASIC_INFO basic{};
+    if (!::GetFileInformationByHandle(handle, &data) ||
+        !::GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic)))
+        return lastErrorAs("cannot inspect file");
+    if (::GetFileType(handle) != FILE_TYPE_DISK ||
+        (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        return {MaiErrorCode::InvalidInput, "requires a non-link ordinary file or directory"};
+    constexpr std::uint64_t epochOffset = 116444736000000000ull;
+    if (static_cast<std::uint64_t>(basic.LastWriteTime.QuadPart) < epochOffset)
+        return {MaiErrorCode::NotSupported, "modification time precedes supported epoch"};
+    MaiFileInfo info;
+    info.isDirectory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    info.sizeKnown = !info.isDirectory;
+    info.bytes = info.sizeKnown
+                     ? (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow
+                     : 0;
+    info.modified = (basic.LastWriteTime.QuadPart - epochOffset) / 10000000ull;
+    info.identity = std::to_string(data.dwVolumeSerialNumber) + ":" +
+                    std::to_string(data.nFileIndexHigh) + ":" + std::to_string(data.nFileIndexLow) +
+                    ":" + std::to_string(basic.LastWriteTime.QuadPart) + ":" +
+                    std::to_string(basic.ChangeTime.QuadPart);
+    return info;
+}
+
+bool isWindowsFilesystemRoot(const MaiFilePath& path) {
+    auto native = path.value();
+    std::replace(native.begin(), native.end(), L'/', L'\\');
+    if (native.compare(0, 4, L"\\\\?\\") == 0 || native.compare(0, 4, L"\\\\.\\") == 0) {
+        native.erase(0, 4);
+        const bool unc = native.size() >= 4 && (native[0] == L'U' || native[0] == L'u') &&
+                         (native[1] == L'N' || native[1] == L'n') &&
+                         (native[2] == L'C' || native[2] == L'c') && native[3] == L'\\';
+        if (unc)
+            native = L"\\\\" + native.substr(4);
+        else if (native.size() < 2 || native[1] != L':')
+            return true;
+    }
+    while (native.size() > 1 && native.back() == L'\\') native.pop_back();
+    if (native.empty() || native == L"\\" || (native.size() == 2 && native[1] == L':')) return true;
+    if (native.compare(0, 2, L"\\\\") != 0) return false;
+    // FilePath 的 UNC 前缀只认双斜杠，不能靠 dirName 识别共享根。这里纯词法拒绝，
+    // 在任何解析/网络 I/O 或递归枚举前挡住 server/share（也包括扩展 UNC 和 . / ..）。
+    std::vector<std::wstring> components;
+    for (std::size_t start = 2; start < native.size();) {
+        const auto end = native.find(L'\\', start);
+        const auto part = native.substr(start, end == std::wstring::npos ? end : end - start);
+        if (part == L"..") {
+            if (components.size() <= 2) return true;
+            components.pop_back();
+        } else if (!part.empty() && part != L".")
+            components.push_back(part);
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+    }
+    return components.size() <= 2;
+}
+
+MaiError validateTransfer(const MaiFilePath& source, const MaiFilePath& destination) {
+    if (source.isEmpty() || destination.isEmpty() ||
+        MaiFileSystem::resolve(source) == MaiFileSystem::resolve(destination))
+        return {MaiErrorCode::InvalidInput,
+                "source and destination must be distinct nonempty paths"};
+    if (MaiFileSystem::exists(destination) || MaiFileSystem::isSymbolicLink(destination))
+        return {MaiErrorCode::InvalidInput, "destination already exists; nothing was overwritten"};
+    if (MaiFileSystem::isSymbolicLink(source) ||
+        MaiFileSystem::isSymbolicLink(destination.dirName()))
+        return {MaiErrorCode::InvalidInput, "file transfer refuses symbolic links and junctions"};
+    return {};
+}
+
+MaiError deleteWindowsNode(const MaiFilePath& path, const MaiDirectoryDeleteOptions& options,
+                           MaiDirectoryDeleteResult& result, bool root, unsigned depth) {
+    if (depth > 256) return {MaiErrorCode::InvalidInput, "directory depth exceeds delete limit"};
+    if (options.isCanceled && options.isCanceled())
+        return {MaiErrorCode::Canceled, "directory deletion canceled; prior removals are retained"};
+    const auto realPath = MaiFileSystem::resolve(path);
+    if (realPath.isEmpty() || isWindowsFilesystemRoot(realPath) || realPath == realPath.dirName() ||
+        (options.pathAllowed && !options.pathAllowed(realPath)))
+        return {MaiErrorCode::InvalidInput, "directory deletion path was denied"};
+    // 不共享删除，防止枚举期间该节点被重命名或替换；最终也通过同一已验证句柄标记删除。
+    MaiOwnedWindowsHandle handle(
+        ::CreateFileW(path.value().c_str(), DELETE | FILE_READ_ATTRIBUTES,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (handle.get() == INVALID_HANDLE_VALUE) return lastErrorAs("cannot open delete target");
+    auto info = objectInfo(handle.get());
+    if (!info) return info.error();
+    if (root && (!info.value().isDirectory || (!options.expectedIdentity.empty() &&
+                                               options.expectedIdentity != info.value().identity)))
+        return {MaiErrorCode::InvalidInput,
+                "directory identity changed after approval or target is not a directory"};
+    if (info.value().isDirectory && options.recursive) {
+        WIN32_FIND_DATAW entry{};
+        const auto pattern = path.append(MaiFilePath(L"*"));
+        const HANDLE finder = ::FindFirstFileW(pattern.value().c_str(), &entry);
+        if (finder == INVALID_HANDLE_VALUE && ::GetLastError() != ERROR_FILE_NOT_FOUND)
+            return lastErrorAs("cannot enumerate delete directory");
+        if (finder != INVALID_HANDLE_VALUE) {
+            MaiError error;
+            do {
+                if (std::wcscmp(entry.cFileName, L".") == 0 ||
+                    std::wcscmp(entry.cFileName, L"..") == 0)
+                    continue;
+                if (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                    error = {MaiErrorCode::InvalidInput,
+                             "recursive deletion refuses symbolic links and junctions"};
+                    break;
+                }
+                error = deleteWindowsNode(path.append(MaiFilePath(entry.cFileName)), options,
+                                          result, false, depth + 1);
+                if (error) break;
+            } while (::FindNextFileW(finder, &entry));
+            const auto last = ::GetLastError();
+            ::FindClose(finder);
+            if (error) return error;
+            if (last != ERROR_NO_MORE_FILES) {
+                ::SetLastError(last);
+                return lastErrorAs("cannot finish delete enumeration");
+            }
+        }
+    }
+    if (options.isCanceled && options.isCanceled())
+        return {MaiErrorCode::Canceled, "directory deletion canceled; prior removals are retained"};
+    if (MaiFileSystem::resolve(path) != realPath ||
+        (options.pathAllowed && !options.pathAllowed(realPath)))
+        return {MaiErrorCode::InvalidInput, "delete path changed or access was denied"};
+    FILE_DISPOSITION_INFO disposition{TRUE};
+    if (!::SetFileInformationByHandle(handle.get(), FileDispositionInfo, &disposition,
+                                      sizeof(disposition)))
+        return lastErrorAs("cannot delete node (directory must be empty unless recursive is true)");
+    if (info.value().isDirectory)
+        ++result.removedDirectories;
+    else
+        ++result.removedFiles;
+    return {};
+}
+}  // namespace
+
+MaiResult<MaiFileInfo> MaiFileSystem::stat(const MaiFilePath& path) {
+    maiAssertBlockingAllowed("MaiFileSystem::stat");
+    if (path.isEmpty()) return {MaiErrorCode::InvalidInput, "empty stat path"};
+    if (isSymbolicLink(path))
+        return {MaiErrorCode::InvalidInput, "stat refuses symbolic links and junctions"};
+    MaiOwnedWindowsHandle handle(::CreateFileW(
+        path.value().c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (handle.get() == INVALID_HANDLE_VALUE) return lastErrorAs("cannot stat path");
+    return objectInfo(handle.get());
+}
+
+MaiError MaiFileSystem::moveFile(const MaiFilePath& source, const MaiFilePath& destination,
+                                 const std::string& expectedIdentity,
+                                 const std::function<bool()>& isCanceled) {
+    maiAssertBlockingAllowed("MaiFileSystem::moveFile");
+    auto error = validateTransfer(source, destination);
+    if (error) return error;
+    MaiOwnedWindowsHandle handle(
+        ::CreateFileW(source.value().c_str(), DELETE | FILE_READ_ATTRIBUTES,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (handle.get() == INVALID_HANDLE_VALUE) return lastErrorAs("cannot open move source");
+    const auto info = objectInfo(handle.get());
+    if (!info) return info.error();
+    if (info.value().isDirectory ||
+        (!expectedIdentity.empty() && expectedIdentity != info.value().identity))
+        return {MaiErrorCode::InvalidInput, "move requires an unchanged ordinary file"};
+    if (isCanceled && isCanceled())
+        return {MaiErrorCode::Canceled, "file move canceled before commit"};
+    const auto target = resolve(destination).value();
+    std::vector<unsigned char> storage(sizeof(FILE_RENAME_INFO) + target.size() * sizeof(wchar_t));
+    auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+    rename->ReplaceIfExists = FALSE;
+    rename->RootDirectory = nullptr;
+    rename->FileNameLength = static_cast<DWORD>(target.size() * sizeof(wchar_t));
+    std::copy(target.begin(), target.end(), rename->FileName);
+    if (::SetFileInformationByHandle(handle.get(), FileRenameInfo, rename,
+                                     static_cast<DWORD>(storage.size())))
+        return {};
+    if (::GetLastError() == ERROR_NOT_SAME_DEVICE)
+        return {MaiErrorCode::NotSupported,
+                "cross-filesystem move is not supported; source was retained"};
+    return lastErrorAs("cannot move file without overwriting");
+}
+
+MaiError MaiFileSystem::copyFile(const MaiFilePath& source, const MaiFilePath& destination,
+                                 const std::string& expectedIdentity,
+                                 const std::function<bool()>& isCanceled) {
+    maiAssertBlockingAllowed("MaiFileSystem::copyFile");
+    auto error = validateTransfer(source, destination);
+    if (error) return error;
+    auto sourceHandle = MaiFileReadHandle::open(source);
+    if (!sourceHandle) return sourceHandle.error();
+    const auto before = sourceHandle.value()->snapshot();
+    if (!before) return before.error();
+    if (!expectedIdentity.empty() && before.value().identity != expectedIdentity)
+        return {MaiErrorCode::InvalidInput, "copy source identity changed after approval"};
+    MaiFilePath temporary;
+    HANDLE output = INVALID_HANDLE_VALUE;
+    static std::atomic<std::uint64_t> sequence{0};
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        temporary = destination.dirName().append(
+            MaiFilePath::fromUtf8(".mai-copy-" + std::to_string(::GetCurrentProcessId()) + "-" +
+                                  std::to_string(++sequence)));
+        output = ::CreateFileW(temporary.value().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (output != INVALID_HANDLE_VALUE) break;
+        if (::GetLastError() != ERROR_FILE_EXISTS && ::GetLastError() != ERROR_ALREADY_EXISTS)
+            return lastErrorAs("cannot create private copy staging file");
+    }
+    if (output == INVALID_HANDLE_VALUE)
+        return lastErrorAs("cannot allocate private copy staging file");
+    std::uint64_t offset = 0;
+    bool eof = false;
+    while (!error && !eof) {
+        if (isCanceled && isCanceled()) {
+            error = {MaiErrorCode::Canceled, "file copy canceled before publication"};
+            break;
+        }
+        std::string bytes;
+        error = sourceHandle.value()->readAt(offset, 64 * 1024, bytes, &eof);
+        if (error) break;
+        std::size_t done = 0;
+        while (done < bytes.size()) {
+            DWORD written = 0;
+            if (!::WriteFile(output, bytes.data() + done, static_cast<DWORD>(bytes.size() - done),
+                             &written, nullptr) ||
+                written == 0) {
+                error = lastErrorAs("cannot write copied bytes");
+                break;
+            }
+            done += written;
+        }
+        offset += bytes.size();
+    }
+    if (!error) error = sourceHandle.value()->validate(before.value());
+    if (!error && !::FlushFileBuffers(output)) error = lastErrorAs("cannot flush copied bytes");
+    if (!::CloseHandle(output) && !error) error = lastErrorAs("cannot close copied file");
+    if (!error && isCanceled && isCanceled())
+        error = {MaiErrorCode::Canceled, "file copy canceled before publication"};
+    if (!error) error = publishNewFile(temporary, destination);
+    if (error && !::DeleteFileW(temporary.value().c_str()) &&
+        ::GetLastError() != ERROR_FILE_NOT_FOUND)
+        return {error.code(),
+                error.message() + "; could not remove private staging file: " + temporary.toUtf8()};
+    return error;
+}
+
+MaiDirectoryDeleteResult MaiFileSystem::deleteDirectory(const MaiFilePath& path,
+                                                        const MaiDirectoryDeleteOptions& options) {
+    maiAssertBlockingAllowed("MaiFileSystem::deleteDirectory");
+    MaiDirectoryDeleteResult result;
+    if (isWindowsFilesystemRoot(path))
+        result.error = {MaiErrorCode::InvalidInput,
+                        "directory deletion refuses filesystem and UNC share roots"};
+    else if (isSymbolicLink(path))
+        result.error = {MaiErrorCode::InvalidInput,
+                        "directory deletion refuses symbolic links and junctions"};
+    else
+        result.error = deleteWindowsNode(path, options, result, true, 0);
+    return result;
 }
 
 MaiError MaiFileSystem::createDirectories(const MaiFilePath& path) {

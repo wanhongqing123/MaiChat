@@ -292,6 +292,7 @@ private:
     std::optional<std::uint64_t> mEofOffset;
     bool mBufferEof = false;
     std::uint64_t mBufferOffset = 0;
+    std::size_t mReadBytes = 4096;
     std::string mBytes;
     std::string mLegacyText;
     std::vector<unsigned char> mLegacySourceWidths;
@@ -319,7 +320,9 @@ MaiError MaiTextFileBuffer::ensure(std::uint64_t offset) {
     mLegacyText.clear();
     mLegacySourceWidths.clear();
     mLegacyUtf8Offsets.clear();
-    const auto error = mHandle.readAt(offset, kBufferBytes, mBytes, &mBufferEof);
+    const auto error = mHandle.readAt(offset, mReadBytes, mBytes, &mBufferEof);
+    // 小页先读 4KiB；持续扫描长行/大前缀时按需增长，避免每个字符或小块一次系统调用。
+    if (mReadBytes < kBufferBytes) mReadBytes = std::min<std::size_t>(kBufferBytes, mReadBytes * 4);
     if (error) return error;
     if (mBufferEof) mEofOffset = offset + mBytes.size();
     return {};
@@ -328,6 +331,9 @@ MaiError MaiTextFileBuffer::ensure(std::uint64_t offset) {
 MaiResult<std::string> MaiTextFileBuffer::prefix() {
     const auto error = ensure(0);
     if (error) return error;
+    // 固定探测窗口与 limit 无关，续读始终沿用已保存编码；超过窗口的歧义明确报错。
+    // 大页/跳过前缀下一块恢复 64KiB，小页若继续扫描则逐步增大。
+    if (mOptions.limit > 8 || mOptions.offset > 1) mReadBytes = kBufferBytes;
     return mBytes;
 }
 

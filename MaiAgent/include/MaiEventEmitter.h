@@ -20,6 +20,11 @@
 // 像在取 session，而它其实是在发事件。
 class MaiEventEmitter {
 public:
+    // 调用方先保存原始轮次状态，订阅者收到通知后按 turnId 查询，不从消息段推断终态。
+    void emitTurnOutcome(const std::string& sessionId, const std::string& turnId,
+                         const std::optional<MaiContextStatus>& context = {});
+    void emitContextStatus(const std::string& sessionId, const std::string& turnId,
+                           const MaiContextStatus& status);
     explicit MaiEventEmitter(MaiEventBus& bus);
 
     // field 仅用于 SessionUpdated；缺省空值表示未分类，宿主必须按未知更新撤销旧授权。

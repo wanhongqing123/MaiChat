@@ -1,0 +1,15 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+
+MaiChat includes adapted POSIX shell startup and non-evaluating ENV path expansion
+logic derived from OpenAI Codex, licensed under the Apache License, Version 2.0.
+
+Upstream: https://github.com/openai/codex
+Reference commit: 553c764e8b99fa519e9c6eb9b657875ef0f5e1c1
+Source files:
+  codex-rs/shell-command/src/startup.rs
+  codex-rs/shell-command/src/shell_snapshot.rs
+
+Modified for MaiChat's fresh-per-command startup, internal helper names, native
+Windows/MSYS path handling, and explicit working-directory restoration.
+The accompanying LICENSE contains the full Apache License, Version 2.0.

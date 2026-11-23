@@ -7,6 +7,16 @@ bool maiIsResponseBoundaryPart(const MaiMessagePart& part) {
     return part.created == 0 && reasoning && reasoning->text.empty() && !reasoning->continuation;
 }
 
+const char* maiTurnStatusToString(MaiTurnStatus status) {
+    switch (status) {
+        case MaiTurnStatus::Running: return "running";
+        case MaiTurnStatus::Completed: return "completed";
+        case MaiTurnStatus::Failed: return "failed";
+        case MaiTurnStatus::Interrupted: return "interrupted";
+    }
+    return "unknown";
+}
+
 const char* maiToolStateToString(MaiToolState state) {
     switch (state) {
         case MaiToolState::Pending: return "pending";

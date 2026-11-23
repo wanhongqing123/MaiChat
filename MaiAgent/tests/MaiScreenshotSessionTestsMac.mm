@@ -45,7 +45,10 @@ CMSampleBufferRef stateSample(SCFrameStatus status) {
 void inject(const std::shared_ptr<StreamState>& state, SCFrameStatus status) {
     CMSampleBufferRef sample = stateSample(status);
     STATE_CHECK(sample != nullptr);
-    const DesktopAvailability available{true, true, true, true, false};
+    const DesktopAvailability available{
+        MaiScreenshotObservation::True, MaiScreenshotObservation::True,
+        MaiScreenshotObservation::True, MaiScreenshotObservation::True,
+        MaiScreenshotObservation::False};
     if (sample) {
         receiveFrame(state, state->generation, sample, &available);
         CFRelease(sample);
@@ -91,8 +94,9 @@ void terminalCannotRevive(int terminal, SCFrameStatus soft) {
         inject(state, SCFrameStatusStopped);
     } else {
         std::lock_guard<std::mutex> lock(state->mutex);
-        rejectDesktopLocked(*state,
-                            MaiError::make(MaiErrorCode::NotConfigured, "test unavailable"));
+        DesktopAvailability denied;
+        denied.guiSession = MaiScreenshotObservation::False;
+        checkAvailabilityLocked(*state, denied, MaiScreenshotCheckPhase::Worker);
     }
     STATE_CHECK(state->failed);
     const auto received = counts.value.framesReceived;
@@ -105,6 +109,21 @@ void terminalCannotRevive(int terminal, SCFrameStatus soft) {
 }  // namespace
 int main() {
     @autoreleasepool {
+        // 只验证供应器对缺失/错误类型的解释，不读取当前会话或系统权限。
+        CFMutableDictionaryRef session = CFDictionaryCreateMutable(
+            nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        STATE_CHECK(sessionBoolean(session, kCGSessionOnConsoleKey) ==
+                    MaiScreenshotObservation::Unknown);
+        CFDictionarySetValue(session, kCGSessionOnConsoleKey, CFSTR("true"));
+        STATE_CHECK(sessionBoolean(session, kCGSessionOnConsoleKey) ==
+                    MaiScreenshotObservation::Unknown);
+        CFDictionarySetValue(session, kCGSessionOnConsoleKey, kCFBooleanFalse);
+        STATE_CHECK(sessionBoolean(session, kCGSessionOnConsoleKey) ==
+                    MaiScreenshotObservation::False);
+        CFDictionarySetValue(session, kCGSessionOnConsoleKey, kCFBooleanTrue);
+        STATE_CHECK(sessionBoolean(session, kCGSessionOnConsoleKey) ==
+                    MaiScreenshotObservation::True);
+        CFRelease(session);
         stateRace(SCFrameStatusBlank);
         stateRace(SCFrameStatusSuspended);
         stateRace(SCFrameStatusStopped);
@@ -113,15 +132,18 @@ int main() {
             terminalCannotRevive(terminal, SCFrameStatusBlank);
             terminalCannotRevive(terminal, SCFrameStatusSuspended);
         }
-        const DesktopAvailability available{true, true, true, true, false};
+        const DesktopAvailability available{
+            MaiScreenshotObservation::True, MaiScreenshotObservation::True,
+            MaiScreenshotObservation::True, MaiScreenshotObservation::True,
+            MaiScreenshotObservation::False};
         STATE_CHECK(desktopCanCapture(available));
         for (int field = 0; field < 5; ++field) {
             auto denied = available;
-            if (field == 0) denied.guiSession = false;
-            if (field == 1) denied.onConsole = false;
-            if (field == 2) denied.loginDone = false;
-            if (field == 3) denied.frontmostKnown = false;
-            if (field == 4) denied.loginWindow = true;
+            if (field == 0) denied.guiSession = MaiScreenshotObservation::False;
+            if (field == 1) denied.onConsole = MaiScreenshotObservation::False;
+            if (field == 2) denied.loginDone = MaiScreenshotObservation::False;
+            if (field == 3) denied.frontmostKnown = MaiScreenshotObservation::False;
+            if (field == 4) denied.loginWindow = MaiScreenshotObservation::True;
             STATE_CHECK(!desktopCanCapture(denied));
             CaptureCounters counts;
             auto state = std::make_shared<StreamState>(counts);
@@ -131,6 +153,11 @@ int main() {
             receiveFrame(state, state->generation, sample, &denied);
             CFRelease(sample);
             STATE_CHECK(!state->pixels && !frameStampIsCurrent(*state, old));
+            STATE_CHECK(state->error.code() == MaiErrorCode::Busy);
+            STATE_CHECK(counts.value.failed);
+            STATE_CHECK(counts.value.availability.hasRejection);
+            STATE_CHECK(counts.value.availability.lastRejection.phase ==
+                        MaiScreenshotCheckPhase::Frame);
         }
         {
             CaptureCounters counts;

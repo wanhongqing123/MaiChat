@@ -162,6 +162,18 @@ mkdir -p "$code_font_licenses_dir"
 cp "$code_font_license" "$code_font_licenses_dir/LICENSE-SarasaFixedSC.txt"
 cmp "$code_font_license" "$code_font_licenses_dir/LICENSE-SarasaFixedSC.txt"
 
+# Preserve the Apache license/notice for the adapted native shell startup helper.
+for codex_notice in LICENSE NOTICE; do
+  codex_notice_source="$repo_root/MaiAgent/third_party/codex-shell/$codex_notice"
+  codex_notice_target="$code_font_licenses_dir/CODEX_SHELL_$codex_notice.txt"
+  if [[ ! -f "$codex_notice_source" ]]; then
+    echo "Missing Codex shell notice: $codex_notice_source" >&2
+    exit 1
+  fi
+  cp "$codex_notice_source" "$codex_notice_target"
+  cmp "$codex_notice_source" "$codex_notice_target"
+done
+
 trtc_root="$project_root/vendor/tencent-trtc/macos/TXLiteAVSDK_TRTC_Mac"
 trtc_slice="macos-arm64_x86_64"
 trtc_target_dir="$staged_app/Contents/Frameworks"

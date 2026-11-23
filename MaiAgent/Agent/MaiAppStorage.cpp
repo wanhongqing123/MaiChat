@@ -217,6 +217,8 @@ public:
     std::int64_t createdAt = 0;
     std::array<MaiFilePath, 3> previewRoots;
     std::vector<Candidate> candidates;
+    // 统计与公开候选保留在普通服务，分页读取不创建第二套工具侧审批状态。
+    MaiAppStoragePreview preview;
 
     MaiResult<std::array<MaiFilePath, 3>> roots(const MaiAppStorageContext& context) const {
         const auto work = context.workspace.empty() ? paths.workspace : context.workspace;
@@ -270,7 +272,11 @@ MaiResult<MaiAppStoragePreview> MaiAppStorage::preview(const MaiAppStorageSelect
         const auto& root = roots[index];
         // 显式 scope 不允许借中间目录链接跳出根目录；枚举也不跟随任何链接。
         if (!selection.scope.empty() && selection.scope.find('*') == std::string::npos) {
-            const auto scoped = root.append(MaiFilePath::fromUtf8(selection.scope));
+            // 协议使用 /，原生 Windows 路径使用反斜线；逐段拼接只统一分隔符，
+            // 仍保留后面的逐级链接拒绝、解析相等及根目录边界检查。
+            auto scoped = root;
+            for (const auto& component : components(selection.scope))
+                scoped = scoped.append(MaiFilePath::fromUtf8(component));
             if (!withinWithoutLinks(root, scoped))
                 return {MaiErrorCode::InvalidInput,
                         "scope contains a symbolic link or leaves its root"};
@@ -278,50 +284,64 @@ MaiResult<MaiAppStoragePreview> MaiAppStorage::preview(const MaiAppStorageSelect
         MaiAppStorageSummary summary;
         summary.target = names[index];
         std::size_t visited = 0;
-        MaiFileSystem::walk(root, [&](const MaiFileEntry& entry) {
-            if (canceled(context) || ++visited > kMaximumFiles) {
+        MaiFileSystem::walk(
+            root,
+            [&](const MaiFileEntry& entry) {
+                if (canceled(context) || ++visited > kMaximumFiles) {
+                    summary.truncated = true;
+                    return MaiWalkAction::Stop;
+                }
+                const auto relative = relativeTo(root, entry.path);
+                if (MaiFileSystem::isSymbolicLink(entry.path)) return MaiWalkAction::SkipDirectory;
+                if (entry.isDirectory) {
+                    if (!mayContainSelection(selection, relative))
+                        return MaiWalkAction::SkipDirectory;
+                    if (selection.target == MaiAppStorageTarget::Workspace &&
+                        !workspaceFamily(relative) && relative != ".maiagent")
+                        return MaiWalkAction::SkipDirectory;
+                    return MaiWalkAction::Continue;
+                }
+                if (!selected(selection, relative)) return MaiWalkAction::Continue;
+                MaiRegularFileInfo info;
+                if (!withinWithoutLinks(root, entry.path) ||
+                    !MaiFileSystem::regularFileInfo(entry.path, info)) {
+                    ++summary.scanErrorCount;
+                    summary.truncated = true;
+                    return MaiWalkAction::Continue;
+                }
+                ++summary.files;
+                summary.bytes += info.bytes;
+                const bool allowed =
+                    index != 2 || (selection.target == MaiAppStorageTarget::Workspace &&
+                                   workspaceIntermediateFile(relative));
+                if (!allowed) {
+                    ++summary.excludedPolicyFiles;
+                    summary.excludedPolicyBytes += info.bytes;
+                } else if (info.modified <= 0 || info.modified > cutoff) {
+                    ++summary.excludedRecentFiles;
+                    summary.excludedRecentBytes += info.bytes;
+                } else if (protectedFile(entry.path, relative, context,
+                                         boundedSelection(selection))) {
+                    ++summary.excludedProtectedFiles;
+                    summary.excludedProtectedBytes += info.bytes;
+                } else {
+                    ++summary.eligibleFiles;
+                    summary.eligibleBytes += info.bytes;
+                    if (candidates.size() < kMaximumCandidates)
+                        candidates.push_back({{entry.path.toUtf8(), relative, names[index],
+                                               info.bytes, info.modified},
+                                              info,
+                                              root});
+                    else
+                        result.limited = true;
+                }
+                return MaiWalkAction::Continue;
+            },
+            [&](const MaiFilePath&, const MaiError&) {
+                // 遍历失败不是空目录；保留已观察统计，同时明确其不是完整覆盖。
+                ++summary.scanErrorCount;
                 summary.truncated = true;
-                return MaiWalkAction::Stop;
-            }
-            const auto relative = relativeTo(root, entry.path);
-            if (MaiFileSystem::isSymbolicLink(entry.path)) return MaiWalkAction::SkipDirectory;
-            if (entry.isDirectory) {
-                if (!mayContainSelection(selection, relative)) return MaiWalkAction::SkipDirectory;
-                if (selection.target == MaiAppStorageTarget::Workspace &&
-                    !workspaceFamily(relative) && relative != ".maiagent")
-                    return MaiWalkAction::SkipDirectory;
-                return MaiWalkAction::Continue;
-            }
-            if (!selected(selection, relative)) return MaiWalkAction::Continue;
-            MaiRegularFileInfo info;
-            if (!withinWithoutLinks(root, entry.path) ||
-                !MaiFileSystem::regularFileInfo(entry.path, info))
-                return MaiWalkAction::Continue;
-            ++summary.files;
-            summary.bytes += info.bytes;
-            const bool allowed =
-                index != 2 || (selection.target == MaiAppStorageTarget::Workspace &&
-                               workspaceIntermediateFile(relative));
-            if (!allowed) {
-                ++summary.excludedPolicyFiles;
-            } else if (info.modified <= 0 || info.modified > cutoff) {
-                ++summary.excludedRecentFiles;
-                summary.excludedRecentBytes += info.bytes;
-            } else if (protectedFile(entry.path, relative, context, boundedSelection(selection))) {
-                ++summary.excludedProtectedFiles;
-            } else {
-                ++summary.eligibleFiles;
-                summary.eligibleBytes += info.bytes;
-                if (candidates.size() < kMaximumCandidates)
-                    candidates.push_back(
-                        {{entry.path.toUtf8(), relative, names[index], info.bytes, info.modified},
-                         info,
-                         root});
-                else
-                    result.limited = true;
-            }
-            return MaiWalkAction::Continue;
-        });
+            });
         result.summaries.push_back(summary);
     }
     if (canceled(context)) return {MaiErrorCode::Canceled, "storage preview was canceled"};
@@ -339,7 +359,26 @@ MaiResult<MaiAppStoragePreview> MaiAppStorage::preview(const MaiAppStorageSelect
     mImplementation->createdAt = static_cast<std::int64_t>(std::time(nullptr));
     mImplementation->previewRoots = roots;
     mImplementation->candidates = std::move(candidates);
+    mImplementation->preview = result;
     return result;
+}
+
+MaiResult<MaiAppStoragePreview> MaiAppStorage::readPreview(const std::string& previewId,
+                                                           const MaiAppStorageContext& context) {
+    if (canceled(context)) return {MaiErrorCode::Canceled, "storage preview read was canceled"};
+    const auto rootsResult = mImplementation->roots(context);
+    if (!rootsResult) return rootsResult.error();
+    std::lock_guard<std::mutex> lock(mImplementation->mutex);
+    const auto age = static_cast<std::int64_t>(std::time(nullptr)) - mImplementation->createdAt;
+    if (previewId.empty() || previewId != mImplementation->previewId ||
+        context.sessionId != mImplementation->sessionId || age < 0 || age > 600 ||
+        rootsResult.value() != mImplementation->previewRoots)
+        return {MaiErrorCode::InvalidInput,
+                "scan storage again for a fresh preview in this session"};
+    if (mImplementation->needsProtection && !context.protectionComplete)
+        return {MaiErrorCode::InvalidInput,
+                "workspace preview requires current delivery protection records"};
+    return mImplementation->preview;
 }
 
 MaiResult<MaiAppStorageCleanup> MaiAppStorage::cleanup(const std::string& previewId,

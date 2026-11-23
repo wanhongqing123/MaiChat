@@ -10,9 +10,9 @@
 
 namespace {
 bool isShellProcessTool(const QString& tool) {
-    // Match shell/shell_input and the desktop_process_* tools still registered
-    // by this public baseline. Keep the same exact names for stored history
-    // when the command-session tools replace the desktop process catalog.
+    // The active shell tools are shell and shell_input, sharing Core command
+    // sessions. The retired desktop_process_* names remain here only so stored
+    // history keeps its shell classification; they are not active catalog IDs.
     // ssh_exec is explicitly built-in by product decision: libssh2 creates no
     // local process. curl/openssl use in-process mai_*_execute entry points;
     // other host tools, including desktop_browser/computer, also stay built-in.

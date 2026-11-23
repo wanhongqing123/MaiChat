@@ -39,7 +39,6 @@
 #include "MaiChatTools/DesktopPdfRenderer.h"
 #include "MaiChatTools/DesktopPdfPasswordPrompt.h"
 #include "MaiChatTools/DesktopCalendarEvents.h"
-#include "MaiChatTools/DesktopProcessTools.h"
 #include "MaiChatTools/DesktopBrowserTools.h"
 #include "MaiChatTools/DesktopComputerTools.h"
 #if defined(MAICHAT_DESKTOP_PORTRAIT)
@@ -242,6 +241,8 @@ struct AgentController::Runtime {
     QTimer scheduleTimer;
     MaiEventBus::Token token = 0;
     QString openError;
+    QHash<QString, std::optional<MaiContextStatus>> contextStatuses;
+    QHash<QString, QString> contextStatusTurns;
     // 只有主线程碰它：所有事件都排队到主线程之后才分类。
     QHash<QString, QHash<QString, PartKind>> partKindsBySession;
     QHash<QString, QHash<QString, QString>> livePartTextBySession;
@@ -348,7 +349,6 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     if (!databasePath.isEmpty())
         registerDesktopPortraitTools(*tools, QFileInfo(databasePath).absolutePath());
 #endif
-    registerDesktopProcessTools(*tools, std::make_shared<DesktopProcessManager>());
     registerDesktopBrowserTools(*tools, std::make_shared<DesktopBrowserManager>());
     registerDesktopComputerTools(*tools, computer);
 #if defined(MAICHAT_EMBEDDED_FFMPEG)
@@ -1020,7 +1020,24 @@ void AgentController::onEventQueued(const MaiEvent& event) {
     const QString sessionId = fromUtf8(event.sessionId);
     const QString messageId = fromUtf8(event.messageId);
     const QString partId = fromUtf8(event.partId);
+    // 即使最终状态因存储/交付失败没有到达，已结束的轮次也不能让标签永远停在整理中。
+    // 这里只修正 GUI 已观察到的进度，不伪造 Core 的持久成功或覆盖已有 Ready 快照。
+    const auto closeContextPresentation = [this, &sessionId, &event](MaiContextPhase phase) {
+        if (event.turnId.empty()) return; // 无轮次身份的会话通知不能关闭另一轮的已知进度。
+        auto current = runtime_->contextStatuses.find(sessionId);
+        if (current == runtime_->contextStatuses.end() || !current.value()) return;
+        auto& state = *current.value();
+        if (state.phase != MaiContextPhase::Preparing && state.phase != MaiContextPhase::Summarizing) return;
+        state.phase = phase;
+        state.error = {phase == MaiContextPhase::Interrupted ? MaiErrorCode::Canceled : MaiErrorCode::Internal,
+                       "Context preparation stopped without a final status update."};
+        emit contextStatusChanged(sessionId);
+    };
     if (event.type == MaiEventType::SessionCreated || event.type == MaiEventType::SessionDeleted) {
+        if (event.type == MaiEventType::SessionDeleted) {
+            runtime_->contextStatuses.remove(sessionId);
+            runtime_->contextStatusTurns.remove(sessionId);
+        }
         if (event.type == MaiEventType::SessionDeleted && runtime_->scheduleStore)
             runtime_->scheduleStore->cancelSession(event.sessionId);
         emit sessionStructureChanged();
@@ -1028,7 +1045,23 @@ void AgentController::onEventQueued(const MaiEvent& event) {
     }
 
     switch (event.type) {
+        case MaiEventType::TurnOutcomeUpdated:
+        case MaiEventType::ContextStatusUpdated: {
+            if (!event.contextStatus && event.type == MaiEventType::ContextStatusUpdated) return;
+            const auto active = runtime_->agent->activeTurnId(event.sessionId);
+            if (!active.empty() && active != event.turnId) return;
+            if (active.empty()) {
+                const auto latest = runtime_->agent->getTurnOutcome(event.sessionId);
+                if (!latest || latest.value().turnId != event.turnId) return;
+            }
+            runtime_->contextStatuses[sessionId] = event.contextStatus;
+            runtime_->contextStatusTurns[sessionId] = fromUtf8(event.turnId);
+            emit contextStatusChanged(sessionId);
+            return;
+        }
         case MaiEventType::SessionStatus:
+            runtime_->contextStatuses.remove(sessionId);
+            runtime_->contextStatusTurns.remove(sessionId);
             if (event.detail == "running" && !event.turnId.empty()) emit turnStarted(sessionId, fromUtf8(event.turnId));
             return;
 
@@ -1118,7 +1151,10 @@ void AgentController::onEventQueued(const MaiEvent& event) {
             if (!event.turnId.empty()) {
                 const auto active = runtime_->agent->activeTurnId(event.sessionId);
                 if (!active.empty() && active != event.turnId) return;
+                const auto observed = runtime_->contextStatusTurns.value(sessionId);
+                if (!observed.isEmpty() && observed != fromUtf8(event.turnId)) return;
             }
+            closeContextPresentation(MaiContextPhase::Interrupted);
             // 一轮结束，这一轮的片段表可以丢了。不丢的话长会话会一直涨。
             runtime_->partKindsBySession.remove(sessionId);
             if (runtime_->scheduleRunner) runtime_->scheduleRunner->finish(event.sessionId);
@@ -1131,7 +1167,10 @@ void AgentController::onEventQueued(const MaiEvent& event) {
             if (!event.turnId.empty()) {
                 const auto active = runtime_->agent->activeTurnId(event.sessionId);
                 if (!active.empty() && active != event.turnId) return;
+                const auto observed = runtime_->contextStatusTurns.value(sessionId);
+                if (!observed.isEmpty() && observed != fromUtf8(event.turnId)) return;
             }
+            closeContextPresentation(MaiContextPhase::Failed);
             if (runtime_->scheduleRunner) runtime_->scheduleRunner->finish(event.sessionId, event.detail);
             emit turnFailed(sessionId, fromUtf8(event.detail));
             return;
@@ -1160,4 +1199,14 @@ void AgentController::onEventQueued(const MaiEvent& event) {
             // 建会话和发消息的返回值里已经有 id 了，删除由发起那一侧自己知道。
             return;
     }
+}
+
+std::optional<MaiContextStatus> AgentController::contextStatus(const QString& sessionId) const {
+    const auto cached = runtime_->contextStatuses.constFind(sessionId);
+    if (cached != runtime_->contextStatuses.constEnd()) return cached.value();
+    const auto outcome = runtime_->agent->getTurnOutcome(toUtf8(sessionId));
+    auto value = outcome ? outcome.value().context : std::optional<MaiContextStatus>{};
+    if (outcome) runtime_->contextStatusTurns[sessionId] = fromUtf8(outcome.value().turnId);
+    runtime_->contextStatuses.insert(sessionId, value);
+    return value;
 }

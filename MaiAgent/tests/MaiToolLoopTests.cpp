@@ -34,6 +34,7 @@
 #include "MaiQuestionTool.h"
 #include "MaiScreenshotTool.h"
 #include "MaiViewImageTool.h"
+#include "MaiToolOutputTool.h"
 
 namespace fs = std::filesystem;
 
@@ -2361,7 +2362,174 @@ void test_native_tool_responses_keep_every_previously_sent_message_unchanged(boo
     }
 }
 
+void test_large_tool_results_keep_published_prefix(bool sqlite, bool knownWindow,
+                                                   bool fullUnknown = false) {
+    class LargeTool final : public MaiTool {
+    public:
+        explicit LargeTool(bool full) : full(full) {}
+        bool full;
+        std::string name() const override {
+            return "owned_frozen_large";
+        }
+        std::string description() const override {
+            return "Return an owned large observation.";
+        }
+        std::string parametersSchema() const override {
+            return R"({"type":"object"})";
+        }
+        bool requiresApproval(const std::string&) const override {
+            return false;
+        }
+        bool requiresWorkingDirectory(const std::string&) const override {
+            return false;
+        }
+        MaiToolResult execute(const std::string& input, const MaiToolContext&) override {
+            return MaiToolResult::success(full ? std::string(64 * 1024, 'x')
+                                               : "Owned large result " + input +
+                                                     std::string(100 * 1024, 'x'));
+        }
+    };
+    struct Observation {
+        std::vector<MaiModelRequest> requests;
+    } observed;
+    class LargeModel final : public MaiModelClient {
+    public:
+        LargeModel(Observation& observation, bool known) : observation(observation), known(known) {}
+        Observation& observation;
+        bool known;
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
+        MaiModelContextLimits contextLimits(const std::string&) const override {
+            return known ? MaiModelContextLimits{1048576, 8192} : MaiModelContextLimits{};
+        }
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                        const std::atomic<bool>&) override {
+            observation.requests.push_back(request);
+            const auto index = observation.requests.size();
+            if (index <= 2 && sink.onToolCall) {
+                const auto count = index == 1 ? 4 : 1;
+                for (int call = 0; call < count; ++call)
+                    sink.onToolCall(
+                        {"owned-large-" + std::to_string(index) + "-" + std::to_string(call),
+                         "owned_frozen_large", "{}"});
+            } else if (sink.onText)
+                sink.onText("Owned task completed without replaying tools.");
+            return {};
+        }
+    };
+    const auto tools = [fullUnknown] {
+        auto registry = std::make_unique<MaiToolRegistry>();
+        registry->add(std::make_unique<LargeTool>(fullUnknown));
+        registry->add(makeMaiToolOutputReadTool());
+        return registry;
+    };
+    auto store = makeMaiMemoryStore();
+    const auto path = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8("owned-frozen-prefix-" + MaiIdGenerator::newSessionId() + ".sqlite"));
+    if (sqlite) {
+        auto opened = makeMaiSqliteStore(path.toUtf8());
+        CHECK(opened);
+        if (!opened) return;
+        store = std::move(opened.value());
+    }
+    auto* rawStore = store.get();
+    MaiAgent::Options options;
+    options.defaultModel = "owned-frozen-model";
+    std::string session;
+    {
+        MaiAgent agent(std::move(store), std::make_unique<LargeModel>(observed, knownWindow),
+                       tools(), options);
+        const auto created = agent.submit(MaiCreateSession{"", "Owned frozen prefix", ""});
+        CHECK(created);
+        if (!created) return;
+        session = created.value();
+        CHECK(agent.submit(MaiSendPrompt{session, "Inspect four observations, then a fifth."}));
+        agent.waitIdle();
+        CHECK(observed.requests.size() == (fullUnknown ? 2 : 3));
+        CHECK(agent.submit(MaiSendPrompt{session, std::string(10000, 'u')}));
+        agent.waitIdle();
+        CHECK(observed.requests.size() == (fullUnknown ? 2 : 4));
+        MaiContextCheckpoint checkpoint;
+        CHECK(!rawStore->getContextCheckpoint(session, checkpoint));
+        std::size_t rawResults = 0;
+        for (const auto& message : agent.listMessages(session))
+            for (const auto& part : message.parts)
+                if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
+                    ++rawResults;
+                    CHECK(fullUnknown ? tool->output.size() == 64 * 1024
+                                      : tool->output.size() > 100 * 1024);
+                    CHECK(tool->modelOutputVersion == 1);
+                }
+        CHECK(rawResults == 5);
+    }
+    if (sqlite) {
+        auto reopened = makeMaiSqliteStore(path.toUtf8());
+        CHECK(reopened);
+        if (reopened) {
+            MaiAgent agent(std::move(reopened.value()),
+                           std::make_unique<LargeModel>(observed, knownWindow), tools(), options);
+            CHECK(agent.submit(
+                MaiSendPrompt{session, "Continue after reopening the owned database."}));
+            agent.waitIdle();
+            CHECK(observed.requests.size() == (fullUnknown ? 2 : 5));
+        }
+    }
+    for (std::size_t index = 1; index < observed.requests.size(); ++index) {
+        const auto& before = observed.requests[index - 1];
+        const auto& after = observed.requests[index];
+        CHECK(before.messages.size() < after.messages.size());
+        for (std::size_t messageIndex = 0;
+             messageIndex < before.messages.size() && messageIndex < after.messages.size();
+             ++messageIndex) {
+            const auto& left = before.messages[messageIndex];
+            const auto& right = after.messages[messageIndex];
+            CHECK(left.role == right.role && left.content == right.content);
+            CHECK(left.reasoning == right.reasoning && left.toolCallId == right.toolCallId);
+            CHECK(left.invocations.size() == right.invocations.size());
+            for (std::size_t call = 0;
+                 call < left.invocations.size() && call < right.invocations.size(); ++call)
+                CHECK(left.invocations[call].id == right.invocations[call].id &&
+                      left.invocations[call].name == right.invocations[call].name &&
+                      left.invocations[call].arguments == right.invocations[call].arguments);
+        }
+        std::size_t results = 0;
+        for (const auto& message : after.messages)
+            if (message.role == MaiModelRole::ToolResult) {
+                ++results;
+                CHECK(!message.sourceMessageId.empty() && !message.sourcePartId.empty());
+                CHECK(message.content.size() <= 64 * 1024);
+                const auto wrapper = nlohmann::json::parse(message.content, nullptr, false);
+                CHECK(fullUnknown ? !wrapper.is_object() : wrapper.is_object());
+                if (!fullUnknown && wrapper.is_object()) {
+                    CHECK(wrapper.value("capture_available", false));
+                    CHECK(wrapper.value("recovery_tool", std::string{}) == "tool_output_read");
+                    CHECK(wrapper.contains("recovery_args"));
+                }
+            }
+        CHECK(results == (index == 1 ? 4 : 5));
+    }
+    if (sqlite) {
+        MaiFileSystem::removeFile(path);
+        MaiFileSystem::removeFile(MaiFilePath::fromUtf8(path.toUtf8() + "-wal"));
+        MaiFileSystem::removeFile(MaiFilePath::fromUtf8(path.toUtf8() + "-shm"));
+    }
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--frozen-tool-prefix") {
+        for (bool sqlite : {false, true})
+            for (bool known : {false, true})
+                test_large_tool_results_keep_published_prefix(sqlite, known);
+        for (bool sqlite : {false, true})
+            test_large_tool_results_keep_published_prefix(sqlite, false, true);
+        return failures == 0 ? 0 : 1;
+    }
+    for (bool sqlite : {false, true})
+        for (bool known : {false, true})
+            test_large_tool_results_keep_published_prefix(sqlite, known);
+    for (bool sqlite : {false, true})
+        test_large_tool_results_keep_published_prefix(sqlite, false, true);
     if (argc == 2 && std::string(argv[1]) == "--request-prefix-only") {
         test_native_tool_responses_keep_every_previously_sent_message_unchanged();
         test_native_tool_responses_keep_every_previously_sent_message_unchanged(true);

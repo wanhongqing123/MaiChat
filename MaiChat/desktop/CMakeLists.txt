@@ -722,7 +722,14 @@ if(WIN32)
       "$<TARGET_FILE_DIR:maichat>/ThirdPartyLicenses/QPDF_LICENSE.txt"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/qpdf/NOTICE.md"
-      "$<TARGET_FILE_DIR:maichat>/ThirdPartyLicenses/QPDF_NOTICE.md")
+      "$<TARGET_FILE_DIR:maichat>/ThirdPartyLicenses/QPDF_NOTICE.md"
+    # 移植的 shell 启动脚本随产品保留上游 Apache 许可及相关声明，无新增运行库。
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/codex-shell/LICENSE"
+      "$<TARGET_FILE_DIR:maichat>/ThirdPartyLicenses/CODEX_SHELL_LICENSE.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/codex-shell/NOTICE"
+      "$<TARGET_FILE_DIR:maichat>/ThirdPartyLicenses/CODEX_SHELL_NOTICE.txt")
 elseif(APPLE)
   add_custom_command(TARGET maichat POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -736,6 +743,12 @@ elseif(APPLE)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/qpdf/NOTICE.md"
       "$<TARGET_BUNDLE_DIR:maichat>/Contents/Resources/ThirdPartyLicenses/QPDF_NOTICE.md"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/codex-shell/LICENSE"
+      "$<TARGET_BUNDLE_DIR:maichat>/Contents/Resources/ThirdPartyLicenses/CODEX_SHELL_LICENSE.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/codex-shell/NOTICE"
+      "$<TARGET_BUNDLE_DIR:maichat>/Contents/Resources/ThirdPartyLicenses/CODEX_SHELL_NOTICE.txt"
     # 静态链接的 QUIC 与 HTTP/3 库要求随产品保留各自的 MIT 许可。
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/ngtcp2/COPYING"
@@ -912,8 +925,6 @@ add_library(maichat_agent
   ../MaiChatTools/MaiCalendarTools.cpp
   src/MaiChatTools/DesktopCalendarEvents.h
   src/MaiChatTools/DesktopCalendarEvents.cpp
-  src/MaiChatTools/DesktopProcessTools.h
-  src/MaiChatTools/DesktopProcessTools.cpp
   src/MaiChatTools/DesktopBrowserTools.h
   src/MaiChatTools/DesktopBrowserTools.cpp
   src/MaiChatTools/DesktopComputerPlatform.h
@@ -1358,12 +1369,6 @@ target_include_directories(mai_session_schedule_test PRIVATE
   ../../MaiAgent/third_party/nlohmann ../../MaiAgent/third_party/sqlite)
 target_link_libraries(mai_session_schedule_test PRIVATE maiagent mai_sqlite)
 add_test(NAME mai_session_schedule COMMAND mai_session_schedule_test)
-
-add_executable(desktop_process_tools_test tests/DesktopProcessToolsTest.cpp)
-target_link_libraries(desktop_process_tools_test PRIVATE maichat_agent Qt6::Core)
-target_include_directories(desktop_process_tools_test PRIVATE
-  src ../../MaiAgent/third_party/nlohmann)
-add_test(NAME desktop_process_tools COMMAND desktop_process_tools_test)
 
 add_executable(desktop_browser_tools_test tests/DesktopBrowserToolsTest.cpp)
 target_link_libraries(desktop_browser_tools_test PRIVATE maichat_agent Qt6::Core)

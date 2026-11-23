@@ -6,6 +6,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -16,6 +17,80 @@ namespace {
 
 class MemoryStore final : public MaiSessionStore {
 public:
+    MaiResult<std::string> getToolModelOutput(const MaiToolModelOutputKey& key) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!ownsToolModelOutputLocked(key))
+            return {MaiErrorCode::NotFound, "The model tool output source is unavailable."};
+        const auto found = mToolModelOutputs.find(modelOutputKey(key));
+        if (found == mToolModelOutputs.end())
+            return {MaiErrorCode::NotFound, "The fixed model tool output is unavailable."};
+        return found->second;
+    }
+
+    MaiResult<std::string> saveToolModelOutput(const MaiToolModelOutputKey& key,
+                                               const std::string& content) override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (key.model.empty() || key.sourceFingerprint.empty() || !ownsToolModelOutputLocked(key))
+            return {MaiErrorCode::InvalidInput, "The model tool output source or key is invalid."};
+        // emplace 的既有值获胜，避免并发候选把已经发送的正文覆盖成更短的版本。
+        return mToolModelOutputs.emplace(modelOutputKey(key), content).first->second;
+    }
+
+    MaiResult<MaiMessage> readTurnMetadata(const std::string& sessionId,
+                                           const std::string& turnId) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mMessages.find(sessionId);
+        if (found == mMessages.end()) return {MaiErrorCode::NotFound, "Turn not found."};
+        const MaiMessage* source = nullptr;
+        for (const auto& candidate : found->second) {
+            if (turnId.empty()) {
+                if (candidate.role == MaiRole::Assistant && (!source || candidate.id > source->id))
+                    source = &candidate;
+            } else if (candidate.id == turnId) {
+                source = &candidate;
+                break;
+            }
+        }
+        if (!source) return {MaiErrorCode::NotFound, "Turn not found."};
+        if (turnId.empty() && !source->turnId.empty() && source->turnId != source->id) {
+            const auto initialId = source->turnId;
+            source = nullptr;
+            for (const auto& item : found->second)
+                if (item.id == initialId) {
+                    source = &item;
+                    break;
+                }
+        }
+        if (!source) return {MaiErrorCode::NotFound, "Originating turn not found."};
+        MaiMessage result;
+        result.id = source->id;
+        result.role = source->role;
+        result.created = source->created;
+        result.completed = source->completed;
+        result.turnId = source->turnId;
+        result.turnOutcome = source->turnOutcome;
+        return result;
+    }
+    MaiError updateTurnContext(const std::string& sessionId, const std::string& turnId,
+                               const MaiContextStatus& status) override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mMessages.find(sessionId);
+        if (found == mMessages.end()) return {MaiErrorCode::NotFound, "Turn not found."};
+        for (auto& message : found->second) {
+            if (message.id != turnId) continue;
+            if (message.role != MaiRole::Assistant ||
+                (!message.turnId.empty() && message.turnId != turnId))
+                return {MaiErrorCode::InvalidInput, "Context status requires an originating turn."};
+            if (!message.turnOutcome || message.turnOutcome->turnId != turnId)
+                return {MaiErrorCode::NotSupported, "This message is not a recorded turn."};
+            if (message.turnOutcome->status != MaiTurnStatus::Running)
+                return {MaiErrorCode::Busy, "The originating turn is already terminal."};
+            message.turnId = turnId;
+            message.turnOutcome->context = status;
+            return {};
+        }
+        return {MaiErrorCode::NotFound, "Turn not found."};
+    }
     MaiResult<MaiContextImportProgress> beginContextImport(
         const MaiContextImportSpec& spec) override {
         if (const auto error = maiValidateContextImportSpec(spec)) return error;
@@ -558,6 +633,16 @@ public:
         } else {
             list.push_back(std::move(ordinary));
         }
+        // 只清理真正消失/改变类型的来源；流式重写仍存在的工具片段不触碰固定正文。
+        for (auto saved = mToolModelOutputs.begin(); saved != mToolModelOutputs.end();) {
+            const auto& key = saved->first;
+            if (std::get<0>(key) == sessionId && std::get<1>(key) == message.id &&
+                !ownsToolModelOutputLocked(
+                    {sessionId, message.id, std::get<2>(key), std::get<3>(key), std::get<4>(key)}))
+                saved = mToolModelOutputs.erase(saved);
+            else
+                ++saved;
+        }
     }
 
     std::vector<MaiMessage> listMessages(const std::string& sessionId) const override {
@@ -614,6 +699,19 @@ public:
         for (auto& entry : mMessages) {
             for (MaiMessage& message : entry.second) {
                 bool changed = false;
+                if (message.turnOutcome && message.turnOutcome->turnId == message.id &&
+                    message.turnOutcome->status == MaiTurnStatus::Running) {
+                    message.turnOutcome->status = MaiTurnStatus::Interrupted;
+                    message.turnOutcome->completed = completedAt;
+                    message.turnOutcome->error = {MaiErrorCode::Canceled, error};
+                    if (message.turnOutcome->context &&
+                        (message.turnOutcome->context->phase == MaiContextPhase::Preparing ||
+                         message.turnOutcome->context->phase == MaiContextPhase::Summarizing)) {
+                        message.turnOutcome->context->phase = MaiContextPhase::Interrupted;
+                        message.turnOutcome->context->error = {MaiErrorCode::Canceled, error};
+                    }
+                    changed = true;
+                }
                 for (MaiMessagePart& part : message.parts) {
                     auto* tool = std::get_if<MaiToolPart>(&part.body);
                     if (!tool || (tool->state != MaiToolState::Pending &&
@@ -721,6 +819,12 @@ private:
 
     // 同锁清理字节和编号墓碑；淘汰仅丢字节，直至消息被清空才释放其不可变编号。
     void clearToolOutputsLocked(const std::string& sessionId) {
+        for (auto it = mToolModelOutputs.begin(); it != mToolModelOutputs.end();) {
+            if (std::get<0>(it->first) == sessionId)
+                it = mToolModelOutputs.erase(it);
+            else
+                ++it;
+        }
         for (auto it = mToolOutputs.begin(); it != mToolOutputs.end();) {
             if (it->second.sessionId == sessionId)
                 it = mToolOutputs.erase(it);
@@ -736,6 +840,26 @@ private:
     }
 
     mutable std::mutex mMutex;
+    using ModelOutputKey =
+        std::tuple<std::string, std::string, std::string, std::string, std::string>;
+
+    static ModelOutputKey modelOutputKey(const MaiToolModelOutputKey& key) {
+        return {key.sessionId, key.messageId, key.partId, key.model, key.sourceFingerprint};
+    }
+
+    bool ownsToolModelOutputLocked(const MaiToolModelOutputKey& key) const {
+        if (mSessions.count(key.sessionId) == 0) return false;
+        const auto found = mMessages.find(key.sessionId);
+        if (found == mMessages.end()) return false;
+        for (const auto& message : found->second) {
+            if (message.id != key.messageId) continue;
+            for (const auto& part : message.parts)
+                if (part.id == key.partId) return std::holds_alternative<MaiToolPart>(part.body);
+        }
+        return false;
+    }
+
+    std::map<ModelOutputKey, std::string> mToolModelOutputs;
     std::unordered_map<std::string, MaiSession> mSessions;
     std::unordered_map<std::string, std::vector<MaiMessage>> mMessages;
     std::unordered_map<std::string, MaiContextCheckpoint> mContextCheckpoints;
