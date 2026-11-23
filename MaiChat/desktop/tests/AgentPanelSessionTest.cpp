@@ -1188,28 +1188,61 @@ void AgentPanelSessionTest::welcomeToolRowsOnlyAppendSessionDrafts() {
 }
 
 void AgentPanelSessionTest::remotePromptAppearsInOpenOwnerSession() {
-    AgentController controller(std::make_unique<SilentModel>(), QString());
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    auto model = std::make_unique<DelayedFirstChunkModel>(false);
+    auto* controlled = model.get();
+    AgentController controller(std::move(model), QString());
     AgentChatPanel panel(controller);
-    panel.resize(700, 500);
+    panel.resize(1000, 700);
     panel.show();
-    const QString sessionId = controller.createSession(QDir::currentPath());
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString sessionId = controller.createSession(workspace.path());
     panel.openSession(sessionId);
     auto* view = panel.findChild<MarkdownView*>();
-    QVERIFY(view != nullptr);
-
-    // Same entry point used when an iPhone sends into a Mac-owned Session.
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    auto* stop = panel.findChild<QPushButton*>(QStringLiteral("agentStopButton"));
+    QVERIFY(view && editor && stop);
+    editor->setPlainText(QStringLiteral("Owned unsent local draft"));
+    QSignalSpy accepted(&controller, &AgentController::turnStarted);
+    QSignalSpy output(&controller, &AgentController::textDelta);
     DesktopSessionSyncHost host(controller);
-    const QJsonObject result = host.applyCommand(sessionId, {{QStringLiteral("action"), QStringLiteral("prompt")},
-                                                             {QStringLiteral("text"), QStringLiteral("你好")}});
+    const QJsonObject result =
+        host.applyCommand(sessionId, {{QStringLiteral("action"), QStringLiteral("prompt")},
+                                      {QStringLiteral("text"), QStringLiteral("Owned message from another device")}});
     QVERIFY(result.value(QStringLiteral("ok")).toBool());
     const QString userId = result.value(QStringLiteral("user_message_id")).toString();
-    QVERIFY(!userId.isEmpty());
-    QTRY_VERIFY_WITH_TIMEOUT(view->contains(userId), 3000);
-    view->selectAll();
-    QCOMPARE(view->selectedText().count(QStringLiteral("你好")), 1);
-    view->clearSelection();
-    const QString capturePath = qEnvironmentVariable("MAICHAT_REMOTE_USER_CAPTURE");
-    if (!capturePath.isEmpty()) QVERIFY(panel.grab().save(capturePath));
+    QTRY_VERIFY_WITH_TIMEOUT(controlled->entered(), 1000);
+    QTRY_VERIFY_WITH_TIMEOUT(view->contains(userId), 1000);
+    QTRY_COMPARE_WITH_TIMEOUT(accepted.count(), 1, 1000);
+    QCOMPARE(output.count(), 0);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Owned unsent local draft"));
+    auto visibleThinking = [&panel] {
+        int count = 0;
+        for (auto* widget : panel.findChildren<QWidget*>(QStringLiteral("agentThinkingCard")))
+            if (widget->isVisibleTo(&panel)) ++count;
+        return count;
+    };
+    QTRY_COMPARE_WITH_TIMEOUT(visibleThinking(), 1, 1000);
+    QVERIFY(stop->isVisibleTo(&panel));
+    const QString evidence = qEnvironmentVariable("MAICHAT_AGENT_EVIDENCE_DIR");
+    if (!evidence.isEmpty()) {
+        QDir().mkpath(evidence);
+        QVERIFY(panel.grab().save(QDir(evidence).filePath(QStringLiteral("remote-prompt-before-first-token.png"))));
+    }
+    const QString other = controller.createSession(workspace.path());
+    panel.openSession(other);
+    QCOMPARE(visibleThinking(), 0);
+    panel.openSession(sessionId);
+    QCOMPARE(visibleThinking(), 1);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Owned unsent local draft"));
+    controlled->release();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(sessionId.toStdString()), 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(visibleThinking(), 0, 1000);
+    QVERIFY(!stop->isVisibleTo(&panel));
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Owned unsent local draft"));
+    if (!evidence.isEmpty())
+        QVERIFY(panel.grab().save(QDir(evidence).filePath(QStringLiteral("remote-prompt-completed.png"))));
 }
 
 void AgentPanelSessionTest::localPromptKeepsOneBubbleAfterUserMessageEvent() {

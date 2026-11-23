@@ -21,6 +21,7 @@
 #include <QJsonDocument>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QImage>
 #include <QJsonArray>
 #include <QKeyEvent>
 #include <QLabel>
@@ -946,8 +947,7 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
     QFont editorFont = runtime_->editor->font();
     editorFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
     UiZoom::setFont(runtime_->editor, UiZoom::TextRole::Body, editorFont);
-    runtime_->editor->setMimeHandler(
-        [](const QMimeData* mime) { return mime && (mime->hasImage() || mime->hasUrls()); });
+    runtime_->editor->setMimeHandler([this](const QMimeData* mime) { return insertComposerMimeData(mime); });
     runtime_->editor->submit = [this] { sendOrStop(); };
     auto* attachment = new QPushButton(QStringLiteral("+"), runtime_->editor);
     attachment->setObjectName(QStringLiteral("remoteAgentAttachButton"));
@@ -960,27 +960,7 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
     connect(attachment, &QPushButton::clicked, this, [this] {
         const QStringList picked =
             QFileDialog::getOpenFileNames(this, QStringLiteral("选择会话附件"), QDir::homePath());
-        for (const QString& path : picked) {
-            const QFileInfo file(path);
-            const QByteArray name = file.fileName().toUtf8();
-            MaiCloudDriveMediaInfo media{};
-            if (!file.isFile() || !mai_session_attachment_media_info(name.constData(), &media) || file.size() < 1 ||
-                quint64(file.size()) > media.max_size_bytes) {
-                showStatus(QStringLiteral("附件格式或大小无效：%1").arg(file.fileName()), true);
-                continue;
-            }
-            if (runtime_->attachments.size() >= 10) {
-                showStatus(QStringLiteral("每条消息最多添加 10 项附件"), true);
-                break;
-            }
-            if (!runtime_->attachments.contains(file.absoluteFilePath()))
-                runtime_->attachments.append(file.absoluteFilePath());
-        }
-        runtime_->attachmentsLabel->setText(attachmentSummary(runtime_->attachments));
-        runtime_->attachmentsLabel->setToolTip(runtime_->attachments.join(QLatin1Char('\n')));
-        runtime_->attachmentsLabel->setVisible(!runtime_->attachments.isEmpty());
-        runtime_->clearAttachments->setVisible(!runtime_->attachments.isEmpty());
-        updateControls();
+        addComposerAttachments(picked);
     });
     runtime_->editor->setLeadingAction(attachment);
     runtime_->stop = new QPushButton(runtime_->editor);
@@ -1027,6 +1007,8 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
     attachmentsLayout->addWidget(runtime_->clearAttachments);
     connect(runtime_->clearAttachments, &QPushButton::clicked, this, [this] {
         runtime_->attachments.clear();
+        runtime_->attachmentDrafts.insert(sessionKey(runtime_->session), {});
+        persistOutbox();
         runtime_->attachmentsLabel->hide();
         runtime_->clearAttachments->hide();
         updateControls();
@@ -1730,6 +1712,81 @@ bool RemoteAgentPanel::persistOutbox() {
     if (!file.open(QIODevice::WriteOnly)) return false;
     file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
     return file.write(data) == data.size() && file.commit();
+}
+
+bool RemoteAgentPanel::insertComposerMimeData(const QMimeData* mime) {
+    if (!mime) return false;
+    QStringList paths;
+    for (const QUrl& url : mime->urls())
+        if (url.isLocalFile()) paths.append(url.toLocalFile());
+    if (!paths.isEmpty()) {
+        addComposerAttachments(paths);
+        return true;
+    }
+    if (!mime->hasImage()) return false;
+    if (runtime_->attachments.size() >= 10) {
+        showStatus(QStringLiteral("每条消息最多添加 10 项附件"), true);
+        return true;
+    }
+    const QImage image = qvariant_cast<QImage>(mime->imageData());
+    if (image.isNull()) {
+        showStatus(QStringLiteral("无法读取粘贴的图片"), true);
+        return true;
+    }
+    // 原始剪贴板像素没有文件路径，保存为普通上传输入；不能在发送/关闭面板时删除，
+    // 因为离线草稿和未知回执重试仍持有它。与 outbox 同目录保留，随原附件路径持久化。
+    const QString directory =
+        QDir(QFileInfo(runtime_->outboxFile).absolutePath()).filePath(QStringLiteral("remote-composer-images"));
+    const QString path =
+        QDir(directory).filePath(QUuid::createUuid().toString(QUuid::WithoutBraces) + QStringLiteral(".png"));
+    QSaveFile file(path);
+    if (!QDir().mkpath(directory) || !file.open(QIODevice::WriteOnly)) {
+        showStatus(QStringLiteral("无法保存粘贴的图片，请重试"), true);
+        return true;
+    }
+    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    if (!image.save(&file, "PNG") || !file.commit()) {
+        showStatus(QStringLiteral("无法保存粘贴的图片，请重试"), true);
+        return true;
+    }
+    MaiCloudDriveMediaInfo media{};
+    const bool supported = mai_session_attachment_media_info("clipboard.png", &media);
+    if (!supported || quint64(QFileInfo(path).size()) > media.max_size_bytes) {
+        QFile::remove(path);  // 只清理本次尚未进入草稿/发送队列的自有文件。
+        showStatus(QStringLiteral("粘贴图片大小超过会话附件限制"), true);
+        return true;
+    }
+    addComposerAttachments({path});
+    return true;
+}
+
+void RemoteAgentPanel::addComposerAttachments(const QStringList& paths) {
+    for (const QString& path : paths) {
+        const QFileInfo file(path);
+        const QByteArray name = file.fileName().toUtf8();
+        MaiCloudDriveMediaInfo media{};
+        if (!file.isFile() || !mai_session_attachment_media_info(name.constData(), &media) || file.size() < 1 ||
+            quint64(file.size()) > media.max_size_bytes) {
+            showStatus(QStringLiteral("附件格式或大小无效：%1").arg(file.fileName()), true);
+            continue;
+        }
+        const QString absolute = file.absoluteFilePath();
+        if (runtime_->attachments.contains(absolute)) continue;
+        if (runtime_->attachments.size() >= 10) {
+            showStatus(QStringLiteral("每条消息最多添加 10 项附件"), true);
+            break;
+        }
+        runtime_->attachments.append(absolute);
+    }
+    // 同一入口复用选择文件、粘贴和拖放的校验、显示及持久草稿，发送仍走既有上传协议。
+    const QString key = sessionKey(runtime_->session);
+    if (!key.isEmpty()) {
+        runtime_->drafts.insert(key, runtime_->editor->toPlainText());
+        runtime_->attachmentDrafts.insert(key, runtime_->attachments);
+        if (!persistOutbox()) showStatus(QStringLiteral("附件草稿无法保存，请保留原图后重试"), true);
+    }
+    refreshAttachments();
+    updateControls();
 }
 
 void RemoteAgentPanel::refreshAttachments() {

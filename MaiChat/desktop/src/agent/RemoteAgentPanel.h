@@ -2,6 +2,7 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QStringList>
 #include <QWidget>
 #include "auth/DesktopVideoCircleAccess.h"
 
@@ -52,6 +53,8 @@ private:
     void dispatchQueued(const QString& ownerKey = {});
     void finishQueued(const QString& requestId, const QJsonObject& result, bool unknown = false);
     void recoverQueuedDraft();
+    bool insertComposerMimeData(const class QMimeData* mime);
+    void addComposerAttachments(const QStringList& paths);
     void refreshAttachments();
     void sendAction(const QJsonObject& action, bool clearDraft, const QJsonObject& question = {});
     void sendPrompt(const QJsonObject& action, const QString& retryId = {});

@@ -10,7 +10,7 @@ if(CMAKE_HOST_APPLE)
   endif()
 endif()
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 3.1.3 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 3.2.0 LANGUAGES C CXX)
 if(MSVC AND MSVC_VERSION LESS 1930)
   message(FATAL_ERROR "The source Qt 6 desktop build requires MSVC 2022 or later")
 endif()
@@ -1197,6 +1197,13 @@ target_include_directories(remote_tool_detail_test PRIVATE ../MaiChatTools)
 target_link_libraries(remote_tool_detail_test PRIVATE remote_im_desktop_ui
   remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 add_test(NAME remote_tool_detail_test COMMAND remote_tool_detail_test)
+
+# Owned MIME attachment tests; never touch the system clipboard.
+add_executable(remote_composer_attachment_test tests/RemoteComposerAttachmentTest.cpp)
+target_include_directories(remote_composer_attachment_test PRIVATE src)
+target_link_libraries(remote_composer_attachment_test PRIVATE remote_im_desktop_ui maichat_agent Qt6::Widgets Qt6::Test)
+add_test(NAME remote_composer_attachment_test COMMAND remote_composer_attachment_test)
+
 add_executable(desktop_session_sync_channel_test
   tests/DesktopSessionSyncChannelTest.cpp)
 target_include_directories(desktop_session_sync_channel_test PRIVATE

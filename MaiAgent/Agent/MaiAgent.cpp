@@ -579,6 +579,8 @@ struct MaiAgent::Runtime {
         }
         emitter.emitTurnIdle(sessionId, turn->id);
         if (next) {
+            // 排队输入接续的新轮次也要通知宿主；锁外且在 worker 放行前发布。
+            emitter.emitTurnStarted(sessionId, next->id);
             emitter.emitMessage(MaiEventType::MessageUpdated, sessionId, assistant.id);
             next->signalReady();
         } else if (startError)
@@ -1620,6 +1622,8 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 mRuntime->emitter.emitSession(MaiEventType::SessionUpdated, prompt.sessionId, {},
                                               "input");
                 if (started) {
+                    // 持久化接收入口与直接发送共用开始事件，避免只有消息、没有等待状态。
+                    mRuntime->emitter.emitTurnStarted(prompt.sessionId, started->id);
                     mRuntime->emitter.emitMessage(MaiEventType::MessageUpdated, prompt.sessionId,
                                                   assistant.id);
                     started->signalReady();

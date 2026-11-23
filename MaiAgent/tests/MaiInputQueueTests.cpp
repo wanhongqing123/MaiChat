@@ -459,67 +459,111 @@ static void iterationLimitStillDeliversTheNewInput() {
 }
 
 static void busyInputsArePersistedAndConsumedInOrder() {
-    auto model = std::make_unique<InputModel>();
-    auto* observed = model.get();
-    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::make_unique<MaiToolRegistry>());
-    const auto session = agent.submit(MaiCreateSession{"", "Input queue", ""}).value();
-    CHECK(enqueue(agent, session, "first", "First task"));
-    CHECK(waitEntered(*observed));
-    std::vector<std::string> expected{"First task"};
-    std::string second;
-    for (int i = 0; i < 80; ++i) {
-        const auto text = "Input " + std::to_string(i);
-        const auto sent = enqueue(agent, session, "request_" + std::to_string(i), text);
-        CHECK(sent);
-        if (i == 0 && sent) second = sent.value();
-        expected.push_back(text);
-    }
-    CHECK(enqueue(agent, session, "request_0", "Input 0").value() == second);
-    CHECK(!enqueue(agent, session, "request_0", "Different input"));
-    CHECK(observed->lastUsers() == std::vector<std::string>{"First task"});
-    CHECK(agent.isBusy(session));
-    observed->release.store(true);
-    agent.waitIdle();
-    CHECK(observed->lastUsers() == expected);
-    size_t users = 0;
-    for (const auto& message : agent.listMessages(session)) {
-        if (message.role == MaiRole::User) ++users;
-        CHECK(!message.pendingInput);
-    }
-    CHECK(users == 81);
-    CHECK(enqueue(agent, session, "request_0", "Input 0").value() == second);
+  auto model = std::make_unique<InputModel>();
+  auto *observed = model.get();
+  MaiAgent agent(makeMaiMemoryStore(), std::move(model),
+                 std::make_unique<MaiToolRegistry>());
+  const auto session =
+      agent.submit(MaiCreateSession{"", "Input queue", ""}).value();
+  // 队列路径必须在模型执行前发开始事件，宿主才能显示等待/停止。
+  // 回调重入只读 API 同时确保通知在 Runtime 锁外发布。
+  std::atomic<int> started{0};
+  const auto subscription =
+      agent.eventBus().subscribe([&](const MaiEvent &event) {
+        if (event.sessionId != session ||
+            event.type != MaiEventType::SessionStatus ||
+            event.detail != "running")
+          return;
+        CHECK(!event.turnId.empty());
+        CHECK(agent.isBusy(session));
+        CHECK(agent.activeTurnId(session) == event.turnId);
+        if (started.fetch_add(1) == 0)
+          CHECK(!observed->entered.load());
+      });
+  CHECK(enqueue(agent, session, "first", "First task"));
+  CHECK(waitEntered(*observed));
+  CHECK(started.load() == 1);
+  std::vector<std::string> expected{"First task"};
+  std::string second;
+  for (int i = 0; i < 80; ++i) {
+    const auto text = "Input " + std::to_string(i);
+    const auto sent =
+        enqueue(agent, session, "request_" + std::to_string(i), text);
+    CHECK(sent);
+    if (i == 0 && sent)
+      second = sent.value();
+    expected.push_back(text);
+  }
+  CHECK(enqueue(agent, session, "request_0", "Input 0").value() == second);
+  CHECK(!enqueue(agent, session, "request_0", "Different input"));
+  CHECK(observed->lastUsers() == std::vector<std::string>{"First task"});
+  CHECK(agent.isBusy(session));
+  observed->release.store(true);
+  agent.waitIdle();
+  CHECK(observed->lastUsers() == expected);
+  size_t users = 0;
+  for (const auto &message : agent.listMessages(session)) {
+    if (message.role == MaiRole::User)
+      ++users;
+    CHECK(!message.pendingInput);
+  }
+  CHECK(users == 81);
+  CHECK(enqueue(agent, session, "request_0", "Input 0").value() == second);
+  CHECK(started.load() == 1);
+  agent.eventBus().unsubscribe(subscription);
 }
 
 static void finalBoundaryStartsTheNextQueuedTurn() {
-    auto model = std::make_unique<InputModel>();
-    auto* observed = model.get();
-    observed->finalBoundary = true;
-    auto tools = std::make_unique<MaiToolRegistry>();
-    tools->add(std::make_unique<InputNoop>());
-    MaiAgent::Options options;
-    options.maxToolIterations = 1;
-    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools), options);
-    const auto session = agent.submit(MaiCreateSession{"", "Final boundary", ""}).value();
-    CHECK(enqueue(agent, session, "first", "Original task"));
-    CHECK(waitEntered(*observed));
-    CHECK(enqueue(agent, session, "late", "Input during final response"));
-    observed->release.store(true);
-    agent.waitIdle();
-    CHECK(observed->lastUsers() ==
-          (std::vector<std::string>{"Original task", "Input during final response"}));
-    const auto observations = observed->lastToolObservations();
-    CHECK(observations.size() == 1);
-    if (observations.size() == 1) {
-        CHECK(observations[0].at("type") == "tool_execution_observation");
-        CHECK(observations[0].at("executions").size() == 1);
-        if (observations[0].at("executions").size() == 1) {
-            const auto& execution = observations[0].at("executions")[0];
-            CHECK(execution.at("call_id") == "fixture_call");
-            CHECK(execution.at("tool") == "fixture_noop");
-            CHECK(execution.at("execution").at("canceled") == false);
-        }
+  auto model = std::make_unique<InputModel>();
+  auto *observed = model.get();
+  observed->finalBoundary = true;
+  auto tools = std::make_unique<MaiToolRegistry>();
+  tools->add(std::make_unique<InputNoop>());
+  MaiAgent::Options options;
+  options.maxToolIterations = 1;
+  MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools),
+                 options);
+  const auto session =
+      agent.submit(MaiCreateSession{"", "Final boundary", ""}).value();
+  // 队列路径必须在模型执行前发开始事件，宿主才能显示等待/停止。
+  // 回调重入只读 API 同时确保通知在 Runtime 锁外发布。
+  std::atomic<int> started{0};
+  const auto subscription =
+      agent.eventBus().subscribe([&](const MaiEvent &event) {
+        if (event.sessionId != session ||
+            event.type != MaiEventType::SessionStatus ||
+            event.detail != "running")
+          return;
+        CHECK(!event.turnId.empty());
+        CHECK(agent.isBusy(session));
+        CHECK(agent.activeTurnId(session) == event.turnId);
+        if (started.fetch_add(1) == 0)
+          CHECK(!observed->entered.load());
+      });
+  CHECK(enqueue(agent, session, "first", "Original task"));
+  CHECK(waitEntered(*observed));
+  CHECK(started.load() == 1);
+  CHECK(enqueue(agent, session, "late", "Input during final response"));
+  observed->release.store(true);
+  agent.waitIdle();
+  CHECK(observed->lastUsers() ==
+        (std::vector<std::string>{"Original task",
+                                  "Input during final response"}));
+  const auto observations = observed->lastToolObservations();
+  CHECK(observations.size() == 1);
+  if (observations.size() == 1) {
+    CHECK(observations[0].at("type") == "tool_execution_observation");
+    CHECK(observations[0].at("executions").size() == 1);
+    if (observations[0].at("executions").size() == 1) {
+      const auto &execution = observations[0].at("executions")[0];
+      CHECK(execution.at("call_id") == "fixture_call");
+      CHECK(execution.at("tool") == "fixture_noop");
+      CHECK(execution.at("execution").at("canceled") == false);
     }
-    CHECK(observed->requests.size() >= 3);
+  }
+  CHECK(observed->requests.size() >= 3);
+  CHECK(started.load() == 2);
+  agent.eventBus().unsubscribe(subscription);
 }
 
 static void stopRetainsTheQueueAndSqliteReceiptSurvivesRestart() {
