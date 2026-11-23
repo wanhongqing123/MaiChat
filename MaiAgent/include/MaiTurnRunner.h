@@ -174,6 +174,7 @@ private:
     // 只属于当前轮次；一次软区整理失败后不在每项工具后重复整理，硬上限仍会重检。
     bool mCompactionDeferred = false;
     bool mForceCompaction = false;
+    std::size_t mRequestByteBudget = 0;
 
     MaiError mError;
     bool mHasVisibleText = false;

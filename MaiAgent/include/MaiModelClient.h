@@ -336,6 +336,11 @@ public:
     virtual MaiModelContextLimits contextLimits(const std::string& model) const;
     // 默认返回明确标为估计的本地计数；有真实 tokenizer 的实现可返回 exact=true。
     virtual MaiModelTokenEstimate estimateInputTokens(const MaiModelRequest& request) const;
+    // 返回与 stream 相同编码器产生的 JSON 请求体字节数，不发送网络请求。
+    // 仅容量恢复时调用；允许复用正常的本地图片预览准备及其线程安全缓存。
+    // 0 表示此实现无法测量，调用方不得把未知当作零字节或据此重发已拒绝请求。
+    // 文件/图片编码错误原样返回。默认实现不读取文件，未知的自定义传输保持兼容。
+    virtual MaiResult<std::size_t> requestBodyBytes(const MaiModelRequest& request);
 };
 
 // 工厂在 MaiOpenAiClient.h——那是**实现**，这里是接口。

@@ -75,6 +75,9 @@ public:
         // 工具优先策略每次相对触发前完整输入回收约此百分比；不是窗口的固定目标占比。
         // 达标就停止，后续检查点继续缩减剩余工具；仍须满足真实硬输入预算。
         unsigned int priorityReductionPercent = 20;
+        // HTTP 413 恢复专用的实际编码请求体预算；0 保持普通 token 策略。
+        // 不向模型或计费 usage 把字节伪装成 token；候选必须同时满足两种容量。
+        std::size_t requestByteBudget = 0;
     };
 
     // 特殊宿主可注入“从消息/片段边界构建原文并保留指定 user”的同线程回调。

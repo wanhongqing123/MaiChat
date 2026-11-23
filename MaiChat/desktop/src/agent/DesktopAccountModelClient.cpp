@@ -95,6 +95,10 @@ MaiModelContextLimits DesktopAccountModelClient::contextLimits(const std::string
     return routed_->contextLimits(model);
 }
 
+MaiResult<std::size_t> DesktopAccountModelClient::requestBodyBytes(const MaiModelRequest& request) {
+    return routed_->requestBodyBytes(request);
+}
+
 bool DesktopAccountModelClient::isConfiguredForModel(const std::string& model) const {
     const auto info = maiCloudModelInfo(model);
     if (!info || !config_.keyProvider) return false;

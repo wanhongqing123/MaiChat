@@ -581,6 +581,17 @@ public:
                                      : maiOfficialModelContextLimits(mConfig.baseUrl, model);
     }
 
+    MaiResult<std::size_t> requestBodyBytes(const MaiModelRequest& request) override {
+        const auto body = buildRequestBody(
+            request,
+            [this](const std::string& source, const std::string& workspace) {
+                return prepareImage(source, workspace);
+            },
+            mConfig.includeStreamUsage);
+        if (!body) return body.error();
+        return body.value().size();
+    }
+
     // 发送 Chat Completions 流式请求并将增量事件交给上层 sink。
     // 请求构造或传输失败时返回错误，不向会话写入伪造的完成事件。
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
@@ -783,6 +794,11 @@ public:
                 if (status == 400 && MaiModelRetry::isContextLengthError(context.rawBody))
                     return {MaiErrorCode::ContextWindowExceeded,
                             "The provider rejected the model context length."};
+                if (status == 413)
+                    return {MaiErrorCode::RequestBodyTooLarge,
+                            "HTTP 413: The provider rejected the request body (" +
+                                std::to_string(body.size()) + " bytes). " +
+                                providerErrorMessage(context.rawBody)};
                 if (status >= 400) {
                     const std::string provider = providerErrorMessage(context.rawBody);
                     std::string message = "HTTP " + std::to_string(status);

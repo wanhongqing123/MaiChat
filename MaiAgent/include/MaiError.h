@@ -41,6 +41,8 @@ enum class MaiErrorCode {
     Internal,  // 剩下的。落库失败、curl 初始化失败之类
     // 服务方明确返回上下文超限；用于一次强制压缩恢复，不从错误文案推断。
     ContextWindowExceeded,
+    // HTTP 413 是请求体字节超限，独立于 token 窗口；恢复前必须实际缩小 wire 数据。
+    RequestBodyTooLarge,
 };
 
 // 转成 "not_found" 这类稳定字符串。给日志和跨进程传递用——接收方据此分支，

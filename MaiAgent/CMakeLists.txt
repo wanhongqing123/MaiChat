@@ -651,6 +651,7 @@ if(MAIAGENT_BUILD_TESTS)
       MaiAgentSendMediaToolTests # 当前会话媒体交付、工作区边界与类型校验
       MaiContextBuilderImageTests # 图像历史有界，当前用户附件仍然可见
       MaiContextCompactorTests # Token budgets, atomic checkpoints and original history retrieval
+      MaiRequestBodyRecoveryTests # HTTP 413 byte-aware recovery and bounded summary rechunking
       MaiRvmMattingTests   # ONNX 递推状态和模型输入输出边界
       MaiRvmCompositeTests # 前景原色、透明背景和边缘混合
       MaiVideoMattingToolTests # 标准工具注册参数、路径和新文件契约

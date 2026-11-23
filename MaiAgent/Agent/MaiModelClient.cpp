@@ -117,6 +117,10 @@ MaiModelTokenEstimate MaiModelClient::estimateInputTokens(const MaiModelRequest&
     return maiEstimateModelInputTokens(request);
 }
 
+MaiResult<std::size_t> MaiModelClient::requestBodyBytes(const MaiModelRequest&) {
+    return std::size_t{0};
+}
+
 std::optional<MaiWireApi> MaiModelClient::wireApiForModel(const std::string&) const {
     return wireApi();
 }

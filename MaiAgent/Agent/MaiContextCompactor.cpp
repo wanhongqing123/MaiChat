@@ -826,12 +826,29 @@ MaiResult<std::string> collectSummaryText(MaiModelClient& model, const MaiModelR
 
 MaiResult<std::string> summarize(MaiModelClient& model, const MaiModelRequest& request,
                                  std::size_t summaryLimit, std::size_t inputLimit,
-                                 double estimateMultiplier, const std::atomic<bool>& cancel) {
+                                 double estimateMultiplier, const std::atomic<bool>& cancel,
+                                 std::size_t byteBudget = 0,
+                                 std::size_t* rejectedBodyBytes = nullptr) {
     MaiModelRequest attempt = request;
     for (unsigned int index = 0; index < 2; ++index) {
+        if (byteBudget != 0) {
+            const auto bytes = model.requestBodyBytes(attempt);
+            if (!bytes) return bytes.error();
+            if (bytes.value() == 0 || bytes.value() > byteBudget) {
+                if (rejectedBodyBytes) *rejectedBodyBytes = bytes.value();
+                return {MaiErrorCode::RequestBodyTooLarge,
+                        "The summary request exceeds its encoded-body budget."};
+            }
+        }
         auto text = collectSummaryText(model, attempt, cancel);
         // 流错误保持原失败（含 typed 恢复建议），不挪用摘要格式重试预算。
-        if (!text) return text.error();
+        if (!text) {
+            if (text.error().code() == MaiErrorCode::RequestBodyTooLarge && rejectedBodyBytes) {
+                const auto bytes = model.requestBodyBytes(attempt);
+                if (bytes) *rejectedBodyBytes = bytes.value();
+            }
+            return text.error();
+        }
         const auto validated = validateSummary(text.value());
         bool oversized = false;
         if (validated) {
@@ -879,14 +896,13 @@ MaiResult<std::string> summarize(MaiModelClient& model, const MaiModelRequest& r
     return {MaiErrorCode::Internal, "Context summary attempt accounting failed."};
 }
 
-MaiResult<std::string> summarizeSelectedFields(MaiModelClient& model,
-                                               const MaiModelRequest& request,
-                                               const std::vector<SourceField>& sourceFields,
-                                               std::string summary, std::size_t summaryOutput,
-                                               std::size_t summaryLimit, std::size_t summaryInput,
-                                               double multiplier, const std::atomic<bool>& cancel,
-                                               bool protectHostRecords,
-                                               const std::function<void()>& onStarted = {}) {
+MaiResult<std::string> summarizeSelectedFieldsOnce(
+    MaiModelClient& model, const MaiModelRequest& request,
+    const std::vector<SourceField>& sourceFields, std::string summary, std::size_t summaryOutput,
+    std::size_t summaryLimit, std::size_t summaryInput, double multiplier,
+    const std::atomic<bool>& cancel, bool protectHostRecords,
+    const std::function<void()>& onStarted, std::size_t byteBudget,
+    std::size_t* rejectedBodyBytes) {
     const auto estimate = [&](const MaiModelRequest& value) {
         return scaledTokens(model.estimateInputTokens(value), multiplier);
     };
@@ -898,8 +914,9 @@ MaiResult<std::string> summarizeSelectedFields(MaiModelClient& model,
             started = true;
             if (onStarted) onStarted();
         }
-        const auto merged = summarize(model, summaryRequest(request, summary, batch, summaryOutput),
-                                      summaryLimit, summaryInput, multiplier, cancel);
+        const auto merged =
+            summarize(model, summaryRequest(request, summary, batch, summaryOutput), summaryLimit,
+                      summaryInput, multiplier, cancel, byteBudget, rejectedBodyBytes);
         if (!merged) return merged.error();
         summary = merged.value();
         if (protectHostRecords) {
@@ -938,6 +955,15 @@ MaiResult<std::string> summarizeSelectedFields(MaiModelClient& model,
                 batch.push_back(fragment);
                 fits = estimate(summaryRequest(request, summary, batch, summaryOutput)) <=
                        summaryInput / 100 * 85;
+                if (fits && byteBudget != 0) {
+                    const auto bytes = model.requestBodyBytes(
+                        summaryRequest(request, summary, batch, summaryOutput));
+                    if (!bytes) return bytes.error();
+                    if (bytes.value() == 0)
+                        return {MaiErrorCode::RequestBodyTooLarge,
+                                "The summary transport cannot measure request bytes."};
+                    fits = bytes.value() <= byteBudget;
+                }
                 if (fits) break;
                 batch.erase(batch.end() - 1);
                 // 有已有内容时先总结它，避免每个字段被切成许多极小尾块。
@@ -960,6 +986,33 @@ MaiResult<std::string> summarizeSelectedFields(MaiModelClient& model,
         return {MaiErrorCode::Protocol,
                 "No valid context summary was produced; original history is preserved."};
     return summary;
+}
+
+MaiResult<std::string> summarizeSelectedFields(
+    MaiModelClient& model, const MaiModelRequest& request, const std::vector<SourceField>& fields,
+    const std::string& summary, std::size_t output, std::size_t summaryLimit,
+    std::size_t inputLimit, double multiplier, const std::atomic<bool>& cancel,
+    bool protectHostRecords, const std::function<void()>& onStarted, std::size_t byteBudget = 0) {
+    // 摘要自身也可能被 413 拒绝；从原始字段重新分块，失败的部分摘要不写入检查点。
+    for (unsigned int attempt = 0; attempt < 5; ++attempt) {
+        std::size_t rejected = 0;
+        auto result = summarizeSelectedFieldsOnce(
+            model, request, fields, summary, output, summaryLimit, inputLimit, multiplier, cancel,
+            protectHostRecords, onStarted, byteBudget, &rejected);
+        if (result || result.error().code() != MaiErrorCode::RequestBodyTooLarge || attempt == 4 ||
+            rejected <= 1 || (byteBudget != 0 && byteBudget <= 1))
+            return result;
+        const auto fixed =
+            model.requestBodyBytes(summaryRequest(request, summary, Json::array(), output));
+        if (!fixed) return fixed.error();
+        if (fixed.value() == 0 || fixed.value() >= rejected - 1) return result;
+        // 只折半可分块的来源部分；基础指令和原摘要是不能随意裁掉的固定开销。
+        const auto reduced = fixed.value() + (rejected - fixed.value()) / 2;
+        byteBudget = byteBudget == 0 ? reduced : std::min(byteBudget - 1, reduced);
+        if (cancel.load(std::memory_order_relaxed))
+            return {MaiErrorCode::Canceled, "Context summarization was canceled."};
+    }
+    return {MaiErrorCode::Internal, "Summary request-size recovery accounting failed."};
 }
 
 }  // namespace
@@ -1043,8 +1096,28 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
         std::min(effectiveWindow, limits.contextWindowTokens - outputReserve);
     const std::size_t trigger =
         std::min(windowPercent(limits.contextWindowTokens, mOptions.triggerPercent), inputBudget);
+    MaiError bodyMeasureError;
     const auto estimate = [&](const MaiModelRequest& value) {
-        return scaledTokens(model.estimateInputTokens(value), mOptions.estimateMultiplier);
+        const auto tokens =
+            scaledTokens(model.estimateInputTokens(value), mOptions.estimateMultiplier);
+        if (mOptions.requestByteBudget == 0) return tokens;
+        const auto bytes = model.requestBodyBytes(value);
+        if (!bytes || bytes.value() == 0) {
+            bodyMeasureError =
+                !bytes ? bytes.error()
+                       : MaiError{MaiErrorCode::RequestBodyTooLarge,
+                                  "The transport cannot measure the rejected request body. "
+                                  "Original history is preserved; start a fresh conversation."};
+            return std::numeric_limits<std::size_t>::max();
+        }
+        // 仅内部容量排序使用统一压力刻度；实际 token/usage 和持久计数仍独立保存。
+        const long double pressure = std::ceil(static_cast<long double>(bytes.value()) *
+                                               inputBudget / mOptions.requestByteBudget);
+        const auto bounded =
+            pressure >= static_cast<long double>(std::numeric_limits<std::size_t>::max())
+                ? std::numeric_limits<std::size_t>::max()
+                : static_cast<std::size_t>(pressure);
+        return std::max(tokens, bounded);
     };
     std::size_t target =
         allowToolProjection
@@ -1052,6 +1125,7 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
                        inputBudget)
             : std::min(windowPercent(limits.contextWindowTokens, mOptions.targetPercent),
                        inputBudget);
+    if (bodyMeasureError) return bodyMeasureError;
     if (trigger == 0 || target == 0)
         return {MaiErrorCode::InvalidInput, "The selected model has no usable context budget."};
     prepared.inputEstimate = model.estimateInputTokens(request);
@@ -1261,6 +1335,17 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
         next.created = allowToolProjection ? candidateCreated : MaiTime::getCurrentTime();
         MaiModelRequest compacted = request;
         compacted.messages = withCheckpoint(next);
+        if (mOptions.requestByteBudget != 0) {
+            const auto bytes = model.requestBodyBytes(compacted);
+            if (!bytes) return bytes.error();
+            if (bytes.value() == 0 || bytes.value() > mOptions.requestByteBudget) {
+                if (capacityExceeded) *capacityExceeded = true;
+                return {MaiErrorCode::RequestBodyTooLarge,
+                        "The protected conversation still exceeds the request-body budget. "
+                        "Original history is preserved; start a fresh conversation or send a "
+                        "smaller current image."};
+            }
+        }
         if (estimate(compacted) > inputBudget || estimate(compacted) >= estimate(request)) {
             if (capacityExceeded) *capacityExceeded = true;
             return {MaiErrorCode::InvalidInput,
@@ -1271,7 +1356,9 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
             const auto savedFrame = priorityFrameFingerprint(
                 sessionId, compacted, true, mOptions.priorityReductionPercent,
                 limits.contextWindowTokens, inputBudget, trigger);
-            markPriorityState(references, sourceFingerprint, savedFrame, estimate(compacted));
+            markPriorityState(
+                references, sourceFingerprint, savedFrame,
+                scaledTokens(model.estimateInputTokens(compacted), mOptions.estimateMultiplier));
             next.references = dumpContextJson(references);
         }
         // 索引恢复在候选全部组装后核对完整来源与旧检查点身份；普通语义摘要沿用原来的
@@ -1590,10 +1677,10 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
                 if (countCandidate(retained) <= aim) break;
             }
             if (selected.empty()) break;
-            auto merged = summarizeSelectedFields(model, request, selected, summary, summaryOutput,
-                                                  summaryLimit, summaryInput,
-                                                  mOptions.estimateMultiplier, cancel, true,
-                                                  notifyCompactionStarted);
+            auto merged = summarizeSelectedFields(
+                model, request, selected, summary, summaryOutput, summaryLimit, summaryInput,
+                mOptions.estimateMultiplier, cancel, true, notifyCompactionStarted,
+                mOptions.requestByteBudget);
             if (!merged) return deferOrFail(merged.error());
             summary = std::move(merged.value());
             // 模型实际摘要比预留更短时，回填本轮刚选中、且与保留尾段相邻的正文。
@@ -1696,7 +1783,7 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
     auto merged =
         summarizeSelectedFields(model, request, fields, summary, summaryOutput, summaryLimit,
                                 summaryInput, mOptions.estimateMultiplier, cancel, false,
-                                notifyCompactionStarted);
+                                notifyCompactionStarted, mOptions.requestByteBudget);
     if (!merged) return deferOrFail(merged.error());
     return commitSummary(std::move(merged.value()), false);
 }

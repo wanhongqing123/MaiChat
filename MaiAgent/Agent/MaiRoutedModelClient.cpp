@@ -87,6 +87,19 @@ public:
         return mWire;
     }
 
+    MaiResult<std::size_t> requestBodyBytes(const MaiModelRequest& request) override {
+        const auto* route = mError ? nullptr : findRoute(request.model);
+        if (!route) return std::size_t{0};
+        std::shared_ptr<MaiModelClient> client;
+        {
+            std::lock_guard<std::mutex> lock(mClientsMutex);
+            const auto found = mClients.find(route);
+            if (found != mClients.end()) client = found->second.client;
+        }
+        // HTTP 413 后只复用刚才实际使用的传输；不额外取凭据、切换供应商或启动模型。
+        return client ? client->requestBodyBytes(request) : MaiResult<std::size_t>{std::size_t{0}};
+    }
+
     std::optional<MaiWireApi> wireApiForModel(const std::string& model) const override {
         const auto* route = mError ? nullptr : findRoute(model);
         return route ? std::optional<MaiWireApi>(route->config.wire) : std::nullopt;

@@ -883,6 +883,15 @@ public:
 
     // 建立 Responses 流并逐事件更新上层，保留取消与传输失败的明确结果。
     // 只在供应商确认完成后结束流，不从连接关闭推断模型已经完成。
+    MaiResult<std::size_t> requestBodyBytes(const MaiModelRequest& request) override {
+        const auto body =
+            buildBody(request, [this](const std::string& source, const std::string& workspace) {
+                return prepareImage(source, workspace);
+            });
+        if (!body) return body.error();
+        return body.value().size();
+    }
+
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                     const std::atomic<bool>& cancel) override {
         if (cancel.load(std::memory_order_relaxed))
@@ -1067,6 +1076,11 @@ public:
                 if (status == 400 && MaiModelRetry::isContextLengthError(context.rawBody))
                     return {MaiErrorCode::ContextWindowExceeded,
                             "The provider rejected the model context length."};
+                if (status == 413)
+                    return {MaiErrorCode::RequestBodyTooLarge,
+                            "HTTP 413: The provider rejected the request body (" +
+                                std::to_string(body.size()) + " bytes). " +
+                                providerError(context.rawBody)};
                 if (status >= 400) {
                     const std::string detail = providerError(context.rawBody);
                     std::string message =

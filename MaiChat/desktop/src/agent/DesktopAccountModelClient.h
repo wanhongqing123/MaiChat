@@ -28,6 +28,7 @@ public:
     MaiWireApi wireApi() const override;
     std::optional<MaiWireApi> wireApiForModel(const std::string& model) const override;
     MaiModelContextLimits contextLimits(const std::string& model) const override;
+    MaiResult<std::size_t> requestBodyBytes(const MaiModelRequest& request) override;
     bool isConfiguredForModel(const std::string& model) const;
 
 private:
