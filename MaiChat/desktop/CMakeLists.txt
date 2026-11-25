@@ -1192,6 +1192,12 @@ target_include_directories(agent_controller_test PRIVATE
 target_link_libraries(agent_controller_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
   remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 
+# Exercise the actual sidebar with owned sessions, without a provider or account database.
+add_executable(agent_session_list_scrollbar_test tests/AgentSessionListScrollBarTest.cpp)
+target_link_libraries(agent_session_list_scrollbar_test PRIVATE remote_im_desktop_ui
+  remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
+add_test(NAME agent_session_list_scrollbar_test COMMAND agent_session_list_scrollbar_test)
+
 add_executable(desktop_session_sync_host_test tests/DesktopSessionSyncHostTest.cpp)
 target_include_directories(desktop_session_sync_host_test PRIVATE ../MaiChatTools)
 target_link_libraries(desktop_session_sync_host_test PRIVATE remote_im_desktop_ui

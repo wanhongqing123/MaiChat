@@ -231,6 +231,7 @@ AgentSessionList::AgentSessionList(AgentController& controller, QWidget* parent)
 
     // ---- 会话 ----
     runtime_->list = new QListWidget(this);
+    runtime_->list->setObjectName(QStringLiteral("agentSessionEntries"));
     runtime_->list->setFrameShape(QFrame::NoFrame);
     runtime_->list->setSelectionMode(QAbstractItemView::SingleSelection);
     runtime_->list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -238,9 +239,21 @@ AgentSessionList::AgentSessionList(AgentController& controller, QWidget* parent)
     runtime_->list->setMouseTracking(true);
     runtime_->list->viewport()->installEventFilter(this);
     runtime_->list->viewport()->setContextMenuPolicy(Qt::CustomContextMenu);
-    runtime_->list->setStyleSheet(QStringLiteral(
+    // 主窗口的细滚动条规则仅覆盖联系人/IM 列表；创作中心在自己的列表作用域内复用
+    // 同一配色与尺寸，避免设备展开后露出系统箭头和粗轨道。UiZoom 保留逻辑像素来源。
+    UiZoom::setStyle(runtime_->list, QStringLiteral(
         "QListWidget{background:transparent;border:none;outline:none;}"
-        "QListWidget::item{background:transparent;}"));
+        "QListWidget::item{background:transparent;}"
+        "QListWidget#agentSessionEntries QScrollBar:vertical{"
+        "background:transparent;width:8px;margin:0;}"
+        "QListWidget#agentSessionEntries QScrollBar::handle:vertical{"
+        "background:#d3dae4;border-radius:4px;min-height:24px;}"
+        "QListWidget#agentSessionEntries QScrollBar::handle:vertical:hover{background:#b9c3d1;}"
+        "QListWidget#agentSessionEntries QScrollBar::add-line:vertical,"
+        "QListWidget#agentSessionEntries QScrollBar::sub-line:vertical{"
+        "height:0;border:0;background:transparent;}"
+        "QListWidget#agentSessionEntries QScrollBar::add-page:vertical,"
+        "QListWidget#agentSessionEntries QScrollBar::sub-page:vertical{background:transparent;}"));
     column->addWidget(runtime_->list, 1);
 
     // 本机与远端的新建入口都放在设备标题中。使用真实按钮保留键盘与辅助功能，
