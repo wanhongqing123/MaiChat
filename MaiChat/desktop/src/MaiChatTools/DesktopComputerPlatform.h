@@ -28,9 +28,21 @@ struct DesktopNativeWindow {
     bool toolWindow = false;
     std::uint64_t ownerId = 0;
     std::string className;
+    // 原生指针单位/窗口逻辑像素；Windows 来自窗口 DPI，macOS 屏幕点为 1。
+    double coordinateScale = 1.0;
 };
 
 enum class DesktopWindowStateAction { Minimize, Restore };
+
+// 应用目录来自系统注册/安装位置；缺失的可选使用信息保持未知，不伪造为零。
+struct DesktopNativeApplication {
+    std::string id;
+    std::optional<std::string> displayName;
+    std::optional<bool> isRunning;
+    std::optional<std::string> lastUsedDate;
+    std::optional<std::uint64_t> useCount;
+    std::vector<DesktopNativeWindow> windows;
+};
 
 // Snapshot-owned native identity. Platform references retain only the selected
 // object and are never serialized or accepted from model arguments.
@@ -55,6 +67,9 @@ struct DesktopNativeElement {
     bool enabled = true;
     bool offscreen = false;
     std::shared_ptr<const DesktopNativeElementReference> reference;
+    // 深度和次级动作来自当前原生观察；动作名称不能由模型自行扩充。
+    std::size_t depth = 0;
+    std::vector<std::string> secondaryActions;
 };
 
 struct DesktopNativeAccessibilitySnapshot {
@@ -66,6 +81,11 @@ struct DesktopNativeAccessibilitySnapshot {
     bool countsKnown = false;
     bool truncated = false;
     std::string limitReason;
+    // 未提供与空字符串不同：provider 没有该项时保持 nullopt。
+    std::optional<std::string> focusedElement;
+    std::optional<std::string> selectedText;
+    std::optional<std::vector<std::string>> selectedElements;
+    std::optional<std::string> documentText;
 };
 
 // Bounds use native pointer coordinates; the observation reports PNG pixels
@@ -116,8 +136,8 @@ struct DesktopNativeInputState {
     std::vector<DesktopInputDevice> controllers;
     std::int64_t idleRemainingMs = 0;
     bool empty() const {
-        return buttonsDown.empty() && keysDown.empty() && rawKeys.empty() && touchPointers.empty() && !penActive && devices.empty() &&
-               controllers.empty();
+        return buttonsDown.empty() && keysDown.empty() && rawKeys.empty() && touchPointers.empty() && !penActive &&
+               devices.empty() && controllers.empty();
     }
 };
 
@@ -186,15 +206,24 @@ public:
 std::shared_ptr<DesktopNativeInputSession> maiDesktopCreateInputSession();
 
 MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows();
+MaiResult<std::vector<DesktopNativeApplication>> maiDesktopApplications(const std::function<bool()>& isCanceled = {});
+MaiResult<std::string> maiDesktopApplicationId(const DesktopNativeWindow& window);
+MaiError maiDesktopLaunchApplication(const std::string& app, const std::function<bool()>& isCanceled = {});
 MaiResult<std::vector<DesktopNativeDisplay>> maiDesktopDisplays();
 MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(const DesktopNativeWindow& window);
-MaiResult<DesktopNativeAccessibilitySnapshot> maiDesktopInspectElements(
-    const DesktopNativeWindow& window, const std::function<bool()>& isCanceled = {});
-MaiResult<DesktopNativeElement> maiDesktopResolveElement(
-    const DesktopNativeWindow& window, const DesktopNativeElement& observedElement,
-    const std::function<bool()>& isCanceled = {});
+MaiResult<DesktopNativeAccessibilitySnapshot> maiDesktopInspectElements(const DesktopNativeWindow& window,
+                                                                        const std::function<bool()>& isCanceled = {});
+MaiResult<DesktopNativeElement> maiDesktopResolveElement(const DesktopNativeWindow& window,
+                                                         const DesktopNativeElement& observedElement,
+                                                         const std::function<bool()>& isCanceled = {});
+// 仅操作仍属于所选窗口的原生元素；不以聚焦后全选输入替代原生值/元素动作。
+MaiError maiDesktopSetElementValue(const DesktopNativeWindow& window, const DesktopNativeElement& observedElement,
+                                   const std::string& value, const std::function<bool()>& isCanceled = {});
+MaiError maiDesktopPerformSecondaryAction(const DesktopNativeWindow& window,
+                                          const DesktopNativeElement& observedElement, const std::string& action,
+                                          const std::function<bool()>& isCanceled = {});
 MaiError maiDesktopSetWindowState(const DesktopNativeWindow& window, DesktopWindowStateAction action,
-                                   const std::function<bool()>& isCanceled = {});
+                                  const std::function<bool()>& isCanceled = {});
 MaiError maiDesktopActivateWindow(const DesktopNativeWindow& window);
 // Callback is valid only during this synchronous call. Queued platform work
 // must abandon activation and clear its callback before the waiter returns.

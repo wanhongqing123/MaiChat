@@ -9,6 +9,7 @@
 
 #include <json.hpp>
 
+#include "MaiCloudModelCatalog.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiPathGuard.h"
@@ -53,9 +54,11 @@ public:
     }
 
     bool isAvailableForModel(const std::string& model) const override {
+        // 已知云型号使用共用视觉能力，避免升级旗舰后残留文本专用例外。
         // 当前本地主模型传输只接受文本。按实际 local: 模型标识拒绝，不能因为
         // 底层架构可能支持视觉就宣称已经接入图像输入。
-        return model != "glm-5.3" && model.compare(0, 6, "local:") != 0;
+        if (const auto capability = maiCloudModelInfo(model)) return capability->supportsImages;
+        return model.compare(0, 6, "local:") != 0;
     }
 
     std::string parametersSchema() const override {
@@ -76,16 +79,11 @@ public:
                                           "view_image requires one string parameter named path");
         }
         if (!isAvailableForModel(context.model)) {
-            if (context.model != "glm-5.3")
-                return MaiToolResult::failure(
-                    MaiErrorCode::NotSupported,
-                    "The current local primary model accepts text only and cannot analyze image "
-                    "pixels. To display this file to the user, use mobile_preview_image when "
-                    "available. Do not claim that the image was analyzed.");
             return MaiToolResult::failure(
                 MaiErrorCode::NotSupported,
-                "The current glm-5.3 model accepts text only. Ask the user to switch to "
-                "glm-5.3-flash before viewing an image.");
+                "The current primary model accepts text only and cannot analyze image "
+                "pixels. To display this file to the user, use mobile_preview_image when "
+                "available. Do not claim that the image was analyzed.");
         }
 
         const std::string rawPath = arguments["path"].get<std::string>();

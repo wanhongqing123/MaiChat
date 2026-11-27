@@ -517,8 +517,6 @@ private:
 struct Workflow {
     std::shared_ptr<DesktopComputerController> controller;
     std::shared_ptr<OwnedBackend> backend;
-    MaiToolRegistry registry;
-    MaiTool* tool = nullptr;
     MaiToolContext context;
     std::atomic<bool> canceled{false};
     Json trace = Json::array();
@@ -531,8 +529,6 @@ struct Workflow {
         : evidence(std::move(evidenceDirectory)) {
         backend = std::make_shared<OwnedBackend>(owned);
         controller = std::make_shared<DesktopComputerController>(backend);
-        registerDesktopComputerTools(registry, controller);
-        tool = registry.find("desktop_computer");
         context.sessionId = "owned-actions-" + std::to_string(GetCurrentProcessId());
         context.turnId = "owned-actions-turn";
         context.root = workspace.toUtf8().toStdString();
@@ -551,8 +547,45 @@ struct Workflow {
     MaiToolResult call(const Json& request, const char* stage) {
         const auto action = request.value("action", std::string());
         if (action == "click" || action == "double_click" || action == "right_click") attemptedInput = true;
-        const auto result = worker([&] { return tool->execute(request.dump(), context); });
-        Json record{{"stage", stage}, {"request", request}, {"ok", !result.hasError()}};
+        // 此 fixture 验证普通快照 ID、显示器范围和窗口状态，不再借用模型 action 协议。
+        const auto result = worker([&]() -> MaiToolResult {
+            const auto identifier = [&](const char* name) { return std::stoull(request.value(name, std::string("0")));
+            };
+            const auto canceled = [&] { return context.isCanceled(); };
+            if (action == "observe") {
+                const auto observed =
+                    request.value("target", std::string("window")) == "display"
+                        ? controller->observeDisplay(context.sessionId, context.root, identifier("display_id"),
+                                                     canceled, 0, 0, 0, context.turnId, identifier("element_window_id"))
+                        : controller->observe(context.sessionId, "", context.root,
+                                              request.value("include_elements", true), identifier("window_id"),
+                                              request.value("include_image", false), canceled, context.turnId);
+                if (!observed) return MaiToolResult::failure(observed.error().code(), observed.error().message());
+                std::vector<MaiToolImage> images;
+                if (!observed.value().imagePath.empty()) images.push_back({observed.value().imagePath, "image/png"});
+                return MaiToolResult::successWithImages(observed.value().json, std::move(images));
+            }
+            DesktopComputerAction input;
+            input.action = action;
+            input.windowId = identifier("window_id");
+            input.displayId = identifier("display_id");
+            input.desktopScope = request.value("target", std::string("window")) == "display";
+            input.snapshotId = request.value("snapshot_id", std::string());
+            input.elementId = request.value("element_id", std::string());
+            input.turnId = context.turnId;
+            input.workspace = context.root;
+            input.isCanceled = canceled;
+            const auto performed = controller->perform(context.sessionId, input);
+            if (!performed) return MaiToolResult::failure(performed.error().code(), performed.error().message());
+            std::vector<MaiToolImage> images;
+            if (!performed.value().observation.imagePath.empty())
+                images.push_back({performed.value().observation.imagePath, "image/png"});
+            return MaiToolResult::successWithImages(Json{{"state", performed.value().state},
+                                                         {"dispatched", performed.value().dispatched},
+                                                         {"verified", performed.value().verified}}
+                                                        .dump(),
+                                                    std::move(images)); });
+        Json record{{"stage", stage}, {"interface", "ordinary_controller"}, {"request", request}, {"ok", !result.hasError()}};
         if (result.hasError()) {
             record["error"] = result.error().message();
             record["error_code"] = int(result.error().code());
@@ -564,7 +597,7 @@ struct Workflow {
                     const QString filename = QString::fromLatin1(stage) + QStringLiteral("-%1.png").arg(qulonglong(index));
                     const bool copied = QFile::copy(QString::fromStdString(result.images()[index].path),
                                                      QDir(evidence).filePath(filename));
-                    check(copied, "owned tool screenshot evidence is preserved");
+                    check(copied, "owned ordinary screenshot evidence is preserved");
                     images.push_back(filename.toStdString());
                 }
                 record["owned_images"] = std::move(images);
@@ -858,7 +891,7 @@ int run() {
     }
 
     Workflow workflow(workspace.path(), owned, evidence);
-    if (!workflow.tool) return 1;
+    if (!workflow.controller) return 1;
     workflow.trace.push_back({{"stage", "startup-normal-native-activation"}, {"result", startupActivation}});
     const auto cleanup = qScopeGuard([&] {
         worker([&] { return workflow.controller->releaseInput(workflow.context.sessionId, workflow.context.turnId); });
@@ -935,7 +968,7 @@ int run() {
     workflow.check(preserve("owned-main-before"), "production window capture retains owned pixels");
     auto snapshot = workflow.observe(target.id, "before-id-click");
     auto element = Workflow::element(snapshot, "Owned action button");
-    workflow.check(!element.empty(), "tool observation exposes a snapshot-bound native control ID");
+    workflow.check(!element.empty(), "ordinary observation exposes a snapshot-bound native control ID");
     if (element.empty() || !owned.ready()) return 1;
     const auto firstRequest = Workflow::click(target.id, snapshot, element);
     const auto clicked = workflow.call(firstRequest, "id-click");
@@ -979,7 +1012,8 @@ int run() {
                                          {"window_id", std::to_string(target.id)},
                                          {"snapshot_id", metadata.value("snapshot_id", std::string())}}, "restore");
     pump();
-    workflow.check(!restored.hasError() && !IsIconic(mainHandle), "tool restores exact owned HWND without a focus workaround");
+    workflow.check(!restored.hasError() && !IsIconic(mainHandle),
+                   "ordinary controller restores exact owned HWND without a focus workaround");
     const auto canceledState = worker([&] {
         return maiDesktopSetWindowState(target, DesktopWindowStateAction::Minimize, [] { return true; });
     });

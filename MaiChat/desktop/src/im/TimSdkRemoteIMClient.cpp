@@ -614,7 +614,7 @@ void TimSdkRemoteIMClient::connectToService(int sdkAppId, const QString& userId,
             if (self && self->currentAccount() == account && self->connected_ &&
                 self->profileSession_ == profileSession) {
                 ++self->selfProfileRevision_;
-                self->handleSelfProfilePayload(payload);
+                self->handleSelfProfilePayload(payload, self->selfProfileRevision_);
             }
         }, Qt::AutoConnection);
     });
@@ -703,6 +703,7 @@ void TimSdkRemoteIMClient::setSelfAvatar(const QString &avatarUrl, RemoteIMCompl
                     return;
                 }
                 ++self->selfProfileRevision_;
+                self->selfAvatarRevision_ = self->selfProfileRevision_;
                 self->selfAvatarUrl_ = avatarUrl;
                 emit self->selfProfileReceived(self->currentUserId_,
                                                self->selfDisplayName_.isEmpty()
@@ -1555,15 +1556,15 @@ void TimSdkRemoteIMClient::syncInitialData() {
         if (code != 0 || !self) return;
         QMetaObject::invokeMethod(self, [self, account, session, revision, payload] {
             if (self && self->connected_ && self->currentAccount() == account &&
-                self->profileSession_ == session && self->selfProfileRevision_ == revision)
-                self->handleSelfProfilePayload(payload);
+                self->profileSession_ == session)
+                self->handleSelfProfilePayload(payload, revision);
         }, Qt::AutoConnection);
     });
     fetchFriendList();
     fetchConversationList();
 }
 
-void TimSdkRemoteIMClient::handleSelfProfilePayload(const QString& payload) {
+void TimSdkRemoteIMClient::handleSelfProfilePayload(const QString& payload, quint64 requestRevision) {
     const QJsonDocument document = QJsonDocument::fromJson(payload.toUtf8());
     QJsonArray profiles;
     if (document.isArray()) profiles = document.array();
@@ -1572,13 +1573,18 @@ void TimSdkRemoteIMClient::handleSelfProfilePayload(const QString& payload) {
         const QJsonObject profile = value.toObject();
         const QString userId = profile.value(QStringLiteral("user_profile_identifier")).toString();
         if (userId != currentUserId_) continue;
-        // 自资料推送可能只含变化字段；头像变化不能顺便清空昵称，反之亦然。
-        if (profile.contains(QStringLiteral("user_profile_nick_name")))
+        // 登录时权限/昵称的稀疏推送可先于完整查询返回。按字段判旧，既补齐未变更的
+        // 头像，也不能让旧查询覆盖推送中的新头像（包括明确清空）或新昵称。
+        if (profile.contains(QStringLiteral("user_profile_nick_name")) && selfNameRevision_ <= requestRevision) {
             selfDisplayName_ = profile.value(QStringLiteral("user_profile_nick_name")).toString();
-        if (profile.contains(QStringLiteral("user_profile_face_url")))
+            selfNameRevision_ = requestRevision;
+        }
+        if (profile.contains(QStringLiteral("user_profile_face_url")) && selfAvatarRevision_ <= requestRevision) {
             selfAvatarUrl_ = profile.value(QStringLiteral("user_profile_face_url")).toString();
+            selfAvatarRevision_ = requestRevision;
+        }
         qInfo() << "[im] self profile updated; has avatar:"
-                << !profile.value(QStringLiteral("user_profile_face_url")).toString().isEmpty();
+                << !selfAvatarUrl_.isEmpty();
         emit selfProfileReceived(userId, selfDisplayName_.isEmpty() ? userId : selfDisplayName_,
                                  selfAvatarUrl_);
     }

@@ -484,6 +484,8 @@ private slots:
     void refusesOversizedQrResponseAndAuthRedirect();
     void refreshesTemporaryModelCredentialsThroughLiveProviders();
     void fetchesAccountModelKeysThroughAccountSession();
+    void openAiAccountModelCredentialsStayOptionalAndValidated_data();
+    void openAiAccountModelCredentialsStayOptionalAndValidated();
     void refusesMalformedTemporaryModelCredentials();
     void retriesStoredSessionAfterTransientRestoreFailure();
     void sessionSyncSocketReusesMaiChatAccount();
@@ -1324,6 +1326,63 @@ void LoginDialogTest::fetchesAccountModelKeysThroughAccountSession() {
             QVERIFY(keys.isEmpty());
         }
     }
+}
+
+void LoginDialogTest::openAiAccountModelCredentialsStayOptionalAndValidated_data() {
+    QTest::addColumn<QJsonObject>("providers");
+    QTest::addColumn<bool>("accepted");
+    QTest::addColumn<bool>("hasOpenAi");
+    const QJsonObject legacy{{QStringLiteral("glm"), QStringLiteral("synthetic-glm")},
+                              {QStringLiteral("deepseek"), QString()}};
+    QTest::newRow("legacy-missing-openai") << legacy << true << false;
+    auto empty = legacy;
+    empty.insert(QStringLiteral("openai"), QString());
+    QTest::newRow("legacy-empty-openai") << empty << true << false;
+    QTest::newRow("openai-only")
+        << QJsonObject{{QStringLiteral("openai"), QStringLiteral("synthetic-openai")}} << true << true;
+    // No real provider credentials enter this fixture. Invalid optional values
+    // reject the complete response even when a legacy provider remains valid.
+    for (const auto& value : {QJsonValue(QJsonValue::Null), QJsonValue(QJsonObject{}), QJsonValue(42),
+                              QJsonValue(QStringLiteral("bad\nkey")), QJsonValue(QString(4097, QLatin1Char('X')))}) {
+        auto invalid = legacy;
+        invalid.insert(QStringLiteral("openai"), value);
+        const auto row = QByteArray("invalid-openai-") + QByteArray::number(int(value.type())) +
+                         QByteArray::number(value.toString().size());
+        QTest::newRow(row.constData()) << invalid << false << false;
+    }
+    QTest::newRow("only-empty-openai") << QJsonObject{{QStringLiteral("openai"), QString()}} << false << false;
+}
+
+void LoginDialogTest::openAiAccountModelCredentialsStayOptionalAndValidated() {
+    QFETCH(QJsonObject, providers);
+    QFETCH(bool, accepted);
+    QFETCH(bool, hasOpenAi);
+    FakeQrServer server;
+    server.claimStatus = 200;
+    server.mainModelKeysOverride = providers;
+    DesktopAuthClient auth(nullptr, server.url(), false);
+    LoginDialog dialog(&auth);
+    QSignalSpy loggedIn(&dialog, &QDialog::accepted);
+    dialog.show();
+    dialog.start();
+    QTRY_COMPARE_WITH_TIMEOUT(loggedIn.size(), 1, 5000);
+    bool finished = false;
+    QHash<QString, QString> keys;
+    QString error;
+    auth.fetchAccountModelKeys([&](const QHash<QString, QString>& received, const QString& failure) {
+        keys = received;
+        error = failure;
+        finished = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(finished, 5000);
+    QCOMPARE(error.isEmpty(), accepted);
+    QCOMPARE(keys.contains(QStringLiteral("openai")), hasOpenAi);
+    if (!accepted) QVERIFY(keys.isEmpty());
+    if (hasOpenAi) {
+        QCOMPARE(keys.size(), 1);
+        QCOMPARE(keys.value(QStringLiteral("openai")), QStringLiteral("synthetic-openai"));
+    }
+    QVERIFY(server.mainModelBearer);
 }
 
 void LoginDialogTest::refusesMalformedTemporaryModelCredentials() {

@@ -265,6 +265,12 @@ public:
     virtual MaiToolSpec specForModel(const std::string& model) const;
 };
 
+// 公开发现只需要名称和描述，不创建参数 Schema 或读取技能正文。
+struct MaiToolMetadata {
+    std::string name;
+    std::string description;
+};
+
 // 工具注册表。
 class MaiToolRegistry {
 public:
@@ -281,6 +287,9 @@ public:
     // 给实际主模型的工具清单，与 findForModel 使用相同能力门禁。
     // model 为空时返回全部公开工具；正式模型请求必须传当前会话的实际模型名。
     std::vector<MaiToolSpec> specs(const std::string& model = {}) const;
+    // 与 specs/findForModel 共用公开性及型号门禁；不调用 specForModel/parametersSchema。
+    // 注册完成后可并发读取，结果归调用方持有，不包含内部工具。
+    std::vector<MaiToolMetadata> metadata(const std::string& model = {}) const;
     // 在工作线程汇总带模型工具的能力快照。它可能读取宿主中的密钥配置状态，
     // 但不得把密钥值放进返回结果；该清单目前不会自动拼入主模型请求。
     std::vector<MaiSpecialistInfo> specialists() const;
@@ -300,9 +309,12 @@ private:
 
 // 把所有内置工具装进清单。
 //
-// **工厂声明在各自的头里**（MaiEditTool.h、MaiShellTool.h 之类），不在这儿。
+// **工厂声明在各自的头里**（MaiEditTool.h、MaiExecCommandTool.h 之类），不在这儿。
 // 都堆在这个头上的话，它会变成个杂货铺：改一个工具要动所有人都包含的文件，
 // 而且看不出哪个声明属于哪个实现。
 //
 // shell 只在跑得了外部进程的平台上注册，见 MaiProcess.h。
-void registerMaiBuiltinTools(MaiToolRegistry& registry);
+// includeFileTools=false 供桌面宿主只暴露终端和补丁路径；不删除共享文件实现。
+// 默认 true 保持普通库/CLI 合同，移动宿主仍可独立注册完整原生文件工具组。
+// apply_patch 不受此开关影响。
+void registerMaiBuiltinTools(MaiToolRegistry& registry, bool includeFileTools = true);

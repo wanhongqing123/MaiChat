@@ -41,7 +41,7 @@ endif()
 #   nlohmann  核心自己也用（走 maiagent 的 PRIVATE include），这里这份是给
 #             测试直接构造线格式用的。
 #   httplib   HTTP **服务端**。产物里没有、也不该有——它在这里的唯一身份是
-#             MaiModelClientTests 的假模型服务端：要测 MaiOpenAiClient 这个
+#             MaiModelClientTests 的假模型服务端：要测 MaiResponsesClient 这个
 #             HTTP **客户端**，就得有个真的 socket 在对面，不然分片和 SSE
 #             边界那些东西根本测不到。
 add_library(mai_thirdparty_for_tests INTERFACE)
@@ -62,6 +62,7 @@ target_compile_definitions(mai_sqlite PUBLIC
                                   # 这是 SQLite 的历史怪癖，写错列名会被
                                   # 当成字符串字面量静默通过
   SQLITE_DEFAULT_MEMSTATUS=0      # 省掉每次分配的统计
+  SQLITE_ENABLE_PREUPDATE_HOOK    # 记录元数据事务，正文生成列不进入 SQLite 行日志
   SQLITE_DEFAULT_FOREIGN_KEYS=0   # 我们显式逐级删，不靠外键
   SQLITE_THREADSAFE=2             # 多线程，但同一个连接由调用方保证串行
                                   # （我们在 SqliteStore 里整体加锁）
@@ -370,6 +371,7 @@ mai_add_llama_dependencies()
 
 # ── 核心库：纯 C++，无 Qt，无 HTTP 服务端依赖 ────────────────────
 # 文件名一律大驼峰 + Mai 前缀，见 docs/CodingStyle.md。
+include(cmake/MaiCurlNetworkRoute.cmake)
 add_library(maiagent STATIC
   Agent/MaiTime.cpp
   Agent/MaiError.cpp
@@ -381,7 +383,23 @@ add_library(maiagent STATIC
   Agent/MaiEventBus.cpp
   Agent/MaiMemoryStore.cpp
   Agent/MaiSqliteStore.cpp
-  Agent/MaiOpenAiClient.cpp
+  Agent/MaiCodexStoreSchema.cpp
+  Agent/MaiRolloutPath.cpp
+  Agent/MaiRolloutLog.cpp
+  Agent/MaiRolloutProjection.cpp
+  Agent/MaiSessionRecordCodec.cpp
+  Agent/MaiLegacySessionReader.cpp
+  Agent/MaiSqliteProjectionMutation.cpp
+  Agent/MaiSessionMigration.cpp
+  Agent/MaiSessionJournal.cpp
+  Agent/MaiRolloutRuntimeFacts.cpp
+  Agent/MaiModelContextUsage.cpp
+  Agent/MaiModelToolCatalog.cpp
+  Agent/MaiSkillManager.cpp
+  Agent/MaiSkillInstaller.cpp
+  Agent/MaiCommandScript.cpp
+  Agent/MaiFileCommands.cpp
+  Agent/MaiTextFileCursorCache.cpp
   Agent/MaiResponsesClient.cpp
   Agent/MaiLlamaModelClient.cpp
   Agent/MaiLlamaModelValidation.cpp
@@ -409,6 +427,7 @@ add_library(maiagent STATIC
   Agent/MaiPermission.cpp
   Agent/MaiQuestion.cpp
   AgentTools/MaiFileTools.cpp
+  AgentTools/MaiInProcessShellTool.cpp
   AgentTools/MaiEditTool.cpp
   AgentTools/MaiTimeTool.cpp
   AgentTools/MaiApplyPatchTool.cpp
@@ -441,7 +460,10 @@ add_library(maiagent STATIC
   AgentTools/MaiSessionTools.cpp
   AgentTools/MaiToolOutputTool.cpp
   AgentTools/MaiSubAgentTools.cpp
-  AgentTools/MaiShellTool.cpp
+  AgentTools/MaiExecCommandTool.cpp
+  AgentTools/MaiSkillTool.cpp
+  AgentTools/MaiSkillInstallTool.cpp
+  AgentTools/MaiToolSearchTool.cpp
   AgentTools/MaiShellSessionManager.cpp
   AgentTools/MaiShellEnvironment.cpp
   AgentTools/MaiScreenshotTool.cpp
@@ -477,6 +499,7 @@ add_library(maiagent STATIC
 if(WIN32)
   target_sources(maiagent PRIVATE
     Agent/MaiFileSystemWindows.cpp
+    Agent/MaiAppendFileWindows.cpp
     AgentTools/MaiProcessWindows.cpp
     AgentTools/MaiScreenshotWindows.cpp
     AgentTools/MaiDesktopDuplication.cpp
@@ -485,6 +508,7 @@ elseif(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
   enable_language(OBJCXX)
   target_sources(maiagent PRIVATE
     Agent/MaiFileSystemPosix.cpp
+    Agent/MaiAppendFilePosix.cpp
     AgentTools/MaiProcessPosix.cpp
     AgentTools/MaiScreenshotMac.mm
   )
@@ -495,6 +519,7 @@ elseif(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
 else()
   target_sources(maiagent PRIVATE
     Agent/MaiFileSystemPosix.cpp
+    Agent/MaiAppendFilePosix.cpp
     AgentTools/MaiProcessPosix.cpp
     AgentTools/MaiScreenshotUnsupported.cpp
   )
@@ -520,7 +545,7 @@ target_include_directories(maiagent
 # 和适配器里的 cpp-httplib（HTTP **服务端**）是两回事，两个都要。
 # sqlite、libcurl 和 md4c 都是 PRIVATE：它们是实现细节，公开头里不出现。
 target_link_libraries(maiagent PUBLIC Threads::Threads PRIVATE CURL::libcurl mai_curl_cli zlibstatic
-  libssh2_static mai_sqlite mai_md4c mai_llama ${CMAKE_DL_LIBS})
+  libssh2_static mai_sqlite mai_md4c mai_llama mai_curl_network_route ${CMAKE_DL_LIBS})
 if(WIN32)
   # zlib.h 仅在 ZLIB_BUILD 下从 include 路径读取上述覆盖头。
   set_source_files_properties(AgentTools/MaiZlibTool.cpp PROPERTIES
@@ -620,9 +645,32 @@ if(MAIAGENT_BUILD_TESTS)
   foreach(test_name
       MaiRuntimeTests # 进程内阶段、并行准入、身份与取消边界
       MaiCoreTests          # id / 会话 / 事件总线
+      MaiGlm54Tests         # 旗舰迁移、视觉请求及历史来源隔离
       MaiInputQueueTests    # 所属端持续接收、收尾排队、幂等与普通/工具入口
       MaiSessionRenameTests # 当前会话改名、普通入口、显式命名与持久化
       MaiFilePathTests      # 路径词法 + 文件系统（走系统 API，不用 std::filesystem）
+      MaiAppendFileTests    # 原生只追加句柄、持久化及跨进程写锁
+      MaiRolloutPathTests   # UTC 毫秒路径及独立 UUIDv7 文件标识
+      MaiRolloutLogTests    # JSONL 权威原文、源序号、有界读取与重放
+      MaiCodexStoreSchemaTests # 定制 Codex 字段全集及无正文重复的生成列
+      MaiRolloutProjectionTests # 原文定位回读、账号根与源损坏边界
+      MaiSessionRecordCodecTests # 正文、原始字节及全部领域字段的无损存取
+      MaiLegacySessionReaderTests # 旧库冻结只读迁移来源
+      MaiSqliteProjectionMutationTests # 元数据事务捕获及无正文重放
+      MaiSessionMigrationTests # 旧库快照、发布中断恢复和源保护
+      MaiJournalStoreTests # 正式工厂 JSONL 写入、迁移及索引重建
+      MaiJournalRuntimeTests # 实际流式完成边界、关闭重开及权威日志重建
+      MaiRolloutRuntimeFactsTests # 完成 item、真实用量及可追溯窗口
+      MaiModelContextUsageTests # 最近主请求占用、累计分离与缺失来源
+      MaiModelToolCatalogTests # 小工具集、按需发现与稳定声明
+      MaiToolDiscoveryRuntimeTests # 下一请求声明、执行门禁及会话隔离
+      MaiSkillTests        # 标准路径、目录快照及技能正文按需读取
+      MaiSkillInstallerTests
+      MaiCommandScriptTests
+      MaiFileCommandTests
+      MaiInProcessShellToolTests
+      MaiSkillDirectoryPublishTests
+      MaiSkillRuntimeTests # 实际轮次的技能目录、读取及权限边界
       MaiTextFileReaderTests # 单句柄流式分页、真实 EOF、编码和字节游标
       MaiFileSearchTests    # 热目录快照、完整行检索、安全正则和可续页结果
       MaiStoreTests         # 存储契约：内存和 SQLite 行为必须一致
@@ -632,6 +680,8 @@ if(MAIAGENT_BUILD_TESTS)
       MaiToolOutputReadTests # 原命令只执行一次，模型补读及重开后尾部恢复
       MaiToolExecutionTests # 执行事实、恢复动作、回灌顺序及元数据身份
       MaiModelClientTests   # 流式解析 + 工具调用分片聚合
+      MaiCurlNetworkRouteTests # 请求租约的 DNS/socket 一致及局域网/代理边界
+      MaiNetworkRouteModelTests # 网络代次变化不重投已接收的 POST
       MaiTurnRunnerTests    # 一轮对话的完整生命周期
       MaiToolTests          # 路径边界 + 内置工具
       MaiContextCheckpointToolTests # Saved summary and reference inspection
@@ -660,6 +710,8 @@ if(MAIAGENT_BUILD_TESTS)
       MaiContextBuilderImageTests # 图像历史有界，当前用户附件仍然可见
       MaiContextCompactorTests # Token budgets, atomic checkpoints and original history retrieval
       MaiRequestBodyRecoveryTests # HTTP 413 byte-aware recovery and bounded summary rechunking
+      MaiResponsesProtocolTests # Responses default transport, business errors and usage provenance
+      MaiCustomPatchWireTests # 原生补丁声明、文本调用、回传及失败取消闸门
       MaiRvmMattingTests   # ONNX 递推状态和模型输入输出边界
       MaiRvmCompositeTests # 前景原色、透明背景和边缘混合
       MaiVideoMattingToolTests # 标准工具注册参数、路径和新文件契约
@@ -667,6 +719,10 @@ if(MAIAGENT_BUILD_TESTS)
       MaiQuestionTests      # 问答闸门 + question 工具：等不到答案时绝不能编一个
       MaiSubAgentTests      # 子 Agent：深度上限、数量上限、不能戳别人的会话
       MaiShellToolTests     # shell：审批粒度、超时、取消、输出上限
+      MaiShellPtyTests      # 原生终端输入、取消、整树回收与隔离
+      MaiExecSessionTests   # 数字进程身份、无限默认生命周期及管道/终端输入
+      MaiUnifiedExecToolTests # Codex 0.172 工具名、参数与统一返回结构
+      MaiOpenAiSolTests     # OpenAI Sol 能力、无状态续接、缓存和真实用量字段
       MaiScreenshotAvailabilityTests # Capture runtime state diagnostics
       MaiScreenshotToolTests  # screenshot：平台能力、审批、原生 PNG 捕获
       MaiViewImageToolTests   # view_image：路径边界、图片识别、多模态回灌
@@ -682,6 +738,11 @@ if(MAIAGENT_BUILD_TESTS)
     endif()
     add_test(NAME ${test_name} COMMAND ${test_name})
   endforeach()
+  # 使用同一份 SQLite 的 preupdate 编译契约，不能只继承最终链接依赖。
+  target_link_libraries(MaiCurlNetworkRouteTests PRIVATE CURL::libcurl)
+  target_link_libraries(MaiSqliteProjectionMutationTests PRIVATE mai_sqlite)
+  target_include_directories(MaiLegacySessionReaderTests PRIVATE ${MAI_OPENSSL_INCLUDE_DIR})
+  target_include_directories(MaiModelToolCatalogTests PRIVATE ${MAI_OPENSSL_INCLUDE_DIR})
   # 直接使用正常 factory + 当前 Qwen 模板/grammar，不加载权重或执行推理。
   # 不能只验 JSON Schema 合法：根 union 在 XML 模板中会丢掉所有参数。
   add_executable(MaiFileToolSchemaTests tests/MaiFileToolSchemaTests.cpp)

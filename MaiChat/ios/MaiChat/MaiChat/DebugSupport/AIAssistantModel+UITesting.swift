@@ -242,9 +242,23 @@ extension AIAssistantModel {
                 deviceSlot: slot, deviceName: "Owned desktop", deviceID: "owned-model-device",
                 loginSessionID: login, online: online)
         }
+        // Persisted preference migration touches only the retired flagship ID.
+        var legacy = AIModelSettings()
+        legacy.model = "glm-5.3"
+        legacy.cloudModel = "glm-5.3"
+        legacy.reasoningEffort = "low"
+        legacy.migrateLegacyCloudSelection()
+        require(legacy.model == "glm-5.4" && legacy.cloudModel == "glm-5.4" && legacy.reasoningEffort == "low",
+                "retired flagship preference was not restored as GLM-5.4")
+        for unchanged in ["glm-5.3-flash", "deepseek-v4-pro", "local:owned-model", "custom-model"] {
+            require(AIModelSettings.restoredCloudModel(unchanged) == unchanged,
+                    "flagship migration changed an unrelated model")
+        }
+        require(!AIModelSettings.cloudModels.contains("glm-5.3") &&
+                AIModelSettings.cloudProvider(for: "glm-5.4") == "glm", "flagship catalog/provider mismatch")
         let a = owner("A"), b = owner("B"), local = owner("local")
         var states: [String: [String: Any]] = [
-            a.sessionID: ["model": "glm-5.3", "reasoningEffort": "low", "wire": "responses"],
+            a.sessionID: ["model": "glm-5.4", "reasoningEffort": "low", "wire": "responses"],
             b.sessionID: ["model": "deepseek-flash", "reasoningEffort": "high", "wire": "responses"],
             local.sessionID: ["model": "local:owned-model", "reasoningEffort": "", "wire": "local"]]
         var commands: [(AIRemoteSession, String, [String: Any])] = []
@@ -273,7 +287,7 @@ extension AIAssistantModel {
         }
         applyUITestMutation(.remoteSessions([a, b, local]))
         await selectRemoteConversation(a)
-        require(readCount == 1 && selectedRemote?.model == "glm-5.3" && settings.model == "glm-5.3" &&
+        require(readCount == 1 && selectedRemote?.model == "glm-5.4" && settings.model == "glm-5.4" &&
                 settings.effectiveReasoningEffort == "low" && canChangeSessionModel,
                 "plain-history open did not request/read owner configuration; reads=\(readCount)")
         guard failures.isEmpty else { uiTestSupport.sessionModelPolicyResult = "FAIL " + failures.joined(separator: " | "); return }
@@ -281,7 +295,7 @@ extension AIAssistantModel {
         drafts[draftA] = "owned draft A"; drafts[draftB] = "owned draft B"
         await selectPrimaryModel("deepseek-v4-pro", reasoningEffort: "max")
         guard let first = commands.last else { uiTestSupport.sessionModelPolicyResult = "FAIL no set command"; return }
-        require(first.2["action"] as? String == "set_model" && selectedRemote?.model == "glm-5.3", "optimistic selection before owner ACK")
+        require(first.2["action"] as? String == "set_model" && selectedRemote?.model == "glm-5.4", "optimistic selection before owner ACK")
         let accepted = result(a, model: "deepseek-v4-pro", effort: "max")
         for wrong in [owner("A", login: "other-login"), owner("A", slot: "mac"), owner("other-session")] {
             await deliverSessionModelUITestReceipt(owner: wrong, id: first.1, result: accepted)
@@ -289,10 +303,10 @@ extension AIAssistantModel {
         await deliverSessionModelUITestReceipt(owner: a, id: "not-the-command", result: accepted)
         await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: result(a, model: "glm-5.3-flash", effort: "max"))
         await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: result(a, model: "deepseek-v4-pro", effort: "low"))
-        require(selectedRemote?.model == "glm-5.3", "mismatched tuple/model/effort consumed the pending request")
-        var wrongWire = accepted; wrongWire["wire"] = "chat_completions"
+        require(selectedRemote?.model == "glm-5.4", "mismatched tuple/model/effort consumed the pending request")
+        var wrongWire = accepted; wrongWire["wire"] = "unsupported_wire"
         await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: wrongWire)
-        require(selectedRemote?.model == "glm-5.3", "legacy Chat wire ACK was accepted")
+        require(selectedRemote?.model == "glm-5.4", "unsupported wire ACK was accepted")
         await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: accepted)
         require(selectedRemote?.model == "deepseek-v4-pro" && settings.effectiveReasoningEffort == "max", "valid ACK was lost after malformed receipts")
         await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: result(a))
@@ -413,10 +427,10 @@ extension AIAssistantModel {
                 "messages": [], "permissions": [], "questions": [], "questionMessages": [], "busy": false, "turnId": ""])
         }
         do {
-            try await publishSessionModelUITestState(page("glm-5.3", effort: "low", wire: "responses"))
+            try await publishSessionModelUITestState(page("glm-5.4", effort: "low", wire: "responses"))
             let count = frames.count
-            require(frames.last?["model"] as? String == "glm-5.3" && frames.last?["reasoningEffort"] as? String == "low", "ordinary publication dropped configuration")
-            try await publishSessionModelUITestState(page("glm-5.3", effort: "low", wire: "responses"))
+            require(frames.last?["model"] as? String == "glm-5.4" && frames.last?["reasoningEffort"] as? String == "low", "ordinary publication dropped configuration")
+            try await publishSessionModelUITestState(page("glm-5.4", effort: "low", wire: "responses"))
             require(frames.count == count, "unchanged configuration republished")
             try await publishSessionModelUITestState(page("deepseek-v4-pro", effort: "max", wire: "responses"))
             require(frames.count == count + 1 && frames.last?["model"] as? String == "deepseek-v4-pro", "config-only change was dropped by state digest")
@@ -428,7 +442,7 @@ extension AIAssistantModel {
             require(fable.2["action"] as? String == "set_model" &&
                 fable.2["model"] as? String == AIModelSettings.fableModel, "Fable did not target the owner model command")
             var invalid = result(a, model: AIModelSettings.fableModel, effort: "high")
-            invalid["wire"] = "chat_completions"
+            invalid["wire"] = "unsupported_wire"
             await deliverSessionModelUITestReceipt(owner: a, id: fable.1, result: invalid)
             require(selectedRemote?.model != AIModelSettings.fableModel, "Fable accepted the wrong wire")
             await deliverSessionModelUITestReceipt(owner: a, id: fable.1,

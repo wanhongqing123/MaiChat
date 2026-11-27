@@ -74,6 +74,7 @@ public:
         QString glmBaseUrl;
         QString deepseekBaseUrl;
         QString openrouterBaseUrl;
+        QString openaiBaseUrl = QStringLiteral("https://api.openai.com/v1");
         QString wanApiKey;
         QString wanWorkspaceId;
         // 短期 Ark/百炼凭据由账号会话提供；工具执行时实时读取，不捕获构造时的旧密钥。
@@ -101,6 +102,11 @@ public:
     // 收场。 界面还没配好模型时是这个状态。
     AgentController(const ModelConfig& model, const QString& databasePath, QObject* parent = nullptr);
     AgentController(const ModelConfig& model, const QString& databasePath, ToolRegistrar hostTools,
+                    QObject* parent = nullptr);
+    // Product startup transfers the backend prepared on its opening worker.
+    // It is used directly by MaiAgent; this overload never opens a second store.
+    AgentController(const ModelConfig& model, const QString& databasePath,
+                    std::unique_ptr<MaiSessionStore> preparedStore, ToolRegistrar hostTools,
                     QObject* parent = nullptr);
 
     // 自己塞一个模型实现进来。给测试用，也给以后接别的供应商留的口子。

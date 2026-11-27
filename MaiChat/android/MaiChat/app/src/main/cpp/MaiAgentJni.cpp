@@ -382,7 +382,8 @@ Java_com_kongshang_maichat_AIAssistantController_nativeRequest(
                             reinterpret_cast<jbyte *>(&request[0]));
   if (env->ExceptionCheck())
     return nullptr;
-  char *response =
+    // 原样传输 Core 快照（含 contextUsage 的数值、来源和会话身份），JNI 不重算 token/窗口。
+    char *response =
       maiMobileAgentRequest(reinterpret_cast<void *>(handle), request.c_str());
   if (!response)
     return nullptr;

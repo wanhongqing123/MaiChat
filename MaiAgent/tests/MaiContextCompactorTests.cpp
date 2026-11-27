@@ -26,7 +26,7 @@
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
 #include "MaiMemoryStore.h"
-#include "MaiOpenAiClient.h"
+#include "MaiResponsesClient.h"
 #include "MaiSessionTools.h"
 #include "MaiSqliteStore.h"
 #include "MaiTurnRunner.h"
@@ -581,6 +581,399 @@ public:
     }
 };
 
+// 请求体拒绝是独立于 token 容量的故障；不能因此把超硬限原请求当作可安全延后。
+void test_summary_body_rejection_defers_only_inside_the_input_budget() {
+    class BodyRejectedModel final : public SummaryModel {
+    public:
+        int attempts = 0;
+        MaiError stream(const MaiModelRequest&, const MaiStreamSink&,
+                        const std::atomic<bool>&) override {
+            ++attempts;
+            return {MaiErrorCode::RequestBodyTooLarge, "Owned summary body rejection."};
+        }
+        MaiModelTokenEstimate estimateInputTokens(const MaiModelRequest& input) const override {
+            std::size_t tokens = 16 + input.baseInstructions.size();
+            for (const auto& item : input.messages) tokens += 16 + item.content.size();
+            for (const auto& tool : input.tools)
+                tokens +=
+                    24 + tool.name.size() + tool.description.size() + tool.parametersJson.size();
+            return {tokens, true};
+        }
+    };
+    for (int mode = 0; mode != 3; ++mode) {
+        auto store = makeMaiMemoryStore();
+        const auto id = newSession(*store);
+        // 第二个硬区用固定指令占满剩余空间，连最小来源索引也无法满足完整输入预算。
+        appendRound(*store, id, std::string(mode == 0 ? 7200 : mode == 1 ? 8500 : 1000, 'b'));
+        store->putMessage(id, message(MaiRole::User, "Continue with the original requirement."));
+        const auto history = store->listMessages(id);
+        const auto fingerprint = maiContextSourceFingerprint(id, history, history.size());
+        auto input = request();
+        if (mode == 2) input.baseInstructions = std::string(7300, 'i');
+        input.messages = MaiContextBuilder{}.build(history);
+        const auto before = requestSnapshot(input);
+        BodyRejectedModel model;
+        const auto beforeTokens = model.estimateInputTokens(input).tokens;
+        MaiContextCompactor::Options options;
+        options.retainRecentTurns = 1;
+        options.allowHistoryIndexRecovery = mode == 2;
+        const std::atomic<bool> cancel{false};
+        const auto result = MaiContextCompactor(options).prepare(*store, model, MaiContextBuilder{},
+                                                                 id, history, input, cancel);
+        constexpr std::size_t hard = 7782;
+        CHECK(model.attempts == 1);
+        if (mode == 0) {
+            CHECK(beforeTokens >= 7372 && beforeTokens <= hard);
+            CHECK(result && result.value().deferredCompaction);
+            if (result) {
+                CHECK(!result.value().advancedCheckpoint);
+                CHECK(requestSnapshot(result.value().request) == before);
+            }
+        } else {
+            CHECK(beforeTokens > hard);
+            CHECK(!result);
+            if (!result) CHECK(result.error().code() == MaiErrorCode::RequestBodyTooLarge);
+        }
+        MaiContextCheckpoint checkpoint;
+        CHECK(!store->getContextCheckpoint(id, checkpoint));
+        CHECK(maiContextSourceFingerprint(id, store->listMessages(id), history.size()) ==
+              fingerprint);
+        std::printf("   summary413 mode=%d before=%zu hard=%zu result=%s attempts=%d\n", mode,
+                    beforeTokens, hard, result ? "deferred" : "rejected", model.attempts);
+    }
+}
+
+// 独立选择器用于定位真实 usage 固定开销被倍率放大到所有后续历史的回归。
+// 服务端量含固定 2000 token 开销；新增工具文本不足以逼近窗口，不应触发整理或容量失败。
+void test_usage_fixed_overhead_does_not_multiply_future_history(int mode = 0) {
+    class ObservationTool final : public MaiTool {
+    public:
+        bool expandedSchema = false;
+        std::function<void()> observe;
+        std::string name() const override {
+            return "growth_observation";
+        }
+        std::string description() const override {
+            return "Return an owned observation.";
+        }
+        std::string parametersSchema() const override {
+            return expandedSchema ? R"({"type":"object","properties":{"new":{"type":"string"}}})"
+                                  : "{}";
+        }
+        bool requiresWorkingDirectory(const std::string&) const override {
+            return false;
+        }
+        MaiToolResult execute(const std::string&, const MaiToolContext&) override {
+            if (observe) observe();
+            return MaiToolResult::success(std::string(1200, 'o'));
+        }
+    };
+    class FixedOverheadModel final : public SummaryModel {
+    public:
+        int mainCalls = 0;
+        int summaries = 0;
+        int mode = 0;
+        bool providerChanged = false;
+        bool wireChanged = false;
+        std::function<std::size_t()> preparedInput;
+        std::vector<std::size_t> localInputs;
+        std::vector<std::size_t> preparedInputs;
+        std::string usageProviderForModel(const std::string&) const override {
+            return mode == 8 ? "" : providerChanged ? "owned-provider-changed" : "owned-provider";
+        }
+        MaiWireApi wireApi() const override {
+            return wireChanged ? MaiWireApi::Local : MaiWireApi::Responses;
+        }
+        MaiModelTokenEstimate estimateInputTokens(const MaiModelRequest& input) const override {
+            auto estimate = SummaryModel::estimateInputTokens(input);
+            estimate.exact = mode == 6;
+            return estimate;
+        }
+        MaiError stream(const MaiModelRequest& input, const MaiStreamSink& sink,
+                        const std::atomic<bool>& cancel) override {
+            for (const auto& item : input.messages)
+                if (item.content.find("\"source_fragments\"") != std::string::npos) {
+                    ++summaries;
+                    return SummaryModel::stream(input, sink, cancel);
+                }
+            ++mainCalls;
+            const auto local = estimateInputTokens(input).tokens;
+            localInputs.push_back(local);
+            preparedInputs.push_back(preparedInput ? preparedInput() : 0);
+            MaiModelUsage usage;
+            usage.inputTokens = mode == 12 ? local - 500 : local + 2000;
+            // total 含输出，不能被错误地用于请求开始时的输入锚点。
+            usage.outputTokens = 1000;
+            usage.totalTokens = usage.inputTokens + usage.outputTokens;
+            if (mode == 7) usage.inputSource = MaiUsageValueSource::Missing;
+            if (sink.onUsage) sink.onUsage(usage);
+            if (mainCalls == 1) {
+                if (sink.onToolCall) sink.onToolCall({"growth_call", "growth_observation", "{}"});
+            } else if (sink.onText) {
+                sink.onText("Completed using the observation.");
+            }
+            return {};
+        }
+    } model;
+    model.mode = mode;
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    auto user = message(MaiRole::User, "Inspect once and finish.");
+    if (mode == 12) std::get<MaiTextPart>(user.parts.front().body).text += std::string(3000, 'u');
+    if (mode == 11)
+        user.parts.push_back(
+            {MaiIdGenerator::newPartId(), MaiImagePart{"owned.png", "image/png"}, 1});
+    store->putMessage(id, user);
+    auto assistant = message(MaiRole::Assistant, {});
+    assistant.parts.clear();
+    assistant.completed = 0;
+    store->putMessage(id, assistant);
+    MaiToolRegistry tools;
+    auto tool = std::make_unique<ObservationTool>();
+    auto* observation = tool.get();
+    bool changedFraming = false;
+    observation->observe = [&] {
+        if (mode == 1) {
+            std::get<MaiTextPart>(user.parts.front().body).text = "Mutated old user prefix.";
+            store->putMessage(id, user);
+        }
+        if (mode == 2) observation->expandedSchema = true;
+        if (mode == 3) model.providerChanged = true;
+        if (mode == 4) model.wireChanged = true;
+        if (mode == 5) model.limits.contextWindowTokens = 4096;
+        if (mode == 9) {
+            user.parts.front().id = MaiIdGenerator::newPartId();
+            store->putMessage(id, user);
+        }
+        if (mode == 10) changedFraming = true;
+    };
+    tools.add(std::move(tool));
+    MaiContextBuilder builder;
+    MaiEventBus bus;
+    MaiEventEmitter emitter(bus);
+    std::size_t readyInput = 0;
+    const auto subscription = bus.subscribe([&](const MaiEvent& event) {
+        if (event.contextStatus) readyInput = event.contextStatus->after.tokens;
+    });
+    model.preparedInput = [&] { return readyInput; };
+    MaiTurnRunner::Dependencies dependencies;
+    dependencies.store = store.get();
+    dependencies.model = &model;
+    dependencies.context = &builder;
+    dependencies.tools = &tools;
+    dependencies.emitter = &emitter;
+    dependencies.defaultModel = "fixture";
+    if (mode == 13) dependencies.maxIterations = 1;
+    dependencies.prepareSkillInputs = [&](const std::vector<MaiMessage>&, const MaiTurnContext&) {
+        return MaiResult<std::map<std::string, std::string>>{
+            changedFraming ? std::map<std::string, std::string>{{user.id, "Changed input framing."}}
+                           : std::map<std::string, std::string>{}};
+    };
+    MaiTurnRunner runner(dependencies, id, assistant);
+    const std::atomic<bool> cancel{false};
+    runner.run(cancel);
+    bus.unsubscribe(subscription);
+    auto represented = request();
+    represented.tools = tools.specs();
+    represented.messages = builder.build(store->listMessages(id));
+    const auto localAfter = model.estimateInputTokens(represented).tokens;
+    std::printf(
+        "   usage-growth mode=%d first=%zu measured=%zu after_local=%zu main=%d "
+        "summaries=%d succeeded=%d\n",
+        mode, model.localInputs.empty() ? 0 : model.localInputs.front(),
+        model.localInputs.empty() ? 0
+        : mode == 12              ? model.localInputs.front() - 500
+                                  : model.localInputs.front() + 2000,
+        localAfter, model.mainCalls, model.summaries, runner.succeeded());
+    if (mode != 11) CHECK(localAfter + 2000 < 7372);
+    CHECK(runner.succeeded());
+    CHECK(model.mainCalls == 2);
+    CHECK(model.summaries == 0);
+    if (model.localInputs.size() == 2 && model.preparedInputs.size() == 2) {
+        const auto expected = mode == 12               ? model.localInputs.back() - 500
+                              : mode == 0 || mode == 9 ? model.localInputs.back() + 2000
+                                                       : model.localInputs.back();
+        CHECK(model.preparedInputs.back() == expected);
+        std::printf("     prepared=%zu local=%zu expected=%zu\n", model.preparedInputs.back(),
+                    model.localInputs.back(), expected);
+    }
+}
+
+void test_continuation_estimate_counts_content_without_transport_inflation() {
+    auto input = request("anthropic/claude-opus-5.5");
+    const auto capability = maiCloudModelInfo(input.model);
+    CHECK(capability);
+    if (!capability) return;
+    Json output = Json::array(
+        {Json{{"type", "reasoning"},
+              {"content",
+               Json::array({Json{{"type", "reasoning_text"}, {"text", "Inspect once."}}})},
+              {"signature", "short_signature"}},
+         Json{{"type", "message"},
+              {"id", "output_id"},
+              {"content",
+               Json::array({Json{{"type", "output_text"}, {"text", "Visible answer."}}})}},
+         Json{{"type", "function_call"}, {"name", "lookup"}, {"arguments", "{\"path\":\"a\"}"}}});
+    MaiModelMessage item;
+    item.role = MaiModelRole::Assistant;
+    item.continuation = MaiModelContinuationState{"responses.output.v1", capability->provider,
+                                                  input.model, output.dump()};
+    input.messages.push_back(item);
+    const auto original = maiEstimateModelInputTokens(input);
+    output[0]["signature"] = std::string(120000, 's');
+    output[1]["id"] = std::string(24000, 'i');
+    output[1]["metadata"] = {{"transport_only", std::string(24000, 'm')}};
+    input.messages.front().continuation->payload = output.dump(2);
+    const auto padded = maiEstimateModelInputTokens(input);
+    CHECK(!original.exact && !padded.exact);
+    CHECK(padded.tokens == original.tokens);
+    const auto saved = input.messages.front().continuation->payload;
+    input.messages.front().content = std::string(50000, 'd');
+    input.messages.front().reasoning = std::string(50000, 'r');
+    CHECK(maiEstimateModelInputTokens(input).tokens == padded.tokens);
+    CHECK(input.messages.front().continuation->payload == saved);
+    output[1]["content"][0]["text"] = std::string(6000, 'v');
+    input.messages.front().continuation->payload = output.dump();
+    CHECK(maiEstimateModelInputTokens(input).tokens > padded.tokens + 1900);
+
+    output =
+        Json::array({Json{{"type", "reasoning"}, {"encrypted_content", std::string(12000, 'e')}}});
+    input.messages.front().continuation->payload = output.dump();
+    const auto encrypted = maiEstimateModelInputTokens(input);
+    output[0]["encrypted_content"] = std::string(24000, 'e');
+    input.messages.front().continuation->payload = output.dump();
+    const auto larger = maiEstimateModelInputTokens(input);
+    // Codex 0.172 的加密 reasoning 估算先去 base64 与固定开销，再按 4 bytes/token 估计。
+    // 密文增加仍提高估计，不能把真实的隐藏上下文错误地视作零或固定值。
+    CHECK(larger.tokens - encrypted.tokens == 2250);
+    CHECK(!encrypted.exact && !larger.exact);
+    std::printf("   continuation-estimate visible=%zu padded=%zu encrypted=%zu larger=%zu\n",
+                original.tokens, padded.tokens, encrypted.tokens, larger.tokens);
+}
+
+// 首轮真实计量已覆盖大前缀。新 Runner/重开 SQLite 后只为新增输入计估计，
+// 不能因完整粗估跨过 90% 就过早整理；前缀改变则必须拒绝这个旧计量锚点。
+void test_measured_input_anchor_survives_runner_and_sqlite_restart(int mode) {
+    const auto root = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8("mai-input-anchor-" + MaiIdGenerator::newSessionId()));
+    const auto path = root.append(MaiFilePath::fromUtf8("agent.db"));
+    auto opened = makeMaiSqliteStore(path.toUtf8());
+    CHECK(opened);
+    if (!opened) return;
+    auto store = std::move(opened.value());
+    const auto id = newSession(*store);
+    auto original = message(MaiRole::User, "OWNED_PERSISTED_PREFIX_" + std::string(21000, 'p'));
+    store->putMessage(id, original);
+    store->putMessage(id, message(MaiRole::Assistant, "Earlier completed observation."));
+    store->putMessage(id, message(MaiRole::User, "Measure the established context once."));
+    class MeasuredModel final : public SummaryModel {
+    public:
+        int summaries = 0, mainCalls = 0;
+        std::size_t local = 0, prepared = 0;
+        std::string usageProviderForModel(const std::string&) const override {
+            return "owned-persistent-input-provider";
+        }
+        MaiError stream(const MaiModelRequest& input, const MaiStreamSink& sink,
+                        const std::atomic<bool>&) override {
+            if (input.baseInstructions.find("Summarize earlier conversation") !=
+                std::string::npos) {
+                ++summaries;
+                if (sink.onText) sink.onText("not JSON");
+                return {};
+            }
+            ++mainCalls;
+            local = estimateInputTokens(input).tokens;
+            MaiModelUsage usage;
+            usage.inputTokens = 2500;
+            if (sink.onUsage) sink.onUsage(usage);
+            if (sink.onText) sink.onText("The owned context was measured.");
+            return {};
+        }
+    };
+    const auto run = [&](MeasuredModel& model) {
+        auto assistant = message(MaiRole::Assistant, {});
+        assistant.parts.clear();
+        assistant.completed = 0;
+        store->putMessage(id, assistant);
+        MaiContextBuilder builder;
+        MaiEventBus bus;
+        MaiEventEmitter emitter(bus);
+        const auto subscription = bus.subscribe([&](const MaiEvent& event) {
+            if (event.contextStatus) model.prepared = event.contextStatus->after.tokens;
+        });
+        MaiTurnRunner::Dependencies dependencies;
+        dependencies.store = store.get();
+        dependencies.model = &model;
+        dependencies.context = &builder;
+        dependencies.emitter = &emitter;
+        dependencies.defaultModel = "fixture";
+        MaiTurnRunner runner(dependencies, id, assistant);
+        const std::atomic<bool> cancel{false};
+        runner.run(cancel);
+        bus.unsubscribe(subscription);
+        CHECK(runner.succeeded());
+    };
+    MeasuredModel first;
+    run(first);
+    CHECK(first.mainCalls == 1 && first.summaries == 0 && first.local < 7372);
+    const auto record = store->readLatestSessionRecord(id, "token_usage_record");
+    CHECK(record);
+    if (record) {
+        auto saved = Json::parse(record.value());
+        CHECK(saved.contains("request_input_anchor"));
+        if (saved.contains("request_input_anchor")) {
+            CHECK(saved["request_input_anchor"].is_object());
+            CHECK(saved["request_input_anchor"].dump().size() <= 2048);
+            CHECK(saved["request_input_anchor"].dump().find("OWNED_PERSISTED_PREFIX_") ==
+                  std::string::npos);
+        }
+        if (mode >= 3 && saved.value("request_input_anchor", Json()).is_object()) {
+            auto& anchor = saved["request_input_anchor"];
+            CHECK(anchor["estimator_version"] == 3);
+            if (mode == 3) anchor["estimator_version"] = 2;
+            if (mode == 4) anchor["messages_digest"] = "not a digest";
+            if (mode == 5) anchor["message_count"] = -1;
+            if (mode == 6) anchor["message_count"] = 1000001;
+            if (mode == 7) anchor["checkpoint_revision"] = 1;
+            if (mode == 8) anchor["measured_input_tokens"] = 1;
+            if (mode == 9) anchor["provider"] = "owned-different-provider";
+            CHECK(!store->appendSessionRecord(id, "token_usage_record", saved.dump()));
+        }
+    }
+    if (mode != 0) {
+        store.reset();
+        auto reopened = makeMaiSqliteStore(path.toUtf8());
+        CHECK(reopened);
+        if (!reopened) return;
+        store = std::move(reopened.value());
+    }
+    if (mode == 2) {
+        std::get<MaiTextPart>(original.parts.front().body).text += " changed old prefix";
+        store->putMessage(id, original);
+    }
+    store->putMessage(
+        id, message(MaiRole::User, "Continue with the saved context. " + std::string(1200, 'n')));
+    MeasuredModel next;
+    run(next);
+    CHECK(next.mainCalls == 1);
+    CHECK(next.local >= 7372 && next.local <= 7782);
+    if (mode >= 2) {
+        CHECK(next.summaries == 2);
+        CHECK(next.prepared == next.local);
+    } else {
+        CHECK(next.summaries == 0);
+        CHECK(next.prepared == 2500 + next.local - first.local);
+    }
+    std::printf(
+        "   persistent-anchor mode=%d first_local=%zu actual=2500 next_local=%zu "
+        "prepared=%zu summaries=%d\n",
+        mode, first.local, next.local, next.prepared, next.summaries);
+    store.reset();
+    const auto temporary = MaiFileSystem::resolve(MaiFileSystem::temporaryDirectory());
+    const auto resolved = MaiFileSystem::resolve(root);
+    if (temporary.isParentOf(resolved)) MaiFileSystem::removeRecursively(resolved);
+}
+
 std::vector<MaiMessage> windowHistoryAtTokens(MaiSessionStore& store, const std::string& id,
                                               WindowBudgetModel& model, MaiModelRequest& input,
                                               std::size_t tokens, bool archive,
@@ -610,7 +1003,7 @@ std::vector<MaiMessage> windowHistoryAtTokens(MaiSessionStore& store, const std:
 
 void test_codex_window_defaults_do_not_reserve_the_catalog_maximum_output() {
     std::puts("   default cloud windows retain original input below the raw-window trigger");
-    for (const char* name : {"deepseek-flash", "glm-5.3", "anthropic/claude-fable-5.2",
+    for (const char* name : {"deepseek-flash", "glm-5.4", "anthropic/claude-fable-5.2",
                              "particle-ai/particle-1:free"}) {
         const auto capability = maiCloudModelInfo(name);
         CHECK(capability);
@@ -1066,6 +1459,9 @@ void test_soft_defer_continues_one_runner_without_replaying_tools() {
             MaiModelRequest lastMainRequest;
             std::vector<std::size_t> mainEstimates;
             std::vector<int> summaryAfterMain;
+            std::string usageProviderForModel(const std::string&) const override {
+                return "owned-soft-defer-provider";
+            }
             MaiWireApi wireApi() const override {
                 return MaiWireApi::Responses;
             }
@@ -1361,17 +1757,23 @@ void test_hard_summary_failure_continues_with_original_history(int mode = 0) {
                 mode, model.mainCalls, model.summaries, rawAction->executions[0],
                 rawAction->executions[1], errors, model.sawOriginal);
     CHECK(rawAction->executions[0] == 1 && rawAction->executions[1] == 1);
-    CHECK(model.mainCalls == (mode == 0 ? 3 : mode == 4 ? 2 : 1));
-    // 正常回查入口可先缩减工具而无需模型；无工具收尾仍检验真实的语义失败/两次格式预算。
-    CHECK(model.summaries == (mode == 0 ? 0 : 2));
-    CHECK(model.sawOriginal == (mode == 0));
-    CHECK(runner.succeeded() == (mode == 0));
-    CHECK(errors == (mode == 0 ? 0 : 1));
+    const bool completed = mode == 0 || mode == 4;
+    CHECK(model.mainCalls == (completed ? 3 : 1));
+    // 无回查宿主/声明仍检验真实语义失败。可信宿主的无工具收尾则不重压：
+    // 已有检查点能放下时正常补答，当前尾部超硬限时保留检查点并显式失败。
+    CHECK(model.summaries == (mode == 1 ? 2 : 0));
+    CHECK(model.sawOriginal == completed);
+    CHECK(runner.succeeded() == completed);
+    CHECK(errors == (completed ? 0 : 1));
     MaiMessage saved;
     CHECK(rawStore->getMessage(id, assistant.id, saved));
-    CHECK(saved.text() == (mode == 0 ? "Finished using exact persisted action evidence." : ""));
+    CHECK(saved.text() == (completed ? "Finished using exact persisted action evidence." : ""));
     MaiContextCheckpoint checkpoint;
     CHECK(rawStore->getContextCheckpoint(id, checkpoint) == (mode == 0 || mode == 4));
+    if (mode == 4) {
+        CHECK(checkpoint.revision == 1);
+        CHECK(checkpoint.references.find("tool_priority_projection") != std::string::npos);
+    }
     int originalCalls = 0;
     for (const auto& part : saved.parts) {
         const auto* tool = std::get_if<MaiToolPart>(&part.body);
@@ -3203,7 +3605,7 @@ void test_empty_history_with_oversized_instructions_or_tools() {
 
 // 模型/effort 已在当前轮固定：摘要请求也不能偷偷改成另一个会话或旧全局等级。
 void test_compaction_keeps_frozen_effort_and_glm_tool_reasoning() {
-    for (const char* selectedModel : {"glm-5.3", "deepseek-v4-pro"}) {
+    for (const char* selectedModel : {"glm-5.4", "deepseek-v4-pro"}) {
         for (const char* effort : {"low", "high", "max"}) {
             auto store = makeMaiMemoryStore();
             const auto id = newSession(*store);
@@ -3283,7 +3685,6 @@ public:
                                  "text/event-stream");
         };
         mServer.Post("/responses", handle);
-        mServer.Post("/chat/completions", handle);
         mPort = mServer.bind_to_any_port("127.0.0.1");
         if (mPort > 0) {
             mThread = std::thread([this] { mServer.listen_after_bind(); });
@@ -3333,26 +3734,25 @@ Json summaryOutputItem(const char* id, const char* phase, std::string text) {
 
 void test_summary_format_through_real_wire() {
     std::puts(
-        "   loopback Chat/Responses preserve final summary identity and accept only bounded "
+        "   loopback Responses preserves final summary identity and accepts only bounded "
         "whole JSON wrappers");
     for (int mode = 0; mode < 13; ++mode) {
-        const bool chat = mode >= 6 && mode <= 11;
+        const bool wrapperCase = mode >= 6 && mode <= 11;
         const bool accepted =
             mode == 0 || mode == 1 || mode == 2 || mode == 5 || mode == 6 || mode == 10;
         std::string script;
-        if (chat) {
+        if (wrapperCase) {
             std::string text = mode == 6   ? "```json\n" + summaryJson() + "\n```"
                                : mode == 7 ? "Here is the summary:\n" + summaryJson()
                                : mode == 8 ? summaryJson().substr(0, 40)
                                            : "```json\n" + summaryJson() + "\n```\nExtra text";
+            const auto item = summaryOutputItem("summary_wrapped", "final_answer", text);
             script =
-                summarySse({{"choices", Json::array({Json{{"delta", {{"content", text}}},
-                                                          {"finish_reason", nullptr}}})}}) +
-                summarySse(
-                    {{"choices",
-                      Json::array({Json{{"delta", Json::object()},
-                                        {"finish_reason", mode == 11 ? "length" : "stop"}}})}}) +
-                "data: [DONE]\n\n";
+                summarySse({{"type", mode == 11 ? "response.incomplete" : "response.completed"},
+                            {"response",
+                             {{"status", mode == 11 ? "incomplete" : "completed"},
+                              {"incomplete_details", {{"reason", "max_output_tokens"}}},
+                              {"output", Json::array({item})}}}});
         } else {
             Json items = Json::array();
             if (mode == 0 || mode == 1 || mode == 4)
@@ -3396,16 +3796,19 @@ void test_summary_format_through_real_wire() {
         }
         const std::string retryScript =
             mode == 10
-                ? summarySse({{"choices", Json::array({Json{{"delta", {{"content", summaryJson()}}},
-                                                            {"finish_reason", "stop"}}})}}) +
-                      "data: [DONE]\n\n"
+                ? summarySse(
+                      {{"type", "response.completed"},
+                       {"response",
+                        {{"status", "completed"},
+                         {"output", Json::array({summaryOutputItem("summary_retry", "final_answer",
+                                                                   summaryJson())})}}}})
                 : std::string{};
         SummaryWireServer server(std::move(script), retryScript);
         CHECK(server.ready());
         if (!server.ready()) continue;
         MaiModelConfig config;
         config.baseUrl = server.baseUrl();
-        config.wire = chat ? MaiWireApi::ChatCompletions : MaiWireApi::Responses;
+        config.wire = MaiWireApi::Responses;
         config.maxRetries = 0;
         config.totalTimeoutSeconds = 5;
         config.proxyResolver = [](const std::string&, MaiModelProxy& route) {
@@ -3426,9 +3829,8 @@ void test_summary_format_through_real_wire() {
         const auto history = store->listMessages(id);
         const auto fingerprint = maiContextSourceFingerprint(id, history, history.size());
         const std::atomic<bool> cancel{false};
-        // Chat 的 thinking/reasoning_effort 属于 GLM 扩展；不能让 DeepSeek
-        // 用例依赖旧的“目录中任何型号都加 GLM 参数”错误来验证重试保真。
-        auto input = request(chat ? "glm-5.3" : "deepseek-flash");
+        // 两个供应商都验证 Responses 的 reasoning.effort 在重试中保持原值。
+        auto input = request(wrapperCase ? "glm-5.4" : "deepseek-flash");
         input.reasoningEffort = "high";
         auto original = input;
         original.messages = MaiContextBuilder{}.build(history);
@@ -3451,17 +3853,10 @@ void test_summary_format_through_real_wire() {
         const auto bodies = server.bodies();
         if (expectedRequests == 2 && bodies.size() == 2) {
             CHECK(bodies[0]["model"] == bodies[1]["model"]);
-            CHECK(bodies[0][chat ? "max_tokens" : "max_output_tokens"] ==
-                  bodies[1][chat ? "max_tokens" : "max_output_tokens"]);
-            if (chat) {
-                CHECK(bodies[0]["messages"].back() == bodies[1]["messages"].back());
-                CHECK(bodies[0]["reasoning_effort"] == "high" &&
-                      bodies[1]["reasoning_effort"] == "high");
-            } else {
-                CHECK(bodies[0]["input"] == bodies[1]["input"]);
-                CHECK(bodies[0]["reasoning"]["effort"] == "high" &&
-                      bodies[1]["reasoning"]["effort"] == "high");
-            }
+            CHECK(bodies[0]["max_output_tokens"] == bodies[1]["max_output_tokens"]);
+            CHECK(bodies[0]["input"] == bodies[1]["input"]);
+            CHECK(bodies[0]["reasoning"]["effort"] == "high" &&
+                  bodies[1]["reasoning"]["effort"] == "high");
         }
         MaiContextCheckpoint checkpoint;
         CHECK(store->getContextCheckpoint(id, checkpoint) == accepted);
@@ -3647,8 +4042,8 @@ void test_metadata_history_index_is_bounded_by_the_assembled_request() {
     CHECK(maiContextSourceFingerprint(id, store->listMessages(id), history.size()) == fingerprint);
 }
 
-void test_oversized_summary_recovery_continues_the_same_runner() {
-    std::puts("   over-budget semantic summaries cannot strand a recoverable persisted task");
+void test_dialogue_overflow_cannot_fall_back_to_a_lossy_source_index() {
+    std::puts("   over-budget dialogue is preserved instead of replaced by a partial source index");
     auto store = makeMaiMemoryStore();
     auto* rawStore = store.get();
     const auto id = newSession(*store);
@@ -3780,12 +4175,15 @@ void test_oversized_summary_recovery_continues_the_same_runner() {
     const std::atomic<bool> cancel{false};
     runner.run(cancel);
     bus.unsubscribe(token);
-    CHECK(runner.succeeded() && errors == 0);
-    CHECK(model.summaries == 2 && model.mainCalls == 2);
-    CHECK(model.readOriginalUser && model.readOriginalTool);
+    CHECK(!runner.succeeded() && errors == 1);
+    CHECK(model.summaries == 0 && model.mainCalls == 0);
+    CHECK(!model.readOriginalUser && !model.readOriginalTool);
     MaiMessage saved;
     CHECK(rawStore->getMessage(id, assistant.id, saved));
-    CHECK(saved.text() == "Continued from exact persisted user and tool evidence.");
+    CHECK(saved.text().empty());
+    CHECK(saved.turnOutcome && saved.turnOutcome->error.code() == MaiErrorCode::InvalidInput);
+    MaiContextCheckpoint noLossyIndex;
+    CHECK(!rawStore->getContextCheckpoint(id, noLossyIndex));
     CHECK(rawStore->getMessage(id, earlier.id, saved) && saved.text() == earlier.text());
     CHECK(rawStore->getMessage(id, completed.id, saved) &&
           std::get<MaiToolPart>(saved.parts.back().body).output ==
@@ -3887,7 +4285,8 @@ void test_reused_original_user_layer_respects_the_same_hard_budget() {
         if (reused) {
             CHECK(reused.value().reusedCheckpoint);
             CHECK(reused.value().inputEstimate.tokens <= reused.value().status.inputBudgetTokens);
-            CHECK(requestSnapshot(first.value().request) == requestSnapshot(reused.value().request));
+            CHECK(requestSnapshot(first.value().request) ==
+                  requestSnapshot(reused.value().request));
         }
     }
     CHECK(exercised);
@@ -3913,11 +4312,14 @@ void test_retained_user_checkpoint_prefix_is_stable_when_tail_grows() {
     if (!next) return;
     CHECK(model.requests().size() == calls);
     CHECK(next.value().request.messages.size() >= first.value().request.messages.size());
-    for (std::size_t i = 0; i < first.value().request.messages.size() &&
-                            i < next.value().request.messages.size(); ++i) {
+    for (std::size_t i = 0;
+         i < first.value().request.messages.size() && i < next.value().request.messages.size();
+         ++i) {
         CHECK(first.value().request.messages[i].role == next.value().request.messages[i].role);
-        CHECK(first.value().request.messages[i].content == next.value().request.messages[i].content);
-        CHECK(first.value().request.messages[i].reasoning == next.value().request.messages[i].reasoning);
+        CHECK(first.value().request.messages[i].content ==
+              next.value().request.messages[i].content);
+        CHECK(first.value().request.messages[i].reasoning ==
+              next.value().request.messages[i].reasoning);
     }
 }
 
@@ -4070,6 +4472,298 @@ void test_tool_first_compaction_preserves_dialogue_without_a_model_call() {
     CHECK(maiContextSourceFingerprint(id, store->listMessages(id), original.size()) == fingerprint);
 }
 
+void test_tool_free_final_response_preserves_priority_checkpoint(bool sqlite = false) {
+    auto store = makeMaiMemoryStore();
+    const auto path = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8("owned-final-context-" + MaiIdGenerator::newSessionId() + ".sqlite"));
+    if (sqlite) {
+        auto opened = makeMaiSqliteStore(path.toUtf8());
+        CHECK(opened);
+        if (!opened) return;
+        store = std::move(opened.value());
+    }
+    const auto id = newSession(*store);
+    store->putMessage(id, message(MaiRole::User, "FINAL_EXACT_USER: keep original requirements."));
+    auto assistant =
+        message(MaiRole::Assistant, "FINAL_EXACT_ASSISTANT: inspected, not published.");
+    MaiToolPart tool;
+    tool.tool = "owned_listing";
+    tool.callId = "owned_final_projection";
+    tool.input = "{}";
+    tool.output = std::string(12000, 'x');
+    tool.state = MaiToolState::Completed;
+    assistant.parts.push_back({MaiIdGenerator::newPartId(), tool, 1});
+    store->putMessage(id, assistant);
+    appendRound(*store, id, "A recent original requirement.");
+    store->putMessage(id, message(MaiRole::User, "Finish without running any further operations."));
+    WindowBudgetModel model;
+    model.limits = {20000, 1000};
+    auto input = request();
+    input.messages = MaiContextBuilder{}.build(store->listMessages(id));
+    const auto measured = model.estimateInputTokens(input).tokens;
+    CHECK(measured < 18500);
+    if (measured >= 18500) return;
+    std::get<MaiToolPart>(assistant.parts[1].body).output.append(18500 - measured, 'x');
+    store->putMessage(id, assistant);
+    MaiContextCompactor::Options options;
+    options.allowToolProjection = true;
+    const std::atomic<bool> cancel{false};
+    const auto first = MaiContextCompactor(options).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(first && first.value().advancedCheckpoint);
+    CHECK(model.requests().empty());
+    if (!first) return;
+    MaiContextCheckpoint saved;
+    CHECK(store->getContextCheckpoint(id, saved));
+    CHECK(saved.references.find("tool_priority_projection") != std::string::npos);
+    const auto fingerprint =
+        maiContextSourceFingerprint(id, store->listMessages(id), store->listMessages(id).size());
+    if (sqlite) {
+        store.reset();
+        auto reopened = makeMaiSqliteStore(path.toUtf8());
+        CHECK(reopened);
+        if (!reopened) return;
+        store = std::move(reopened.value());
+    }
+    options.allowToolProjection = false;
+    options.allowHistoryIndexRecovery = false;
+    auto finalInput = request();
+    finalInput.tools.clear();
+    const auto final = MaiContextCompactor(options).prepareFinalResponse(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), finalInput, cancel);
+    CHECK(final && final.value().reusedCheckpoint && !final.value().advancedCheckpoint);
+    CHECK(model.requests().empty());
+    if (final) {
+        CHECK(final.value().request.tools.empty());
+        CHECK(final.value().inputEstimate.tokens + 256 >= first.value().inputEstimate.tokens);
+        CHECK(final.value().request.messages.size() == first.value().request.messages.size());
+        for (std::size_t i = 0;
+             i < final.value().request.messages.size() && i < first.value().request.messages.size();
+             ++i)
+            CHECK(final.value().request.messages[i].content ==
+                  first.value().request.messages[i].content);
+        std::printf("   final-no-tools first=%zu final=%zu summary_calls=%zu\n",
+                    first.value().inputEstimate.tokens, final.value().inputEstimate.tokens,
+                    model.requests().size());
+    }
+    MaiContextCheckpoint after;
+    CHECK(store->getContextCheckpoint(id, after));
+    CHECK(after.revision == saved.revision && after.summary == saved.summary &&
+          after.references == saved.references);
+    CHECK(maiContextSourceFingerprint(id, store->listMessages(id),
+                                      store->listMessages(id).size()) == fingerprint);
+    const std::string appended = "A late accepted correction stays verbatim in the final response.";
+    store->putMessage(id, message(MaiRole::User, appended));
+    const auto withTail = MaiContextCompactor(options).prepareFinalResponse(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), finalInput, cancel);
+    CHECK(withTail && withTail.value().reusedCheckpoint && !withTail.value().advancedCheckpoint);
+    if (withTail) CHECK(withTail.value().request.messages.back().content == appended);
+    const auto withTools = MaiContextCompactor(options).prepareFinalResponse(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(!withTools && withTools.error().code() == MaiErrorCode::InvalidInput);
+    CHECK(model.requests().empty());
+    store->putMessage(id, message(MaiRole::User, std::string(30000, 'p')));
+    options.force = true;
+    const auto oversized = MaiContextCompactor(options).prepareFinalResponse(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), finalInput, cancel);
+    CHECK(!oversized);
+    CHECK(model.requests().empty());
+    CHECK(store->getContextCheckpoint(id, after));
+    CHECK(after.revision == saved.revision && after.summary == saved.summary);
+    std::get<MaiTextPart>(assistant.parts.front().body).text += " Changed covered source.";
+    store->putMessage(id, assistant);
+    const auto stale = MaiContextCompactor(options).prepareFinalResponse(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), finalInput, cancel);
+    CHECK(!stale && stale.error().code() == MaiErrorCode::Busy);
+    CHECK(model.requests().empty());
+    CHECK(store->getContextCheckpoint(id, after));
+    CHECK(after.revision == saved.revision && after.summary == saved.summary);
+    if (sqlite) {
+        store.reset();
+        MaiFileSystem::removeFile(path);
+        MaiFileSystem::removeFile(MaiFilePath::fromUtf8(path.toUtf8() + "-wal"));
+        MaiFileSystem::removeFile(MaiFilePath::fromUtf8(path.toUtf8() + "-shm"));
+    }
+}
+
+void test_strict_dialogue_is_not_a_compaction_candidate(bool repairLegacy = false) {
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    const std::string user = "STRICT_EXACT_USER: preserve the requested limits and corrections.";
+    const std::string body = "STRICT_EXACT_ASSISTANT:" + std::string(79000, 'a') +
+                             "\n\u4fdd\u7559 \"literal quotes\":END";
+    store->putMessage(id, message(MaiRole::User, user));
+    auto assistant = message(MaiRole::Assistant, body);
+    MaiToolPart tool;
+    tool.tool = "owned_build_log";
+    tool.callId = "strict_owned_build";
+    tool.input = "{}";
+    tool.output = std::string(8000, 'l');
+    tool.state = MaiToolState::Completed;
+    assistant.parts.push_back({MaiIdGenerator::newPartId(), tool, 1});
+    store->putMessage(id, assistant);
+    appendRound(*store, id, "A recent original clarification.");
+    store->putMessage(id, message(MaiRole::User, "Continue preserving all dialogue."));
+    WindowBudgetModel model;
+    model.limits = {100000, 1000};
+    auto input = request();
+    input.messages = MaiContextBuilder{}.build(store->listMessages(id));
+    const auto initial = model.estimateInputTokens(input).tokens;
+    CHECK(initial < 90000);
+    if (initial >= 90000) return;
+    std::get<MaiToolPart>(assistant.parts[1].body).output.append(90000 - initial, 'l');
+    store->putMessage(id, assistant);
+    const std::atomic<bool> cancel{false};
+    MaiContextCheckpoint before;
+    std::size_t summaryCalls = 0;
+    if (repairLegacy) {
+        MaiContextCompactor::Options legacy;
+        legacy.force = true;
+        auto noTools = request();
+        noTools.tools.clear();
+        const auto old = MaiContextCompactor(legacy).prepare(
+            *store, model, MaiContextBuilder{}, id, store->listMessages(id), noTools, cancel);
+        CHECK(old && old.value().advancedCheckpoint);
+        CHECK(store->getContextCheckpoint(id, before));
+        CHECK(before.summary.find("literal_context_field") == std::string::npos);
+        summaryCalls = model.requests().size();
+        CHECK(summaryCalls != 0);
+    }
+    MaiContextCompactor::Options strict;
+    strict.allowToolProjection = true;
+    strict.preserveDialogue = true;
+    const auto kept = MaiContextCompactor(strict).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(kept);
+    CHECK(model.requests().size() == summaryCalls);
+    if (!kept) return;
+    bool keptUser = false, keptAssistant = false;
+    const auto contains = [&](auto&& self, const Json& value, const std::string& expected,
+                              int depth) -> bool {
+        if (depth > 8) return false;
+        if (value.is_string()) {
+            const auto& text = value.get_ref<const std::string&>();
+            if (text == expected) return true;
+            const auto nested = Json::parse(text, nullptr, false);
+            return !nested.is_discarded() && self(self, nested, expected, depth + 1);
+        }
+        if (value.is_structured())
+            for (const auto& item : value)
+                if (self(self, item, expected, depth + 1)) return true;
+        return false;
+    };
+    for (const auto& item : kept.value().request.messages) {
+        keptUser |= item.content.find(user) != std::string::npos;
+        keptAssistant |= item.content.find(body) != std::string::npos;
+        const auto data = Json::parse(item.content, nullptr, false);
+        keptUser |= contains(contains, data, user, 0);
+        keptAssistant |= contains(contains, data, body, 0);
+    }
+    CHECK(keptUser && keptAssistant);
+    MaiContextCheckpoint checkpoint;
+    const bool hasCheckpoint = store->getContextCheckpoint(id, checkpoint);
+    if (repairLegacy) {
+        CHECK(kept.value().advancedCheckpoint && checkpoint.revision == before.revision + 1);
+        CHECK(checkpoint.references.find("dialogue_preservation") != std::string::npos);
+    }
+    std::printf("   preserve-dialogue legacy=%d tokens=%zu summary_calls=%zu\n", repairLegacy,
+                kept.value().inputEstimate.tokens, model.requests().size() - summaryCalls);
+    store->putMessage(id, message(MaiRole::User, std::string(100000, 'p')));
+    strict.force = true;
+    const auto blocked = MaiContextCompactor(strict).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(!blocked);
+    CHECK(model.requests().size() == summaryCalls);
+    MaiContextCheckpoint after;
+    CHECK(store->getContextCheckpoint(id, after) == hasCheckpoint);
+    if (hasCheckpoint)
+        CHECK(after.revision == checkpoint.revision && after.summary == checkpoint.summary);
+}
+
+void test_dialogue_rebuild_keeps_old_omissions_and_new_tool_data() {
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    store->putMessage(id,
+                      message(MaiRole::User, "Keep original dialogue and old omission decisions."));
+    auto old = message(MaiRole::Assistant, "Earlier exact assistant body.");
+    MaiToolPart tool;
+    tool.tool = "owned_log";
+    tool.callId = "old_log";
+    tool.input = "{}";
+    tool.output = std::string(6000, 'o');
+    tool.state = MaiToolState::Completed;
+    old.parts.push_back({MaiIdGenerator::newPartId(), tool, 1});
+    const auto imageId = MaiIdGenerator::newPartId();
+    old.parts.push_back({imageId, MaiImagePart{"owned-old-screen.png", "image/png"}, 1});
+    store->putMessage(id, old);
+    appendRound(*store, id, "Recent user body.");
+    store->putMessage(id, message(MaiRole::User, "Continue."));
+    WindowBudgetModel model;
+    model.limits = {20000, 1000};
+    MaiContextCompactor::Options legacy;
+    legacy.allowToolProjection = true;
+    legacy.force = true;
+    const std::atomic<bool> cancel{false};
+    const auto initial = MaiContextCompactor(legacy).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(initial);
+    if (!initial) return;
+    MaiContextCheckpoint saved;
+    CHECK(store->getContextCheckpoint(id, saved));
+    auto notes = Json::parse(saved.summary);
+    bool marked = false;
+    for (auto& note : notes["source_notes"]) {
+        auto field = Json::parse(note.get<std::string>(), nullptr, false);
+        if (field.is_object() && field.value("field", "") == "image_path" &&
+            field["source"].value("part_id", "") == imageId) {
+            field["source"]["pixels_omitted"] = true;
+            note = field.dump();
+            marked = true;
+        }
+    }
+    CHECK(marked);
+    auto omitted = saved;
+    omitted.revision = saved.revision + 1;
+    omitted.summary = notes.dump();
+    CHECK(!store->advanceContextCheckpoint(id, saved.revision, omitted));
+    CHECK(store->getContextCheckpoint(id, saved));
+    auto fresh = message(MaiRole::Assistant, "New original assistant body.");
+    tool.callId = "new_log";
+    tool.output = "FRESH_OUTPUT_MUST_STAY:" + std::string(2000, 'n');
+    const auto freshId = MaiIdGenerator::newPartId();
+    fresh.parts.push_back({freshId, tool, 1});
+    store->putMessage(id, fresh);
+    appendRound(*store, id, "Latest clarification stays original.");
+    store->putMessage(id, message(MaiRole::User, "Finish."));
+    auto strict = legacy;
+    strict.force = false;
+    strict.preserveDialogue = true;
+    const auto rebuilt = MaiContextCompactor(strict).prepare(
+        *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+    CHECK(rebuilt && rebuilt.value().advancedCheckpoint);
+    CHECK(model.requests().empty());
+    if (!rebuilt) return;
+    for (const auto& item : rebuilt.value().request.messages)
+        for (const auto& image : item.images) CHECK(image.path != "owned-old-screen.png");
+    MaiContextCheckpoint after;
+    CHECK(store->getContextCheckpoint(id, after));
+    bool keptFresh = false;
+    const auto archived = Json::parse(after.summary);
+    for (const auto& note : archived["source_notes"]) {
+        const auto field = Json::parse(note.get<std::string>(), nullptr, false);
+        if (!field.is_object() || field.value("field", "") != "tool_projection" ||
+            field["source"].value("part_id", "") != freshId)
+            continue;
+        const auto receipt = Json::parse(field["text"].get<std::string>());
+        keptFresh =
+            receipt["fields"]["tool_output"].value("preview", std::string{}) == tool.output &&
+            receipt["fields"]["tool_output"].value("original_bytes", std::size_t{0}) ==
+                tool.output.size() &&
+            receipt["fields"]["tool_output"].value("omitted_source_bytes", std::size_t{1}) == 0;
+    }
+    CHECK(keptFresh);
+}
+
 void test_tool_first_semantic_fallback_keeps_source_body_and_independent_failures(
     bool unicode = false) {
     auto store = makeMaiMemoryStore();
@@ -4171,9 +4865,8 @@ void test_tool_first_semantic_fallback_keeps_source_body_and_independent_failure
     CHECK(maiContextSourceFingerprint(id, store->listMessages(id), original.size()) == fingerprint);
 }
 
-void test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(bool large = false,
-                                                                         bool sqlite = false,
-                                                                         bool sameTurn = false) {
+void test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(
+    bool large = false, bool sqlite = false, bool sameTurn = false, bool preserveDialogue = false) {
     const std::size_t firstBefore = large ? 900000 : 18000;
     const std::size_t secondBefore = large ? 925000 : 18500;
     const std::size_t firstTarget = firstBefore * 80 / 100;
@@ -4225,6 +4918,7 @@ void test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(bool l
     MaiContextCompactor::Options options;
     options.allowToolProjection = true;
     const std::atomic<bool> cancel{false};
+    options.preserveDialogue = preserveDialogue;
     const auto compacted = MaiContextCompactor(options).prepare(*store, model, MaiContextBuilder{},
                                                                 id, history, input, cancel);
     CHECK(compacted && compacted.value().advancedCheckpoint);
@@ -4270,25 +4964,27 @@ void test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(bool l
         store->putMessage(id, active);
         auto inspection = options;
         inspection.triggerPercent = 99;
-        const auto measured = MaiContextCompactor(inspection).prepare(
-            *store, model, MaiContextBuilder{}, id, store->listMessages(id), request(), cancel);
+        const auto measured = MaiContextCompactor(inspection)
+                                  .prepare(*store, model, MaiContextBuilder{}, id,
+                                           store->listMessages(id), request(), cancel);
         CHECK(measured && !measured.value().advancedCheckpoint);
         if (!measured) return;
         CHECK(measured.value().inputEstimate.tokens < secondBefore);
         if (measured.value().inputEstimate.tokens >= secondBefore) return;
-        std::get<MaiToolPart>(active.parts.back().body).output.append(
-            secondBefore - measured.value().inputEstimate.tokens, 'q');
+        std::get<MaiToolPart>(active.parts.back().body)
+            .output.append(secondBefore - measured.value().inputEstimate.tokens, 'q');
         store->putMessage(id, active);
         const auto expected = std::get<MaiToolPart>(active.parts.back().body).output;
         history = store->listMessages(id);
-        const auto result = MaiContextCompactor(options).prepare(
-            *store, model, MaiContextBuilder{}, id, history, request(), cancel);
+        const auto result = MaiContextCompactor(options).prepare(*store, model, MaiContextBuilder{},
+                                                                 id, history, request(), cancel);
         CHECK(result && result.value().advancedCheckpoint && model.requests().empty());
         if (!result) return;
         CHECK(result.value().inputEstimate.tokens <= secondTarget);
         const auto boundary = checkpoint.sourceMessageCount;
         CHECK(store->getContextCheckpoint(id, checkpoint));
-        CHECK(checkpoint.sourceMessageCount == boundary && checkpoint.revision == firstRevision + 1);
+        CHECK(checkpoint.sourceMessageCount == boundary &&
+              checkpoint.revision == firstRevision + 1);
         CHECK(budget(checkpoint, tool.callId) <= oldBudget);
         if (result.value().inputEstimate.tokens + 200 < secondTarget) {
             // 整张图片不能拆成若干token；若回填已到上轮预算上界，允许一个图片量子的超额回收。
@@ -4344,7 +5040,8 @@ void test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(bool l
         }
         bool exactObservation = false;
         for (const auto& message : result.value().request.messages)
-            if (message.role == MaiModelRole::ToolResult && message.toolCallId == observation.callId)
+            if (message.role == MaiModelRole::ToolResult &&
+                message.toolCallId == observation.callId)
                 exactObservation = message.content == expected;
         CHECK(exactObservation);
         std::printf("   priority20 same-turn=%zu->%zu no_new_covered_fields=1 model_calls=0\n",
@@ -4393,7 +5090,7 @@ void test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(bool l
     std::printf("   priority20 first=%zu->%zu second=%zu->%zu model_calls=%zu\n", firstBefore,
                 compacted.value().inputEstimate.tokens, secondBefore,
                 again.value().inputEstimate.tokens, model.requests().size());
-    if (!large) {
+    if (!large && !preserveDialogue) {
         bool semanticTriggered = false;
         for (int round = 0; round < 8 && !semanticTriggered; ++round) {
             auto body = message(MaiRole::Assistant, std::string(2400, 'c'));
@@ -4509,6 +5206,39 @@ void test_tool_priority_keeps_raw_source_and_cas_failure_guards() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--persistent-input-anchor") {
+        for (int mode = 0; mode != 10; ++mode)
+            test_measured_input_anchor_survives_runner_and_sqlite_restart(mode);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--continuation-estimate") {
+        test_continuation_estimate_counts_content_without_transport_inflation();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--usage-growth-anchor") {
+        for (int mode = 0; mode != 14; ++mode)
+            test_usage_fixed_overhead_does_not_multiply_future_history(mode);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--summary-body-hard-budget") {
+        test_summary_body_rejection_defers_only_inside_the_input_budget();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--preserve-dialogue") {
+        test_strict_dialogue_is_not_a_compaction_candidate();
+        test_strict_dialogue_is_not_a_compaction_candidate(true);
+        test_dialogue_rebuild_keeps_old_omissions_and_new_tool_data();
+        test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(true, false, false,
+                                                                             true);
+        test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(false, true, false,
+                                                                             true);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--final-context") {
+        test_tool_free_final_response_preserves_priority_checkpoint();
+        test_tool_free_final_response_preserves_priority_checkpoint(true);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--tool-first") {
         test_tool_first_compaction_preserves_dialogue_without_a_model_call();
         test_tool_first_semantic_fallback_keeps_source_body_and_independent_failures();
@@ -4557,7 +5287,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--summary-budget-recovery") {
-        test_oversized_summary_recovery_continues_the_same_runner();
+        test_dialogue_overflow_cannot_fall_back_to_a_lossy_source_index();
         return failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--index-capacity") {
@@ -4594,7 +5324,14 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     std::puts("MaiContextCompactorTests");
+    test_strict_dialogue_is_not_a_compaction_candidate();
+    test_strict_dialogue_is_not_a_compaction_candidate(true);
+    test_dialogue_rebuild_keeps_old_omissions_and_new_tool_data();
+    test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(true, false, false, true);
+    test_priority_compaction_stops_near_twenty_percent_and_resumes_tools(false, true, false, true);
     test_tool_first_compaction_preserves_dialogue_without_a_model_call();
+    test_tool_free_final_response_preserves_priority_checkpoint();
+    test_tool_free_final_response_preserves_priority_checkpoint(true);
     test_tool_first_semantic_fallback_keeps_source_body_and_independent_failures();
     test_tool_first_semantic_fallback_keeps_source_body_and_independent_failures(true);
     test_priority_compaction_stops_near_twenty_percent_and_resumes_tools();
@@ -4632,7 +5369,7 @@ int main(int argc, char** argv) {
     test_soft_defer_continues_one_runner_without_replaying_tools();
     test_summary_format_through_real_wire();
     test_summary_format_retry_guards();
-    test_oversized_summary_recovery_continues_the_same_runner();
+    test_dialogue_overflow_cannot_fall_back_to_a_lossy_source_index();
     test_summary_format_and_size_share_one_retry_budget();
     test_metadata_history_index_is_bounded_by_the_assembled_request();
     test_compaction_keeps_frozen_effort_and_glm_tool_reasoning();
@@ -4654,6 +5391,12 @@ int main(int argc, char** argv) {
     test_failed_summaries_do_not_advance();
     test_source_changes_and_concurrent_compaction();
     test_compaction_preserves_main_output_limits();
+    for (int mode = 0; mode != 10; ++mode)
+        test_measured_input_anchor_survives_runner_and_sqlite_restart(mode);
+    for (int mode = 0; mode != 14; ++mode)
+        test_usage_fixed_overhead_does_not_multiply_future_history(mode);
+    test_continuation_estimate_counts_content_without_transport_inflation();
+    test_summary_body_rejection_defers_only_inside_the_input_budget();
     test_unknown_models_recent_pairs_and_utf8();
     std::printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

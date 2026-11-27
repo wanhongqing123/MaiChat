@@ -8,7 +8,7 @@ import org.junit.Test;
 
 public final class AIAssistantSessionModelTest {
     @Test public void cloudReceiptsRejectForeignWireBeforeCommittingTheRequestedPair() throws Exception {
-        for (String wire : new String[]{"chat_completions", "local"}) {
+        for (String wire : new String[]{"unsupported_wire", "local"}) {
             AIAssistantSessionModels.Remote cache = new AIAssistantSessionModels.Remote();
             JSONObject owner = owner("mac", "login-wire-guard", "wire-session");
             assertTrue(cache.accept(cache.begin(owner, null), receipt("wire-session", "deepseek-flash", "high")));
@@ -27,7 +27,7 @@ public final class AIAssistantSessionModelTest {
     }
 
     @Test public void localReceiptsRejectCloudWireAndKeepThePreviousOwnerConfiguration() throws Exception {
-        for (String wire : new String[]{"responses", "chat_completions"}) {
+        for (String wire : new String[]{"responses", "unsupported_wire"}) {
             AIAssistantSessionModels.Remote cache = new AIAssistantSessionModels.Remote();
             JSONObject owner = owner("mac", "login-local-wire", "local-session");
             assertTrue(cache.accept(cache.begin(owner, null),
@@ -52,7 +52,7 @@ public final class AIAssistantSessionModelTest {
             JSONObject choice = AIAssistantSessionModels.selection("fable", "anthropic/claude-fable-5.2", effort);
             assertEquals(effort, choice.getString("reasoningEffort"));
         }
-        for (String model : new String[]{"glm-5.3", "deepseek-flash"})
+        for (String model : new String[]{"glm-5.4", "deepseek-flash"})
             for (String effort : new String[]{"medium", "xhigh"}) {
                 try {
                     AIAssistantSessionModels.selection("other", model, effort);
@@ -133,7 +133,7 @@ public final class AIAssistantSessionModelTest {
     }
 
     @Test public void selectedTopLevelModelDoesNotChangeAnotherSessionsProjection() throws Exception {
-        JSONObject snapshot = new JSONObject().put("selectedModel", "glm-5.3")
+        JSONObject snapshot = new JSONObject().put("selectedModel", "glm-5.4")
             .put("sessions", new JSONArray().put(new JSONObject().put("id", "b")
                 .put("model", "deepseek-v4-pro").put("reasoningEffort", "low")));
         assertEquals("deepseek-v4-pro", state(snapshot, "b").model);
@@ -157,22 +157,22 @@ public final class AIAssistantSessionModelTest {
         assertEquals("create", created.getString("op"));
         assertEquals(AIAssistantSessionModels.LOCAL, created.getString("model"));
         assertFalse(created.has("reasoningEffort"));
-        assertEquals("", AIAssistantSessionModels.selection("a", "glm-5.3", "")
+        assertEquals("", AIAssistantSessionModels.selection("a", "glm-5.4", "")
             .getString("reasoningEffort"));
     }
 
     @Test public void failedOrWrongSessionReceiptsDoNotConfirmTheSelection() throws Exception {
         for (JSONObject receipt : new JSONObject[]{
-                new JSONObject().put("ok", false).put("session", "a").put("model", "glm-5.3"),
-                new JSONObject().put("ok", true).put("session", "b").put("model", "glm-5.3"),
+                new JSONObject().put("ok", false).put("session", "a").put("model", "glm-5.4"),
+                new JSONObject().put("ok", true).put("session", "b").put("model", "glm-5.4"),
                 new JSONObject().put("ok", true).put("session", "a").put("model", "deepseek-flash")}) {
             try {
-                AIAssistantSessionModels.validateReceipt(receipt, "a", "glm-5.3");
+                AIAssistantSessionModels.validateReceipt(receipt, "a", "glm-5.4");
                 fail("A failed or unrelated receipt cannot commit a choice");
             } catch (IllegalStateException expected) { }
         }
         AIAssistantSessionModels.validateReceipt(new JSONObject().put("ok", true)
-            .put("session", "a").put("model", "glm-5.3"), "a", "glm-5.3");
+            .put("session", "a").put("model", "glm-5.4"), "a", "glm-5.4");
     }
 
     @Test public void sessionHistoryProjectionPreservesLocalAndEmptyEffortInheritsOnlyDefault() throws Exception {
@@ -220,7 +220,7 @@ public final class AIAssistantSessionModelTest {
         AIAssistantSessionModels.Remote.Ticket oldRead = cache.begin(first, null);
         AIAssistantSessionModels.Remote.Ticket current = cache.begin(first, "deepseek-v4-pro");
         assertTrue(cache.accept(current, receipt("same-id", "deepseek-v4-pro", "low")));
-        assertFalse(cache.accept(oldRead, receipt("same-id", "glm-5.3", "max")));
+        assertFalse(cache.accept(oldRead, receipt("same-id", "glm-5.4", "max")));
         assertEquals("deepseek-v4-pro", cache.project(first).getString("model"));
         assertFalse(cache.project(next).has("model"));
         assertTrue(cache.accept(cache.begin(next, null), receipt("same-id", "glm-5.3-flash", "high")));
@@ -238,17 +238,17 @@ public final class AIAssistantSessionModelTest {
     @Test public void remoteCatalogRefreshAndOfflineViewRetainOnlyThatOwnersAck() throws Exception {
         AIAssistantSessionModels.Remote cache = new AIAssistantSessionModels.Remote();
         JSONObject first = owner("mac", "login-a", "a");
-        cache.accept(cache.begin(first, null), receipt("a", "glm-5.3", "max"));
+        cache.accept(cache.begin(first, null), receipt("a", "glm-5.4", "max"));
         JSONObject refreshed = owner("mac", "login-a", "a").put("title", "changed").put("online", false);
         JSONObject projected = cache.project(refreshed);
-        assertEquals("glm-5.3", projected.getString("model"));
+        assertEquals("glm-5.4", projected.getString("model"));
         assertEquals("changed", projected.getString("title"));
         assertFalse(projected.getBoolean("online"));
         assertFalse("Catalog input stays an unmodified owner record", refreshed.has("model"));
         AIAssistantSessionModels.Remote.Ticket request = cache.begin(first, "deepseek-flash");
         cache.finish(request);
         assertFalse(cache.accept(request, receipt("a", "deepseek-flash", "low")));
-        assertEquals("glm-5.3", cache.project(first).getString("model"));
+        assertEquals("glm-5.4", cache.project(first).getString("model"));
     }
 
     @Test public void remoteWireHasOnlySelectionFieldsAndNeverLocalPreparation() throws Exception {
@@ -268,9 +268,9 @@ public final class AIAssistantSessionModelTest {
     @Test public void remoteWrongEffortOrIncompleteWireCannotReplaceCommittedConfiguration() throws Exception {
         AIAssistantSessionModels.Remote cache = new AIAssistantSessionModels.Remote();
         JSONObject owner = owner("mac", "login-a", "a");
-        cache.accept(cache.begin(owner, null), receipt("a", "glm-5.3", "high"));
+        cache.accept(cache.begin(owner, null), receipt("a", "glm-5.4", "high"));
         try {
-            cache.accept(cache.begin(owner, "glm-5.3", "max"), receipt("a", "glm-5.3", "low"));
+            cache.accept(cache.begin(owner, "glm-5.4", "max"), receipt("a", "glm-5.4", "low"));
             fail("A different actual effort does not confirm this selection");
         } catch (IllegalStateException expected) { }
         assertEquals("high", cache.project(owner).getString("reasoningEffort"));
@@ -279,7 +279,7 @@ public final class AIAssistantSessionModelTest {
                 receipt("a", "deepseek-flash", "low").put("wire", "mixed"));
             fail("A route catalog is not an actual per-model wire");
         } catch (IllegalStateException expected) { }
-        assertEquals("glm-5.3", cache.project(owner).getString("model"));
+        assertEquals("glm-5.4", cache.project(owner).getString("model"));
         assertFalse("A different account gets a distinct cache instance",
             new AIAssistantSessionModels.Remote().project(owner).has("model"));
     }

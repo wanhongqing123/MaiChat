@@ -85,6 +85,22 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
     private let diagnosticLog: any DiagnosticLogSink
     private weak var renderView: UIView?
     private var credentials: Credentials?
+    @Published private(set) var discoveredDevices: [RemoteDesktopSignal] = []
+    @Published private(set) var isDiscoveringDevices = false
+    private var discoveryPeerUserID = ""
+    private var discoveryID = ""
+    private var discoveryTask: Task<Void, Never>?
+    private var targetDeviceID = ""
+    private var peerMediaUserID: String {
+        RemoteDesktopSignal.mediaUserID(ownerUserID: peerUserID, deviceID: targetDeviceID)
+    }
+    let localDeviceID: String = {
+        let key = "remote-desktop/device-id"
+        if let value = UserDefaults.standard.string(forKey: key), !value.isEmpty { return value }
+        let value = UUID().uuidString.lowercased()
+        UserDefaults.standard.set(value, forKey: key)
+        return value
+    }()
     private var sessionID = ""
     private var roomID = ""
     private var invitationTimeoutTask: Task<Void, Never>?
@@ -178,11 +194,15 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
     /// 请求、等待、接受与取消各阶段分开处理，避免旧回执接入新会话。
     func requestView(
         peerUserID: String,
+        targetDeviceID: String,
         sdkAppID: Int,
         localUserID: String,
+        mediaUserID: String,
         userSig: String
     ) async {
-        guard canStart else {
+        guard canStart, !targetDeviceID.isEmpty,
+              mediaUserID == RemoteDesktopSignal.mediaUserID(ownerUserID: localUserID, deviceID: localDeviceID)
+        else {
             log(
                 level: .warning,
                 category: "remote-desktop",
@@ -211,12 +231,14 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
         cleanupTRTC()
         let identifier = Self.newIdentifier()
         let roomIdentifier = Self.newIdentifier()
+        cancelDeviceDiscovery()
+        self.targetDeviceID = targetDeviceID
         self.peerUserID = peerUserID
         self.sessionID = identifier
         self.roomID = "mc-\(localUserID)-\(roomIdentifier)"
         self.credentials = Credentials(
             sdkAppID: sdkAppID,
-            localUserID: localUserID,
+            localUserID: mediaUserID,
             userSig: userSig
         )
         captureGeometry = nil
@@ -249,6 +271,32 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
             invitationTimeoutTask = nil
             transition(to: .failed("远程请求发送失败：\(error.localizedDescription)"), cause: "invite-send-failed")
         }
+    }
+
+    /// 发现仅走已登录的 IM，不进入远控房间；刷新/关闭使旧 nonce 与回包失效。
+    func discoverDevices(peerUserID: String) async {
+        cancelDeviceDiscovery()
+        discoveredDevices = []
+        guard canStart, !peerUserID.isEmpty else { return }
+        let id = Self.newIdentifier()
+        discoveryID = id
+        discoveryPeerUserID = peerUserID
+        isDiscoveringDevices = true
+        discoveryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, let self, self.discoveryID == id else { return }
+            self.cancelDeviceDiscovery()
+        }
+        do { try await send(RemoteDesktopSignal(kind: .discover, sessionID: id), to: peerUserID) }
+        catch { if discoveryID == id { cancelDeviceDiscovery() } }
+    }
+
+    func cancelDeviceDiscovery() {
+        discoveryTask?.cancel()
+        discoveryTask = nil
+        discoveryID = ""
+        discoveryPeerUserID = ""
+        isDiscoveringDevices = false
     }
 
     private var inboundSignalTail: Task<Void, Never>?
@@ -297,13 +345,36 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
             ]
         )
 
+        // 仅发现消息按账号发送，其余帧必须绑定本机、所选电脑和当前会话。
+        guard signal.version == RemoteDesktopSignal.protocolVersion,
+              !signal.sourceDeviceID.isEmpty, signal.sourceDeviceID.count <= 128,
+              !signal.sessionID.isEmpty else { return true }
+        if signal.kind == .discover { return true } // iOS 不宣称可共享电脑，也不抢先拒绝广播。
+        guard signal.targetDeviceID == localDeviceID else { return true }
+        if signal.kind == .device {
+            guard userID == discoveryPeerUserID, signal.sessionID == discoveryID,
+                  signal.canShareScreen else { return true }
+            if let index = discoveredDevices.firstIndex(where: { $0.sourceDeviceID == signal.sourceDeviceID }) {
+                discoveredDevices[index] = signal
+            } else if discoveredDevices.count < 64 {
+                discoveredDevices.append(signal)
+            }
+            return true
+        }
+        if signal.kind != .invite {
+            guard userID == peerUserID, signal.sourceDeviceID == targetDeviceID,
+                  signal.sessionID == sessionID else { return true }
+        }
         switch signal.kind {
+        case .discover, .device:
+            return true
         case .invite:
-            let rejection = RemoteDesktopSignal(
+            var rejection = RemoteDesktopSignal(
                 kind: .reject,
                 sessionID: signal.sessionID,
                 reason: "iOS 暂不支持共享本机屏幕"
             )
+            rejection.targetDeviceID = signal.sourceDeviceID
             Task { [weak self] in
                 try? await self?.send(rejection, to: userID)
             }
@@ -386,7 +457,7 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
         )
         #if canImport(TXLiteAVSDK_TRTC)
         guard isRemoteViewStarted, !peerUserID.isEmpty else { return }
-        cloud.updateRemoteView(view, streamType: .sub, forUser: peerUserID)
+        cloud.updateRemoteView(view, streamType: .sub, forUser: peerMediaUserID)
         #endif
     }
 
@@ -550,6 +621,7 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
     func stop(cause: String = "user") async {
         let peer = peerUserID
         let currentSessionID = sessionID
+        let stoppedDeviceID = targetDeviceID
         log(
             level: .info,
             category: "remote-desktop",
@@ -559,10 +631,9 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
         resetSession(cause: cause == "user" ? "user-stop" : cause)
         guard !peer.isEmpty, !currentSessionID.isEmpty else { return }
         do {
-            try await send(
-                RemoteDesktopSignal(kind: .stop, sessionID: currentSessionID),
-                to: peer
-            )
+            var stopped = RemoteDesktopSignal(kind: .stop, sessionID: currentSessionID)
+            stopped.targetDeviceID = stoppedDeviceID
+            try await send(stopped, to: peer)
         } catch {
             // send(_:to:) 已记录可公开的错误类型和数字代码。
         }
@@ -935,9 +1006,9 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
         }
         let renderParams = TRTCRenderParams()
         renderParams.fillMode = .fit
-        cloud.setRemoteRenderParams(peerUserID, streamType: .sub, params: renderParams)
+        cloud.setRemoteRenderParams(peerMediaUserID, streamType: .sub, params: renderParams)
         if isRemoteViewStarted {
-            cloud.updateRemoteView(renderView, streamType: .sub, forUser: peerUserID)
+            cloud.updateRemoteView(renderView, streamType: .sub, forUser: peerMediaUserID)
             log(
                 level: .info,
                 category: "trtc",
@@ -945,7 +1016,7 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
                 fields: ["render_bound": diagnosticBool(renderView != nil)]
             )
         } else {
-            cloud.startRemoteView(peerUserID, streamType: .sub, view: renderView)
+            cloud.startRemoteView(peerMediaUserID, streamType: .sub, view: renderView)
             isRemoteViewStarted = true
             log(
                 level: .info,
@@ -1013,10 +1084,18 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
             )
             throw RemoteIMClientError.sdkInitializationFailed
         }
+        var addressed = signal
+        addressed.version = RemoteDesktopSignal.protocolVersion
+        addressed.sourceDeviceID = localDeviceID
+        if addressed.targetDeviceID.isEmpty && addressed.kind != .discover {
+            guard addressed.sessionID == sessionID, userID == peerUserID else { return }
+            addressed.targetDeviceID = targetDeviceID
+        }
+        guard addressed.kind == .discover || !addressed.targetDeviceID.isEmpty else { return }
         do {
             _ = try await client.sendText(
                 to: userID,
-                text: signal.encodedText(),
+                text: addressed.encodedText(),
                 origin: .machine
             )
             log(
@@ -1053,6 +1132,7 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
     private func fail(_ reason: String, cause: String = "session-failure", code: Int? = nil) {
         let peer = peerUserID
         let currentSessionID = sessionID
+        let failedDeviceID = targetDeviceID
         invitationTimeoutTask?.cancel()
         invitationTimeoutTask = nil
         cleanupTRTC()
@@ -1063,10 +1143,9 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
         if !peer.isEmpty, !currentSessionID.isEmpty {
             Task { [weak self] in
                 do {
-                    try await self?.send(
-                        RemoteDesktopSignal(kind: .stop, sessionID: currentSessionID),
-                        to: peer
-                    )
+                    var stopped = RemoteDesktopSignal(kind: .stop, sessionID: currentSessionID)
+                    stopped.targetDeviceID = failedDeviceID
+                    try await self?.send(stopped, to: peer)
                 } catch {
                     // send(_:to:) 会记录不包含敏感内容的失败条目。
                 }
@@ -1075,6 +1154,7 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
     }
 
     private func resetSession(cause: String) {
+        cancelDeviceDiscovery()
         invitationTimeoutTask?.cancel()
         invitationTimeoutTask = nil
         cleanupTRTC()
@@ -1083,6 +1163,7 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
         #endif
         transition(to: .idle, cause: cause)
         peerUserID = ""
+        targetDeviceID = ""
         sessionID = ""
         roomID = ""
         credentials = nil
@@ -1117,7 +1198,7 @@ final class RemoteDesktopSession: NSObject, ObservableObject {
         #if canImport(TXLiteAVSDK_TRTC)
         cancelSubstreamRecoveryWatchdog()
         if isRemoteViewStarted, !peerUserID.isEmpty {
-            cloud.stopRemoteView(peerUserID, streamType: .sub)
+            cloud.stopRemoteView(peerMediaUserID, streamType: .sub)
         }
         let shouldExitRoom = !isTRTCExitPending
             && (hasEnteredRoom || isEnterRoomInFlight)
@@ -1812,7 +1893,7 @@ extension RemoteDesktopSession: TRTCCloudDelegate {
                 self.logIgnoredTRTCCallbackDuringExit("substream-availability")
                 return
             }
-            let matchesPeer = userId == self.peerUserID
+            let matchesPeer = userId == self.peerMediaUserID
             self.log(
                 level: .info,
                 category: "trtc",
@@ -1847,7 +1928,7 @@ extension RemoteDesktopSession: TRTCCloudDelegate {
                 self.logIgnoredTRTCCallbackDuringExit("first-video-frame")
                 return
             }
-            let matchesPeer = userId == self.peerUserID
+            let matchesPeer = userId == self.peerMediaUserID
             let matchesStream = streamType == .sub
             self.log(
                 level: .info,
@@ -1904,7 +1985,7 @@ extension RemoteDesktopSession: TRTCCloudDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             if self.isTRTCExitPending { return }
-            guard userId == self.peerUserID,
+            guard userId == self.peerMediaUserID,
                   streamType == .sub,
                   newWidth > 0,
                   newHeight > 0

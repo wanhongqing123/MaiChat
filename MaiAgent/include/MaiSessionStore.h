@@ -135,7 +135,6 @@ public:
     // 约定：一轮结束时查一次（MaiTurnRunner::finish），失败就把会话标成
     // 错误让界面看见。
     virtual MaiError lastWriteError() const = 0;
-
     // 原子地改会话的一部分字段。
     //
     // 存在的理由是个真 bug：之前跑一轮的流程是"开头读会话、结尾改标题写回"，
@@ -163,9 +162,40 @@ public:
     virtual MaiError advanceContextCheckpoint(const std::string& sessionId,
                                               std::uint64_t expectedRevision,
                                               const MaiContextCheckpoint& checkpoint);
+
+    // 固定的会话上下文，独立于消息历史；用于跨轮次/重启保留已经发送的指令目录。
+    // get 缺失会话或键返回 NotFound；save 在锁/事务内 insert-if-absent，返回最终赢家，
+    // 调用方必须使用返回字节。每个会话独立命名空间，不得跨会话读取或覆盖。
+    // 清空历史/删除会话同步清除；结果归调用方，可与普通读写并发。
+    // 键为 1..128 字节可打印 ASCII，content 为至多 4MiB 的 UTF-8，可为空；不截断。
+    // 旧自定义后端默认 NotSupported，不能假称持久保存成功。
+    virtual MaiResult<std::string> getSessionContext(const std::string& sessionId,
+                                                     const std::string& name) const;
+    virtual MaiResult<std::string> saveSessionContext(const std::string& sessionId,
+                                                      const std::string& name,
+                                                      const std::string& content);
+
+    // 原始内部记录的普通写入入口；类型及八类载荷的字段由持久化后端契约定义。
+    // payload 为不透明 UTF-8 原文，只由可信源码调用点提供；不从模型内容解析执行授权。
+    // 后端核对会话归属并保留原始事实；旧/临时存储默认 NotSupported，不伪造写入成功。
+    virtual MaiError appendSessionRecord(const std::string& sessionId,
+                                         const std::string& recordType, const std::string& payload);
+    // 分别报告权威读取与派生投影的健康状况，不能将读取失败伪装成空历史或缺失目录。
+    // 临时/旧后端默认健康；内建持久化后端自行同步，调用方在实际读取后查询。
+    virtual MaiError lastReadError() const;
+    virtual MaiError lastProjectionError() const;
+    // 返回该类型最近一次权威原始载荷；没有记录时成功返回空串。
+    // 源读取失败返回错误，旧/临时后端默认 NotSupported；快照归调用方持有。
+    // 可与普通读写并发，不从日志载荷授予执行权限。
+    virtual MaiResult<std::string> readLatestSessionRecord(const std::string& sessionId,
+                                                           const std::string& recordType) const;
 };
 
 // 两个实现的工厂在各自的头里：MaiMemoryStore.h / MaiSqliteStore.h。
 //
 // 不都堆在这个头上，是因为这里是**接口**——自己实现一个存储的人只需要这个文件，
 // 不该被迫看见我们碰巧提供了哪两个实现。
+
+// 内建后端共用的普通参数验证，不查询存储、不修改输入；成功返回空错误。
+MaiError maiValidateSessionContextKey(const std::string& sessionId, const std::string& name);
+MaiError maiValidateSessionContextContent(const std::string& content);

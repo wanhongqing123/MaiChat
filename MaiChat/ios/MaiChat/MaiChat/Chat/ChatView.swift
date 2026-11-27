@@ -2670,6 +2670,8 @@ private struct ChatDetailHeader: View {
     let showRemoteDesktop: () -> Void
     @EnvironmentObject private var appState: RemoteIMAppState
     @State private var showRemoteDiagnostics = false
+    @State private var showRemoteDevices = false
+    @State private var remoteOwnDevices = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -2696,10 +2698,7 @@ private struct ChatDetailHeader: View {
                 if session.state.isActive {
                     showRemoteDesktop()
                 } else {
-                    showRemoteDesktop()
-                    Task {
-                        await appState.requestRemoteDesktopView(of: contact)
-                    }
+                    showRemoteDevices = true
                 }
             } label: {
                 ZStack {
@@ -2737,6 +2736,53 @@ private struct ChatDetailHeader: View {
         .remoteIMBarBackground(edges: .top, opacity: RemoteIMStyle.conversationBarOpacity)
         .overlay(alignment: .bottom) {
             RemoteIMBarSeparator()
+        }
+        .sheet(isPresented: $showRemoteDevices, onDismiss: { session.cancelDeviceDiscovery() }) {
+            NavigationStack {
+                List {
+                    Picker("电脑所属账号", selection: $remoteOwnDevices) {
+                        Text("对方的电脑").tag(false)
+                        Text("我的电脑").tag(true)
+                    }.pickerStyle(.segmented)
+                    .onChange(of: remoteOwnDevices) { _ in
+                        Task { await session.discoverDevices(peerUserID: remoteOwnDevices
+                            ? appState.chatState.ownerUserID : contact.userID) }
+                    }
+                    if session.isDiscoveringDevices {
+                        HStack { ProgressView(); Text("正在查找在线的电脑…") }
+                    } else if session.discoveredDevices.isEmpty {
+                        Text("未找到支持的电脑。请确认电脑在线并已更新 MaiChat，再刷新。")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(session.discoveredDevices, id: \.sourceDeviceID) { device in
+                        Button {
+                            showRemoteDevices = false
+                            showRemoteDesktop()
+                            Task {
+                                await appState.requestRemoteDesktopView(of: contact,
+                                    targetDeviceID: device.sourceDeviceID, ownDevices: remoteOwnDevices)
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Label(device.deviceName.isEmpty ? "电脑" : device.deviceName,
+                                    systemImage: "desktopcomputer")
+                                Text(device.platform + (device.available ? "" : " · 暂不可连接"))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }.disabled(!device.available)
+                    }
+                }
+                .navigationTitle("选择远程电脑")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("取消") { showRemoteDevices = false }
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("刷新") { Task { await session.discoverDevices(peerUserID: remoteOwnDevices ? appState.chatState.ownerUserID : contact.userID) } }
+                    }
+                }
+                .task { await session.discoverDevices(peerUserID: remoteOwnDevices ? appState.chatState.ownerUserID : contact.userID) }
+            }
         }
         .sheet(isPresented: $showRemoteDiagnostics) {
             RemoteDiagnosticsView(peer: contact, contacts: appState.chatState.contacts,

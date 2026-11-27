@@ -2,6 +2,10 @@
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QtTest/QtTest>
 
+#include "ui/RemoteDesktopDeviceDialog.h"
+#include <QListWidget>
+#include <QComboBox>
+#include <QPushButton>
 #include <memory>
 
 #include "remote/RemoteDesktopAuth.h"
@@ -81,6 +85,7 @@ public:
         if (failNextStart) return false;
         shareCalls += 1;
         lastRoomId = params.roomId;
+        lastMediaUserId = params.userId;
         active = true;
         return true;
     }
@@ -92,6 +97,7 @@ public:
     bool startViewing(const TrtcRoomParams& params, void*) override {
         viewCalls += 1;
         lastRoomId = params.roomId;
+        lastMediaUserId = params.userId;
         active = true;
         if (emitVideoDuringViewStart && remoteVideoCallback) {
             remoteVideoCallback(videoUserIdDuringViewStart, true);
@@ -115,6 +121,7 @@ public:
     bool emitVideoDuringViewStart = false;
     QString videoUserIdDuringViewStart = QStringLiteral("remote-host");
     QString lastRoomId;
+    QString lastMediaUserId;
     QString lastBoundUserId;
     std::optional<CaptureGeometry> localGeometry;
     RemoteVideoCallback remoteVideoCallback;
@@ -128,45 +135,60 @@ struct SentSignal {
 
 const QString kHostUser = QStringLiteral("desktop-im");
 const QString kPeerUser = QStringLiteral("whq-iphone");
+const QString kHostDevice = QStringLiteral("owned-host-device");
+const QString kPeerDevice = QStringLiteral("owned-peer-device");
+QString encodePeerSignal(Signal signal) {
+    if (signal.sourceDeviceId.isEmpty())
+        signal.sourceDeviceId = kPeerDevice;
+    if (signal.targetDeviceId.isEmpty() && signal.type != Type::Discover)
+        signal.targetDeviceId = kHostDevice;
+    return RemoteDesktopSignals::encodeSignal(signal);
+}
+
 const QString kPassword = QStringLiteral("pw-remote-1");
 
 class Harness {
 public:
-    explicit Harness(HostMode mode, bool withPassword = true) {
-        settings.mode = mode;
-        if (withPassword) {
-            settings.secret =
-                RemoteDesktopAuth::deriveSecret(kPassword, RemoteDesktopAuth::generateSalt());
-        }
+  explicit Harness(HostMode mode, bool withPassword = true, QString deviceId = kHostDevice) {
+      settings.mode = mode;
+      if (withPassword) {
+          settings.secret =
+              RemoteDesktopAuth::deriveSecret(kPassword, RemoteDesktopAuth::generateSalt());
+      }
 
-        RemoteDesktopController::Config config;
-        config.sdkAppId = 1600148979;
-        config.localUserId = kHostUser;
-        config.userSigProvider = [](const QString&) { return QStringLiteral("sig"); };
+      RemoteDesktopController::Config config;
+      config.sdkAppId = 1600148979;
+      config.localUserId = kHostUser;
+      config.localDeviceId = deviceId;
+      config.localDeviceName = QStringLiteral("Owned computer");
+      config.platform = QStringLiteral("macOS");
 
-        auto engineOwner = std::make_unique<FakeTrtcEngine>();
-        engine = engineOwner.get();
+      auto engineOwner = std::make_unique<FakeTrtcEngine>();
+      engine = engineOwner.get();
 
-        controller = std::make_unique<RemoteDesktopController>(
-            config, settings, std::move(engineOwner),
-            [this](const QString& peerId,
-                   const QString& text,
-                   RemoteDesktopController::SignalSendCompletion completion) {
-                sent.append({peerId, RemoteDesktopSignals::decodeSignal(text)});
-                if (!completion) return;
-                if (autoCompleteSignalSends) {
-                    completion();
-                } else {
-                    pendingSignalCompletions.append(std::move(completion));
-                }
-            });
-        controller->setIdGenerator([] { return QStringLiteral("fixed-id"); });
+      controller = std::make_unique<RemoteDesktopController>(
+          config, settings, std::move(engineOwner),
+          [this](const QString &peerId, const QString &text,
+                 RemoteDesktopController::SignalSendCompletion completion) {
+              sent.append({peerId, RemoteDesktopSignals::decodeSignal(text)});
+              if (!completion)
+                  return;
+              if (autoCompleteSignalSends) {
+                  completion();
+              } else {
+                  pendingSignalCompletions.append(std::move(completion));
+              }
+          });
+      controller->setIdGenerator([] { return QStringLiteral("fixed-id"); });
+      controller->setMediaCredential(RemoteDesktopSignals::mediaUserId(kHostUser, deviceId),
+          QStringLiteral("owned-test-signature"), QDateTime::currentSecsSinceEpoch() + 1800);
 
-        // 换掉真实注入器，否则跑一遍测试就真去动鼠标了。
-        auto sinkOwner = std::make_unique<RecordingInputSink>();
-        sink = sinkOwner.get();
-        controller->setInputSink(std::move(sinkOwner));
-    }
+
+      // 换掉真实注入器，否则跑一遍测试就真去动鼠标了。
+      auto sinkOwner = std::make_unique<RecordingInputSink>();
+      sink = sinkOwner.get();
+      controller->setInputSink(std::move(sinkOwner));
+  }
 
     // 把一包输入按被控端收到的样子喂进去。
     void deliverInput(const QString& sessionId, quint32 sequence,
@@ -177,8 +199,9 @@ public:
         packet.sequence = sequence;
         packet.events = events;
         if (engine->customMessageCallback) {
-            engine->customMessageCallback(fromUserId, RemoteInput::kCmdIdReliable,
-                                          RemoteInput::encodePacket(packet));
+            engine->customMessageCallback(
+                RemoteDesktopSignals::mediaUserId(fromUserId, kPeerDevice),
+                RemoteInput::kCmdIdReliable, RemoteInput::encodePacket(packet));
         }
     }
 
@@ -196,7 +219,7 @@ public:
             invite.authProof =
                 RemoteDesktopAuth::makeAuthProof(peerSecret, sessionId, roomId, kPeerUser);
         }
-        return RemoteDesktopSignals::encodeSignal(invite);
+        return encodePeerSignal(invite);
     }
 
     Signal lastSent() const { return sent.isEmpty() ? Signal{} : sent.last().signal; }
@@ -216,35 +239,43 @@ class RemoteDesktopControllerTest : public QObject {
     Q_OBJECT
 
 private slots:
-    void firstFrameEnablesInputSending();
-    void handlesVideoCallbackDuringViewStart();
-    void dropsRemoteInputWhenControlSwitchIsOff();
-    void injectsRemoteInputOnceControlIsAllowed();
-    void dropsRemoteInputFromNonPeerAndStaleSession();
-    void releasesHeldKeysWhenSessionStops();
-    void notifiesControlledPeerBeforeViewerShutdownCompletes();
-    void notifiesViewerBeforeHostShutdownCompletes();
-    void ignoresPlainChatText();
-    void consumesMalformedSignalWithoutActing();
-    void attendedModeEmitsConsentAndSharesAfterAccept();
-    void attendedModeRejectsWhenUserDeclines();
-    void unattendedModeSharesWithoutPrompting();
-    void unattendedModeRejectsWrongPassword();
-    void unattendedModeDowngradesAfterRepeatedFailures();
-    void acceptsPeerWithoutDeviceList();
-    void attendedModeRequestsConsentWithoutDeviceList();
-    void ignoresInvitesWithoutSenderIdentity();
-    void rejectsInviteWhileAlreadySharing();
-    void busyInviteKeepsPendingConsentSession();
-    void busyInviteKeepsActiveSessionInputAndStop();
-    void reportsRejectionToViewer();
-    void stopsSharingOnPeerStop();
-    void reportsFailureWhenScreenShareCannotStart();
-    void doesNotResendInviteWhileOneIsPending();
-    void forwardsRemoteVideoHandlerToEngine();
-    void forwardsRemoteVideoSizeToHandler();
-    void hostAcceptCarriesLocalCaptureGeometry();
-    void viewerAppliesAndClearsCaptureGeometryAcrossLifecycle();
+    void rejectsMissingOrMismatchedMediaCredentialBeforeInviting();
+    void devicePickerSwitchesToOwnAccountAndDiscardsOldReplies();
+  void sameAccountDevicesUseDistinctMediaParticipants();
+  void discoversComputersViaIMWithoutOpeningRoom();
+  void targetsOnlyTheSelectedComputer();
+  void ignoresSiblingRejectionAndWrongAccount();
+  void ignoresStopFromUnselectedDevice();
+  void devicePickerRequiresExplicitSelection();
+  void firstFrameEnablesInputSending();
+  void handlesVideoCallbackDuringViewStart();
+  void dropsRemoteInputWhenControlSwitchIsOff();
+  void injectsRemoteInputOnceControlIsAllowed();
+  void dropsRemoteInputFromNonPeerAndStaleSession();
+  void releasesHeldKeysWhenSessionStops();
+  void notifiesControlledPeerBeforeViewerShutdownCompletes();
+  void notifiesViewerBeforeHostShutdownCompletes();
+  void ignoresPlainChatText();
+  void consumesMalformedSignalWithoutActing();
+  void attendedModeEmitsConsentAndSharesAfterAccept();
+  void attendedModeRejectsWhenUserDeclines();
+  void unattendedModeSharesWithoutPrompting();
+  void unattendedModeRejectsWrongPassword();
+  void unattendedModeDowngradesAfterRepeatedFailures();
+  void acceptsPeerWithoutDeviceList();
+  void attendedModeRequestsConsentWithoutDeviceList();
+  void ignoresInvitesWithoutSenderIdentity();
+  void rejectsInviteWhileAlreadySharing();
+  void busyInviteKeepsPendingConsentSession();
+  void busyInviteKeepsActiveSessionInputAndStop();
+  void reportsRejectionToViewer();
+  void stopsSharingOnPeerStop();
+  void reportsFailureWhenScreenShareCannotStart();
+  void doesNotResendInviteWhileOneIsPending();
+  void forwardsRemoteVideoHandlerToEngine();
+  void forwardsRemoteVideoSizeToHandler();
+  void hostAcceptCarriesLocalCaptureGeometry();
+  void viewerAppliesAndClearsCaptureGeometryAcrossLifecycle();
 };
 
 namespace {
@@ -273,18 +304,18 @@ void RemoteDesktopControllerTest::firstFrameEnablesInputSending() {
     h.controller->setRemoteVideoHandler(
         [&forwarded](const QString&, bool) { ++forwarded; });
 
-    h.controller->requestView(kPeerUser);
+    h.controller->requestView(kPeerUser, {}, kPeerDevice);
     Signal accept;
     accept.type = Type::Accept;
     accept.sessionId = h.lastSent().sessionId;
     accept.roomId = QStringLiteral("room-1");
-    h.controller->handleIncomingText(kPeerUser, RemoteDesktopSignals::encodeSignal(accept));
+    h.controller->handleIncomingText(kPeerUser, encodePeerSignal(accept));
     QCOMPARE(h.controller->viewerState(), ViewerState::Connecting);
 
     // 首帧到达是 Connecting → Viewing 的唯一触发点，而输入会话正是跟着
     // Viewing 开的。少了这一步，画面照常显示、控制却一个包都发不出去。
     QVERIFY(h.engine->remoteVideoCallback);
-    h.engine->remoteVideoCallback(kPeerUser, true);
+    h.engine->remoteVideoCallback(RemoteDesktopSignals::mediaUserId(kPeerUser, kPeerDevice), true);
     QCOMPARE(h.controller->viewerState(), ViewerState::Viewing);
     QCOMPARE(forwarded, 1);
 
@@ -298,15 +329,15 @@ void RemoteDesktopControllerTest::handlesVideoCallbackDuringViewStart() {
     const QString windowsUser = QStringLiteral("company-iphone");
     Harness h(HostMode::Attended);
     h.engine->emitVideoDuringViewStart = true;
-    h.engine->videoUserIdDuringViewStart = windowsUser;
+    h.engine->videoUserIdDuringViewStart =
+        RemoteDesktopSignals::mediaUserId(windowsUser, kPeerDevice);
 
-    h.controller->requestView(windowsUser);
+    h.controller->requestView(windowsUser, {}, kPeerDevice);
     Signal accept;
     accept.type = Type::Accept;
     accept.sessionId = h.lastSent().sessionId;
     accept.roomId = QStringLiteral("room-windows");
-    h.controller->handleIncomingText(windowsUser,
-                                     RemoteDesktopSignals::encodeSignal(accept));
+    h.controller->handleIncomingText(windowsUser, encodePeerSignal(accept));
 
     QCOMPARE(h.controller->viewerPeerId(), windowsUser);
     QCOMPARE(h.controller->viewerState(), ViewerState::Viewing);
@@ -374,14 +405,14 @@ void RemoteDesktopControllerTest::releasesHeldKeysWhenSessionStops() {
 
 void RemoteDesktopControllerTest::notifiesControlledPeerBeforeViewerShutdownCompletes() {
     Harness h(HostMode::Attended);
-    h.controller->requestView(kPeerUser);
+    h.controller->requestView(kPeerUser, {}, kPeerDevice);
     const QString sessionId = h.lastSent().sessionId;
 
     Signal accept;
     accept.type = Type::Accept;
     accept.sessionId = sessionId;
     accept.roomId = QStringLiteral("room-1");
-    h.controller->handleIncomingText(kPeerUser, RemoteDesktopSignals::encodeSignal(accept));
+    h.controller->handleIncomingText(kPeerUser, encodePeerSignal(accept));
 
     h.sent.clear();
     h.autoCompleteSignalSends = false;
@@ -490,7 +521,7 @@ void RemoteDesktopControllerTest::viewerAppliesAndClearsCaptureGeometryAcrossLif
     Harness h(HostMode::Attended);
     // 新邀请发出时必须先清旧机器的坐标系。
     h.controller->inputSender().setCaptureGeometry(geometry);
-    h.controller->requestView(kPeerUser);
+    h.controller->requestView(kPeerUser, {}, kPeerDevice);
     QVERIFY(!h.controller->inputSender().captureGeometry().has_value());
 
     Signal accept;
@@ -498,26 +529,25 @@ void RemoteDesktopControllerTest::viewerAppliesAndClearsCaptureGeometryAcrossLif
     accept.sessionId = h.lastSent().sessionId;
     accept.roomId = QStringLiteral("room-geometry");
     accept.captureGeometry = geometry;
-    h.controller->handleIncomingText(kPeerUser, RemoteDesktopSignals::encodeSignal(accept));
+    h.controller->handleIncomingText(kPeerUser, encodePeerSignal(accept));
     QVERIFY(h.controller->inputSender().captureGeometry().has_value());
     QCOMPARE(h.controller->inputSender().captureGeometry()->sourceSize, QSize(2560, 1600));
 
     Signal stop;
     stop.type = Type::Stop;
     stop.sessionId = accept.sessionId;
-    h.controller->handleIncomingText(kPeerUser, RemoteDesktopSignals::encodeSignal(stop));
+    h.controller->handleIncomingText(kPeerUser, encodePeerSignal(stop));
     QVERIFY(!h.controller->inputSender().captureGeometry().has_value());
 
     // Reject 同样不能留下任何增强几何（即便调用前有陈旧值）。
     Harness rejected(HostMode::Attended);
-    rejected.controller->requestView(kPeerUser);
+    rejected.controller->requestView(kPeerUser, {}, kPeerDevice);
     rejected.controller->inputSender().setCaptureGeometry(geometry);
     Signal reject;
     reject.type = Type::Reject;
     reject.sessionId = rejected.lastSent().sessionId;
     reject.reason = reasonBusy();
-    rejected.controller->handleIncomingText(kPeerUser,
-                                             RemoteDesktopSignals::encodeSignal(reject));
+    rejected.controller->handleIncomingText(kPeerUser, encodePeerSignal(reject));
     QVERIFY(!rejected.controller->inputSender().captureGeometry().has_value());
 }
 
@@ -677,7 +707,7 @@ void RemoteDesktopControllerTest::busyInviteKeepsActiveSessionInputAndStop() {
     Signal stop;
     stop.type = Type::Stop;
     stop.sessionId = QStringLiteral("s-1");
-    h.controller->handleIncomingText(kPeerUser, RemoteDesktopSignals::encodeSignal(stop));
+    h.controller->handleIncomingText(kPeerUser, encodePeerSignal(stop));
     QVERIFY2(inputCalls == QStringList{QStringLiteral("key 65 down")} &&
                  h.engine->stopCalls == 1 && h.controller->hostState() == HostState::Idle,
              qPrintable(QStringLiteral("A input calls=%1, stop calls=%2, host state=%3")
@@ -690,7 +720,7 @@ void RemoteDesktopControllerTest::reportsRejectionToViewer() {
     Harness h(HostMode::Attended);
     QSignalSpy stateSpy(h.controller.get(), &RemoteDesktopController::viewerStateChanged);
 
-    h.controller->requestView(kPeerUser);
+    h.controller->requestView(kPeerUser, {}, kPeerDevice);
     QCOMPARE(static_cast<int>(h.controller->viewerState()), static_cast<int>(ViewerState::Inviting));
     QCOMPARE(static_cast<int>(h.lastSent().type), static_cast<int>(Type::Invite));
     const QString sessionId = h.lastSent().sessionId;
@@ -699,7 +729,7 @@ void RemoteDesktopControllerTest::reportsRejectionToViewer() {
     reject.type = Type::Reject;
     reject.sessionId = sessionId;
     reject.reason = reasonBusy();
-    h.controller->handleIncomingText(kPeerUser, RemoteDesktopSignals::encodeSignal(reject));
+    h.controller->handleIncomingText(kPeerUser, encodePeerSignal(reject));
 
     QCOMPARE(static_cast<int>(h.controller->viewerState()), static_cast<int>(ViewerState::Failed));
     QCOMPARE(stateSpy.last().at(1).toString(), reasonBusy());
@@ -715,7 +745,7 @@ void RemoteDesktopControllerTest::stopsSharingOnPeerStop() {
     Signal stop;
     stop.type = Type::Stop;
     stop.sessionId = QStringLiteral("s1");
-    h.controller->handleIncomingText(kPeerUser, RemoteDesktopSignals::encodeSignal(stop));
+    h.controller->handleIncomingText(kPeerUser, encodePeerSignal(stop));
 
     QCOMPARE(h.engine->stopCalls, 1);
     QCOMPARE(stoppedSpy.count(), 1);
@@ -737,18 +767,19 @@ void RemoteDesktopControllerTest::reportsFailureWhenScreenShareCannotStart() {
 void RemoteDesktopControllerTest::doesNotResendInviteWhileOneIsPending() {
     Harness h(HostMode::Attended);
 
-    h.controller->requestView(kPeerUser);
+    h.controller->requestView(kPeerUser, {}, kPeerDevice);
     QCOMPARE(h.sent.size(), 1);
 
     // 用户连点两下 🖥 不应该发两次邀请，也不能把已有会话的 sessionId 冲掉。
     const QString firstSessionId = h.lastSent().sessionId;
-    h.controller->requestView(kPeerUser);
+    h.controller->requestView(kPeerUser, {}, kPeerDevice);
     QCOMPARE(h.sent.size(), 1);
     QCOMPARE(h.lastSent().sessionId, firstSessionId);
 }
 
 void RemoteDesktopControllerTest::forwardsRemoteVideoHandlerToEngine() {
     Harness h(HostMode::Attended);
+    h.controller->requestView(kPeerUser, {}, kPeerDevice);
 
     QString seenUser;
     bool seenAvailable = false;
@@ -759,17 +790,18 @@ void RemoteDesktopControllerTest::forwardsRemoteVideoHandlerToEngine() {
     QVERIFY(h.engine->remoteVideoCallback != nullptr);
 
     // 模拟 SDK 通知远端画面到达 → UI 层据此才去绑渲染窗口。
-    h.engine->remoteVideoCallback(kPeerUser, true);
+    h.engine->remoteVideoCallback(RemoteDesktopSignals::mediaUserId(kPeerUser, kPeerDevice), true);
     QCOMPARE(seenUser, kPeerUser);
     QVERIFY(seenAvailable);
 
     h.controller->bindRemoteView(kPeerUser, nullptr);
     QCOMPARE(h.engine->bindCalls, 1);
-    QCOMPARE(h.engine->lastBoundUserId, kPeerUser);
+    QCOMPARE(h.engine->lastBoundUserId, RemoteDesktopSignals::mediaUserId(kPeerUser, kPeerDevice));
 }
 
 void RemoteDesktopControllerTest::forwardsRemoteVideoSizeToHandler() {
     Harness h(HostMode::Attended);
+    h.controller->requestView(kPeerUser, {}, kPeerDevice);
 
     int seenWidth = 0;
     int seenHeight = 0;
@@ -782,9 +814,207 @@ void RemoteDesktopControllerTest::forwardsRemoteVideoSizeToHandler() {
 
     // 接收端编码帧回调可能是 2560x1600（16:10）；控制器必须原样转给 UI，
     // 不能继续拿写死的 1920x1080 算 surface 外层黑边。
-    h.engine->remoteVideoSizeCallback(kPeerUser, 2560, 1600);
+    h.engine->remoteVideoSizeCallback(RemoteDesktopSignals::mediaUserId(kPeerUser, kPeerDevice),
+                                      2560, 1600);
     QCOMPARE(seenWidth, 2560);
     QCOMPARE(seenHeight, 1600);
+}
+
+void RemoteDesktopControllerTest::discoversComputersViaIMWithoutOpeningRoom() {
+    Harness viewer(HostMode::Attended, false);
+    viewer.controller->discoverDevices(kPeerUser);
+    QCOMPARE(viewer.lastSent().type, Type::Discover);
+    QVERIFY(viewer.lastSent().targetDeviceId.isEmpty());
+    QCOMPARE(viewer.lastSent().sourceDeviceId, kHostDevice);
+    QCOMPARE(viewer.controller->viewerState(), ViewerState::Idle);
+    Harness host(HostMode::Attended, false, QStringLiteral("computer-b"));
+    host.controller->handleIncomingText(kPeerUser,
+                                        RemoteDesktopSignals::encodeSignal(viewer.lastSent()));
+    QCOMPARE(host.lastSent().type, Type::Device);
+    QCOMPARE(host.lastSent().targetDeviceId, kHostDevice);
+    QCOMPARE(host.controller->hostState(), HostState::Idle);
+    QCOMPARE(host.lastSent().sourceDeviceId, QStringLiteral("computer-b"));
+    viewer.controller->handleIncomingText(kPeerUser,
+                                          RemoteDesktopSignals::encodeSignal(host.lastSent()));
+    QCOMPARE(viewer.controller->discoveredDevices().size(), 1);
+    viewer.controller->cancelDiscovery();
+    auto late = host.lastSent();
+    late.sourceDeviceId = QStringLiteral("late-computer");
+    viewer.controller->handleIncomingText(kPeerUser, RemoteDesktopSignals::encodeSignal(late));
+    QCOMPARE(viewer.controller->discoveredDevices().size(), 1);
+}
+void RemoteDesktopControllerTest::targetsOnlyTheSelectedComputer() {
+    Harness selected(HostMode::Attended, false);
+    Harness sibling(HostMode::Attended, false, QStringLiteral("sibling-computer"));
+    QSignalSpy chosen(selected.controller.get(), &RemoteDesktopController::consentRequested);
+    QSignalSpy other(sibling.controller.get(), &RemoteDesktopController::consentRequested);
+    const auto invite =
+        selected.inviteText(QStringLiteral("owned-session"), QStringLiteral("owned-room"));
+    selected.controller->handleIncomingText(kPeerUser, invite);
+    sibling.controller->handleIncomingText(kPeerUser, invite);
+    QCOMPARE(chosen.count(), 1);
+    QCOMPARE(other.count(), 0);
+    QVERIFY(sibling.sent.isEmpty());
+    QCOMPARE(sibling.controller->hostState(), HostState::Idle);
+}
+void RemoteDesktopControllerTest::ignoresSiblingRejectionAndWrongAccount() {
+    Harness viewer(HostMode::Attended, false);
+    viewer.controller->requestView(kPeerUser, {}, kPeerDevice);
+    Signal rejection;
+    rejection.type = Type::Reject;
+    rejection.sessionId = viewer.lastSent().sessionId;
+    rejection.sourceDeviceId = QStringLiteral("sibling-phone");
+    rejection.reason = QStringLiteral("Not a shareable computer");
+    viewer.controller->handleIncomingText(kPeerUser, encodePeerSignal(rejection));
+    QCOMPARE(viewer.controller->viewerState(), ViewerState::Inviting);
+    rejection.sourceDeviceId = kPeerDevice;
+    viewer.controller->handleIncomingText(QStringLiteral("another-account"),
+                                          encodePeerSignal(rejection));
+    QCOMPARE(viewer.controller->viewerState(), ViewerState::Inviting);
+    Signal accept;
+    accept.type = Type::Accept;
+    accept.sessionId = rejection.sessionId;
+    accept.roomId = QStringLiteral("owned-room");
+    viewer.controller->handleIncomingText(kPeerUser, encodePeerSignal(accept));
+    QCOMPARE(viewer.controller->viewerState(), ViewerState::Connecting);
+}
+void RemoteDesktopControllerTest::ignoresStopFromUnselectedDevice() {
+    Harness host(HostMode::Attended, false);
+    host.controller->handleIncomingText(
+        kPeerUser, host.inviteText(QStringLiteral("owned-session"), QStringLiteral("owned-room")));
+    Signal stop;
+    stop.type = Type::Stop;
+    stop.sessionId = QStringLiteral("owned-session");
+    stop.sourceDeviceId = QStringLiteral("sibling-phone");
+    host.controller->handleIncomingText(kPeerUser, encodePeerSignal(stop));
+    QCOMPARE(host.controller->hostState(), HostState::AwaitingConsent);
+    stop.sourceDeviceId = kPeerDevice;
+    host.controller->handleIncomingText(kPeerUser, encodePeerSignal(stop));
+    QCOMPARE(host.controller->hostState(), HostState::Idle);
+    // 无端点的 v1 邀请仅被消费，不能重新弹授权窗。
+    auto legacy = host.lastSent();
+    legacy.type = Type::Invite;
+    legacy.protocolVersion = 1;
+    host.controller->handleIncomingText(kPeerUser, encodePeerSignal(legacy));
+    QCOMPARE(host.controller->hostState(), HostState::Idle);
+}
+void RemoteDesktopControllerTest::devicePickerRequiresExplicitSelection() {
+    Harness viewer(HostMode::Attended, false);
+    RemoteDesktopDeviceDialog picker(*viewer.controller, kPeerUser);
+    picker.show();
+    auto *list = picker.findChild<QListWidget *>(QStringLiteral("remoteDeviceList"));
+    auto *button = picker.findChild<QPushButton *>(QStringLiteral("remoteDeviceConnect"));
+    QVERIFY(list && button);
+    QTRY_COMPARE(viewer.lastSent().type, Type::Discover);
+    Signal device;
+    device.type = Type::Device;
+    device.sourceDeviceId = kPeerDevice;
+    device.deviceName = QStringLiteral("Owned Windows computer");
+    device.platform = QStringLiteral("Windows");
+    device.sessionId = viewer.lastSent().sessionId;
+    device.canShareScreen = device.available = true;
+    viewer.controller->handleIncomingText(kPeerUser, encodePeerSignal(device));
+    QTRY_COMPARE(list->count(), 1);
+    QVERIFY(!button->isEnabled());
+    list->setCurrentRow(0);
+    QVERIFY(button->isEnabled());
+    QCOMPARE(picker.selectedDeviceId(), kPeerDevice);
+    const auto capture = qEnvironmentVariable("MAICHAT_REMOTE_DEVICE_CAPTURE");
+    if (!capture.isEmpty())
+        QVERIFY(picker.grab().save(capture));
+    QTest::mouseClick(button, Qt::LeftButton);
+    QCOMPARE(picker.result(), int(QDialog::Accepted));
+    QCOMPARE(viewer.controller->viewerState(), ViewerState::Idle);
+}
+
+void RemoteDesktopControllerTest::sameAccountDevicesUseDistinctMediaParticipants() {
+    Harness phone(HostMode::Attended, false, QStringLiteral("owned-phone-device"));
+    Harness mac(HostMode::Attended, false, QStringLiteral("owned-mac-device"));
+    phone.controller->discoverDevices(kHostUser);
+    const auto discover = phone.lastSent();
+    phone.controller->handleIncomingText(kHostUser, RemoteDesktopSignals::encodeSignal(discover));
+    QCOMPARE(phone.sent.size(), 1); // 自己发出的发现帧不能当成另一台电脑来回应。
+    mac.controller->handleIncomingText(kHostUser, RemoteDesktopSignals::encodeSignal(discover));
+    QCOMPARE(mac.lastSent().type, Type::Device);
+    phone.controller->handleIncomingText(kHostUser,
+                                         RemoteDesktopSignals::encodeSignal(mac.lastSent()));
+    QCOMPARE(phone.controller->discoveredDevices().size(), 1);
+    phone.controller->requestView(kHostUser, {}, mac.controller->localDeviceId());
+    mac.controller->handleIncomingText(kHostUser,
+                                       RemoteDesktopSignals::encodeSignal(phone.lastSent()));
+    QCOMPARE(mac.controller->hostState(), HostState::AwaitingConsent);
+    mac.controller->resolveConsent(true);
+    phone.controller->handleIncomingText(kHostUser,
+                                         RemoteDesktopSignals::encodeSignal(mac.lastSent()));
+    QCOMPARE(phone.controller->viewerState(), ViewerState::Connecting);
+    QVERIFY(!mac.engine->lastMediaUserId.isEmpty());
+    QVERIFY(mac.engine->lastMediaUserId != phone.engine->lastMediaUserId);
+    QCOMPARE(mac.engine->lastMediaUserId,
+             RemoteDesktopSignals::mediaUserId(kHostUser, mac.controller->localDeviceId()));
+    QCOMPARE(phone.engine->lastMediaUserId,
+             RemoteDesktopSignals::mediaUserId(kHostUser, phone.controller->localDeviceId()));
+    phone.controller->bindRemoteView(kHostUser, nullptr);
+    QCOMPARE(phone.engine->lastBoundUserId, mac.engine->lastMediaUserId);
+    phone.controller->stopSession();
+    mac.controller->handleIncomingText(kHostUser,
+                                       RemoteDesktopSignals::encodeSignal(phone.lastSent()));
+    QCOMPARE(mac.controller->hostState(), HostState::Idle);
+}
+
+
+void RemoteDesktopControllerTest::devicePickerSwitchesToOwnAccountAndDiscardsOldReplies() {
+    Harness viewer(HostMode::Attended, false);
+    int sequence = 0;
+    viewer.controller->setIdGenerator([&sequence] { return QString::number(++sequence); });
+    RemoteDesktopDeviceDialog picker(*viewer.controller, kPeerUser);
+    picker.show();
+    auto* scope = picker.findChild<QComboBox*>(QStringLiteral("remoteDeviceAccountScope"));
+    auto* list = picker.findChild<QListWidget*>(QStringLiteral("remoteDeviceList"));
+    auto* button = picker.findChild<QPushButton*>(QStringLiteral("remoteDeviceConnect"));
+    QVERIFY(scope && list && button);
+    QTRY_COMPARE(viewer.lastSent().type, Type::Discover);
+    const QString oldQuery = viewer.lastSent().sessionId;
+    QCOMPARE(scope->count(), 2);
+    scope->setCurrentIndex(1);
+    QCOMPARE(picker.selectedPeerId(), kHostUser);
+    QCOMPARE(viewer.sent.last().peerId, kHostUser);
+    QVERIFY(viewer.lastSent().sessionId != oldQuery);
+    Signal device;
+    device.type = Type::Device;
+    device.sessionId = oldQuery;
+    device.canShareScreen = device.available = true;
+    viewer.controller->handleIncomingText(kPeerUser, encodePeerSignal(device));
+    QCOMPARE(list->count(), 0);
+    device.sessionId = viewer.lastSent().sessionId;
+    device.sourceDeviceId = QStringLiteral("owned-other-computer");
+    device.deviceName = QStringLiteral("Owned Mac");
+    device.platform = QStringLiteral("macOS");
+    viewer.controller->handleIncomingText(kHostUser, encodePeerSignal(device));
+    QTRY_COMPARE(list->count(), 1);
+    QVERIFY(!button->isEnabled());
+    list->setCurrentRow(0);
+    QVERIFY(button->isEnabled());
+    const QString capture = qEnvironmentVariable("MAICHAT_REMOTE_DEVICE_CAPTURE");
+    if (!capture.isEmpty()) QVERIFY(picker.grab().save(capture + QStringLiteral("-my-devices.png")));
+    device.available = false;
+    viewer.controller->handleIncomingText(kHostUser, encodePeerSignal(device));
+    QVERIFY(!button->isEnabled());
+    QVERIFY(picker.selectedDeviceId().isEmpty());
+}
+
+
+void RemoteDesktopControllerTest::rejectsMissingOrMismatchedMediaCredentialBeforeInviting() {
+    Harness viewer(HostMode::Attended, false);
+    viewer.controller->setMediaCredential(QStringLiteral("another-device"), QStringLiteral("owned-sig"),
+        QDateTime::currentSecsSinceEpoch() + 1800);
+    viewer.controller->requestView(kPeerUser, {}, kPeerDevice);
+    QCOMPARE(viewer.controller->viewerState(), ViewerState::Failed);
+    QVERIFY(viewer.sent.isEmpty());
+    QCOMPARE(viewer.engine->viewCalls, 0);
+    viewer.controller->setMediaCredential(RemoteDesktopSignals::mediaUserId(kHostUser, kHostDevice),
+        QStringLiteral("owned-sig"), QDateTime::currentSecsSinceEpoch() - 1);
+    viewer.controller->requestView(kPeerUser, {}, kPeerDevice);
+    QVERIFY(viewer.sent.isEmpty());
 }
 
 QTEST_MAIN(RemoteDesktopControllerTest)

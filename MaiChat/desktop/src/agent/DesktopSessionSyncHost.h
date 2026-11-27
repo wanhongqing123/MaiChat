@@ -50,6 +50,9 @@ private:
     QString defaultWorkspaceDirectory_;
     QString imageAccount_, imageSlot_, imageLogin_;
     QJsonObject decorateImages(QJsonObject message, const QString& sessionId) const;
+    // On-demand, bounded codec text preserves integer/source facts without
+    // putting per-session usage records into the presence catalog.
+    QString contextUsage(const QString& sessionId) const;
     // 事件回调只更新共享 revision，不捕获宿主 this；退订后在途回调也不悬空。
     struct Runtime;
     std::shared_ptr<Runtime> runtime_;

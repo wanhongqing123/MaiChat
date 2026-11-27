@@ -26,6 +26,7 @@ QString providerBaseUrl(const DesktopAccountModelClient::Config& config, const Q
     }
     if (provider == QStringLiteral("deepseek")) return config.deepseekBaseUrl;
     if (provider == QStringLiteral("openrouter")) return config.openrouterBaseUrl;
+    if (provider == QStringLiteral("openai")) return config.openaiBaseUrl;
     return {};
 }
 
@@ -60,8 +61,8 @@ DesktopAccountModelClient::DesktopAccountModelClient(Config config) : config_(st
     // 这里只列产品提供的型号，供应商、协议和能力统一来自 Core 目录。
     // 每条 route 的凭据回调在 stream 时执行，不能捕获构造时的旧 Key。
     for (const char* model :
-         {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro", "anthropic/claude-fable-5.2",
-          "anthropic/claude-opus-5.5", "particle-ai/particle-1:free"}) {
+         {"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro", "anthropic/claude-fable-5.2",
+          "anthropic/claude-opus-5.5", "particle-ai/particle-1:free", "gpt-6.1-sol"}) {
         const auto info = maiCloudModelInfo(model);
         if (!info) continue;
         const QString provider = QString::fromStdString(info->provider);
@@ -93,6 +94,11 @@ std::optional<MaiWireApi> DesktopAccountModelClient::wireApiForModel(const std::
 
 MaiModelContextLimits DesktopAccountModelClient::contextLimits(const std::string& model) const {
     return routed_->contextLimits(model);
+}
+
+std::string DesktopAccountModelClient::usageProviderForModel(const std::string& model) const {
+    // 仅查询无凭据的路由身份，不读取账号 Key；与实际采样、冷历史校验共用同一来源。
+    return routed_->usageProviderForModel(model);
 }
 
 MaiResult<std::size_t> DesktopAccountModelClient::requestBodyBytes(const MaiModelRequest& request) {

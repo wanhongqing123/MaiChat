@@ -23,6 +23,7 @@
 #include "MaiAgent.h"
 #include "MaiAppStorageTool.h"
 #include "MaiCloudModelCatalog.h"
+#include "MaiContextCompactor.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
@@ -226,7 +227,7 @@ public:
     }
 
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 };
 
@@ -332,7 +333,7 @@ AgentUnderTest makeAgent(MaiFakeModelClient::Turn repeating, MaiAgent::Options o
     auto model = std::make_unique<MaiFakeModelClient>();
     model->setRepeatingTurn(std::move(repeating));
     MaiFakeModelClient* observer = model.get();
-    if (options.defaultModel.empty()) options.defaultModel = "glm-5.3";
+    if (options.defaultModel.empty()) options.defaultModel = "glm-5.4";
     return {std::make_unique<MaiAgent>(makeMaiMemoryStore(), std::move(model), nullptr, options),
             observer};
 }
@@ -409,7 +410,7 @@ public:
         return {};
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 };
 
@@ -455,7 +456,7 @@ struct TurnCleanupFixture {
         dependencies.tools = &tools;
         dependencies.emitter = &emitter;
         dependencies.context = &context;
-        dependencies.defaultModel = "glm-5.3";
+        dependencies.defaultModel = "glm-5.4";
         dependencies.reasoningEffort = effort;
         dependencies.advanceSteering = advanceSteering;
         dependencies.closeSteering = [this] { steeringClosed = true; };
@@ -868,7 +869,7 @@ void test_runner_session_identity_keeps_root_and_child_sessions_separate() {
     options.defaultModel = "deepseek-flash";
     options.reasoningEffort = "high";
     MaiAgent agent(makeMaiMemoryStore(), std::move(model), nullptr, options);
-    const auto rootA = agent.submit(MaiCreateSession{"/tmp", "Owned root A", "glm-5.3", "low"});
+    const auto rootA = agent.submit(MaiCreateSession{"/tmp", "Owned root A", "glm-5.4", "low"});
     const auto rootB =
         agent.submit(MaiCreateSession{"/tmp", "Owned root B", "deepseek-v4-pro", "max"});
     CHECK(rootA && rootB);
@@ -890,10 +891,10 @@ void test_runner_session_identity_keeps_root_and_child_sessions_separate() {
     CHECK(agent.submit(MaiSendPrompt{rootA.value(), "Owned root A after child."}));
     agent.waitIdle();
     const std::map<std::string, std::pair<std::string, std::string>> expected{
-        {"Owned root A request.", {rootA.value(), "glm-5.3"}},
+        {"Owned root A request.", {rootA.value(), "glm-5.4"}},
         {"Owned root B request.", {rootB.value(), "deepseek-v4-pro"}},
-        {"Owned child request.", {child.value(), "glm-5.3"}},
-        {"Owned root A after child.", {rootA.value(), "glm-5.3"}}};
+        {"Owned child request.", {child.value(), "glm-5.4"}},
+        {"Owned root A after child.", {rootA.value(), "glm-5.4"}}};
     std::set<std::string> observedPrompts;
     CHECK(observedModel->requestCount() == expected.size());
     for (std::size_t index = 0; index < observedModel->requestCount(); ++index) {
@@ -1868,7 +1869,8 @@ void test_automatic_video_reply_skips_an_existing_media_delivery() {
     MaiFileSystem::removeFile(path);
 }
 
-// 通过真实 Agent/TurnRunner 自动触发摘要，再让假模型调用当前会话原史工具找回旧 URL。
+// 通过普通压缩入口整理工具日志，再让真实 Agent/TurnRunner 调用原史工具找回旧 URL。
+// 压力属于工具输出，不能用长用户正文来触发有损摘要；用户和助手正文始终保留。
 // 不调用供应商，也不把“URL 仍在 DB”当成已完成回查。
 void test_compacted_turn_reads_original_link_without_user_resend() {
     std::printf("   compacted turn retrieves original source URL through session_history\n");
@@ -1882,7 +1884,7 @@ void test_compacted_turn_reads_original_link_without_user_resend() {
         int mainCalls = 0;
         bool retrievedExactSource = false;
         MaiModelContextLimits contextLimits(const std::string&) const override {
-            return {8192, 2048};
+            return {32768, 2048};
         }
         MaiWireApi wireApi() const override {
             return MaiWireApi::Responses;
@@ -1938,10 +1940,7 @@ void test_compacted_turn_reads_original_link_without_user_resend() {
         user.role = MaiRole::User;
         user.created = 1;
         user.completed = 2;
-        std::string text =
-            std::string(4000, 'a') + "\n" +
-            (index == 0 ? originalUrl : std::string("Preserve the existing source.")) + "\n" +
-            std::string(4000, 'b');
+        std::string text = index == 0 ? originalUrl : std::string("Preserve the existing source.");
         user.parts.push_back({MaiIdGenerator::newPartId(), MaiTextPart{std::move(text)}, 1});
         store->putMessage(session.id, user);
         if (index == 0) originalId = user.id;
@@ -1952,6 +1951,13 @@ void test_compacted_turn_reads_original_link_without_user_resend() {
         assistant.completed = 3;
         assistant.parts.push_back(
             {MaiIdGenerator::newPartId(), MaiTextPart{"The work remains unfinished."}, 2});
+        MaiToolPart log;
+        log.tool = "owned_recall_log";
+        log.callId = "old_recall_" + std::to_string(index);
+        log.input = "{}";
+        log.output = std::string(8000, 'l');
+        log.state = MaiToolState::Completed;
+        assistant.parts.push_back({MaiIdGenerator::newPartId(), log, 2});
         store->putMessage(session.id, assistant);
     }
     auto* observedStore = store.get();
@@ -1961,10 +1967,23 @@ void test_compacted_turn_reads_original_link_without_user_resend() {
     auto* observedModel = model.get();
     auto tools = std::make_unique<MaiToolRegistry>();
     registerMaiSessionTools(*tools);
+    MaiModelRequest compactInput;
+    compactInput.model = session.model;
+    compactInput.tools = tools->specs(session.model);
+    MaiContextCompactor::Options policy;
+    policy.allowToolProjection = true;
+    policy.preserveDialogue = true;
+    policy.force = true;
+    const std::atomic<bool> cancel{false};
+    const auto prepared = MaiContextCompactor(policy).prepare(
+        *observedStore, *model, MaiContextBuilder{}, session.id,
+        observedStore->listMessages(session.id), compactInput, cancel);
+    CHECK(prepared && prepared.value().advancedCheckpoint);
+    if (!prepared) return;
     MaiAgent agent(std::move(store), std::move(model), std::move(tools));
     CHECK(agent.submit(MaiSendPrompt{session.id, "Continue using my earlier original link."}));
     agent.waitIdle();
-    CHECK(observedModel->summaryCalls > 0);
+    CHECK(observedModel->summaryCalls == 0);
     CHECK(observedModel->mainCalls == 2);
     CHECK(observedModel->retrievedExactSource);
     MaiContextCheckpoint checkpoint;
@@ -2064,7 +2083,7 @@ void test_central_tool_output_bounds_verbose_inventory_and_keeps_raw_recovery(
         bool projectionRecoverableAtDispatch = false;
         mutable bool emptyModelLookup = false;
         MaiWireApi wireApi() const override {
-            return MaiWireApi::ChatCompletions;
+            return MaiWireApi::Responses;
         }
         MaiModelContextLimits contextLimits(const std::string& model) const override {
             // The default large window exposes the missing per-tool cap. The
@@ -2418,7 +2437,7 @@ void test_central_tool_output_preserves_legacy_history_until_checkpoint() {
     public:
         std::vector<MaiModelRequest> requests;
         MaiWireApi wireApi() const override {
-            return MaiWireApi::ChatCompletions;
+            return MaiWireApi::Responses;
         }
         MaiModelContextLimits contextLimits(const std::string&) const override {
             return {262144, 8192};
@@ -2481,7 +2500,7 @@ void test_central_tool_output_applies_aggregate_budget_and_keeps_each_call_owner
     public:
         std::vector<MaiModelRequest> requests;
         MaiWireApi wireApi() const override {
-            return MaiWireApi::ChatCompletions;
+            return MaiWireApi::Responses;
         }
         MaiModelContextLimits contextLimits(const std::string&) const override {
             return {1048576, 8192};
@@ -2574,7 +2593,7 @@ void test_central_tool_output_enforces_aggregate_when_many_envelopes_do_not_fit(
                 bool unknownWindow = false;
                 std::vector<MaiModelRequest> requests;
                 MaiWireApi wireApi() const override {
-                    return MaiWireApi::ChatCompletions;
+                    return MaiWireApi::Responses;
                 }
                 MaiModelContextLimits contextLimits(const std::string&) const override {
                     return unknownWindow ? MaiModelContextLimits{}
@@ -2606,9 +2625,11 @@ void test_central_tool_output_enforces_aggregate_when_many_envelopes_do_not_fit(
                     (outcome.value().error.message().find("budget") != std::string::npos ||
                      outcome.value().error.message().find("capacity") != std::string::npos);
                 if (!explicitCapacityFailure) {
-                    std::fprintf(stderr, "central-capacity outcome=%d status=%s error=%s\n",
-                                 bool(outcome), outcome ? maiTurnStatusToString(outcome.value().status) : "missing",
-                                 outcome ? outcome.value().error.message().c_str() : outcome.error().message().c_str());
+                    std::fprintf(
+                        stderr, "central-capacity outcome=%d status=%s error=%s\n", bool(outcome),
+                        outcome ? maiTurnStatusToString(outcome.value().status) : "missing",
+                        outcome ? outcome.value().error.message().c_str()
+                                : outcome.error().message().c_str());
                 }
                 CHECK(explicitCapacityFailure);
             } else {
@@ -2689,7 +2710,7 @@ void test_central_tool_output_never_retypes_forged_small_json_after_eviction() {
             : mObservation(observation), mStore(store) {}
         int calls = 0;
         MaiWireApi wireApi() const override {
-            return MaiWireApi::ChatCompletions;
+            return MaiWireApi::Responses;
         }
         MaiModelContextLimits contextLimits(const std::string&) const override {
             return {262144, 8192};
@@ -2791,7 +2812,8 @@ void test_active_turn_compaction_uses_sqlite_stored_bytes() {
             return MaiWireApi::Responses;
         }
         MaiModelContextLimits contextLimits(const std::string&) const override {
-            return {8192, 1024};
+            // 20 份工具的必要来源骨架也计入窗口；压力仍由输入/输出超过窗口提供。
+            return {16384, 1024};
         }
         MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                         const std::atomic<bool>&) override {
@@ -2809,8 +2831,11 @@ void test_active_turn_compaction_uses_sqlite_stored_bytes() {
                         sink.onToolCall(
                             {"raw_call_" + std::to_string(index), "raw_fixture",
                              nlohmann::json{{"owned_context", std::string(1024, 'i')}}.dump()});
-            } else if (sink.onText)
-                sink.onText("The active tool loop continued after compaction.");
+            } else {
+                if (storedBeforeSummary.empty())
+                    storedBeforeSummary = store->listMessages(sessionId);
+                if (sink.onText) sink.onText("The active tool loop continued after compaction.");
+            }
             return {};
         }
     };
@@ -2825,13 +2850,14 @@ void test_active_turn_compaction_uses_sqlite_stored_bytes() {
     model->sessionId = session.id;
     auto* observedModel = model.get();
     auto tools = std::make_unique<MaiToolRegistry>();
+    registerMaiSessionTools(*tools, false);
     tools->add(std::make_unique<RawTool>());
     {
         MaiAgent agent(std::move(store), std::move(model), std::move(tools));
         CHECK(agent.submit(
             MaiSendPrompt{session.id, "Preserve this instruction and complete all tool work."}));
         agent.waitIdle();
-        CHECK(observedModel->summaries > 0);
+        CHECK(observedModel->summaries == 0);
         CHECK(observedModel->mainRequests == 2);
         MaiContextCheckpoint checkpoint;
         CHECK(observedStore->getContextCheckpoint(session.id, checkpoint));
@@ -2848,8 +2874,9 @@ void test_active_turn_compaction_uses_sqlite_stored_bytes() {
                 CHECK(oldTool && newTool);
                 if (oldTool && newTool) {
                     CHECK(oldTool->output == newTool->output);
-                    CHECK(oldTool->output.find(static_cast<char>(0xff)) == std::string::npos);
-                    CHECK(oldTool->output.find("\xef\xbf\xbd") != std::string::npos);
+                    // 权威会话保留原始字节；模型文本编码与展示清洗由请求边界负责。
+                    CHECK(oldTool->output.find(static_cast<char>(0xff)) != std::string::npos);
+                    CHECK(oldTool->output.find("\xef\xbf\xbd") == std::string::npos);
                 }
             }
             CHECK(maiContextPartialSourceFingerprint(checkpoint,
@@ -2927,7 +2954,9 @@ void test_unfenced_image_groups_follow_execute_tools_and_continue() {
                 return MaiWireApi::Responses;
             }
             MaiModelContextLimits contextLimits(const std::string&) const override {
-                return {32768, 4096};
+                // 两组40份工具骨架和读取声明都必须容纳；下面的调用参数继续
+                // 制造超过此窗口的真实压力，而不扩大任何用户/助手正文。
+                return {65536, 4096};
             }
             MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                             const std::atomic<bool>&) override {
@@ -2957,6 +2986,12 @@ void test_unfenced_image_groups_follow_execute_tools_and_continue() {
                     return {};
                 }
                 ++mainRequests;
+                if (mainRequests == 2 && initialSource.empty()) {
+                    initialSource = store->listMessages(sessionId);
+                    for (const auto& part : initialSource.back().parts)
+                        if (std::holds_alternative<MaiToolPart>(part.body))
+                            initialToolParts.insert(part.id);
+                }
                 CHECK(request.maxOutputTokens == 0);
                 if (mainRequests > 1) {
                     // Projection can make tool text fit without compaction. A
@@ -2973,12 +3008,17 @@ void test_unfenced_image_groups_follow_execute_tools_and_continue() {
                             keptUser = true;
                         for (const auto& image : message.images) {
                             ++observations;
-                            CHECK(image.path.find("phase-" + std::to_string(mainRequests - 2) +
-                                                  "-") != std::string::npos);
                             std::string actual;
                             CHECK(!MaiFileSystem::readFile(MaiFilePath::fromUtf8(image.path),
                                                            actual, 1024));
                             CHECK(actual == pixels);
+                            // 未为达到目标而省略的旧工具图片仍可保留；只对本轮最新
+                            // 观察要求原来的完整组来源，不把旧图强行归给最新调用组。
+                            if (image.path.find("phase-" + std::to_string(mainRequests - 2) +
+                                                "-") == std::string::npos) {
+                                --observations;
+                                continue;
+                            }
                             const auto data = nlohmann::json::parse(message.content);
                             CHECK(data["ownership"] == "tool_group_only");
                             CHECK(data["source_message_id"] == initialSource.back().id);
@@ -3005,7 +3045,7 @@ void test_unfenced_image_groups_follow_execute_tools_and_continue() {
                                  index == 19 ? "screenshot_fixture" : "read_fixture",
                                  nlohmann::json{{"index", index},
                                                 {"phase", mainRequests - 1},
-                                                {"owned_context", std::string(6000, 'i')}}
+                                                {"owned_context", std::string(12000, 'i')}}
                                      .dump()});
                 } else if (sink.onText)
                     sink.onText("Completed both image groups after context compaction.");
@@ -3028,6 +3068,7 @@ void test_unfenced_image_groups_follow_execute_tools_and_continue() {
         model->imageCount = multiImage ? 2 : 1;
         auto* observedModel = model.get();
         auto tools = std::make_unique<MaiToolRegistry>();
+        registerMaiSessionTools(*tools, false);
         for (const auto& name : {"read_fixture", "screenshot_fixture"}) {
             auto tool = std::make_unique<BatchTool>();
             tool->toolName = name;
@@ -3040,13 +3081,16 @@ void test_unfenced_image_groups_follow_execute_tools_and_continue() {
             MaiAgent agent(std::move(store), std::move(model), std::move(tools));
             CHECK(agent.submit(MaiSendPrompt{session.id, observedModel->instruction}));
             agent.waitIdle();
-            CHECK(observedModel->mainRequests == 3 && observedModel->summaryRequests > 0);
+            CHECK(observedModel->mainRequests == 3 && observedModel->summaryRequests == 0);
             std::printf("     images=%d main_requests=%d summary_requests=%d\n", multiImage ? 2 : 1,
                         observedModel->mainRequests, observedModel->summaryRequests);
             MaiContextCheckpoint checkpoint;
             CHECK(observedStore->getContextCheckpoint(session.id, checkpoint));
             CHECK(checkpoint.revision == observedModel->firstCheckpoint.revision + 1);
             const auto after = agent.listMessages(session.id);
+            if (observedModel->mainRequests != 3 && after.back().turnOutcome)
+                std::printf("     image-group failure=%s\n",
+                            after.back().turnOutcome->error.message().c_str());
             CHECK(after.back().text().find("Completed both image groups") != std::string::npos);
             CHECK(maiContextCheckpointMatches(checkpoint, session.id, after));
             if (!observedModel->initialSource.empty())
@@ -3114,7 +3158,7 @@ void test_runner_efforts_follow_the_actual_model_and_preserve_invalid_errors() {
         runCase("", "", fable, effort, false, true, effort);
         runCase(fable, "", "deepseek-flash", effort, true, true, effort);
     }
-    for (const auto& model : {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"}) {
+    for (const auto& model : {"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"}) {
         for (const auto& effort : {"low", "high", "max"})
             runCase(model, effort, fable, "xhigh", false, true, effort);
         for (const auto& effort : {"medium", "xhigh"}) {
@@ -3151,7 +3195,7 @@ void test_session_model_effort_are_atomic_and_turn_scoped() {
             std::unique_lock<std::mutex> lock(mutex);
             requests.push_back(request);
             const bool first = requests.size() == 1;
-            const int glmCycle = request.model == "glm-5.3" ? ++glmRequests : 0;
+            const int glmCycle = request.model == "glm-5.4" ? ++glmRequests : 0;
             wake.notify_all();
             if (first && !wake.wait_for(lock, std::chrono::seconds(10),
                                         [&] { return released || cancel.load(); }))
@@ -3196,12 +3240,12 @@ void test_session_model_effort_are_atomic_and_turn_scoped() {
     options.defaultModel = "deepseek-flash";
     options.reasoningEffortProvider = [&] { return defaultEffort.load() == 1 ? "high" : "max"; };
     MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools), options);
-    const auto a = agent.submit(MaiCreateSession{"/tmp/work", "A", "glm-5.3", "low"}).value();
+    const auto a = agent.submit(MaiCreateSession{"/tmp/work", "A", "glm-5.4", "low"}).value();
     const auto b =
         agent.submit(MaiCreateSession{"/tmp/work", "B", "deepseek-v4-pro", "max"}).value();
     CHECK(!agent.submit(MaiCreateSession{"/tmp/work", "Bad", "glm-unknown", "low"}));
-    CHECK(!agent.submit(MaiCreateSession{"/tmp/work", "Bad", "glm-5.3", "medium"}));
-    CHECK(agent.submit(MaiUpdateSession{b, "Must not change", "glm-5.3", "", "", "medium"})
+    CHECK(!agent.submit(MaiCreateSession{"/tmp/work", "Bad", "glm-5.4", "medium"}));
+    CHECK(agent.submit(MaiUpdateSession{b, "Must not change", "glm-5.4", "", "", "medium"})
               .error()
               .code() == MaiErrorCode::InvalidInput);
     CHECK(agent.submit(MaiUpdateSession{b, "Must not change", "glm-unknown", "", "", "low"})
@@ -3231,7 +3275,7 @@ void test_session_model_effort_are_atomic_and_turn_scoped() {
         probe->wake.notify_all();
     }
     agent.waitIdle();
-    CHECK(observedTool->actualModel == "glm-5.3");
+    CHECK(observedTool->actualModel == "glm-5.4");
     {
         std::lock_guard<std::mutex> lock(probe->mutex);
         CHECK(probe->requests.size() == 4);
@@ -3250,13 +3294,13 @@ void test_session_model_effort_are_atomic_and_turn_scoped() {
         }
         CHECK(retainedReasoning);
         for (const auto& request : probe->requests)
-            CHECK((request.model == "glm-5.3" && request.reasoningEffort == "low") ||
+            CHECK((request.model == "glm-5.4" && request.reasoningEffort == "low") ||
                   (request.model == "deepseek-v4-pro" && request.reasoningEffort == "high"));
     }
     CHECK(agent.submit(MaiUpdateSession{a, "", "", "", "/tmp/new-work"}));
     MaiSession after;
     CHECK(agent.getSession(a, after));
-    CHECK(after.model == "glm-5.3" && after.reasoningEffort == "low" && after.title == "A");
+    CHECK(after.model == "glm-5.4" && after.reasoningEffort == "low" && after.title == "A");
     CHECK(agent.submit(MaiUpdateSession{a, "", "", "", "", std::string{}}));
     CHECK(agent.getSession(a, after) && after.reasoningEffort.empty());
 }
@@ -3402,7 +3446,7 @@ void test_accepted_task_failure_queries_existing_task_without_resubmission() {
         dependencies.tools = &tools;
         dependencies.emitter = &emitter;
         dependencies.context = &context;
-        dependencies.defaultModel = "glm-5.3";
+        dependencies.defaultModel = "glm-5.4";
         MaiTurnRunner runner(dependencies, session.id, assistant);
         std::atomic<bool> cancel{false};
         runner.run(cancel);
@@ -3504,7 +3548,7 @@ void test_terminal_accepted_task_failure_keeps_trusted_terminal_state() {
         dependencies.tools = &tools;
         dependencies.emitter = &emitter;
         dependencies.context = &context;
-        dependencies.defaultModel = "glm-5.3";
+        dependencies.defaultModel = "glm-5.4";
         MaiTurnRunner runner(dependencies, session.id, assistant);
         std::atomic<bool> cancel{false};
         runner.run(cancel);
@@ -3593,7 +3637,7 @@ void test_untrusted_tool_output_cannot_claim_accepted_task_identity() {
         dependencies.tools = &tools;
         dependencies.emitter = &emitter;
         dependencies.context = &context;
-        dependencies.defaultModel = "glm-5.3";
+        dependencies.defaultModel = "glm-5.4";
         MaiTurnRunner runner(dependencies, session.id, assistant);
         std::atomic<bool> cancel{false};
         runner.run(cancel);

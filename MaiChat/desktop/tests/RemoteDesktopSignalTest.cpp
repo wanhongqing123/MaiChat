@@ -10,23 +10,25 @@ class RemoteDesktopSignalTest : public QObject {
     Q_OBJECT
 
 private slots:
-    void roundTripsEverySignalType();
-    void roundTripsOptionalFields();
-    void treatsPlainChatTextAsUnknown();
-    void survivesMalformedPayloads();
-    void rejectsUnknownProtocolVersion();
-    void rejectsUnknownSignalType();
-    void encodesNothingForUnknownType();
-    void keepsSignalOutOfPlainSight();
-    void roundTripsNoticeWithCode();
-    void rejectsNoticeWithoutCode();
-    void decodesSharedCaptureGeometryFixture();
-    void ignoresInvalidOptionalGeometryWithoutRejectingAccept();
-    void acceptsLegacyAcceptWithoutGeometry();
+  void mediaIdentityMatchesAccountService();
+  void roundTripsEverySignalType();
+  void roundTripsOptionalFields();
+  void treatsPlainChatTextAsUnknown();
+  void survivesMalformedPayloads();
+  void rejectsUnknownProtocolVersion();
+  void rejectsUnknownSignalType();
+  void encodesNothingForUnknownType();
+  void keepsSignalOutOfPlainSight();
+  void roundTripsNoticeWithCode();
+  void rejectsNoticeWithoutCode();
+  void decodesSharedCaptureGeometryFixture();
+  void ignoresInvalidOptionalGeometryWithoutRejectingAccept();
+  void acceptsLegacyAcceptWithoutGeometry();
 };
 
 void RemoteDesktopSignalTest::roundTripsEverySignalType() {
-    const QVector<Type> types{Type::Invite, Type::Accept, Type::Reject, Type::Stop, Type::Notice};
+    const QVector<Type> types{Type::Invite, Type::Accept,   Type::Reject, Type::Stop,
+                              Type::Notice, Type::Discover, Type::Device};
 
     // 这个列表是手写的，新增枚举值时极易漏——漏了这条用例照样全绿，
     // 名字却还叫"每一种类型"（加 Notice 时就漏过一次）。
@@ -248,6 +250,15 @@ void RemoteDesktopSignalTest::acceptsLegacyAcceptWithoutGeometry() {
     QCOMPARE(decoded.type, Type::Accept);
     QCOMPARE(decoded.sessionId, QStringLiteral("old-s"));
     QVERIFY(!decoded.captureGeometry.has_value());
+}
+
+void RemoteDesktopSignalTest::mediaIdentityMatchesAccountService() {
+    QCOMPARE(mediaUserId(QStringLiteral("owned_account"),
+                         QStringLiteral("0123456789abcdef0123456789abcdef")),
+             QStringLiteral("rd_0f41444bc8e51e0eef0dba30"));
+    QVERIFY(mediaUserId(QStringLiteral("owned_account"), QStringLiteral("another-device")) !=
+            mediaUserId(QStringLiteral("owned_account"),
+                        QStringLiteral("0123456789abcdef0123456789abcdef")));
 }
 
 QTEST_MAIN(RemoteDesktopSignalTest)

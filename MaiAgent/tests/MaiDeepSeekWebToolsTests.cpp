@@ -890,7 +890,7 @@ void test_provider_web_discovery_requires_a_native_provider_contract() {
         CHECK(registry.findForModel(name, "anthropic/claude-fable-5.2") == nullptr);
         CHECK(registry.findForModel(name, "unconfigured-model") == nullptr);
         CHECK(registry.findForModel(name, "local:synthetic-model") == nullptr);
-        for (const auto* model : {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
+        for (const auto* model : {"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
             CHECK(registry.findForModel(name, model) != nullptr);
     }
     // 空型号仍是无执行/凭据读取的普通工具目录，保持既有发现入口。
@@ -949,15 +949,15 @@ void test_glm_errors_cancel_and_provider_dispatch_never_fallback() {
           0}});
     MaiToolRegistry registry;
     registerMaiProviderWebTools(registry, {deepseek.options(), glm.glmOptions()});
-    CHECK(registry.specs("glm-5.3").size() == 2 && registry.specs("deepseek-v4-pro").size() == 2);
+    CHECK(registry.specs("glm-5.4").size() == 2 && registry.specs("deepseek-v4-pro").size() == 2);
     CHECK(registry.findForModel("web_search", "unconfigured-model") == nullptr);
     CHECK(Json::parse(
-              registry.specs("glm-5.3")[0].parametersJson)["properties"]["query"]["maxLength"] ==
+              registry.specs("glm-5.4")[0].parametersJson)["properties"]["query"]["maxLength"] ==
           70);
     CHECK(Json::parse(registry.specs("deepseek-v4-pro")[0]
                           .parametersJson)["properties"]["query"]["maxLength"] == 128);
     MaiToolContext context;
-    context.model = "glm-5.3";
+    context.model = "glm-5.4";
     context.sessionId = "ses_glm_native";
     auto* search = registry.findForModel("web_search", context.model);
     CHECK(search && !search->requiresApproval("{}") && !search->requiresPaidApproval("{}"));

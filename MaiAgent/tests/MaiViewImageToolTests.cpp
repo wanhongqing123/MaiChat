@@ -90,11 +90,11 @@ void test_desktop_can_view_image_outside_session_directory() {
 void test_rejects_text_only_models() {
     std::unique_ptr<MaiTool> tool = makeMaiViewImageTool();
     MaiToolContext context;
-    context.model = "glm-5.3";
+    context.model = "local:qa";
     const MaiToolResult result = tool->execute(R"({"path":"image.png"})", context);
     CHECK(result.hasError());
     CHECK(result.error().code() == MaiErrorCode::NotSupported);
-    CHECK(result.error().message().find("glm-5.3-flash") != std::string::npos);
+    CHECK(result.error().message().find("mobile_preview_image") != std::string::npos);
 }
 
 void test_local_primary_rejects_pixels_before_preview_work() {
@@ -125,11 +125,11 @@ void test_registry_filters_the_same_model_capability_as_direct_execution() {
     MaiToolRegistry registry;
     registry.add(makeMaiViewImageTool());
     CHECK(registry.find("view_image") != nullptr);
-    for (const char* model : {"local:qa", "local:qwen3.5-2b-instruct-q4_k_m", "glm-5.3"}) {
+    for (const char* model : {"local:qa", "local:qwen3.5-2b-instruct-q4_k_m", "deepseek-v4-pro"}) {
         CHECK(registry.findForModel("view_image", model) == nullptr);
         CHECK(registry.specs(model).empty());
     }
-    for (const char* model : {"glm-5.3-flash", ""}) {
+    for (const char* model : {"glm-5.4", "glm-5.3-flash", ""}) {
         CHECK(registry.findForModel("view_image", model) != nullptr);
         CHECK(registry.specs(model).size() == 1);
     }

@@ -936,6 +936,30 @@ void test_grep_returns_utf8_for_legacy_files() {
     CHECK(result.output().find("\u4f60\u597d") != std::string::npos);
 }
 
+// 显式编码不能覆盖相反字节序的 BOM，否则检索会把解码错误误报为无命中。
+void test_grep_utf16_bom_conflicts_match_reader_errors() {
+    Workspace workspace;
+    const auto context = workspace.context();
+    Workspace::write(workspace.root / "little.txt", std::string("\xFF\xFE\x61\x00", 4));
+    Workspace::write(workspace.root / "big.txt", std::string("\xFE\xFF\x00\x61", 4));
+    for (const auto& input :
+         {std::pair<const char*, const char*>{"little.txt", "utf-16be"}, {"big.txt", "utf-16le"}}) {
+        const auto query = args({{"path", input.first}, {"encoding", input.second}});
+        const auto read = makeMaiReadTool()->execute(query, context);
+        const auto grep = makeMaiGrepTool()->execute(args({{"path", input.first},
+                                                           {"encoding", input.second},
+                                                           {"pattern", "a"},
+                                                           {"mode", "literal"}}),
+                                                     context);
+        CHECK(read.hasError() && read.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(grep.hasError() && grep.error().code() == read.error().code());
+        CHECK(grep.error().message().find("BOM conflicts") != std::string::npos);
+        const auto automatic = makeMaiGrepTool()->execute(
+            args({{"path", input.first}, {"pattern", "a"}, {"mode", "literal"}}), context);
+        CHECK(!automatic.hasError() && automatic.output().find(":1: a") != std::string::npos);
+    }
+}
+
 void test_explicit_create_and_delete_tools_use_utf8_paths() {
     Workspace workspace;
     const MaiToolContext context = workspace.context();
@@ -1220,7 +1244,7 @@ void test_registry() {
     // 而这条用例想守的是「这些工具都在」，不是「一共有几个」。
     for (const char* n :
          {"file_read", "file_create", "file_create_directory", "file_delete", "file_write",
-          "file_edit", "file_patch", "file_glob", "file_grep", "current_time"}) {
+          "file_edit", "apply_patch", "file_glob", "file_grep", "current_time"}) {
         CHECK(reg.find(n) != nullptr);
     }
     CHECK(reg.find("no-such-tool") == nullptr);
@@ -1546,6 +1570,7 @@ int main(int argc, char* argv[]) {
     RUN(test_read);
     RUN(test_read_decodes_non_utf8_files_for_the_model);
     RUN(test_grep_returns_utf8_for_legacy_files);
+    RUN(test_grep_utf16_bom_conflicts_match_reader_errors);
     RUN(test_write);
     RUN(test_explicit_create_and_delete_tools_use_utf8_paths);
     RUN(test_glob);

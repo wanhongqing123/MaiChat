@@ -2,6 +2,7 @@
 // 主要入口：event、updateWindowChromeBackground、closeEvent、eventFilter。
 // 直接依赖：diagnostics/PerformanceLog.h、model/ContactGroups.h、model/MessageNotification.h、model/MessageQuote.h；实现与这些接口协作。
 #include "ui/MainWindow.h"
+#include "agent/DesktopAgentStoragePreparation.h"
 #include "ui/DesktopRasterImage.h"
 #include "app/DesktopPasswordChangeRequests.h"
 #include "diagnostics/PerformanceLog.h"
@@ -140,6 +141,7 @@
 
 #include "remote/TrtcEngine.h"
 #include "ui/RemoteDesktopConsentDialog.h"
+#include "ui/RemoteDesktopDeviceDialog.h"
 #include "ui/RemoteDesktopProxyDialog.h"
 #include "ui/RemoteDesktopSessionCard.h"
 #include "ui/RemoteDesktopViewPanel.h"
@@ -152,6 +154,8 @@
 #include <QJsonObject>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QSysInfo>
+#include <QUuid>
 
 #include "MaiChatTools/MaiChatHostTools.h"
 #include "MaiChatTools/DesktopCloudDriveTools.h"
@@ -1701,25 +1705,6 @@ AgentController::ModelConfig loadAgentModelConfig(
   return config;
 }
 
-// 会话和消息落在哪。放应用数据目录，不放当前目录——
-// 当前目录是用户的工作目录，往里扔数据库文件不礼貌。
-QString accountAgentDirectory(const QString &ownerUserId) {
-  if (ownerUserId.isEmpty()) return {};
-  QString root = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-  if (root.isEmpty())
-    root = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-  if (root.isEmpty()) return {};
-  const QString account = QString::fromLatin1(
-      QCryptographicHash::hash(ownerUserId.toUtf8(), QCryptographicHash::Sha256).toHex());
-  return QDir(root).filePath(QStringLiteral("Agent/Accounts/%1").arg(account));
-}
-
-QString agentDatabasePath(const QString &ownerUserId) {
-  const QString root = accountAgentDirectory(ownerUserId);
-  if (root.isEmpty() || !QDir().mkpath(root)) return {};
-  return QDir(root).filePath(QStringLiteral("agent.db"));
-}
-
 #ifdef Q_OS_WIN
 // Keep the perimeter independent of page layouts and hit testing. In particular,
 // adding transparent outer margins would shrink maximized content and turn the
@@ -1848,28 +1833,31 @@ void configureWindowsTitleBar(QWidget* window) {
 } // namespace
 
 MainWindow::MainWindow(RemoteIMApplication &app, QWidget *parent)
-    : MainWindow(app, 0, {}, {}, {}, parent) {}
+    : MainWindow(app, 0, {}, {}, parent) {}
 
 MainWindow::MainWindow(RemoteIMApplication& app, DesktopScreenCaptureControl& captureControl,
                        QWidget* parent)
-    : MainWindow(app, 0, {}, {}, {}, parent, &captureControl) {}
+    : MainWindow(app, 0, {}, {}, parent, &captureControl) {}
 
 MainWindow::MainWindow(RemoteIMApplication &app, int imSdkAppId,
-                       std::function<QString(const QString&)> userSigProvider,
                        QWidget *parent)
-    : MainWindow(app, imSdkAppId, std::move(userSigProvider), {}, {}, parent) {}
+    : MainWindow(app, imSdkAppId, {}, {}, parent) {}
 
 MainWindow::MainWindow(
     RemoteIMApplication &app, int imSdkAppId,
-    std::function<QString(const QString&)> userSigProvider,
     std::function<QString()> arkApiKeyProvider,
     std::function<QPair<QString, QString>()> wanCredentialsProvider,
-    QWidget *parent, DesktopScreenCaptureControl* captureControl)
+    QWidget *parent, DesktopScreenCaptureControl* captureControl,
+    std::unique_ptr<MaiSessionStore> preparedStore,
+    std::function<QPair<QString, QString>()> initialMediaAccess,
+    std::function<DesktopVideoCircleAccess()> initialVideoAccess)
     : QMainWindow(parent), app_(app), imSdkAppId_(imSdkAppId),
-      userSigProvider_(std::move(userSigProvider)),
       arkApiKeyProvider_(std::move(arkApiKeyProvider)),
       wanCredentialsProvider_(std::move(wanCredentialsProvider)),
       notificationTracker_(QDateTime::currentMSecsSinceEpoch()) {
+  preparedAgentStore_ = std::move(preparedStore);
+  mediaServiceAccessProvider_ = std::move(initialMediaAccess);
+  videoCircleAccessProvider_ = std::move(initialVideoAccess);
   Q_INIT_RESOURCE(resources);
   // 缩放只作用于主界面：登录窗（先于此构造）保持设计尺寸，
   // 进入主界面时才把全局字体切到基准 16px × 倍率。
@@ -1933,6 +1921,7 @@ MainWindow::MainWindow(
   // 放在 refresh 之前：refresh 会重建列表但不产生入站消息，先后顺序无所谓，
   // 重要的是通知在第一条实时消息到达之前就已经接好线。
   setUpMessageNotifications();
+  if (videoCircleAccessProvider_) probeCloudDriveAvailability();
   refresh();
 }
 
@@ -5409,11 +5398,14 @@ void MainWindow::rebuildAgentPage() {
   modelConfig.glmBaseUrl = QStringLiteral("https://open.bigmodel.cn/api/v1");
   modelConfig.deepseekBaseUrl = QStringLiteral("https://api.deepseek.com");
   modelConfig.openrouterBaseUrl = QStringLiteral("https://openrouter.ai/api/v1");
+  // OpenAI uses the same live provider-key cache as the other account routes.
+  modelConfig.openaiBaseUrl = QStringLiteral("https://api.openai.com/v1");
   modelConfig.arkApiKeyProvider = arkApiKeyProvider_;
   modelConfig.wanCredentialsProvider = wanCredentialsProvider_;
   modelConfig.mediaServiceAccessProvider = mediaServiceAccessProvider_;
   agentController_ = new AgentController(
       modelConfig, agentDatabasePath(app_.chatState().ownerUserId()),
+      std::move(preparedAgentStore_),
       [this](MaiToolRegistry &registry) {
         registerSessionImBindingTool(registry);
         registerMaiChatHostTools(registry, app_);
@@ -8868,9 +8860,25 @@ void MainWindow::setupRemoteDesktop() {
   RemoteDesktopController::Config config;
   config.sdkAppId = imSdkAppId_;
   config.localUserId = ownerId;
-  config.userSigProvider = [this, ownerId](const QString &userId) {
-    return userId == ownerId && userSigProvider_ ? userSigProvider_(userId) : QString();
-  };
+  // 与会话同步复用同一个安装身份；账号仅负责 IM 鉴权，设备用于端点定向。
+  QSettings identity;
+  config.localDeviceId = identity.value(QStringLiteral("session-sync/device-id")).toString();
+  if (!QRegularExpression(QStringLiteral("^[a-f0-9]{32}$"))
+           .match(config.localDeviceId)
+           .hasMatch()) {
+    config.localDeviceId = QUuid::createUuid().toString(QUuid::Id128);
+    identity.setValue(QStringLiteral("session-sync/device-id"), config.localDeviceId);
+  }
+  config.localDeviceName = QSysInfo::machineHostName().left(80);
+#if defined(Q_OS_WIN)
+  config.platform = QStringLiteral("Windows");
+#elif defined(Q_OS_MACOS)
+  config.platform = QStringLiteral("macOS");
+#else
+  config.platform = QStringLiteral("Desktop");
+#endif
+
+
 
   RemoteDesktopSettings remoteSettings = remoteDesktopSettingsStore_->load();
   if (!RemoteInput::isInputInjectionSupported())
@@ -9067,6 +9075,8 @@ void MainWindow::setupRemoteDesktop() {
 void MainWindow::promptRemoteDesktopPassword(const QString &peerUserId) {
   if (peerUserId.isEmpty())
     return;
+  const QString deviceId = remoteDesktop_->viewerDeviceId();
+  if (deviceId.isEmpty()) return;
   AppTextInputDialog::Options options;
   options.title = QStringLiteral("需要访问密码");
   options.description =
@@ -9081,8 +9091,10 @@ void MainWindow::promptRemoteDesktopPassword(const QString &peerUserId) {
     return;
 
   // 记住本次会话内的密码，避免重试时反复询问。
-  remoteDesktopPasswords_.insert(peerUserId, password);
-  remoteDesktop_->requestView(peerUserId, password);
+  if (remoteDesktop_->viewerDeviceId() != deviceId || remoteDesktop_->viewerPeerId() != peerUserId)
+    return;
+  remoteDesktopPasswords_.insert(peerUserId + QLatin1Char('/') + deviceId, password);
+  remoteDesktop_->requestView(peerUserId, password, deviceId);
 }
 
 void MainWindow::openRemoteDesktopViewer(const QString &peerUserId) {
@@ -9317,9 +9329,22 @@ void MainWindow::requestRemoteDesktop() {
   if (peerId.isEmpty())
     return;
 
-  // 直接发起，由对端的被控模式决定确认或自动接受；
-  // 无人值守若额外设了访问密码，收到密码拒绝后再按需索取。
-  remoteDesktop_->requestView(peerId, remoteDesktopPasswords_.value(peerId));
+  // 先通过 IM 发现并明确选择电脑；对方的其他登录端不参与这次邀请。
+  QPointer<MainWindow> self(this);
+  QPointer<RemoteDesktopDeviceDialog> chooser =
+      new RemoteDesktopDeviceDialog(*remoteDesktop_, peerId, this);
+  const int result = chooser->exec();
+  if (!self || !chooser)
+    return;
+  const QString deviceId = chooser->selectedDeviceId();
+  const QString targetPeer = chooser->selectedPeerId();
+  chooser->deleteLater();
+  if (result != QDialog::Accepted || deviceId.isEmpty() ||
+      app_.chatState().selectedPeerId() != peerId)
+    return;
+  remoteDesktop_->requestView(
+      targetPeer, remoteDesktopPasswords_.value(targetPeer + QLatin1Char('/') + deviceId),
+      deviceId);
 }
 
 void MainWindow::showConversationContextMenu(const QPoint &pos) {
@@ -9547,4 +9572,26 @@ QString MainWindow::contactName(const QString &userId) const {
                                            : contact.displayName;
   }
   return userId;
+}
+
+void MainWindow::setRemoteDesktopCredentialProvider(RemoteDesktopCredentialProvider provider) {
+  if (!remoteDesktop_ || !provider)
+    return;
+  QPointer<MainWindow> owner(this);
+  auto refresh = [owner, provider] {
+    if (!owner || !owner->remoteDesktop_)
+      return;
+    const QString deviceId = owner->remoteDesktop_->localDeviceId();
+    provider(deviceId, [owner, deviceId](const QString &userId, const QString &sig,
+                                         qint64 expires) {
+      if (!owner || !owner->remoteDesktop_ || owner->remoteDesktop_->localDeviceId() != deviceId)
+        return;
+      owner->remoteDesktop_->setMediaCredential(userId, sig, expires);
+    });
+  };
+  auto *timer = new QTimer(this);
+  timer->setInterval(20 * 60 * 1000);
+  connect(timer, &QTimer::timeout, this, refresh);
+  timer->start();
+  refresh();
 }

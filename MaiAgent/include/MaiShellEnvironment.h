@@ -31,8 +31,8 @@ std::vector<std::string> maiShellCommandArguments(const MaiShellEnvironment& she
 
 // 直接、每进程的启动准备：login Bash/Zsh 按 Codex startup.rs 加载当前账户 rc，
 // 再恢复授权 workdir；Sh 按 frozen Codex 的非求值规则展开 ENV，只 source 可读且非目录的路径。
-// 登录 PowerShell 用模块限定 Set-Location 恢复目录；
-// Cmd 不改命令体；login=false 不加载 rc/profile。
+// PowerShell 在登录和非登录模式都按 Codex 0.172 前置 UTF-8 输出设置，避免原始流回执乱码；
+// 登录模式再用模块限定 Set-Location 恢复目录。Cmd 不改命令体；login=false 不加载 rc/profile。
 // 不读取/捕获环境值，不写快照；用户命令另起一行，以保留 rc 中配置的 alias 解析规则。
 // 与 Codex 一致，不额外配置 pipefail/-e 或覆盖用户最终状态；沿用解释器和 profile 的选项。
 std::string maiShellStartupCommand(const MaiShellEnvironment& shell, const std::string& command,

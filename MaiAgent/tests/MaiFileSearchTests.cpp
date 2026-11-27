@@ -4,7 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <regex>
 #include <set>
 #include <string>
@@ -56,10 +55,11 @@ Fixture::~Fixture() {
     fs::remove_all(mPath, ignored);
 }
 void Fixture::write(const std::string& relative, const std::string& text) {
-    const auto destination = mPath / fs::u8path(relative);
-    fs::create_directories(destination.parent_path());
-    std::ofstream stream(destination, std::ios::binary);
-    stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+    // Windows 的长临时根叠加长文件名可超过 MAX_PATH；旧 ofstream 静默失败会让搜索空树。
+    // 夹具与产品共用宽字符/扩展路径入口，并核对创建结果，不能把素材缺失当搜索回归。
+    const auto destination = path().append(MaiFilePath::fromUtf8(relative));
+    CHECK(!MaiFileSystem::createDirectories(destination.dirName()));
+    CHECK(!MaiFileSystem::writeFile(destination, text));
 }
 MaiFilePath Fixture::path() const {
     return MaiFilePath::fromUtf8(mPath.u8string());
@@ -135,6 +135,57 @@ void test_enumeration_budget_keeps_work_metrics_and_content_phase_honest() {
     const auto first = service.searchText(content, callbacks);
     CHECK(first.partial && first.visitedEntries > 0 && first.searchedFiles == 0);
     CHECK(!first.contentSearchStarted && first.matches.empty() && !first.totalMatches);
+}
+
+// 只有 CRLF 的 CR 属于分隔符；末尾独立 CR 必须和普通 reader 一样保留。
+void test_final_standalone_carriage_return_remains_searchable() {
+    Fixture fixture;
+    fixture.write("standalone.txt", "needle\r");
+    fixture.write("crlf.txt", "needle\r\n");
+    MaiFileSearch service;
+    MaiFileContentSearchOptions options;
+    options.root = fixture.path();
+    options.pattern = "\r";
+    const auto page = service.searchText(options);
+    CHECK(!page.error && !page.partial);
+    CHECK(page.matches.size() == 1);
+    if (!page.matches.empty()) {
+        CHECK(page.matches.front().path == "standalone.txt");
+        CHECK(page.matches.front().text == "needle\r");
+    }
+}
+
+// 忽略规则也是输入文件；读取它们和正文必须共享总字节预算，并报告本次真实 I/O。
+void test_ignore_files_share_total_read_budget_and_cached_io_is_zero() {
+    Fixture fixture;
+    const std::string rules = "# bounded ignore rules\n";
+    fixture.write(".gitignore", rules);
+    fixture.write("source.txt", "needle\n");
+    MaiFileSearch service;
+    MaiFileContentSearchOptions options;
+    options.root = fixture.path();
+    options.pattern = "needle";
+    options.budget.maxBytes = rules.size();
+    const auto page = service.searchText(options);
+    CHECK(!page.error && page.partial);
+    CHECK(page.readBytes == rules.size());
+    CHECK(page.matches.empty());
+    CHECK(!page.totalMatches);
+
+    MaiFileNameSearchOptions names;
+    names.root = fixture.path();
+    names.query = "*.txt";
+    const auto first = service.findFiles(names);
+    CHECK(!first.error && !first.partial && first.readBytes == rules.size());
+    const auto cached = service.findFiles(names);
+    CHECK(cached.cacheReused && cached.readBytes == 0);
+    CHECK(cached.files.size() == first.files.size());
+    names.refresh = true;
+    names.budget.maxBytes = rules.size() - 1;
+    const auto exhausted = service.findFiles(names);
+    CHECK(!exhausted.error && exhausted.partial);
+    CHECK(exhausted.readBytes <= names.budget.maxBytes);
+    CHECK(exhausted.files.empty() && !exhausted.totalMatches);
 }
 
 void test_totals_units_aggregation_budgets_and_replay() {
@@ -807,6 +858,8 @@ void test_regex_subset_agrees_with_ecmascript_for_short_text() {
 }  // namespace
 
 int main() {
+    test_final_standalone_carriage_return_remains_searchable();
+    test_ignore_files_share_total_read_budget_and_cached_io_is_zero();
     test_immediate_entries_include_typed_directories_without_descending();
     test_enumeration_budget_keeps_work_metrics_and_content_phase_honest();
     test_totals_units_aggregation_budgets_and_replay();

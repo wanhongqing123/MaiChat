@@ -152,7 +152,7 @@ bool maiIsResponseBoundaryPart(const MaiMessagePart& part);
 //
 // 没有 System：系统提示词是 MaiContextBuilder 在组装请求时**临时加**的，不属于对话历史，
 // 也不该被存下来或显示给用户。没有 Tool：工具结果是 assistant 消息里的一个片段（MaiToolPart），
-// 不是独立的一条消息——那是 OpenAI 线格式的事，翻译发生在 MaiOpenAiClient。
+// 不是独立的一条消息——那是 OpenAI 线格式的事，翻译发生在 MaiResponsesClient。
 enum class MaiRole {
     User,
     Assistant,

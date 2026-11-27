@@ -57,7 +57,7 @@ public:
         return {};
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
     std::vector<std::string> lastUsers() {
         std::lock_guard<std::mutex> lock(mutex);

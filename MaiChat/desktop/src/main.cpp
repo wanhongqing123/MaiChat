@@ -9,6 +9,7 @@
 #include <QFontDatabase>
 #include <QHash>
 #include <QStandardPaths>
+#include <QSettings>
 #include <QTimer>
 #include <memory>
 #include <utility>
@@ -18,6 +19,7 @@
 #include "auth/DesktopAuthClient.h"
 #include "agent/DesktopSessionSyncCoordinator.h"
 #include "agent/DesktopSessionSyncChannel.h"
+#include "agent/DesktopAgentStoragePreparation.h"
 #include "logging/AppLog.h"
 #include "platform/DesktopRemoteIMClientFactory.h"
 #include "storage/LocalMessageDatabase.h"
@@ -73,6 +75,18 @@ int main(int argc, char* argv[]) {
     // 与其它应用的数据树分开。
     QApplication::setApplicationName(QStringLiteral("Desktop IM"));
     QApplication::setOrganizationName(QStringLiteral("MaiChat"));
+#ifdef MAICHAT_LOCAL_PREVIEW
+    // 本地预览使用独立资料与 INI 设置；不读取正式版的账号令牌、消息库或字体偏好。
+    // 仅 CFFIXED_USER_HOME 不会隔离 macOS CFPreferences，因此不能靠启动环境变量替代。
+    QApplication::setApplicationName(QStringLiteral("Desktop IM Preview"));
+    QApplication::setApplicationDisplayName(QStringLiteral("MaiChat 本地测试版"));
+    QApplication::setOrganizationName(QStringLiteral("MaiChatPreview"));
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope,
+        QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
+            .filePath(QStringLiteral("settings")));
+#endif
+
     const QStringList arguments = QCoreApplication::arguments();
     const bool smokeMode = arguments.contains(QStringLiteral("--smoke"));
 #ifdef MAICHAT_VERSION
@@ -83,6 +97,10 @@ int main(int argc, char* argv[]) {
     // 后续所有 qInfo/qWarning（含 Qt 自身的）都能落盘——GUI 子系统下 stderr
     // 没有去处，不接管的话双击启动等于完全没有日志。
     AppLog::install();
+#ifdef MAICHAT_LOCAL_PREVIEW
+    qInfo("[preview] isolated application data and INI settings enabled");
+#endif
+
 
     // IM 附件和头像的 HTTPS 传输走共享 libcurl；报告实际 TLS 后端，避免把 Qt
     // 的 supportsSsl() 误当成附件下载可用性的证据。
@@ -159,6 +177,22 @@ int main(int argc, char* argv[]) {
         qCritical("[auth] invalid IM credential after desktop login");
         return 1;
     }
+    // Migration and journal replay can take time. Prepare the real backend on
+    // the worker while Qt paints progress and processes cancellation, before a
+    // window can imply that failed storage means an empty conversation list.
+    auto preparedStorage = prepareDesktopAgentStorage(agentDatabasePath(credential.userId));
+    if (!preparedStorage.store) {
+        if (preparedStorage.canceled) {
+            AppMessageDialog::show(nullptr, AppMessageDialog::Kind::Warning,
+                QStringLiteral("已取消启动"), QStringLiteral("本地会话准备已取消，应用未进入主界面。"));
+            return 0;
+        }
+        AppMessageDialog::show(nullptr, AppMessageDialog::Kind::Warning,
+            QStringLiteral("无法打开本地会话"),
+            QStringLiteral("本地会话准备失败，请检查磁盘空间和文件访问权限后重试。\n%1")
+                .arg(preparedStorage.error));
+        return 1;
+    }
     RemoteIMApplication remoteIM(credential.userId,
                                  createDesktopRemoteIMClient(),
                                  std::make_unique<LocalMessageDatabase>(messageDatabasePath(credential.userId)));
@@ -178,11 +212,17 @@ int main(int argc, char* argv[]) {
             auth.authenticatedSessionIdentity(), media.first, media.second};
     });
     MainWindow window(remoteIM, credential.sdkAppId,
-                      [&auth](const QString& userId) {
-        const DesktopImCredential current = auth.imCredential();
-        return current.isValid() && current.userId == userId ? current.userSig : QString();
-    }, auth.arkApiKeyProvider(), auth.bailianCredentialProvider());
-    window.setMediaServiceAccessProvider(auth.mediaServiceAccessProvider());
+                      auth.arkApiKeyProvider(), auth.bailianCredentialProvider(), nullptr, nullptr,
+                      std::move(preparedStorage.store), auth.mediaServiceAccessProvider(),
+                      auth.videoCircleAccessProvider());
+    window.setRemoteDesktopCredentialProvider(
+        [&auth](const QString &deviceId, MainWindow::RemoteDesktopCredentialCompletion completion) {
+            auth.fetchRemoteDesktopCredential(
+                deviceId, [completion](const DesktopImCredential &credential, const QString &) {
+                    completion(credential.userId, credential.userSig,
+                               credential.expiresAt.toSecsSinceEpoch());
+                });
+        });
     window.setFriendQrProvider([&auth](MainWindow::FriendQrCompletion completion) {
         auth.fetchFriendQr(std::move(completion));
     });
@@ -191,7 +231,6 @@ int main(int argc, char* argv[]) {
         [&auth](const QString& password, DesktopAuthClient::PasswordCompletion completion) {
             auth.setPassword(password, std::move(completion));
         }, [&auth] { return auth.authenticatedSessionIdentity(); });
-    window.setVideoCircleAccessProvider(auth.videoCircleAccessProvider());
     window.setMaiChatNicknameProvider([&auth] { return auth.nickname(); });
     remoteIM.setNicknameUpdater([&auth](const QString& nickname,
                                         RemoteIMCompletion completion) {

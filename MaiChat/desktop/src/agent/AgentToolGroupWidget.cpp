@@ -10,13 +10,14 @@
 
 namespace {
 bool isShellProcessTool(const QString& tool) {
-    // The active shell tools are shell and shell_input, sharing Core command
-    // sessions. The retired desktop_process_* names remain here only so stored
-    // history keeps its shell classification; they are not active catalog IDs.
+    // Active exec_command/write_stdin share Core command sessions. Retired
+    // shell/shell_input and desktop_process_* names remain display-only so
+    // stored history keeps its classification; they are not active aliases.
     // ssh_exec is explicitly built-in by product decision: libssh2 creates no
     // local process. curl/openssl use in-process mai_*_execute entry points;
-    // other host tools, including desktop_browser/computer, also stay built-in.
-    static const QSet<QString> tools{QStringLiteral("shell"), QStringLiteral("shell_input"),
+    // other host tools, including computer, also stay built-in.
+    static const QSet<QString> tools{QStringLiteral("exec_command"), QStringLiteral("write_stdin"),
+                                    QStringLiteral("shell"), QStringLiteral("shell_input"),
                                     QStringLiteral("desktop_process_start"),
                                     QStringLiteral("desktop_process_read"), QStringLiteral("desktop_process_write"),
                                     QStringLiteral("desktop_process_stop")};

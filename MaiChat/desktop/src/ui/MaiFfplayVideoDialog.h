@@ -164,6 +164,9 @@ private:
     bool firstFramePauseQueued_ = false;
     bool controlsPlaying_ = true;
     bool controlsSeeking_ = false;
+    QTimer *scrubPreviewTimer_ = nullptr;
+    double scrubPreviewFraction_ = 0;
+    bool scrubPreviewPending_ = false;
     bool controlsVisible_ = true;
     bool hudOwnerActive_ = true;
     bool docked_ = false;

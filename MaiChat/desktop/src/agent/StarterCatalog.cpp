@@ -19,9 +19,9 @@ QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools)
          QStringLiteral("kling_bailian_video minimax_video seedance_video wan_video"),
          QStringLiteral("先了解它支持的视频创作方式和需要的素材，暂不提交生成任务。")},
         {QStringLiteral("文件处理"), QStringLiteral("文"),
-         QStringLiteral("查找、读取、新建、编辑和删除本地文件与目录。"),
-         QStringLiteral("file_glob file_read file_grep file_create file_create_directory file_write file_edit file_patch file_delete"),
-         QStringLiteral("查找工作目录中的会议记录，列出文件路径。")},
+         QStringLiteral("用补丁新建、修改和删除文本文件；读取与搜索使用终端工具。"),
+         QStringLiteral("apply_patch"),
+         QStringLiteral("按我指定的修改生成并应用补丁，保留无关内容。")},
         {QStringLiteral("文件与媒体交付"), QStringLiteral("传"),
          QStringLiteral("将已有文件、图片、视频或音频展示为当前对话中的持久卡片。"),
          QStringLiteral("agent_send_file agent_send_media"),
@@ -31,7 +31,7 @@ QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools)
          QStringLiteral("view_image"), QStringLiteral("查看工作目录中的指定图片，说明画面内容。")},
         {QStringLiteral("电脑操作"), QStringLiteral("控"),
          QStringLiteral("像人一样查看屏幕，使用鼠标和键盘操作电脑。"),
-         QStringLiteral("desktop_computer screenshot"), QStringLiteral("在电脑上完成我指定的操作。")},
+         QStringLiteral("computer computer_input screenshot"), QStringLiteral("在电脑上完成我指定的操作。")},
         {QStringLiteral("网页检索"), QStringLiteral("搜"),
          QStringLiteral("使用当前主模型供应商的搜索与网页读取能力查找资料。"),
          QStringLiteral("web_search web_fetch"), QStringLiteral("搜索指定主题的公开资料，并给出来源。")},
@@ -39,13 +39,10 @@ QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools)
          QStringLiteral("按指定网址发起 HTTP 请求、读取响应或传输文件；先确认目标和要发送的内容。"),
          QStringLiteral("curl curl_fetch curl_request curl_download curl_upload"),
          QStringLiteral("查看指定 HTTPS 网页的响应头，不发送账号凭据。")},
-        {QStringLiteral("浏览器操作"), QStringLiteral("览"),
-         QStringLiteral("打开网页、读取页面内容并操作网页。"), QStringLiteral("desktop_browser"),
-         QStringLiteral("打开指定网页并找到下载入口，先不要下载。")},
         {QStringLiteral("终端与进程"), QStringLiteral("终"),
          QStringLiteral("运行短命令或长时间命令，使用命令会话 ID 补读输出、输入内容或停止。"),
-         QStringLiteral("shell shell_input"),
-         QStringLiteral("启动我指定的长时间命令；若返回会话 ID，使用 shell_input 补读输出，需要输入或停止时先确认。")},
+         QStringLiteral("exec_command write_stdin"),
+         QStringLiteral("启动我指定的长时间命令；若返回会话 ID，使用 write_stdin 补读输出，需要输入或停止时先确认。")},
         {QStringLiteral("SSH 远程命令"), QStringLiteral("连"),
          QStringLiteral("连接指定 SSH 主机执行命令；密码和主机指纹交给本机确认。"),
          QStringLiteral("ssh_exec"), QStringLiteral("连接我指定的主机查看系统版本，先确认主机、端口和用户名。")},
@@ -193,15 +190,15 @@ QList<StarterEntry> desktopStarterCatalog(const std::vector<MaiToolSpec>& tools)
         QString symbol = group.symbol;
         // 截图与电脑输入属于同一张卡；部分注册时只描述真实可用的成员，
         // 不能因卡片合并就向仅有截图的模型承诺鼠标或键盘操作。
-        if (candidates.contains(QStringLiteral("desktop_computer")) &&
-            !names.contains(QStringLiteral("desktop_computer"))) {
+        if (candidates.contains(QStringLiteral("computer")) &&
+            !names.contains(QStringLiteral("computer"))) {
             purpose = QStringLiteral("查看当前电脑屏幕，说明画面内容。");
             symbol = QStringLiteral("屏");
             goal = QStringLiteral("查看当前屏幕上的报错，说明报错内容。");
         }
         // A host exposing only the continuation tool can operate an existing
         // command session, but cannot promise that a new command can start.
-        if (candidates.contains(QStringLiteral("shell_input")) && !names.contains(QStringLiteral("shell"))) {
+        if (candidates.contains(QStringLiteral("write_stdin")) && !names.contains(QStringLiteral("exec_command"))) {
             purpose = QStringLiteral("补读本会话已有命令会话的输出，按要求输入内容或停止。");
             goal = QStringLiteral("补读我指定的已有命令会话输出，先不要输入或停止。");
         }

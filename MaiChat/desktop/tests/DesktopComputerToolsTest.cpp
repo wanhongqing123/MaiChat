@@ -229,15 +229,15 @@ int main(int argc, char** argv) {
     MaiToolRegistry registry;
     auto controller = std::make_shared<DesktopComputerController>();
     registerDesktopComputerTools(registry, controller);
-    MaiTool* tool = registry.find("desktop_computer");
+    MaiTool* tool = registry.find("computer");
     CHECK(tool && nlohmann::json::parse(tool->parametersSchema()).is_object());
     CHECK(!nlohmann::json::parse(tool->parametersSchema())["properties"].contains("include_image"));
-    CHECK(tool->requiresPerCallApproval(R"({"action":"observe"})"));
-    CHECK(tool->requiresPerCallApproval(R"({"action":"click"})"));
-    CHECK(!tool->requiresPerCallApproval(R"({"action":"clear"})"));
+    CHECK(nlohmann::json::parse(tool->parametersSchema())["properties"]["method"]["enum"].size() == 13);
+    CHECK(tool->requiresPerCallApproval(R"({"method":"list_windows","parameters":{}})"));
+    CHECK(tool->requiresPerCallApproval(R"({"method":"click","parameters":{}})"));
     MaiToolContext absent;
-    CHECK(tool->execute(R"({"action":"observe","window_title":"test"})", absent)
-              .error().code() == MaiErrorCode::NotConfigured);
+    CHECK(tool->execute(R"({"method":"list_windows","parameters":{}})", absent)
+              .error().code() == MaiErrorCode::InvalidInput);
     CHECK(controller->act("no-observation", "click", "unknown", 1,
                           0.5, 0.5, "", "", 0).code() == MaiErrorCode::NotFound);
     QWidget window;
@@ -297,8 +297,7 @@ int main(int argc, char** argv) {
 #endif
     QTemporaryDir workspace;
     CHECK(workspace.isValid());
-    // Ordinary controller observations may capture this self-owned fixture for
-    // native evidence; model-facing desktop_computer.observe is metadata only.
+    // 原生截图只作为此 fixture 的普通接口证据，不依赖模型观察的默认截图开关。
     const auto observed = controller->observe("owner", native.title, workspace.path().toUtf8().toStdString(), true);
     if (!observed) {
         std::fprintf(stderr, "computer observe unavailable: %s\n",
@@ -473,7 +472,9 @@ int main(int argc, char** argv) {
         CHECK(QFile::copy(QString::fromStdString(finalObservation.value().imagePath), copy));
     }
     CHECK(!controller->clear("owner"));
-    std::fprintf(stderr, "computer native input verified: own pid=%llu hwnd=%llu Unicode/shortcuts/empty replacement/gestures/Enter/readback\n",
+    std::fprintf(stderr,
+                 "computer native input verified: own pid=%llu hwnd=%llu Unicode/shortcuts/empty "
+                 "replacement/gestures/Enter/readback\n",
                  static_cast<unsigned long long>(native.processId),
                  static_cast<unsigned long long>(native.id));
     return 0;

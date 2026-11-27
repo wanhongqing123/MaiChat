@@ -1395,8 +1395,8 @@ private struct AIActionPanel: View {
                             .accessibilityIdentifier("ai-primary-model-deepseek-flash")
                         option("DeepSeek V4 Pro", selected: selectedModelID == "deepseek-v4-pro") { selectModel("deepseek-v4-pro") }
                             .accessibilityIdentifier("ai-primary-model-deepseek-v4-pro")
-                        option("GLM-5.3", selected: selectedModelID == "glm-5.3") { selectModel("glm-5.3") }
-                            .accessibilityIdentifier("ai-primary-model-glm-5.3")
+                        option("GLM-5.4", selected: selectedModelID == "glm-5.4") { selectModel("glm-5.4") }
+                            .accessibilityIdentifier("ai-primary-model-glm-5.4")
                         option("GLM-5.3-Flash", selected: selectedModelID == "glm-5.3-flash") { selectModel("glm-5.3-flash") }
                             .accessibilityIdentifier("ai-primary-model-glm-5.3-flash")
                         option("Claude Fable 5.2", selected: selectedModelID == AIModelSettings.fableModel) {
@@ -1407,6 +1407,10 @@ private struct AIActionPanel: View {
                             selectModel(AIModelSettings.opusModel)
                         }
                         .accessibilityIdentifier("ai-primary-model-" + AIModelSettings.opusModel)
+                        option("GPT-6.1 Sol", selected: selectedModelID == AIModelSettings.solModel) {
+                            selectModel(AIModelSettings.solModel)
+                        }
+                        .accessibilityIdentifier("ai-primary-model-" + AIModelSettings.solModel)
                         // Keep free-tier limits beside the explicit free model choice.
                         option("Particle-1（免费）", selected: selectedModelID == AIModelSettings.particleFreeModel) {
                             selectModel(AIModelSettings.particleFreeModel)

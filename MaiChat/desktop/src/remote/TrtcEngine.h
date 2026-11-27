@@ -19,7 +19,7 @@
 //     其余功能不受影响。
 namespace RemoteDesktop {
 
-// 进房参数。UserSig 与 IM 共用服务端签发的凭据。
+// 进房身份按账号+设备派生，并由服务端另签 UserSig；IM 继续使用原账号身份。
 struct TrtcRoomParams {
     int sdkAppId = 0;
     QString userId;

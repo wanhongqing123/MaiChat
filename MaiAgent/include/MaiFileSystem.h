@@ -110,6 +110,12 @@ enum class MaiWalkAction {
 
 class MaiFileSystem {
 public:
+#if defined(_WIN32)
+    // 仅供 Win32 原生 API 边界使用，返回扩展长度路径，领域路径仍保留普通表示。
+    // 长路径先展开相对段，再添加驱动器或 UNC 前缀；已有设备前缀保持不变。
+    // 不解析符号链接、不授予路径权限，不依赖宿主 manifest 或全局长路径设置。
+    static std::wstring windowsApiPath(const MaiFilePath& path);
+#endif
     // ── 查询 ────────────────────────────────────────────────────
     static bool exists(const MaiFilePath& path);
     static bool isDirectory(const MaiFilePath& path);
@@ -154,9 +160,21 @@ public:
 
     // 将完整临时文件交付到同一文件系统内的新路径，不替换现有目标。
     // 失败时源路径仍由调用方持有；目标父目录必须已存在。本操作会阻塞线程。
-    // Android 宿主通过 Java 文件接口完成此操作，适用于 App 私有工作区内、
-    // 所有发布者都使用同一宿主桥接的场景；不保证与绕过桥接的写入者跨进程无覆盖竞争。
+    // Android 优先探测公开 libc 的原子无覆盖接口；缺失时保留 Java 宿主兼容路径。
+    // 兼容路径限 App 私有工作区，不保证与绕过桥接的写入者跨进程无覆盖竞争。
     static MaiError publishNewFile(const MaiFilePath& source, const MaiFilePath& destination);
+
+    // 将调用方独占的完整暂存目录原子移动到同一文件系统的新路径，绝不替换已有节点。
+    // 拒绝空路径、文件系统根、末段链接和非目录源；目标父目录必须已存在。
+    // 成功后源路径消失；失败时源目录仍归调用方所有。跨卷或平台缺少无覆盖原语时
+    // 返回 NotSupported，不退化为先检查再覆盖。调用方负责父目录授权和暂存树内容验证，
+    // 并在调用期间独占源目录及双方父目录；目标名称可有其它发布者竞争。
+    // 本操作同步阻塞线程，不提供取消回调；调用方应在提交前自行检查取消状态。
+    static MaiError publishNewDirectory(const MaiFilePath& source, const MaiFilePath& destination);
+
+    // 只接受不跟随末段链接的普通文件；POSIX 在已验证句柄上保留权限并添加所有者执行位，
+    // Windows 只验证文件，不修改 ACL。失败保留已有权限；同步阻塞，父目录授权由调用方负责。
+    static MaiError setUserExecutable(const MaiFilePath& path);
 
     // 普通文件移动/复制；不覆盖、不创建父目录、不跟随末段链接。
     // moveFile 仅同文件系统，跨卷返回 NotSupported，绝不暗中复制后删除。
@@ -177,6 +195,11 @@ public:
     // ── 目录 ────────────────────────────────────────────────────
     // 逐级创建，已存在不算错。
     static MaiError createDirectories(const MaiFilePath& path);
+
+    // 原子独占创建一层空目录，父目录必须已存在；已有文件、目录或链接均失败。
+    // 拒绝空路径及文件系统根，失败不改已有节点；成功调用方拥有新目录，可据此清理暂存区。
+    // 同步阻塞线程；调用方负责父目录授权，不自动创建或更改父目录。
+    static MaiError createNewDirectory(const MaiFilePath& path);
 
     // 递归遍历。
     //

@@ -1,6 +1,12 @@
 // 文件作用：为自定义存储提供用户输入凭据及队列的普通查询兜底。
 #include "MaiSessionStore.h"
 
+MaiResult<std::string> MaiSessionStore::readLatestSessionRecord(const std::string&,
+                                                                const std::string&) const {
+    return {MaiErrorCode::NotSupported, "session record reads are not supported"};
+}
+
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <memory>
@@ -8,6 +14,28 @@
 #include <string_view>
 
 #include <openssl/evp.h>
+
+MaiError MaiSessionStore::appendSessionRecord(const std::string&, const std::string&,
+                                              const std::string&) {
+    return {MaiErrorCode::NotSupported, "This store cannot retain original session records."};
+}
+
+MaiError MaiSessionStore::lastReadError() const {
+    return {};
+}
+MaiError MaiSessionStore::lastProjectionError() const {
+    return {};
+}
+
+MaiResult<std::string> MaiSessionStore::getSessionContext(const std::string&,
+                                                          const std::string&) const {
+    return {MaiErrorCode::NotSupported, "This store cannot retain fixed session context."};
+}
+
+MaiResult<std::string> MaiSessionStore::saveSessionContext(const std::string&, const std::string&,
+                                                           const std::string&) {
+    return {MaiErrorCode::NotSupported, "This store cannot retain fixed session context."};
+}
 
 MaiResult<std::string> MaiSessionStore::getToolModelOutput(const MaiToolModelOutputKey&) const {
     return {MaiErrorCode::NotSupported, "This store cannot retain fixed model tool output."};
@@ -62,6 +90,24 @@ bool isImportIdentifier(std::string_view value, std::size_t maximum) {
 }
 
 }  // namespace
+
+MaiError maiValidateSessionContextKey(const std::string& sessionId, const std::string& name) {
+    const auto valid = [](const std::string& value) {
+        return !value.empty() && value.size() <= 128 &&
+               std::all_of(value.begin(), value.end(),
+                           [](unsigned char byte) { return byte >= 0x21 && byte <= 0x7e; });
+    };
+    if (!valid(sessionId) || !valid(name))
+        return {MaiErrorCode::InvalidInput,
+                "Session context keys require 1..128 printable ASCII bytes."};
+    return {};
+}
+
+MaiError maiValidateSessionContextContent(const std::string& content) {
+    if (content.size() > 4 * 1024 * 1024 || !isImportUtf8(content))
+        return {MaiErrorCode::InvalidInput, "Session context must be UTF-8 text within 4 MiB."};
+    return {};
+}
 
 MaiError maiValidateContextImportSpec(const MaiContextImportSpec& spec) {
     if (!isImportIdentifier(spec.sessionId, 128) || !isImportIdentifier(spec.sourceKey, 128) ||

@@ -557,6 +557,8 @@ MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows() {
             DesktopNativeWindow candidate;
             candidate.id = std::uint64_t(reinterpret_cast<std::uintptr_t>(window));
             candidate.processId = pid;
+            const UINT dpi = GetDpiForWindow(window);
+            if (dpi) candidate.coordinateScale = double(dpi) / 96.0;
             const int length = GetWindowTextLengthW(window);
             if (length > 0) {
                 std::vector<wchar_t> title(std::size_t(length) + 1);
@@ -650,9 +652,58 @@ struct AccessibilityTraversal {
     bool complete = true;
 };
 
-MaiResult<AccessibilityTraversal> inspectAccessibility(const DesktopNativeWindow& window,
-                                                       const std::string& soughtIdentity,
-                                                       const std::function<bool()>& isCanceled) {
+// 只发布当前 provider 模式支持的动作；执行时再次查询，避免把右键当作元素动作。
+std::vector<std::string> secondaryActions(IUIAutomationElement* element) {
+    std::vector<std::string> actions;
+    IUIAutomationExpandCollapsePattern* rawExpand = nullptr;
+    element->GetCurrentPatternAs(UIA_ExpandCollapsePatternId, IID_IUIAutomationExpandCollapsePattern,
+                                 reinterpret_cast<void**>(&rawExpand));
+    AutomationPointer<IUIAutomationExpandCollapsePattern> expand(rawExpand);
+    ExpandCollapseState state = ExpandCollapseState_LeafNode;
+    if (expand && SUCCEEDED(expand->get_CurrentExpandCollapseState(&state))) {
+        if (state == ExpandCollapseState_Collapsed || state == ExpandCollapseState_PartiallyExpanded)
+            actions.push_back("Expand");
+        if (state == ExpandCollapseState_Expanded || state == ExpandCollapseState_PartiallyExpanded)
+            actions.push_back("Collapse");
+    }
+    IUIAutomationScrollPattern* rawScroll = nullptr;
+    element->GetCurrentPatternAs(UIA_ScrollPatternId, IID_IUIAutomationScrollPattern,
+                                 reinterpret_cast<void**>(&rawScroll));
+    AutomationPointer<IUIAutomationScrollPattern> scroll(rawScroll);
+    BOOL horizontal = FALSE;
+    BOOL vertical = FALSE;
+    if (scroll && SUCCEEDED(scroll->get_CurrentHorizontallyScrollable(&horizontal)) && horizontal) {
+        actions.push_back("Scroll Left");
+        actions.push_back("Scroll Right");
+    }
+    if (scroll && SUCCEEDED(scroll->get_CurrentVerticallyScrollable(&vertical)) && vertical) {
+        actions.push_back("Scroll Up");
+        actions.push_back("Scroll Down");
+    }
+    return actions;
+}
+
+bool sameObservedElement(const DesktopNativeElement& current, const DesktopNativeElement& observed) {
+    return current.nativeId == observed.nativeId && current.role == observed.role && current.label == observed.label &&
+           current.automationId == observed.automationId && current.x == observed.x && current.y == observed.y &&
+           current.width == observed.width && current.height == observed.height &&
+           current.enabled == observed.enabled && current.offscreen == observed.offscreen;
+}
+
+bool sameAction(const std::string& left, const std::string& right) {
+    return QString::fromStdString(left).compare(QString::fromStdString(right), Qt::CaseInsensitive) == 0;
+}
+
+MaiError nativeElementMutationError(HRESULT status) {
+    if (status == UIA_E_ELEMENTNOTAVAILABLE)
+        return {MaiErrorCode::NotFound, "native element became unavailable; observe again"};
+    if (status == UIA_E_TIMEOUT) return {MaiErrorCode::Busy, "native element provider timed out; observe again"};
+    return {MaiErrorCode::NotSupported, "provider rejected the native element operation"};
+}
+
+MaiResult<AccessibilityTraversal> inspectAccessibility(
+    const DesktopNativeWindow& window, const std::string& soughtIdentity, const std::function<bool()>& isCanceled,
+    const std::function<MaiError(IUIAutomationElement*, const DesktopNativeElement&)>& dispatch = {}) {
     DpiScope dpi;
     if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "accessibility inspection canceled"};
     if (!windowMatchesProcess(window))
@@ -669,6 +720,7 @@ MaiResult<AccessibilityTraversal> inspectAccessibility(const DesktopNativeWindow
     bool providerError = false;
     bool nodeLimit = false;
     bool elementLimit = false;
+    bool textLimit = false;
     const auto expired = [&] {
         timedOut = timedOut || std::chrono::steady_clock::now() >= deadline;
         return timedOut || (isCanceled && isCanceled());
@@ -676,12 +728,12 @@ MaiResult<AccessibilityTraversal> inspectAccessibility(const DesktopNativeWindow
     ComScope com;
     IUIAutomation* rawUi = nullptr;
     HRESULT opened = CoCreateInstance(CLSID_CUIAutomation8, nullptr, CLSCTX_INPROC_SERVER, IID_IUIAutomation,
-                                       reinterpret_cast<void**>(&rawUi));
+                                      reinterpret_cast<void**>(&rawUi));
     if (FAILED(opened) || !rawUi) {
         if (rawUi) rawUi->Release();
         rawUi = nullptr;
         opened = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_IUIAutomation,
-                                    reinterpret_cast<void**>(&rawUi));
+                                  reinterpret_cast<void**>(&rawUi));
     }
     AutomationPointer<IUIAutomation> ui(rawUi);
     if (FAILED(opened) || !ui) {
@@ -736,24 +788,30 @@ MaiResult<AccessibilityTraversal> inspectAccessibility(const DesktopNativeWindow
     // Every COM object stays on this call's apartment. Snapshot identity is
     // value-only; fresh resolution never dereferences a retained COM pointer.
     std::vector<AutomationPointer<IUIAutomationElement>> pending;
+    std::vector<std::size_t> depths{0};
+    IUIAutomationElement* matchedElement = nullptr;
     pending.push_back(std::move(root));
     for (std::size_t index = 0; index < pending.size() && !expired(); ++index) {
         auto* current = pending[index].get();
         ++snapshot.visitedNodes;
         DesktopNativeElement item;
+        item.depth = depths[index];
         item.nativeId = runtimeIdentity(current);
         bool propertiesValid = !expired();
         const auto readString = [&](auto getter, std::string& output) {
             if (expired()) return false;
             BSTR text = nullptr;
             const HRESULT status = (current->*getter)(&text);
-            const auto release = qScopeGuard([&] { if (text) SysFreeString(text); });
+            const auto release = qScopeGuard([&] {
+                if (text) SysFreeString(text);
+            });
             if (FAILED(status) || (text && SysStringLen(text) > 4096)) return false;
             if (text) output = utf8(std::wstring(text, SysStringLen(text)));
             return !expired();
         };
         propertiesValid = readString(&IUIAutomationElement::get_CurrentName, item.label) && propertiesValid;
-        propertiesValid = readString(&IUIAutomationElement::get_CurrentAutomationId, item.automationId) && propertiesValid;
+        propertiesValid =
+            readString(&IUIAutomationElement::get_CurrentAutomationId, item.automationId) && propertiesValid;
         CONTROLTYPEID type = 0;
         BOOL enabled = FALSE;
         BOOL offscreen = TRUE;
@@ -776,9 +834,83 @@ MaiResult<AccessibilityTraversal> inspectAccessibility(const DesktopNativeWindow
             item.y = frame.top;
             item.width = double(frame.right) - frame.left;
             item.height = double(frame.bottom) - frame.top;
+            if (!expired()) item.secondaryActions = secondaryActions(current);
+            if (soughtIdentity.empty() && snapshot.elements.size() < 80 && !item.nativeId.empty() && !expired()) {
+                BOOL focused = FALSE;
+                const bool isFocused = SUCCEEDED(current->get_CurrentHasKeyboardFocus(&focused)) && focused;
+                if (isFocused) snapshot.focusedElement = item.nativeId;
+                IUIAutomationSelectionItemPattern* rawSelection = nullptr;
+                current->GetCurrentPatternAs(UIA_SelectionItemPatternId, IID_IUIAutomationSelectionItemPattern,
+                                             reinterpret_cast<void**>(&rawSelection));
+                AutomationPointer<IUIAutomationSelectionItemPattern> selection(rawSelection);
+                BOOL selected = FALSE;
+                if (selection && SUCCEEDED(selection->get_CurrentIsSelected(&selected))) {
+                    if (!snapshot.selectedElements) snapshot.selectedElements.emplace();
+                    if (selected) snapshot.selectedElements->push_back(item.nativeId);
+                }
+                // 密码状态无法确认时也不读取内容；文本使用同一遍历预算和长度上限。
+                BOOL secure = TRUE;
+                if ((isFocused || type == UIA_DocumentControlTypeId || index == 0) && !expired() &&
+                    SUCCEEDED(current->get_CurrentIsPassword(&secure)) && !secure) {
+                    IUIAutomationTextPattern* rawText = nullptr;
+                    current->GetCurrentPatternAs(UIA_TextPatternId, IID_IUIAutomationTextPattern,
+                                                 reinterpret_cast<void**>(&rawText));
+                    AutomationPointer<IUIAutomationTextPattern> text(rawText);
+                    const auto readRange = [&](IUIAutomationTextRange* range) -> std::optional<std::string> {
+                        if (!range || expired()) return std::nullopt;
+                        BSTR value = nullptr;
+                        const HRESULT read = range->GetText(16385, &value);
+                        const auto release = qScopeGuard([&] {
+                            if (value) SysFreeString(value);
+                        });
+                        if (FAILED(read)) return std::nullopt;
+                        const UINT length = value ? SysStringLen(value) : 0;
+                        textLimit = textLimit || length > 16384;
+                        UINT bounded = (std::min)(length, UINT(16384));
+                        if (bounded && value[bounded - 1] >= 0xd800 && value[bounded - 1] <= 0xdbff) --bounded;
+                        return value ? utf8(std::wstring(value, bounded)) : std::string();
+                    };
+                    if (text && !snapshot.documentText && (type == UIA_DocumentControlTypeId || index == 0)) {
+                        IUIAutomationTextRange* rawRange = nullptr;
+                        text->get_DocumentRange(&rawRange);
+                        AutomationPointer<IUIAutomationTextRange> range(rawRange);
+                        snapshot.documentText = readRange(range.get());
+                    }
+                    if (text && isFocused && !expired()) {
+                        IUIAutomationTextRangeArray* rawRanges = nullptr;
+                        const HRESULT read = text->GetSelection(&rawRanges);
+                        AutomationPointer<IUIAutomationTextRangeArray> ranges(rawRanges);
+                        int count = 0;
+                        if (SUCCEEDED(read) && ranges && SUCCEEDED(ranges->get_Length(&count)) && count >= 0) {
+                            std::string selectedText;
+                            bool readable = true;
+                            textLimit = textLimit || count > 16;
+                            for (int rangeIndex = 0; rangeIndex < (std::min)(count, 16) && !expired(); ++rangeIndex) {
+                                IUIAutomationTextRange* rawRange = nullptr;
+                                ranges->GetElement(rangeIndex, &rawRange);
+                                AutomationPointer<IUIAutomationTextRange> range(rawRange);
+                                const auto value = readRange(range.get());
+                                if (!value) {
+                                    readable = false;
+                                    break;
+                                }
+                                if (!selectedText.empty()) selectedText += "\n";
+                                selectedText += *value;
+                                if (selectedText.size() > 65536) {
+                                    readable = false;
+                                    textLimit = true;
+                                    break;
+                                }
+                            }
+                            if (readable && !expired()) snapshot.selectedText = std::move(selectedText);
+                        }
+                    }
+                }
+            }
             if (!soughtIdentity.empty()) {
                 if (item.nativeId == soughtIdentity) {
                     ++result.matches;
+                    matchedElement = current;
                     result.match = std::move(item);
                 }
             } else if (snapshot.elements.size() < 80) {
@@ -798,6 +930,7 @@ MaiResult<AccessibilityTraversal> inspectAccessibility(const DesktopNativeWindow
                 break;
             }
             auto* siblingOf = child.get();
+            depths.push_back(depths[index] + 1);
             pending.push_back(std::move(child));
             IUIAutomationElement* rawNext = nullptr;
             const HRESULT next = walker->GetNextSiblingElement(siblingOf, &rawNext);
@@ -810,12 +943,22 @@ MaiResult<AccessibilityTraversal> inspectAccessibility(const DesktopNativeWindow
         return {MaiErrorCode::NotFound, "selected window changed during accessibility inspection"};
     timedOut = timedOut || std::chrono::steady_clock::now() >= deadline;
     result.complete = !timedOut && !nodeLimit && !providerError;
-    snapshot.truncated = timedOut || nodeLimit || elementLimit;
+    snapshot.truncated = timedOut || nodeLimit || elementLimit || textLimit;
     snapshot.status = snapshot.truncated || providerError ? "partial" : "available";
-    if (timedOut) snapshot.limitReason = "time_budget";
-    else if (nodeLimit) snapshot.limitReason = "node_limit";
-    else if (elementLimit) snapshot.limitReason = "element_limit";
-    else if (providerError) snapshot.limitReason = "provider_error";
+    if (timedOut)
+        snapshot.limitReason = "time_budget";
+    else if (nodeLimit)
+        snapshot.limitReason = "node_limit";
+    else if (elementLimit)
+        snapshot.limitReason = "element_limit";
+    else if (textLimit)
+        snapshot.limitReason = "text_limit";
+    else if (providerError)
+        snapshot.limitReason = "provider_error";
+    if (dispatch && result.complete && result.matches == 1) {
+        const MaiError error = dispatch(matchedElement, result.match);
+        if (error) return error;
+    }
     return result;
 }
 
@@ -848,6 +991,111 @@ MaiResult<DesktopNativeElement> maiDesktopResolveElement(const DesktopNativeWind
     if (inspected.value().matches != 1)
         return {MaiErrorCode::NotFound, "observed UI Automation identity is missing or ambiguous; observe again"};
     return inspected.value().match;
+}
+
+namespace {
+
+// 完整重解引用后才执行原生调用；运行时 ID 重用、布局变化和未知安全状态均拒绝。
+MaiError mutateObservedElement(const DesktopNativeWindow& window, const DesktopNativeElement& observed,
+                               const std::function<bool()>& isCanceled,
+                               const std::function<MaiError(IUIAutomationElement*)>& operation) {
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+    if (observed.nativeId.empty())
+        return {MaiErrorCode::InvalidInput, "an observed UI Automation identity is required"};
+    if (!interactiveDesktop()) return {MaiErrorCode::NotConfigured, "the interactive desktop is unavailable"};
+    const auto inspected = inspectAccessibility(
+        window, observed.nativeId, isCanceled,
+        [&](IUIAutomationElement* element, const DesktopNativeElement& current) -> MaiError {
+            if (!sameObservedElement(current, observed))
+                return {MaiErrorCode::Busy, "observed element changed; observe again"};
+            if (!current.enabled || current.offscreen)
+                return {MaiErrorCode::NotSupported, "disabled or offscreen elements cannot be modified"};
+            BOOL secure = TRUE;
+            int process = 0;
+            if (FAILED(element->get_CurrentProcessId(&process)) || std::uint64_t(process) != window.processId)
+                return {MaiErrorCode::NotFound, "element no longer belongs to the observed process"};
+            if (FAILED(element->get_CurrentIsPassword(&secure)) || secure)
+                return {MaiErrorCode::NotSupported, "secure or unverified elements cannot be modified"};
+            if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+            if (!windowMatchesProcess(window)) return {MaiErrorCode::NotFound, "selected window identity changed"};
+            return operation(element);
+        });
+    if (!inspected) return inspected.error();
+    if (!inspected.value().complete)
+        return {MaiErrorCode::Busy, "UI Automation could not complete identity verification; observe again"};
+    if (inspected.value().matches != 1)
+        return {MaiErrorCode::NotFound, "observed UI Automation identity is missing or ambiguous; observe again"};
+    return {};
+}
+
+}  // namespace
+
+MaiError maiDesktopSetElementValue(const DesktopNativeWindow& window, const DesktopNativeElement& observed,
+                                   const std::string& value, const std::function<bool()>& isCanceled) {
+    if (value.size() > 65536 || value.find('\0') != std::string::npos)
+        return {MaiErrorCode::InvalidInput, "element value must be at most 65536 UTF-8 bytes without NUL"};
+    const std::wstring replacement = wide(value);
+    if (utf8(replacement) != value) return {MaiErrorCode::InvalidInput, "element value is not valid UTF-8"};
+    return mutateObservedElement(window, observed, isCanceled, [&](IUIAutomationElement* element) -> MaiError {
+        IUIAutomationValuePattern* rawValue = nullptr;
+        element->GetCurrentPatternAs(UIA_ValuePatternId, IID_IUIAutomationValuePattern,
+                                     reinterpret_cast<void**>(&rawValue));
+        AutomationPointer<IUIAutomationValuePattern> pattern(rawValue);
+        BOOL readOnly = TRUE;
+        if (!pattern || FAILED(pattern->get_CurrentIsReadOnly(&readOnly)) || readOnly)
+            return {MaiErrorCode::NotSupported, "element does not expose a writable native value"};
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+        BSTR nativeValue = SysAllocStringLen(replacement.data(), UINT(replacement.size()));
+        const auto release = qScopeGuard([&] {
+            if (nativeValue) SysFreeString(nativeValue);
+        });
+        if (!nativeValue) return {MaiErrorCode::Internal, "could not allocate the native element value"};
+        const HRESULT status = pattern->SetValue(nativeValue);
+        if (FAILED(status)) return nativeElementMutationError(status);
+        return {};
+    });
+}
+
+MaiError maiDesktopPerformSecondaryAction(const DesktopNativeWindow& window, const DesktopNativeElement& observed,
+                                          const std::string& action, const std::function<bool()>& isCanceled) {
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+    const auto allowed = std::find_if(observed.secondaryActions.begin(), observed.secondaryActions.end(),
+                                      [&](const auto& label) { return sameAction(label, action); });
+    if (allowed == observed.secondaryActions.end())
+        return {MaiErrorCode::NotSupported, "action was not reported by the observed element"};
+    return mutateObservedElement(window, observed, isCanceled, [&](IUIAutomationElement* element) -> MaiError {
+        const auto currentActions = secondaryActions(element);
+        if (std::none_of(currentActions.begin(), currentActions.end(),
+                         [&](const auto& label) { return sameAction(label, action); }))
+            return {MaiErrorCode::NotSupported, "element no longer supports the observed secondary action"};
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+        HRESULT performed = E_NOTIMPL;
+        if (sameAction(action, "Expand") || sameAction(action, "Collapse")) {
+            IUIAutomationExpandCollapsePattern* rawPattern = nullptr;
+            element->GetCurrentPatternAs(UIA_ExpandCollapsePatternId, IID_IUIAutomationExpandCollapsePattern,
+                                         reinterpret_cast<void**>(&rawPattern));
+            AutomationPointer<IUIAutomationExpandCollapsePattern> pattern(rawPattern);
+            if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+            if (pattern) performed = sameAction(action, "Expand") ? pattern->Expand() : pattern->Collapse();
+        } else {
+            IUIAutomationScrollPattern* rawPattern = nullptr;
+            element->GetCurrentPatternAs(UIA_ScrollPatternId, IID_IUIAutomationScrollPattern,
+                                         reinterpret_cast<void**>(&rawPattern));
+            AutomationPointer<IUIAutomationScrollPattern> pattern(rawPattern);
+            if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+            if (pattern) {
+                const auto horizontal = sameAction(action, "Scroll Left")    ? ScrollAmount_SmallDecrement
+                                        : sameAction(action, "Scroll Right") ? ScrollAmount_SmallIncrement
+                                                                             : ScrollAmount_NoAmount;
+                const auto vertical = sameAction(action, "Scroll Up")     ? ScrollAmount_SmallDecrement
+                                      : sameAction(action, "Scroll Down") ? ScrollAmount_SmallIncrement
+                                                                          : ScrollAmount_NoAmount;
+                performed = pattern->Scroll(horizontal, vertical);
+            }
+        }
+        if (FAILED(performed)) return nativeElementMutationError(performed);
+        return {};
+    });
 }
 
 MaiError maiDesktopSetWindowState(const DesktopNativeWindow& window, DesktopWindowStateAction action,

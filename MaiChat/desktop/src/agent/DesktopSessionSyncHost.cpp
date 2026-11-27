@@ -20,6 +20,7 @@
 #include <variant>
 
 #include "MaiQuestionTranscript.h"
+#include "MaiSessionRecordCodec.h"
 #include "MaiCloudModelCatalog.h"
 #include "MaiToolDetail.h"
 #include "MaiFilePath.h"
@@ -390,6 +391,16 @@ QJsonObject DesktopSessionSyncHost::decorateImages(QJsonObject message, const QS
     return message;
 }
 
+QString DesktopSessionSyncHost::contextUsage(const QString& sessionId) const {
+    const auto usage = controller_.agent().getModelContextUsage(sessionId.toStdString());
+    if (!usage) return {};
+    const auto encoded = MaiSessionRecordCodec::encodeContextUsage(usage.value());
+    // This is internal usage metadata, never provider payload or credentials.
+    // Keep the integer-preserving codec opaque to QJson's numeric conversion.
+    if (!encoded || encoded.value().size() > 16 * 1024) return {};
+    return text(encoded.value());
+}
+
 QJsonArray DesktopSessionSyncHost::rootSessions() const {
     QJsonArray result;
     for (const MaiSession& session : controller_.agent().listSessions()) {
@@ -487,6 +498,7 @@ QJsonObject DesktopSessionSyncHost::historyPage(const QString& sessionId, const 
     }
     return {{QStringLiteral("ok"), true},
             {QStringLiteral("busy"), controller_.agent().isBusy(session.id)},
+            {QStringLiteral("contextUsage"), contextUsage(sessionId)},
             {QStringLiteral("turnId"), text(controller_.agent().activeTurnId(session.id))},
             {QStringLiteral("messages"), messages},
             {QStringLiteral("permissions"), permissions},
@@ -676,11 +688,11 @@ QJsonObject DesktopSessionSyncHost::applyCommand(const QString& sessionId, const
         if (!controller_.sessionModelConfiguration(sessionId, configuration))
             return failure(QStringLiteral("无法读取会话模型配置"));
         const auto wire = QString::fromLatin1(maiWireApiToString(configuration.wire));
-        if (wire != QStringLiteral("chat_completions") && wire != QStringLiteral("responses") &&
-            wire != QStringLiteral("local"))
+        if (wire != QStringLiteral("responses") && wire != QStringLiteral("local"))
             return failure(QStringLiteral("会话模型路由尚未明确"));
         return {{QStringLiteral("ok"), true},
                 {QStringLiteral("session"), sessionId},
+                {QStringLiteral("contextUsage"), contextUsage(sessionId)},
                 {QStringLiteral("model"), configuration.model},
                 {QStringLiteral("reasoningEffort"), configuration.reasoningEffort},
                 {QStringLiteral("wire"), wire}};

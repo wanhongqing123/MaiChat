@@ -201,7 +201,7 @@ public:
             const char* command = "sh emit-output.sh";
 #endif
             sink.onToolCall(
-                {"call_emit_once", "shell", Json{{"command", command}, {"login", false}}.dump()});
+                {"call_emit_once", "exec_command", Json{{"cmd", command}, {"login", false}}.dump()});
         } else if (phase == 1) {
             for (const auto& message : request.messages) {
                 if (message.role != MaiModelRole::User) continue;
@@ -231,7 +231,7 @@ public:
         return {};
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 };
 

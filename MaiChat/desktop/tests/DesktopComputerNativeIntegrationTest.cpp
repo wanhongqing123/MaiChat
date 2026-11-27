@@ -1,8 +1,7 @@
 // Native integration across two owned processes. The child only hosts a Qt
 // editor; the parent uses the production tool/controller/native backend. Child
 // state is an independent assertion source, never a substitute for UIA readback.
-// Tool observations are metadata/UIA only. Native screenshots remain separate
-// controlled fixture evidence produced by the ordinary controller API.
+// 模型入口显式请求文本观察；截图由独立普通会话保存，不覆盖模型输入所用的树。
 #include <QApplication>
 #include <QAbstractNativeEventFilter>
 #include <QDir>
@@ -292,7 +291,9 @@ int awaitOwnedForeground(QProcess& child, const DesktopNativeWindow& window, int
                 ready["focus_wait_state"] = "foreground_ready";
                 ready["foreground_idle_stable_ms"] = stable.elapsed();
                 if (!writeJson(readyPath, ready)) return 1;
-                std::fprintf(stderr, "owned editor is actually foreground with all input released for 200 ms; continuing strict native tools\n");
+                std::fprintf(stderr,
+                             "owned editor is actually foreground with all input released for 200 ms; continuing "
+                             "strict native tools\n");
                 return 0;
             }
         } else {
@@ -474,18 +475,29 @@ public:
     }
 
     bool observe(const QString& stage) {
-        if (!call({{"action", "observe"}, {"window_id", std::to_string(window_.id)}, {"include_elements", true}},
+        const auto selected = controller_.getWindow({{}, window_.id, {}});
+        if (!expect(bool(selected), "owned window has no canonical app identity")) return false;
+        canonicalWindow_ = {{"app", selected.value().app}, {"id", selected.value().id}};
+        if (!call({{"method", "get_window_state"}, {"parameters", {{"window", canonicalWindow_}, {"include_screenshot", false}, {"include_text", true}}}},
                   stage))
             return false;
-        snapshot_ = output_;
+        if (!expect(output_.contains("window") && output_["window"]["id"] == window_.id,
+                    "canonical observation returned a different window") ||
+            !expect(output_.value("screenshots", Json::array()).empty() && lastImages_.empty(),
+                    "text-only canonical observation returned image attachments"))
+            return false;
+        // 定位诊断单独使用普通接口；不覆盖模型会话的最新树和授权状态。
+        const auto located = controller_.observe(context_.sessionId + "-locator", "", context_.root, true, window_.id,
+                                                 false, {}, context_.turnId);
+        if (!expect(bool(located), "ordinary native element locator is unavailable")) return false;
+        snapshot_ = Json::parse(located.value().json, nullptr, false);
         if (!expect(snapshot_.value("window_id", std::string()) == std::to_string(window_.id),
                     "observed a different window ID") ||
             !expect(snapshot_.value("process_id", std::uint64_t(0)) == window_.processId,
                     "observed a different process ID") ||
             !expect(!snapshot_.value("snapshot_id", std::string()).empty(), "observation omitted its snapshot token") ||
-            !expect(!snapshot_.contains("image_path"), "computer metadata observation exposed an image path") ||
-            !expect(!snapshot_.value("has_image", false), "computer metadata observation claimed an image") ||
-            !expect(lastImages_.empty(), "computer metadata observation returned image attachments"))
+            !expect(!snapshot_.contains("image_path"), "ordinary metadata locator exposed an image path") ||
+            !expect(!snapshot_.value("has_image", false), "ordinary metadata locator claimed an image"))
             return false;
 
         // Preserve native screenshots through the ordinary API under a distinct
@@ -590,21 +602,75 @@ private:
 
     bool call(const Json& request, const QString& stage) {
         if (!expect(child_.state() == QProcess::Running, "owned editor process exited before the operation")) return false;
-        const std::string action = request.value("action", std::string());
+        const std::string action = request.value("action", request.value("method", std::string()));
         // Mark an input-capable call before execution: even a failed call may
         // have dispatched a partial native sequence. Only readiness work before
         // the first such attempt can report an environment skip. Focus itself
         // activates the owned window without sending keyboard/mouse input.
-        if (action != "list" && action != "observe" && action != "focus" && action != "verify" && action != "clear")
+        if (action != "get_window_state" && action != "focus" && action != "verify")
             inputAttempted_ = true;
-        const MaiToolResult result = tool_.execute(request.dump(), context_);
-        Json record{{"stage", stage.toUtf8().toStdString()}, {"request", request}, {"input_attempted", inputAttempted_}};
+        Json dispatchedRequest = request;
+        const MaiToolResult result = [&]() -> MaiToolResult {
+            if (action == "verify" || action == "replace_text") {
+                // 焦点文本读回与原子替换属于普通接口，不再伪装为模型方法。
+                const auto observed = controller_.observe(context_.sessionId, "", context_.root, false, window_.id,
+                                                          false, {}, context_.turnId);
+                if (!observed) return MaiToolResult::failure(observed.error().code(), observed.error().message());
+                DesktopComputerAction input;
+                input.action = action;
+                input.windowId = window_.id;
+                input.snapshotId = Json::parse(observed.value().json).value("snapshot_id", std::string());
+                input.text = request.value("text", std::string());
+                input.expectedText = request.value("expected_text", std::string());
+                input.turnId = context_.turnId;
+                input.isCanceled = [&] { return context_.isCanceled(); };
+                const auto performed = controller_.perform(context_.sessionId, input);
+                if (!performed) return MaiToolResult::failure(performed.error().code(), performed.error().message());
+                return MaiToolResult::success(Json{{"state", performed.value().state},
+                                                   {"dispatched", performed.value().dispatched},
+                                                   {"verified", performed.value().verified},
+                                                   {"actual_text", performed.value().actualText}}
+                                                  .dump());
+            }
+            if (!request.contains("method")) {
+                const auto logical = [&](const char* field, const char* dimension) {
+                    return request.value(field, 0.0) * (snapshot_["bounds"].value(dimension, 0.0) - 1) /
+                           window_.coordinateScale;
+                };
+                Json parameters{{"window", canonicalWindow_}};
+                std::string method;
+                if (action == "focus")
+                    method = "activate_window";
+                else if (action == "key") {
+                    method = "press_key";
+                    parameters["key"] = request.at("key");
+                } else if (action == "type") {
+                    method = "type_text";
+                    parameters["text"] = request.at("text");
+                } else if (action == "drag") {
+                    method = "drag";
+                    parameters.update({{"from_x", logical("x_ratio", "width")},
+                                       {"from_y", logical("y_ratio", "height")},
+                                       {"to_x", logical("to_x_ratio", "width")},
+                                       {"to_y", logical("to_y_ratio", "height")}});
+                } else if (action == "click" || action == "double_click" || action == "right_click") {
+                    method = "click";
+                    parameters.update({{"x", logical("x_ratio", "width")}, {"y", logical("y_ratio", "height")}});
+                    if (action == "double_click") parameters["click_count"] = 2;
+                    if (action == "right_click") parameters["mouse_button"] = "right";
+                } else return MaiToolResult::failure(MaiErrorCode::InvalidInput, "unsupported native workflow method");
+                dispatchedRequest = {{"method", method}, {"parameters", std::move(parameters)}};
+            }
+            return tool_.execute(dispatchedRequest.dump(), context_);
+        }();
+        Json record{{"stage", stage.toUtf8().toStdString()}, {"request", dispatchedRequest},
+                    {"interface",
+                     action == "verify" || action == "replace_text" ? "ordinary_controller" : "canonical_model_tool"}, {"input_attempted", inputAttempted_}};
         if (result.hasError()) {
             const MaiError& error = result.error();
             record["error"] = error.message();
             transcript_.push_back(record);
-            std::fprintf(stderr, "native step %s (%s): %s\n", stage.toUtf8().constData(),
-                         request.value("action", std::string()).c_str(), error.message().c_str());
+            std::fprintf(stderr, "native step %s (%s): %s\n", stage.toUtf8().constData(), action.c_str(), error.message().c_str());
             if (!inputAttempted_ && (error.code() == MaiErrorCode::Busy || error.code() == MaiErrorCode::NotConfigured ||
                                     error.code() == MaiErrorCode::NotSupported)) exitCode_ = unavailable(error.message());
             else exitCode_ = 1;
@@ -626,6 +692,7 @@ private:
     QString statePath_;
     QString evidencePath_;
     Json snapshot_;
+    Json canonicalWindow_;
     Json output_;
     Json transcript_ = Json::array();
     std::vector<MaiToolImage> lastImages_;
@@ -720,7 +787,7 @@ int runParent(bool physicalKeyCatalog = true) {
     MaiToolRegistry registry;
     auto controller = std::make_shared<DesktopComputerController>();
     registerDesktopComputerTools(registry, controller);
-    MaiTool* tool = registry.find("desktop_computer");
+    MaiTool* tool = registry.find("computer");
     if (!tool) return 1;
     MaiToolContext context;
     context.sessionId = "native-owned-editor-" + std::to_string(childPid);
@@ -933,7 +1000,9 @@ int runParent(bool physicalKeyCatalog = true) {
     if (!workflow.verify(finalText, QStringLiteral("uia-readback-after-gestures"))) return workflow.exitCode();
     if (!workflow.observe(QStringLiteral("completed-owned-editor"))) return workflow.exitCode();
     if (!textIs(finalText, "mouse gestures unexpectedly changed the child editor text")) return workflow.exitCode();
-    std::fprintf(stderr, "native two-process computer workflow verified: Unicode, Ctrl+A, empty replacement, Enter, gestures and real focusedText readback\n");
+    std::fprintf(stderr,
+                 "native two-process computer workflow verified: Unicode, Ctrl+A, empty replacement, Enter, gestures "
+                 "and real focusedText readback\n");
     return 0;
 }
 

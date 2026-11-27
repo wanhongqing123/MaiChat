@@ -55,7 +55,7 @@ MaiError MaiFakeModelClient::stream(const MaiModelRequest& request, const MaiStr
 }
 
 MaiWireApi MaiFakeModelClient::wireApi() const {
-    return MaiWireApi::ChatCompletions;
+    return MaiWireApi::Responses;
 }
 
 std::size_t MaiFakeModelClient::requestCount() const {

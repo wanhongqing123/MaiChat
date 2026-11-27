@@ -155,14 +155,14 @@ test('HTTP adapter rejects oversized and invalid requests without invoking auth'
   }
 });
 
-test('HTTP model keys extend the existing authenticated control plane with OpenRouter', async () => {
+test('HTTP model keys extend the existing authenticated control plane with OpenRouter and OpenAI', async () => {
   const internalToken = 'abcdef0123456789abcdef0123456789';
   const keys = { glm: 'glm-test-key', deepseek: 'deepseek-test-key',
-    minimax: 'minimax-test-key', openrouter: 'openrouter-test-key' };
+    minimax: 'minimax-test-key', openrouter: 'openrouter-test-key', openai: 'openai-test-key' };
   const credentialServer = createModelCredentialServer(createModelCredentialHandler({ env: {
     MAICHAT_AUTH_SERVICE_TOKEN: internalToken, MAICHAT_GLM_API_KEY: keys.glm,
     MAICHAT_DEEPSEEK_API_KEY: keys.deepseek, MAICHAT_MINIMAX_API_KEY: keys.minimax,
-    MAICHAT_OPENROUTER_API_KEY: keys.openrouter
+    MAICHAT_OPENROUTER_API_KEY: keys.openrouter, MAICHAT_OPENAI_API_KEY: keys.openai
   } }));
   await new Promise(resolve => credentialServer.listen(0, '127.0.0.1', resolve));
   const db = openStore(':memory:');

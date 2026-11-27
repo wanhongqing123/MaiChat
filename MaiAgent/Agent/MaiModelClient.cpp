@@ -6,6 +6,8 @@
 #include <limits>
 #include <string_view>
 
+#include <json.hpp>
+
 namespace {
 
 std::size_t addSaturated(std::size_t left, std::size_t right) {
@@ -43,18 +45,122 @@ std::size_t estimateText(std::string_view source) {
     return addSaturated(tokens, (ascii + 2) / 3);
 }
 
+std::size_t estimateJsonText(const nlohmann::json& object, const char* key) {
+    const auto found = object.find(key);
+    return found != object.end() && found->is_string()
+               ? estimateText(found->get_ref<const std::string&>())
+               : 0;
+}
+
+// 只估模型读取的内容；签名、ID、外层 JSON 转义和 data URL 编码均不是自然语言 token。
+// 媒体沿用普通请求的估计余量，不读取文件，也不把编码字节当作实际视觉用量。
+std::size_t estimateResponseContent(const nlohmann::json& content) {
+    if (content.is_string()) return estimateText(content.get_ref<const std::string&>());
+    if (!content.is_array()) return 0;
+    std::size_t tokens = 0;
+    for (const auto& part : content) {
+        if (!part.is_object()) continue;
+        tokens = addSaturated(tokens, estimateJsonText(part, "text"));
+        tokens = addSaturated(tokens, estimateJsonText(part, "refusal"));
+        const auto type = part.find("type");
+        if (type != part.end() && (*type == "input_image" || *type == "output_image"))
+            tokens = addSaturated(tokens, 4096);
+    }
+    return tokens;
+}
+
+// 对齐 Codex rust-v0.172.0 history.rs 的加密 reasoning 兜底：base64 长度还原后
+// 扣除固定封装开销，再按 4 bytes/token 估计。它不是解密、实际 usage 或精确 tokenizer；
+// 真实 usage 覆盖的前缀应由宿主使用其测量基线，不再重复估计密文字节。
+// https://github.com/openai/codex/blob/3d86e43b075adeba2193ec5c22ac92f55afd82e6/
+// codex-rs/core/src/context_manager/history.rs
+std::size_t estimateEncryptedReasoning(std::size_t encodedBytes) {
+    const auto decodedBytes = encodedBytes / 4 * 3 + encodedBytes % 4 * 3 / 4;
+    const auto contentBytes = decodedBytes > 650 ? decodedBytes - 650 : 0;
+    return contentBytes / 4 + (contentBytes % 4 != 0 ? 1 : 0);
+}
+
+std::size_t estimateResponseOutput(std::string_view payload) {
+    const auto output = nlohmann::json::parse(payload.begin(), payload.end(), nullptr, false);
+    // 损坏/未知协议仍保守估计，发送层负责拒绝；计数器不能修复或改写续接状态。
+    if (!output.is_array()) return estimateText(payload);
+    std::size_t tokens = 0;
+    for (const auto& item : output) {
+        if (!item.is_object()) return estimateText(payload);
+        const auto type = item.find("type");
+        if (type == item.end() || !type->is_string()) return estimateText(payload);
+        std::size_t itemTokens = 16;
+        if (*type == "message") {
+            const auto content = item.find("content");
+            if (content != item.end())
+                itemTokens = addSaturated(itemTokens, estimateResponseContent(*content));
+        } else if (*type == "reasoning") {
+            const auto encrypted = item.find("encrypted_content");
+            if (encrypted != item.end() && encrypted->is_string()) {
+                itemTokens = addSaturated(
+                    itemTokens,
+                    estimateEncryptedReasoning(encrypted->get_ref<const std::string&>().size()));
+            } else {
+                // 兼容供应商会真实回传签名的明文思考；仅计明文字段，绝不重复计签名或摘要。
+                const auto content = item.find("content");
+                if (content != item.end())
+                    itemTokens = addSaturated(itemTokens, estimateResponseContent(*content));
+            }
+        } else if (*type == "function_call" || *type == "custom_tool_call") {
+            for (const char* key : {"name", "namespace"})
+                itemTokens = addSaturated(itemTokens, estimateJsonText(item, key));
+            itemTokens = addSaturated(
+                itemTokens,
+                estimateJsonText(item, *type == "custom_tool_call" ? "input" : "arguments"));
+        } else if (*type == "function_call_output" || *type == "custom_tool_call_output") {
+            const auto content = item.find("output");
+            if (content != item.end())
+                itemTokens = addSaturated(itemTokens, estimateResponseContent(*content));
+        } else if (*type == "image_generation_call") {
+            itemTokens = addSaturated(itemTokens, estimateJsonText(item, "revised_prompt"));
+            const auto result = item.find("result");
+            if (result != item.end() && result->is_string() &&
+                !result->get_ref<const std::string&>().empty())
+                itemTokens = addSaturated(itemTokens, 4096);
+        } else {
+            // 新的模型可见 item 尚无字段契约，不能猜测其内容为空。
+            itemTokens = addSaturated(itemTokens, estimateText(item.dump()));
+        }
+        tokens = addSaturated(tokens, itemTokens);
+    }
+    return tokens;
+}
+
 }  // namespace
+
+const char* maiWireApiToString(MaiWireApi wire) {
+    switch (wire) {
+        case MaiWireApi::Responses: return "responses";
+        case MaiWireApi::Local: return "local";
+        case MaiWireApi::Mixed: return "mixed";
+    }
+    return "unknown";
+}
+
+const char* maiUsageValueSourceToString(MaiUsageValueSource source) {
+    switch (source) {
+        case MaiUsageValueSource::Missing: return "missing";
+        case MaiUsageValueSource::Provider: return "provider";
+        case MaiUsageValueSource::Derived: return "derived";
+    }
+    return "missing";
+}
 
 MaiModelContextLimits maiOfficialModelContextLimits(const std::string& baseUrl,
                                                     const std::string& model) {
     std::string endpoint = baseUrl;
     while (!endpoint.empty() && endpoint.back() == '/') endpoint.pop_back();
-    // 官网 2026-11-10：GLM-5.3 文本页及 GLM-5.3-Flash 视觉页均列 1M/128K。
-    // https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3
+    // 官网 2026-11-27：GLM-5.4 与保持不变的 GLM-5.3-Flash 均列 1M/128K。
+    // https://docs.bigmodel.cn/cn/guide/models/glm-5.4
     // https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash
     if ((endpoint == "https://open.bigmodel.cn/api/paas/v4" ||
          endpoint == "https://open.bigmodel.cn/api/v1") &&
-        (model == "glm-5.3" || model == "glm-5.3-flash"))
+        (model == "glm-5.4" || model == "glm-5.3-flash"))
         return {1048576, 131072};
     // 官网 2026-11-10：deepseek-flash 当前别名为 V4.1-Flash-1017，1M/384K。
     // https://api-docs.deepseek.com/quick_start/pricing/
@@ -68,20 +174,25 @@ MaiModelContextLimits maiOfficialModelContextLimits(const std::string& baseUrl,
     // https://docs.particle.ai/models；不把收费同名或其它代理地址视为此免费目录容量。
     if (endpoint == "https://openrouter.ai/api/v1" && model == "particle-ai/particle-1:free")
         return {1048576, 131072};
+    // 2026-11-25 官方 Sol 目录；代理同名型号和未核对别名都不继承容量或生成预留。
+    // https://developers.openai.com/api/docs/models/gpt-6.1-sol
+    if (endpoint == "https://api.openai.com/v1" && model == "gpt-6.1-sol") return {1050000, 128000};
     return {};
 }
 
 MaiModelTokenEstimate maiEstimateModelInputTokens(const MaiModelRequest& request) {
+    const auto capability = maiCloudModelInfo(request.model);
+    const bool nativePatch = capability && capability->provider == "openai";
     std::size_t tokens = addSaturated(16, estimateText(request.baseInstructions));
     for (const auto& message : request.messages) {
         tokens = addSaturated(tokens, 16);
-        const auto capability = maiCloudModelInfo(request.model);
-        if (message.continuation && capability &&
+        if (message.role == MaiModelRole::Assistant && message.continuation && capability &&
             message.continuation->format == "responses.output.v1" &&
             message.continuation->provider == capability->provider &&
             message.continuation->model == request.model) {
-            // wire 使用完整原始输出替代显示投影；只估真正回传的状态，避免重复计算。
-            tokens = addSaturated(tokens, estimateText(message.continuation->payload));
+            // wire 原样重放完整输出；预算只估其中模型可见内容，显示投影不再重复计数。
+            // 不解析签名、不修改密文，HTTP 413 仍以真实编码请求体字节另行处理。
+            tokens = addSaturated(tokens, estimateResponseOutput(message.continuation->payload));
             continue;
         }
         tokens = addSaturated(tokens, estimateText(message.content));
@@ -91,7 +202,15 @@ MaiModelTokenEstimate maiEstimateModelInputTokens(const MaiModelRequest& request
             tokens = addSaturated(tokens, 16);
             tokens = addSaturated(tokens, estimateText(call.id));
             tokens = addSaturated(tokens, estimateText(call.name));
-            tokens = addSaturated(tokens, estimateText(call.arguments));
+            // OpenAI 原生补丁只发送 patch 原文；中立调用的 JSON 包装和转义不属于模型输入。
+            const auto arguments = nativePatch && call.name == "apply_patch"
+                                       ? nlohmann::json::parse(call.arguments, nullptr, false)
+                                       : nlohmann::json();
+            if (arguments.is_object() && arguments.size() == 1 && arguments.contains("patch") &&
+                arguments["patch"].is_string())
+                tokens = addSaturated(tokens, estimateJsonText(arguments, "patch"));
+            else
+                tokens = addSaturated(tokens, estimateText(call.arguments));
         }
         // 像素分词依赖尺寸和供应商，不读取文件，也不把 base64 大小当作 token。
         // 未知 tokenizer 时为每张保留较高媒体余量；这是估计，不是视觉用量保证。
@@ -104,12 +223,19 @@ MaiModelTokenEstimate maiEstimateModelInputTokens(const MaiModelRequest& request
         tokens = addSaturated(tokens, 24);
         tokens = addSaturated(tokens, estimateText(tool.name));
         tokens = addSaturated(tokens, estimateText(tool.description));
-        tokens = addSaturated(tokens, estimateText(tool.parametersJson));
+        tokens = addSaturated(tokens, estimateText(nativePatch && tool.name == "apply_patch" &&
+                                                           !tool.inputGrammar.empty()
+                                                       ? tool.inputGrammar
+                                                       : tool.parametersJson));
     }
     return {tokens, false};
 }
 
 MaiModelContextLimits MaiModelClient::contextLimits(const std::string&) const {
+    return {};
+}
+
+std::string MaiModelClient::usageProviderForModel(const std::string&) const {
     return {};
 }
 

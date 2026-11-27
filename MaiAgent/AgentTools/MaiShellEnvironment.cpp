@@ -329,9 +329,13 @@ std::vector<std::string> maiShellCommandArguments(const MaiShellEnvironment& she
 std::string maiShellStartupCommand(const MaiShellEnvironment& shell, const std::string& command,
                                    bool login, const std::string& workdir) {
     // 与 Codex 一致，不注入 pipefail/-e 或改写最终状态；管道选项由解释器、profile 和命令决定。
-    // 非登录模式直接执行原命令，不能额外加载 rc/profile。
-    if (!login || shell.type == MaiShellType::Cmd) return command;
+    // 非登录模式不能额外加载 rc/profile；PowerShell 仍统一输出编码，避免运行中回执乱码。
     if (shell.type == MaiShellType::PowerShell) {
+        // 对齐 Codex 0.172 shell-command/src/powershell.rs 的 UTF8_OUTPUT_PREFIX。
+        // manager 的未完成输出是原始字节，必须在解释器写入管道前统一，不能等待退出后转换。
+        const std::string prefix =
+            "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
+        if (!login) return prefix + command;
         std::string literal = "'";
         for (char ch : workdir) literal += ch == '\'' ? "''" : std::string(1, ch);
         literal += "'";
@@ -339,11 +343,13 @@ std::string maiShellStartupCommand(const MaiShellEnvironment& shell, const std::
         // 并让失败终止脚本，不能在错误目录中继续用户命令。这是明确的工作目录保护。
         // profile 的全局 trap { continue } 能吞掉普通终止错误；本地 catch 显式 exit，
         // 目录恢复失败时不能落入原命令。诊断只含固定文本，不输出异常或环境值。
-        return "try {\n  Microsoft.PowerShell.Management\\Set-Location -LiteralPath " + literal +
+        return prefix + "try {\n  Microsoft.PowerShell.Management\\Set-Location -LiteralPath " +
+               literal +
                " -ErrorAction Stop\n} catch {\n  try { [Console]::Error.WriteLine('Could not "
                "restore requested shell workdir.') } catch {}\n  exit 1\n}\n" +
                command;
     }
+    if (!login || shell.type == MaiShellType::Cmd) return command;
     std::string startup;
     if (shell.type == MaiShellType::Zsh) {
         // 与 frozen Codex startup.rs 一致，但使用独立变量避免覆盖用户自己的 rc 变量。

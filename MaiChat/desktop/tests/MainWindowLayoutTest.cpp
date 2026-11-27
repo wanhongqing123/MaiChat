@@ -3726,7 +3726,7 @@ void MainWindowLayoutTest::agentReasoningEffortKeepsConversation() {
     QCOMPARE(draft->toPlainText(), QStringLiteral("未发送的草稿"));
     QCOMPARE(view->verticalScrollBar()->value(), 37);
     QVERIFY(window.findChild<QDialog*>(QStringLiteral("agentModelDialog")) == nullptr);
-    QVERIFY(panel->findChild<QPushButton*>(QStringLiteral("agentModelOption-glm-5.3")) != nullptr);
+    QVERIFY(panel->findChild<QPushButton*>(QStringLiteral("agentModelOption-glm-5.4")) != nullptr);
     QVERIFY(window.findChild<AgentChatPanel*>() == panel);
     QCOMPARE(panel->sessionId(), session);
     QCOMPARE(draft->toPlainText(), QStringLiteral("未发送的草稿"));

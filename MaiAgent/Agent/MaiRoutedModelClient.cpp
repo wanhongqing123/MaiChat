@@ -7,7 +7,7 @@
 #include <map>
 #include <utility>
 
-#include "MaiOpenAiClient.h"
+#include "MaiResponsesClient.h"
 
 namespace {
 class RoutedModelClient final : public MaiModelClient {
@@ -111,6 +111,12 @@ public:
         return route->config.contextLimits
                    ? route->config.contextLimits(model)
                    : maiOfficialModelContextLimits(route->config.baseUrl, model);
+    }
+
+    std::string usageProviderForModel(const std::string& model) const override {
+        const auto* route = mError ? nullptr : findRoute(model);
+        return route && !route->clientFactory ? maiModelUsageProviderForConfig(route->config)
+                                              : std::string{};
     }
 
 private:

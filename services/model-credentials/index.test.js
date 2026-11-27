@@ -80,7 +80,7 @@ test('account-only main model key route never accepts the client service token',
   assert.equal(issued.statusCode, 200);
   assert.deepEqual(JSON.parse(issued.body), {
     api_keys: { glm: 'glm-model-key', deepseek: 'deepseek-model-key',
-      minimax: 'minimax-model-key', openrouter: 'openrouter-model-key' }
+      minimax: 'minimax-model-key', openrouter: 'openrouter-model-key', openai: '' }
   });
   assert.ok(!issued.body.includes('fedcba9876543210'));
   assert.equal((await handle({ ...requestKeys(authToken),
@@ -97,7 +97,7 @@ test('missing OpenRouter configuration preserves all existing account model keys
   assert.equal(result.statusCode, 200);
   assert.deepEqual(JSON.parse(result.body).api_keys, {
     glm: 'glm-model-key', deepseek: 'deepseek-model-key', minimax: 'minimax-model-key',
-    openrouter: ''
+    openrouter: '', openai: ''
   });
 });
 
@@ -113,11 +113,55 @@ test('OpenRouter alone is sufficient without calling a model provider', async ()
   const result = await createHandler(options)(issue);
   assert.equal(result.statusCode, 200);
   assert.deepEqual(JSON.parse(result.body).api_keys, {
-    glm: '', deepseek: '', minimax: '', openrouter: 'openrouter-model-key'
+    glm: '', deepseek: '', minimax: '', openrouter: 'openrouter-model-key', openai: ''
   });
   const unavailable = await createHandler({ ...options,
     env: { MAICHAT_AUTH_SERVICE_TOKEN: authToken, MAICHAT_OPENROUTER_API_KEY: '' } })(issue);
   assert.equal(unavailable.statusCode, 503);
+});
+
+test('OpenAI extends existing credentials without changing other provider values', async () => {
+  const authToken = 'fedcba9876543210fedcba9876543210';
+  const handle = createHandler({ env: { MAICHAT_AUTH_SERVICE_TOKEN: authToken,
+    MAICHAT_GLM_API_KEY: 'glm-model-key', MAICHAT_DEEPSEEK_API_KEY: 'deepseek-model-key',
+    MAICHAT_MINIMAX_API_KEY: 'minimax-model-key',
+    MAICHAT_OPENROUTER_API_KEY: 'openrouter-model-key', MAICHAT_OPENAI_API_KEY: 'openai-model-key' } });
+  const result = await handle({ ...request({ action: 'account_models' }, authToken),
+    rawPath: '/account-model-keys' });
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.headers['Cache-Control'], 'no-store');
+  assert.deepEqual(JSON.parse(result.body).api_keys, {
+    glm: 'glm-model-key', deepseek: 'deepseek-model-key', minimax: 'minimax-model-key',
+    openrouter: 'openrouter-model-key', openai: 'openai-model-key'
+  });
+});
+
+test('OpenAI alone is sufficient and still requires the internal account token', async () => {
+  const authToken = 'fedcba9876543210fedcba9876543210';
+  const handle = createHandler({ env: { MAICHAT_AUTH_SERVICE_TOKEN: authToken,
+    MAICHAT_OPENAI_API_KEY: 'openai-model-key' },
+    fetcher: async () => { throw new Error('must not call a model provider'); },
+    callArk: async () => { throw new Error('must not request temporary credentials'); } });
+  const issue = token => ({ ...request({ action: 'account_models' }, token),
+    rawPath: '/account-model-keys' });
+  assert.equal((await handle(issue(accountToken))).statusCode, 401);
+  const result = await handle(issue(authToken));
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(JSON.parse(result.body).api_keys, {
+    glm: '', deepseek: '', minimax: '', openrouter: '', openai: 'openai-model-key'
+  });
+});
+
+test('missing OpenAI configuration adds an empty field without changing existing keys', async () => {
+  const authToken = 'fedcba9876543210fedcba9876543210';
+  const handle = createHandler({ env: { MAICHAT_AUTH_SERVICE_TOKEN: authToken,
+    MAICHAT_GLM_API_KEY: 'glm-model-key' } });
+  const result = await handle({ ...request({ action: 'account_models' }, authToken),
+    rawPath: '/account-model-keys' });
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(JSON.parse(result.body).api_keys, {
+    glm: 'glm-model-key', deepseek: '', minimax: '', openrouter: '', openai: ''
+  });
 });
 
 test('issues a five-minute Seedance and Seedream key only to the account service', async () => {

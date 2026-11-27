@@ -257,6 +257,7 @@ TreeSnapshot collectTree(const MaiFilePath& root, const MaiFileSearchFilter& fil
     TreeSnapshot tree;
     tree.root = root;
     std::map<std::string, std::vector<IgnoreRule>> ignoreFiles;
+    bool ignoreBudgetExhausted = false;
     const std::string rootText = root.toGenericUtf8();
     auto loadIgnore = [&](const std::string& directory) {
         if (!filter.respectGitIgnore || ignoreFiles.count(directory)) return;
@@ -276,9 +277,24 @@ TreeSnapshot collectTree(const MaiFilePath& root, const MaiFileSearchFilter& fil
             ignoreFiles.emplace(directory, std::move(rules));
             return;
         }
+        // 忽略规则读取同样消耗输入预算；规则无法读取时停止采集，不能继续假装过滤完整。
+        const auto remaining = budget.maxBytes - tree.observations.readBytes;
+        if (info.bytes > remaining || remaining == 0) {
+            addIssue(tree.observations, "ignore_read_budget", directory);
+            ignoreBudgetExhausted = true;
+            ignoreFiles.emplace(directory, std::move(rules));
+            return;
+        }
         std::string contents;
         bool truncated = false;
-        const auto error = MaiFileSystem::readFile(path, contents, 64u * 1024, &truncated);
+        const auto readLimit =
+            static_cast<std::size_t>(std::min<std::uint64_t>(64u * 1024, remaining));
+        const auto error = MaiFileSystem::readFile(path, contents, readLimit, &truncated);
+        tree.observations.readBytes += contents.size();
+        if (truncated && readLimit < 64u * 1024) {
+            addIssue(tree.observations, "ignore_read_budget", directory);
+            ignoreBudgetExhausted = true;
+        }
         MaiRegularFileInfo after;
         const bool stable = MaiFileSystem::regularFileInfo(path, after) && sameInfo(info, after) &&
                             isInside(root, MaiFileSystem::resolve(path));
@@ -322,6 +338,10 @@ TreeSnapshot collectTree(const MaiFilePath& root, const MaiFileSearchFilter& fil
         ignoreFiles.emplace(directory, std::move(rules));
     };
     loadIgnore({});
+    if (ignoreBudgetExhausted) {
+        tree.captured = Clock::now();
+        return tree;
+    }
     MaiFileSystem::walk(
         root,
         [&](const MaiFileEntry& entry) {
@@ -394,6 +414,7 @@ TreeSnapshot collectTree(const MaiFilePath& root, const MaiFileSearchFilter& fil
             bool ignored = false;
             for (const auto& ancestor : ancestors) {
                 loadIgnore(ancestor);
+                if (ignoreBudgetExhausted) return MaiWalkAction::Stop;
                 const auto found = ignoreFiles.find(ancestor);
                 if (found == ignoreFiles.end()) continue;
                 for (const auto& rule : found->second)
@@ -1032,7 +1053,9 @@ std::vector<TextPosition> textLines(const std::string& text) {
     for (std::size_t start = 0; start < text.size();) {
         const auto newline = text.find('\n', start);
         const auto end = newline == std::string::npos ? text.size() : newline;
-        const auto length = end > start && text[end - 1] == '\r' ? end - start - 1 : end - start;
+        const auto length = newline != std::string::npos && end > start && text[end - 1] == '\r'
+                                ? end - start - 1
+                                : end - start;
         lines.push_back({start, length});
         start = newline == std::string::npos ? text.size() : newline + 1;
     }
@@ -1376,7 +1399,10 @@ MaiFileSearchPage MaiFileSearch::findFiles(const MaiFileNameSearchOptions& optio
     } else {
         // 排名不能丢掉已经做过的枚举工作；预算在收集阶段用尽时仍报告真实覆盖情况。
         page = tree->observations;
-        if (reused) page.visitedEntries = 0;
+        if (reused) {
+            page.visitedEntries = 0;
+            page.readBytes = 0;
+        }
         const auto scalarQuery = unicodeScalars(options.query, options.caseSensitive);
         Impl::Session fresh;
         fresh.id = mImpl->newId();
@@ -1408,7 +1434,10 @@ MaiFileSearchPage MaiFileSearch::findFiles(const MaiFileNameSearchOptions& optio
         session = &inserted.first->second;
     }
     page = session->tree->observations;
-    if (reused) page.visitedEntries = 0;
+    if (reused) {
+        page.visitedEntries = 0;
+        page.readBytes = 0;
+    }
     const auto oldPosition = session->namePosition;
     std::size_t outputBytes = metadataReserve(options.budget);
     while (session->namePosition < session->names.size() && page.files.size() < options.pageSize) {
@@ -1561,7 +1590,10 @@ MaiFileSearchPage MaiFileSearch::searchText(const MaiFileContentSearchOptions& o
     const auto oldText = session->currentText;
     const auto oldLines = session->currentLines;
     page = session->tree->observations;
-    if (reused) page.visitedEntries = 0;
+    if (reused) {
+        page.visitedEntries = 0;
+        page.readBytes = 0;
+    }
     for (const auto& issue : session->skippedIssues) {
         const auto existing = std::find_if(
             page.issues.begin(), page.issues.end(), [&](const MaiFileSearchIssue& item) {

@@ -523,7 +523,7 @@ final class SessionModelsUITests: XCTestCase {
         require("deepseek-flash", "high")
         composer.tap(); composer.typeText("draft-A")
         let a = try sessionID()
-        chooseModel("glm-5.3"); chooseEffort("低"); require("glm-5.3", "low")
+        chooseModel("glm-5.4"); chooseEffort("低"); require("glm-5.4", "low")
         closePanel(); XCTAssertEqual(composer.value as? String, "draft-A")
         let selected = XCTAttachment(screenshot: app.screenshot()); selected.name = "session-A-glm-low-with-draft"; selected.lifetime = .keepAlways; add(selected)
         let b = try createSession()
@@ -531,7 +531,7 @@ final class SessionModelsUITests: XCTestCase {
         chooseModel("deepseek-v4-pro"); chooseEffort("最高"); require("deepseek-v4-pro", "max")
         closePanel(); composer.tap(); composer.typeText("Reply in session B\n")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "value CONTAINS %@", "Fixture DeepSeek reply"), object: app.staticTexts["primary-ui-model-output"])], timeout: 15), .completed)
-        selectSession(a); require("glm-5.3", "low")
+        selectSession(a); require("glm-5.4", "low")
         XCTAssertEqual(composer.value as? String, "draft-A")
         composer.tap(); composer.typeText("\n")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "value CONTAINS %@", "Fixture GLM reply"), object: app.staticTexts["primary-ui-model-output"])], timeout: 15), .completed)
@@ -571,7 +571,7 @@ final class SessionModelsUITests: XCTestCase {
         selectSession(c); require(fable, "max")
         let restored = XCTAttachment(screenshot: app.screenshot())
         restored.name = "session-C-fable-native-wire-after-relaunch"; restored.lifetime = .keepAlways; add(restored)
-        XCTAssertTrue(glm.requests().contains { $0["model"] as? String == "glm-5.3" && ($0["reasoning"] as? [String: Any])?["effort"] as? String == "low" })
+        XCTAssertTrue(glm.requests().contains { $0["model"] as? String == "glm-5.4" && ($0["reasoning"] as? [String: Any])?["effort"] as? String == "low" })
         XCTAssertTrue(deepseek.requests().contains { $0["model"] as? String == "deepseek-v4-pro" && ($0["reasoning"] as? [String: Any])?["effort"] as? String == "max" })
         for value in ["low", "medium", "high", "xhigh", "max"] {
             XCTAssertTrue(openrouter.requests().contains { $0["model"] as? String == fable &&

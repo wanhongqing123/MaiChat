@@ -36,6 +36,7 @@
 #include "MaiTool.h"
 #include "MaiIdGenerator.h"
 #include "MaiSqliteStore.h"
+#include "MaiSessionRecordCodec.h"
 #include "MaiIMHistoryFormat.h"
 #include "MaiSessionSchedule.h"
 #include "MaiChatTools/DesktopRemoteSessionTools.h"
@@ -88,7 +89,7 @@ public:
         }
         return {};
     }
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override { return MaiWireApi::Responses; }
 private:
     int calls_ = 0;
 };
@@ -106,7 +107,7 @@ public:
     }
 
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 
 private:
@@ -127,7 +128,7 @@ public:
         return {};
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 };
 
@@ -148,7 +149,7 @@ public:
         return {};
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 };
 
@@ -179,7 +180,7 @@ public:
         return {};
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 
 private:
@@ -266,6 +267,7 @@ private slots:
     void remoteHostRejectsInvalidAndBusyModelChangesWithoutMutation();
     void coordinatorModelCommandKeepsOwnerTupleAndRejectsOldLogin();
     void remoteModelDisplayWaitsForOwnerAckAndSurvivesCatalogRefresh();
+    void remoteFableEffortsAndNormalizedModelPairWaitForOwnerAck_data();
     void remoteFableEffortsAndNormalizedModelPairWaitForOwnerAck();
     void remoteModelReceiptsCannotCrossSessionOrLogin();
     void remoteLocalConfigurationKeepsCloudChoicesButDisablesEffort();
@@ -467,7 +469,7 @@ void DesktopSessionSyncHostTest::explicitImagePreparationWaitsForPendingAckWitho
             return MaiError::make(MaiErrorCode::Internal, "No model may be called to prepare an image");
         }
         MaiWireApi wireApi() const override {
-            return MaiWireApi::ChatCompletions;
+            return MaiWireApi::Responses;
         }
     };
     QTemporaryDir workspace;
@@ -1721,20 +1723,31 @@ void DesktopSessionSyncHostTest::remoteHostReadsAndPersistsOnlyTheTargetSessionM
         other = controller.createSession(directory.path(), QStringLiteral("Other model fixture"));
         QVERIFY(!target.isEmpty() && !other.isEmpty());
         // Seed through the existing Core mutation, avoiding the Controller's old global selector.
-        QVERIFY(controller.agent().submit(MaiUpdateSession{target.toStdString(), "", "glm-5.3", "", ""}));
+        QVERIFY(controller.agent().submit(MaiUpdateSession{target.toStdString(), "", "glm-5.4", "", ""}));
         QVERIFY(controller.agent().submit(MaiUpdateSession{other.toStdString(), "", "deepseek-flash", "", ""}));
         DesktopSessionSyncHost host(controller);
         const auto current = host.applyCommand(target, {{QStringLiteral("action"), QStringLiteral("get_session")}});
         QVERIFY2(current.value(QStringLiteral("ok")).toBool(),
                  qPrintable(current.value(QStringLiteral("error")).toString()));
         QCOMPARE(current.value(QStringLiteral("session")).toString(), target);
-        QCOMPARE(current.value(QStringLiteral("model")).toString(), QStringLiteral("glm-5.3"));
+        QCOMPARE(current.value(QStringLiteral("model")).toString(), QStringLiteral("glm-5.4"));
         QCOMPARE(current.value(QStringLiteral("reasoningEffort")).toString(), QStringLiteral("high"));
         QVERIFY(current.value(QStringLiteral("wire")).isString());
         QVERIFY(!current.value(QStringLiteral("wire")).toString().isEmpty());
-        QCOMPARE(current.value(QStringLiteral("wire")).toString(), QStringLiteral("chat_completions"));
+        QCOMPARE(current.value(QStringLiteral("wire")).toString(), QStringLiteral("responses"));
+        // On-demand metadata uses the owner's ordinary typed query. Presence
+        // stays small even when many sessions have accumulated usage receipts.
+        const auto usage = controller.agent().getModelContextUsage(target.toStdString());
+        QVERIFY(usage);
+        const auto encodedUsage = MaiSessionRecordCodec::encodeContextUsage(usage.value());
+        QVERIFY(encodedUsage);
+        QCOMPARE(current.value(QStringLiteral("contextUsage")).toString(), QString::fromStdString(encodedUsage.value()));
+        QCOMPARE(host.historyPage(target, {}, 1).value(QStringLiteral("contextUsage")), current.value(QStringLiteral("contextUsage")));
+        for (const auto row : host.rootSessions()) {
+            QVERIFY(!row.toObject().contains(QStringLiteral("contextUsage")));
+        }
         QVERIFY(!current.contains(QStringLiteral("session_id")));
-        for (const QString& selected : {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
+        for (const QString& selected : {QStringLiteral("glm-5.4"), QStringLiteral("glm-5.3-flash"),
                                         QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")}) {
             const auto changed = host.applyCommand(
                 target, {{QStringLiteral("action"), QStringLiteral("set_model")},
@@ -1747,9 +1760,7 @@ void DesktopSessionSyncHostTest::remoteHostReadsAndPersistsOnlyTheTargetSessionM
             QCOMPARE(changed.value(QStringLiteral("reasoningEffort")).toString(), QStringLiteral("high"));
             QVERIFY(changed.value(QStringLiteral("wire")).isString());
             QVERIFY(!changed.value(QStringLiteral("wire")).toString().isEmpty());
-            QCOMPARE(changed.value(QStringLiteral("wire")).toString(),
-                     selected.startsWith(QStringLiteral("glm-")) ? QStringLiteral("chat_completions")
-                                                                  : QStringLiteral("responses"));
+            QCOMPARE(changed.value(QStringLiteral("wire")).toString(), QStringLiteral("responses"));
             QVERIFY(!changed.contains(QStringLiteral("session_id")));
             MaiSession savedTarget;
             MaiSession savedOther;
@@ -1799,7 +1810,7 @@ void DesktopSessionSyncHostTest::remoteHostRejectsInvalidAndBusyModelChangesWith
     AgentController controller(std::move(model), {});
     const QString target = controller.createSession(directory.path());
     const QString other = controller.createSession(directory.path());
-    QVERIFY(controller.agent().submit(MaiUpdateSession{target.toStdString(), "", "glm-5.3", "", ""}));
+    QVERIFY(controller.agent().submit(MaiUpdateSession{target.toStdString(), "", "glm-5.4", "", ""}));
     QVERIFY(controller.agent().submit(MaiUpdateSession{other.toStdString(), "", "deepseek-flash", "", ""}));
     DesktopSessionSyncHost host(controller);
     for (const QJsonObject& invalid : {
@@ -1822,7 +1833,7 @@ void DesktopSessionSyncHostTest::remoteHostRejectsInvalidAndBusyModelChangesWith
         QVERIFY(!result.value(QStringLiteral("error")).toString().isEmpty());
         MaiSession saved;
         QVERIFY(controller.agent().getSession(target.toStdString(), saved));
-        QCOMPARE(QString::fromStdString(saved.model), QStringLiteral("glm-5.3"));
+        QCOMPARE(QString::fromStdString(saved.model), QStringLiteral("glm-5.4"));
     }
     QVERIFY(!host.applyCommand(QStringLiteral("ses_missing"),
                                {{QStringLiteral("action"), QStringLiteral("get_session")}})
@@ -1843,7 +1854,7 @@ void DesktopSessionSyncHostTest::remoteHostRejectsInvalidAndBusyModelChangesWith
     QVERIFY(!refused.value(QStringLiteral("error")).toString().isEmpty());
     MaiSession unchanged;
     QVERIFY(controller.agent().getSession(target.toStdString(), unchanged));
-    QCOMPARE(QString::fromStdString(unchanged.model), QStringLiteral("glm-5.3"));
+    QCOMPARE(QString::fromStdString(unchanged.model), QStringLiteral("glm-5.4"));
     QCOMPARE(QString::fromStdString(controller.agent().activeTurnId(target.toStdString())),
              QString::fromStdString(turn));
     const auto independent = host.applyCommand(
@@ -3314,7 +3325,7 @@ void DesktopSessionSyncHostTest::remoteModelDisplayWaitsForOwnerAckAndSurvivesCa
     QCOMPARE(composer->toPlainText(), QStringLiteral("Keep this draft during model selection"));
     // Presence/catalog is discovery data, including when it happens to carry stale model-looking keys.
     auto catalog = owner;
-    catalog.insert(QStringLiteral("model"), QStringLiteral("glm-5.3"));
+    catalog.insert(QStringLiteral("model"), QStringLiteral("glm-5.4"));
     catalog.insert(QStringLiteral("reasoningEffort"), QStringLiteral("low"));
     panel.updateSession(catalog);
     QCOMPARE(value->text(), QStringLiteral("deepseek-flash"));
@@ -3338,14 +3349,24 @@ void DesktopSessionSyncHostTest::remoteModelDisplayWaitsForOwnerAckAndSurvivesCa
     offline.insert(QStringLiteral("online"), false);
     panel.updateSession(offline);
     const auto beforeOfflineChoice = commands.size();
-    if (auto* offlineOption = remoteModelOption(panel, QStringLiteral("glm-5.3")))
+    if (auto* offlineOption = remoteModelOption(panel, QStringLiteral("glm-5.4")))
         QTest::mouseClick(offlineOption, Qt::LeftButton);
     QCOMPARE(commands.size(), beforeOfflineChoice);
     QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
     QCOMPARE(composer->toPlainText(), QStringLiteral("Keep this draft during model selection"));
 }
 
+void DesktopSessionSyncHostTest::remoteFableEffortsAndNormalizedModelPairWaitForOwnerAck_data() {
+    QTest::addColumn<QString>("model");
+    QTest::addColumn<QString>("label");
+    QTest::newRow("fable") << QStringLiteral("anthropic/claude-fable-5.2")
+                           << QStringLiteral("anthropic/claude-fable-5.2");
+    QTest::newRow("openai-sol") << QStringLiteral("gpt-6.1-sol") << QStringLiteral("GPT-6.1 Sol");
+}
+
 void DesktopSessionSyncHostTest::remoteFableEffortsAndNormalizedModelPairWaitForOwnerAck() {
+    QFETCH(QString, model);
+    QFETCH(QString, label);
     QTemporaryDir spool;
     QVERIFY(spool.isValid());
     RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("five-effort-outbox.json")));
@@ -3366,14 +3387,14 @@ void DesktopSessionSyncHostTest::remoteFableEffortsAndNormalizedModelPairWaitFor
     panel.show();
     panel.openSession(owner);
     QTRY_VERIFY_WITH_TIMEOUT(!commands.isEmpty(), 3000);
-    auto fable = modelReceipt(owner, QStringLiteral("anthropic/claude-fable-5.2"));
+    auto fable = modelReceipt(owner, model);
     fable.insert(QStringLiteral("reasoningEffort"), QStringLiteral("medium"));
     auto* value = panel.findChild<QLabel*>(QStringLiteral("remoteAgentModelValue"));
     auto* effortValue = panel.findChild<QLabel*>(QStringLiteral("remoteAgentEffortValue"));
     QVERIFY(value && effortValue);
     const auto unconfirmedModel = value->text();
     const auto unconfirmedEffort = effortValue->text();
-    for (const auto& wire : {QStringLiteral("chat_completions"), QStringLiteral("local")}) {
+    for (const auto& wire : {QStringLiteral("mixed"), QStringLiteral("local")}) {
         auto wrongWire = fable;
         wrongWire.insert(QStringLiteral("wire"), wire);
         deliverModelReceipt(panel, owner, commands.first(), wrongWire);
@@ -3381,8 +3402,14 @@ void DesktopSessionSyncHostTest::remoteFableEffortsAndNormalizedModelPairWaitFor
         QCOMPARE(effortValue->text(), unconfirmedEffort);
     }
     deliverModelReceipt(panel, owner, commands.first(), fable);
-    QCOMPARE(value->text(), QStringLiteral("anthropic/claude-fable-5.2"));
+    QCOMPARE(value->text(), label);
     QCOMPARE(effortValue->text(), QStringLiteral("中"));
+    if (model == QStringLiteral("gpt-6.1-sol")) {
+        auto* option = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentModelOption-gpt-6.1-sol"));
+        QVERIFY(option);
+        QCOMPARE(option->text(), label);
+        QVERIFY(option->isChecked());
+    }
     auto* more = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentMoreActions"));
     auto* section = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentEffortSection"));
     QVERIFY(more && section);
@@ -3400,12 +3427,12 @@ void DesktopSessionSyncHostTest::remoteFableEffortsAndNormalizedModelPairWaitFor
     QTRY_COMPARE_WITH_TIMEOUT(commands.size(), 2, 3000);
     const auto selection = commands.last();
     QVERIFY(!selection.contains(QStringLiteral("reasoningEffort")));
-    QCOMPARE(value->text(), QStringLiteral("anthropic/claude-fable-5.2"));
+    QCOMPARE(value->text(), label);
     QCOMPARE(effortValue->text(), QStringLiteral("中"));
     auto invalid = modelReceipt(owner, QStringLiteral("deepseek-flash"));
     invalid.insert(QStringLiteral("reasoningEffort"), QStringLiteral("medium"));
     deliverModelReceipt(panel, owner, selection, invalid);
-    QCOMPARE(value->text(), QStringLiteral("anthropic/claude-fable-5.2"));
+    QCOMPARE(value->text(), label);
     QCOMPARE(effortValue->text(), QStringLiteral("中"));
     deliverModelReceipt(panel, owner, selection, modelReceipt(owner, QStringLiteral("deepseek-flash")));
     QCOMPARE(value->text(), QStringLiteral("deepseek-flash"));
@@ -3517,7 +3544,7 @@ void DesktopSessionSyncHostTest::remoteLocalConfigurationKeepsCloudChoicesButDis
     auto* effortSection = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentEffortSection"));
     QVERIFY(value && composer && modelSection && effortSection);
     const auto unconfirmedModel = value->text();
-    for (const auto& wire : {QStringLiteral("responses"), QStringLiteral("chat_completions")}) {
+    for (const auto& wire : {QStringLiteral("responses"), QStringLiteral("mixed")}) {
         auto wrongWire = local;
         wrongWire.insert(QStringLiteral("wire"), wire);
         deliverModelReceipt(panel, owner, commands.first(), wrongWire);
@@ -3553,7 +3580,7 @@ void DesktopSessionSyncHostTest::remoteLocalConfigurationKeepsCloudChoicesButDis
                         {{QStringLiteral("ok"), false},
                          {QStringLiteral("error"), QStringLiteral("Fixture rejects the cloud model change")}});
     QCOMPARE(value->text(), QStringLiteral("local:fixture"));
-    for (const auto& model : {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
+    for (const auto& model : {QStringLiteral("glm-5.4"), QStringLiteral("glm-5.3-flash"),
                               QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")}) {
         auto* option = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentModelOption-") + model);
         QVERIFY(option && !option->isChecked());
@@ -4467,10 +4494,10 @@ void DesktopSessionSyncHostTest::remoteToolGroupsKeepMetadataOutsideOrdinaryText
     auto* first = groups.first()->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure"));
     auto* second = groups.last()->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure"));
     QVERIFY(first && second);
-    QVERIFY(first->text().contains(QStringLiteral("工具调用 2 次")));
-    QVERIFY(first->text().contains(QStringLiteral("运行中")));
-    QVERIFY(second->text().contains(QStringLiteral("工具调用 1 次")));
-    QVERIFY(second->text().contains(QStringLiteral("已完成")));
+    // Remote snapshots use the same built-in/shell counts as local groups;
+    // classification changes metadata only, not the selectable answer text.
+    QCOMPARE(first->text(), QStringLiteral("⌘  内置工具调用 1 次 · shell 调用 1 次 · 运行中  ›"));
+    QCOMPARE(second->text(), QStringLiteral("⌘  shell 调用 1 次 · 已完成  ›"));
     QCOMPARE(first->font().pixelSize(), UiZoom::textPixels(UiZoom::TextRole::Metadata));
     QVERIFY(first->font().pixelSize() < UiZoom::textPixels(UiZoom::TextRole::Body));
     QTRY_VERIFY(first->palette().color(QPalette::ButtonText).lightness() > 100);

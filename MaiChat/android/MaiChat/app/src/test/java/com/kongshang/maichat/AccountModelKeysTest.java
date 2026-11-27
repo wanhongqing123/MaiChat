@@ -10,6 +10,20 @@ public final class AccountModelKeysTest {
         return new JSONObject().put("glm", glm).put("deepseek", deepseek).put("minimax", minimax);
     }
 
+    @Test public void openAiOnlyAccountIsAcceptedAndOldResponsesDefaultToEmpty() throws Exception {
+        MaiChatAuthClient.AccountModelKeys keys = MaiChatAuthClient.parseAccountModelKeys(
+            legacy("", "", "").put("openai", "synthetic-openai"));
+        assertEquals("synthetic-openai", keys.openai);
+        assertEquals("", keys.openrouter);
+        assertEquals("", MaiChatAuthClient.parseAccountModelKeys(legacy("synthetic-glm", "", "")).openai);
+        for (Object invalid : new Object[]{42, true, JSONObject.NULL, "bad\nkey", "x".repeat(4097)}) {
+            try {
+                MaiChatAuthClient.parseAccountModelKeys(legacy("synthetic-glm", "", "").put("openai", invalid));
+                fail("Malformed OpenAI credential must reject the entire response");
+            } catch (Exception expected) { }
+        }
+    }
+
     @Test public void oldResponseKeepsExistingKeysAndDefaultsOpenRouterToEmpty() throws Exception {
         MaiChatAuthClient.AccountModelKeys keys = MaiChatAuthClient.parseAccountModelKeys(
             legacy("synthetic-glm", "synthetic-deepseek", "synthetic-minimax"));

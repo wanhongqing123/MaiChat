@@ -15,6 +15,7 @@
 #include "MaiEventBus.h"
 #include "MaiMessage.h"
 #include "MaiModelClient.h"
+#include "MaiModelToolCatalog.h"
 #include "MaiConversationHistory.h"
 #include "MaiContextCheckpointRead.h"
 #include "MaiPermission.h"
@@ -22,6 +23,7 @@
 #include "MaiSubAgent.h"
 #include "MaiSession.h"
 #include "MaiSessionStore.h"
+#include "MaiSkillManager.h"
 #include "MaiTool.h"
 #include "MaiToolDetail.h"
 #include "MaiToolOutput.h"
@@ -226,7 +228,7 @@ class MaiAgent final : public MaiSubAgentHost {
 public:
     struct Options {
         // 会话没指定模型时用这个。会话上配了就用会话的（MaiUpdateSession）。
-        std::string defaultModel = "glm-5.3";
+        std::string defaultModel = "glm-5.4";
         // 会话 effort 为空时的宿主默认。空串保留供应商默认；显式值按当前轮次型号校验。
         std::string reasoningEffort;
         // 可选宿主默认提供器，仅在轮次开始且会话没有显式值时调用一次。
@@ -261,6 +263,18 @@ public:
         int maxOpenSubAgents = 8;
         // 仅显式只读工具可并发；审批、交互和写操作保持独占，1 可关闭并行。
         int maxParallelTools = 4;
+        // 库默认关闭；产品宿主显式开启后自动注册一个 skill_read。
+        // 首个工作线程轮次固定该会话的技能目录元数据，并复用到后续轮次。
+        // 工作区始终取该轮 MaiSession.directory；空 homeDirectory 在工作线程查询原生主目录。
+        // 标准存储跨重启保留已发送目录；不支持会话上下文的自定义后端只保证本 Agent 生命周期。
+        // 同一工作区新增技能需新会话发现；切换目录使用新作用域，基础提示词保持固定。
+        // 显式选择的正文按用户输入固定为普通上下文，不执行脚本或改变审批策略。
+        bool skillsEnabled = false;
+        MaiSkillManagerOptions skillOptions;
+        // 库默认保留全部公开声明；PC 宿主显式开启有界自举与 tool_search 延迟加载。
+        // 会话首次固定声明后仅追加所选 Schema，旧历史无快照时保留旧完整前缀。
+        // 只控制模型声明暴露，工具执行仍逐次核对公开性、型号和原权限规则。
+        bool toolDiscoveryEnabled = false;
     };
 
     // 三个依赖**都被接管所有权**，活到 MaiAgent 析构为止。
@@ -287,12 +301,28 @@ public:
     // 按生成顺序。会话不存在时返回空 vector，和"会话存在但没有消息"分不开——要分清先用 getSession。
     std::vector<MaiMessage> listMessages(const std::string& sessionId) const;
 
+    // 与 tool_search 复用同一目录核心；同步执行可阻塞存储，应在普通工作线程调用。
+    // 目录按会话当前型号隔离；选择只在下一次模型请求生效，不授予工具执行权限。
+    // 关闭发现返回 NotSupported；会话不存在/参数无效/持久化失败保留明确错误。
+    MaiResult<MaiToolCatalogPage> searchTools(const std::string& sessionId,
+                                               const MaiToolCatalogQuery& query);
+
+    // 读取某条真实用户输入已经固定的技能上下文，不重新发现目录或读取技能文件。
+    // 空字符串是已准备且无选择的有效快照；未准备/不属于此会话返回 NotFound。
+    // 可跨线程查询；持久后端可能阻塞，应在普通工作线程调用。结果归调用方。
+    MaiResult<std::string> getSkillInputContext(const std::string& sessionId,
+                                                const std::string& messageId) const;
+
     // 查询核心持久化的一轮事实，可与执行并发。turnId 非空时精确读取该会话的原始
     // assistant；空值读取最近一轮。旧消息没有记录返回 NotSupported，不猜成功。
     // 会话/指定消息不存在返回 NotFound；存储失败返回其错误。轮内分段 ID 不能替代
     // 初始 turnId；查询不启动任务、不改变授权、不加载所有消息正文。
     MaiResult<MaiTurnOutcome> getTurnOutcome(const std::string& sessionId,
                                              const std::string& turnId = {}) const;
+    // 读取同一权威计量事实，不启动轮次/模型；可与执行并发，在普通工作线程同步调用。
+    // 结果按会话当前型号/供应商核对，来源未知或窗口改变时保留累计但作废占用。
+    // 会话不存在/源失败保留明确错误；不加载消息正文，不依赖 UI/JSON。
+    MaiResult<MaiModelContextUsage> getModelContextUsage(const std::string& sessionId) const;
     MaiResult<MaiTurnOutcome> subAgentOutcome(const std::string& parentSessionId,
                                               const std::string& childSessionId) const override;
     MaiResult<std::string> subAgentReportForTurn(const std::string& parentSessionId,

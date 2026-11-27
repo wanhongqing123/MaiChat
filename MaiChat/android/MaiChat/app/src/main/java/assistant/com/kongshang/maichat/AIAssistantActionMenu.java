@@ -46,10 +46,10 @@ final class AIAssistantActionMenu extends LinearLayout {
     private final List<ImageView> effortChecks = new ArrayList<>(), policyChecks = new ArrayList<>();
     private static final String[] EFFORTS = {"low", "medium", "high", "xhigh", "max"};
     private static final String[] POLICIES = {"on-request", "unless-trusted", "never"};
-    private static final String[] MODELS = {"glm-5.3", "glm-5.3-flash", "deepseek-flash",
+    private static final String[] MODELS = {"glm-5.4", "glm-5.3-flash", "deepseek-flash",
         "deepseek-v4-pro", AIAssistantModelSettings.OPENROUTER_MODEL,
         AIAssistantModelSettings.OPUS_MODEL,
-        AIAssistantModelSettings.PARTICLE_FREE_MODEL, AIAssistantSessionModels.LOCAL};
+        AIAssistantModelSettings.PARTICLE_FREE_MODEL, AIAssistantModelSettings.OPENAI_MODEL, AIAssistantSessionModels.LOCAL};
     private String model = "deepseek-flash";
     private String effort = "high", policy = "on-request";
     private boolean changingModelSource, changeModelAllowed, changeAllowed, clearAllowed;
@@ -76,8 +76,8 @@ final class AIAssistantActionMenu extends LinearLayout {
         modelHeading = heading("主模型", R.drawable.ic_ai_menu_cpu, modelValue, modelChevron,
             ignored -> toggle(MODEL_SECTION));
         addView(modelHeading, match(dp(52)));
-        String[] titles = {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
-            AIAssistantModelSettings.OPENROUTER_MODEL, "Claude Opus 5.5", "Particle-1（免费）", "本地模型"};
+        String[] titles = {"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+            AIAssistantModelSettings.OPENROUTER_MODEL, "Claude Opus 5.5", "Particle-1（免费）", "GPT-6.1 Sol", "本地模型"};
         modelGroup = options(remote ? java.util.Arrays.copyOf(titles, models.length) : titles, models,
             modelChoices, modelChecks, MODEL_SECTION);
         addView(modelGroup, match(LayoutParams.WRAP_CONTENT));
@@ -146,6 +146,7 @@ final class AIAssistantActionMenu extends LinearLayout {
             : model.isEmpty() ? "未读取模型"
             : model.startsWith("local:") ? "本地模型"
             : AIAssistantModelSettings.PARTICLE_FREE_MODEL.equals(model) ? "Particle-1（免费）"
+            : AIAssistantModelSettings.OPENAI_MODEL.equals(model) ? "GPT-6.1 Sol"
             : AIAssistantModelSettings.OPUS_MODEL.equals(model) ? "Claude Opus 5.5" : model);
         effortValue.setText(remote && model.isEmpty() ? "未读取" : effort.isEmpty() ? "跟随默认"
             : effort.equals("low") ? "低" : effort.equals("medium") ? "中"

@@ -19,6 +19,22 @@ import org.robolectric.shadows.ShadowAlertDialog;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34, manifest = Config.NONE)
 public final class AIAssistantActionMenuTest {
+    @Test public void solLocalAndRemoteMenusOfferTheModelAndAllFiveEfforts() {
+        for (boolean remote : new boolean[]{false, true}) {
+            AIAssistantActionMenu menu = menu(remote);
+            click(menu, "主模型");
+            assertNotNull(option(menu, "GPT-6.1 Sol"));
+            option(menu, "GPT-6.1 Sol").performClick();
+            assertEquals("gpt-6.1-sol", modelSelections.get(modelSelections.size() - 1));
+            menu.update("gpt-6.1-sol", false, "medium", "on-request", true, true, true);
+            click(menu, "思考强度");
+            for (String title : new String[]{"低", "中", "高", "超高", "最高"})
+                assertNotNull(option(menu, title));
+            assertTrue(option(menu, "中").isSelected());
+            option(menu, "超高").performClick();
+            assertEquals("xhigh", efforts.get(efforts.size() - 1));
+        }
+    }
     @Test public void opusLocalAndRemoteMenusOfferTheModelAndAllFiveEfforts() {
         for (boolean remote : new boolean[]{false, true}) {
             AIAssistantActionMenu menu = menu(remote);
@@ -47,7 +63,7 @@ public final class AIAssistantActionMenuTest {
             assertEquals("xhigh", efforts.get(efforts.size() - 1));
             menu.update("anthropic/claude-fable-5.2", false, "xhigh", "on-request", true, true, true);
             assertTrue(option(menu, "超高").isSelected());
-            for (String model : new String[]{"glm-5.3", "deepseek-flash"}) {
+            for (String model : new String[]{"glm-5.4", "deepseek-flash"}) {
                 menu.update(model, false, "high", "on-request", true, true, true);
                 assertNull(option(menu, "中"));
                 assertNull(option(menu, "超高"));
@@ -61,13 +77,13 @@ public final class AIAssistantActionMenuTest {
     @Test public void mainModelMenuOffersExactCloudModelsAndKeepsEffortSeparate() {
         AIAssistantActionMenu menu = menu();
         click(menu, "主模型");
-        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+        for (String model : new String[]{"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
                 "anthropic/claude-fable-5.2"})
             assertNotNull("Missing main-model choice: " + model, option(menu, model));
         assertNotNull(option(menu, "本地模型"));
         assertNull(option(menu, "低"));
         click(menu, "思考强度");
-        assertNull(option(menu, "glm-5.3"));
+        assertNull(option(menu, "glm-5.4"));
         assertNotNull(option(menu, "低"));
     }
 
@@ -95,22 +111,22 @@ public final class AIAssistantActionMenuTest {
     @Test public void remoteModelMenuKeepsCloudAndEffortButNeverOffersLocalPathsOrAccountPolicy() {
         AIAssistantActionMenu menu = menu(true);
         click(menu, "主模型");
-        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+        for (String model : new String[]{"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
                 "anthropic/claude-fable-5.2"})
             assertNotNull(option(menu, model));
         assertNull(option(menu, "本地模型"));
         assertNull(heading(menu, "操作权限"));
         assertNull(heading(menu, "清空当前对话"));
-        option(menu, "glm-5.3").performClick();
-        assertEquals(List.of("glm-5.3"), modelSelections);
+        option(menu, "glm-5.4").performClick();
+        assertEquals(List.of("glm-5.4"), modelSelections);
         menu.update("deepseek-flash", true, "high", "on-request", false, false, false);
         assertTrue(option(menu, "deepseek-flash").isSelected());
-        assertFalse(option(menu, "glm-5.3").isSelected());
-        assertFalse(option(menu, "glm-5.3").isEnabled());
-        menu.update("glm-5.3", false, "max", "on-request", true, true, false);
-        assertTrue(option(menu, "glm-5.3").isSelected());
+        assertFalse(option(menu, "glm-5.4").isSelected());
+        assertFalse(option(menu, "glm-5.4").isEnabled());
+        menu.update("glm-5.4", false, "max", "on-request", true, true, false);
+        assertTrue(option(menu, "glm-5.4").isSelected());
         click(menu, "思考强度");
-        assertNull(option(menu, "glm-5.3"));
+        assertNull(option(menu, "glm-5.4"));
         assertNotNull(option(menu, "最高"));
     }
 

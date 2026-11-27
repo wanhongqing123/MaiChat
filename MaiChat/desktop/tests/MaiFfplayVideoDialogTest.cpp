@@ -68,6 +68,7 @@
 extern "C" uint64_t maiFfplayAppleNonSilentBufferCount(void);
 void activateFfplayTestApplication();
 void activateFfplayTestWindow(QWidget* widget);
+void activateFfplayTestFullscreenWindow(QWidget* widget);
 bool ffplayTestWindowInteractive(QWidget* widget);
 bool ffplayTestNativeWindowNumberExists(int number);
 bool ffplayTestNativeWindowRetainsUi(int number);
@@ -392,6 +393,10 @@ private slots:
     void seeksToDecodedTargetFrame_data();
     void seeksToDecodedTargetFrame();
     void sliderSeeksAtPointerPosition();
+    void sliderPreviewsFramesBeforeRelease();
+    void sliderHoverDoesNotSeekPausedVideo();
+    void macInitialWindowHasComfortableBounds();
+    void macInitialWindowHasComfortableBounds_data();
     void sliderKeepsTargetUntilSeekIsApplied_data();
     void sliderKeepsTargetUntilSeekIsApplied();
     void endedVideoShowsPlayAndSeeksWithoutRunning();
@@ -2635,6 +2640,211 @@ void MaiFfplayVideoDialogTest::sliderSeeksAtPointerPosition() {
     }
     player.close();
     QVERIFY(!player.isStarted());
+}
+
+void MaiFfplayVideoDialogTest::sliderPreviewsFramesBeforeRelease() {
+    QTemporaryDir directory;
+    const QString file = directory.filePath(QStringLiteral("owned-scrub-25fps.mp4"));
+    QProcess generate;
+    generate.start(QStringLiteral("ffmpeg"), {QStringLiteral("-v"), QStringLiteral("error"),
+        QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+        QStringLiteral("testsrc2=size=320x180:rate=25:duration=8"), QStringLiteral("-c:v"),
+        QStringLiteral("libx264"), QStringLiteral("-g"), QStringLiteral("25"),
+        QStringLiteral("-preset"), QStringLiteral("ultrafast"), file});
+    QVERIFY(generate.waitForFinished(30000));
+    QCOMPARE(generate.exitCode(), 0);
+    // 原 video-circle 素材仅1fps，不能用于验证150ms内的定位帧；使用动态25fps自有素材。
+    MaiFfplayVideoDialog player(file);
+    showOwnTestWindow(&player);
+    QTRY_VERIFY_WITH_TIMEOUT(player.presentedFrames() > 0, 5000);
+    auto *slider = player.findChild<QSlider *>(QStringLiteral("ffplaySeekSlider"));
+    auto *elapsed = player.findChild<QLabel *>(QStringLiteral("ffplayTimeLabel"));
+    QVERIFY(slider && elapsed);
+    MaiFfplayPlaybackStatus status{};
+    QTRY_VERIFY(maiFfplayGetPlaybackStatus(&status) && status.duration_us > 0);
+    // pause 是切换命令，夹具必须先核实际状态，不能把已有暂停反向切成播放。
+    if (!status.paused) QVERIFY(player.sendCommand(QStringLiteral("pause")));
+    QTRY_VERIFY(maiFfplayGetPlaybackStatus(&status) && status.paused);
+    QTRY_VERIFY(slider->maximum() >= 7000);
+    QTest::mousePress(slider, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(slider->width() / 4, slider->height() / 2));
+    const auto release = qScopeGuard([&] {
+        QTest::mouseRelease(slider, Qt::LeftButton, Qt::NoModifier,
+                            QPoint(slider->width() * 3 / 4, slider->height() / 2));
+        player.close();
+    });
+    for (int quarter : {2, 3}) {
+        const auto before = player.presentedFrames();
+        const QPoint position(slider->width() * quarter / 4, slider->height() / 2);
+        QMouseEvent move(QEvent::MouseMove, QPointF(position), QPointF(slider->mapToGlobal(position)),
+                         Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(slider, &move);
+        const auto target = int64_t(std::llround(slider->sliderPosition() *
+                                                 double(status.duration_us) / slider->maximum()));
+        const auto seconds = target / 1000000;
+        QCOMPARE(
+            elapsed->text(),
+            QStringLiteral("%1:%2").arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0')));
+        QVERIFY(slider->isSliderDown());
+        qInfo() << "owned scrub while held: target_us=" << target << "before_frames=" << before;
+        QTRY_VERIFY_WITH_TIMEOUT(player.presentedFrames() > before &&
+                                     maiFfplayGetPlaybackStatus(&status) && !status.seeking &&
+                                     std::abs(status.position_us - target) < 150000,
+                                 5000);
+        QVERIFY(status.paused); // 定位预览不能悄悄恢复播放。
+    }
+}
+
+void MaiFfplayVideoDialogTest::sliderHoverDoesNotSeekPausedVideo() {
+    MaiFfplayVideoDialog player(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE));
+    showOwnTestWindow(&player);
+    QTRY_VERIFY_WITH_TIMEOUT(player.presentedFrames() > 0, 5000);
+    MaiFfplayPlaybackStatus status{};
+    QVERIFY(player.sendCommand(QStringLiteral("pause")));
+    QTRY_VERIFY(maiFfplayGetPlaybackStatus(&status) && status.paused && status.duration_us > 0);
+    auto* slider = player.findChild<QSlider*>(QStringLiteral("ffplaySeekSlider"));
+    QVERIFY(slider);
+    QTest::qWait(300); // 让普通进度刷新记录时长，不能用未知时长验证 tooltip。
+    const auto position = status.position_us;
+    const int value = slider->value();
+    for (int quarter : {1, 2, 3}) {
+        const QPoint at(slider->width() * quarter / 4, slider->height() / 2);
+        QMouseEvent move(QEvent::MouseMove, QPointF(at), QPointF(slider->mapToGlobal(at)),
+                         Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(slider, &move);
+        QVERIFY(!slider->toolTip().isEmpty());
+        QTest::qWait(200);
+        QCOMPARE(slider->value(), value);
+        QVERIFY(maiFfplayGetPlaybackStatus(&status) && status.paused &&
+            std::abs(status.position_us - position) < 100000);
+    }
+    player.close();
+}
+
+void MaiFfplayVideoDialogTest::macInitialWindowHasComfortableBounds_data() {
+    QTest::addColumn<bool>("fullscreenParent");
+    QTest::newRow("maximized-parent") << false;
+    QTest::newRow("fullscreen-parent") << true;
+}
+
+void MaiFfplayVideoDialogTest::macInitialWindowHasComfortableBounds() {
+#if defined(Q_OS_MACOS)
+    QFETCH(bool, fullscreenParent);
+    QTemporaryDir directory;
+    const QString file = directory.filePath(QStringLiteral("owned-initial-hd.mkv"));
+    QProcess generate;
+    generate.start(QStringLiteral("ffmpeg"),
+                   {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-f"),
+                    QStringLiteral("lavfi"), QStringLiteral("-i"),
+                    QStringLiteral("testsrc2=size=1920x1080:rate=24:duration=3"),
+                    QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+                    QStringLiteral("sine=frequency=440:sample_rate=48000:duration=3"),
+                    QStringLiteral("-c:a"), QStringLiteral("ac3"), QStringLiteral("-ac"), QStringLiteral("6"),
+                    QStringLiteral("-c:v"), QStringLiteral("libx264"), QStringLiteral("-preset"),
+                    QStringLiteral("ultrafast"), file});
+    QVERIFY(generate.waitForFinished(30000));
+    QCOMPARE(generate.exitCode(), 0);
+    // 与现场相同：从已最大化的主窗口走准备首帧后显示的普通入口，不能只验无父窗口show。
+    RemoteIMApplication app(QStringLiteral("owned-compact-player"), std::make_unique<FakeRemoteIMClient>());
+    MainWindow main(app);
+    showOwnTestWindow(&main);
+    restoreFfplayTestMainWindowSpacePolicy(&main);
+    QVERIFY(QTest::qWaitForWindowExposed(&main));
+    QTRY_VERIFY_WITH_TIMEOUT(ffplayTestWindowInteractive(&main) &&
+        ffplayTestVideoLayerGeometry(&main).value("windowKey").toBool() &&
+        ffplayTestVideoLayerGeometry(&main).value("windowOcclusionVisible").toBool(), 5000);
+    bool nativeEntered = false;
+    auto* mainFullscreenObserver = maiObserveMacVideoFullscreen(
+        &main, &nativeEntered, [](void* context, MaiMacFullscreenPhase phase) {
+            if (phase == MaiMacFullscreenPhase::DidEnter) *static_cast<bool*>(context) = true;
+        });
+    QVERIFY(mainFullscreenObserver);
+    qInfo() << "owned before full main" << ffplayTestVideoLayerGeometry(&main);
+    const auto restoreMain = qScopeGuard([&] {
+        if (fullscreenParent) {
+            main.showNormal();
+            QElapsedTimer timeout;
+            timeout.start();
+            while (ffplayTestVideoLayerGeometry(&main).value("nativeFullscreen").toBool() && timeout.elapsed() < 7000)
+                QTest::qWait(20);
+        }
+        maiReleaseMacVideoFullscreenObserver(mainFullscreenObserver);
+    });
+    if (fullscreenParent) main.showFullScreen();
+    else main.showMaximized();
+    QVERIFY(QTest::qWaitForWindowExposed(&main));
+    QTRY_VERIFY(fullscreenParent ? main.isFullScreen() : main.isMaximized());
+    if (fullscreenParent) {
+        // Qt 标志先于AppKit转场完成；必须在真正进入当前原生全屏Space之后再打开视频。
+        QTRY_VERIFY_WITH_TIMEOUT(nativeEntered, 15000);
+        activateFfplayTestFullscreenWindow(&main);
+        QTRY_VERIFY_WITH_TIMEOUT(ffplayTestWindowInteractive(&main), 5000);
+        QVERIFY(ffplayTestVideoLayerGeometry(&main).value("nativeFullscreen").toBool());
+    }
+    qInfo() << "owned parent state" << main.windowState() << main.size();
+    // 定点现场排障可显式传入只读素材；生成器始终只写上面的临时 owned 文件。
+    const QString reportedFile = qEnvironmentVariable("MAICHAT_VIDEO_REGRESSION_FILE");
+    QVERIFY(main.openVideoWindow(reportedFile.isEmpty() ? file : reportedFile));
+    QPointer<MaiFfplayVideoDialog> player = MaiFfplayVideoDialog::activeDialog();
+    QVERIFY(player);
+    const auto cleanup = qScopeGuard([&] {
+        if (!player) return;
+        player->close();
+        QElapsedTimer timeout;
+        timeout.start();
+        while (player && player->isVisible() && timeout.elapsed() < 7000) QTest::qWait(20);
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(player->isVisible() && player->presentedFrames() > 0, 5000);
+    QTest::qWait(1000);
+    qInfo() << "owned prepared initial bounds" << player->size() << ffplayTestVideoLayerGeometry(player);
+    const QRect available = player->screen()->availableGeometry();
+    // 默认窗口至少一个方向用满约 2/3 可用范围，不能只验证“小于屏幕”而漏掉固定小窗。
+    const double widthFraction = double(player->width()) / available.width();
+    const double heightFraction = double(player->height()) / available.height();
+    QVERIFY(std::abs(std::max(widthFraction, heightFraction) - 2.0 / 3.0) < 0.01);
+    QVERIFY(widthFraction <= 0.675 && heightFraction <= 0.675);
+    QVERIFY(std::abs(double(player->width()) / player->height() - 16.0 / 9.0) < 0.01);
+    QVERIFY((player->frameGeometry().center() - available.center()).manhattanLength() <= 2);
+    QVERIFY(!player->isMaximized() && !player->isFullScreen());
+    const auto native = ffplayTestVideoLayerGeometry(player);
+    QVERIFY(std::abs(native.value("windowFrameWidth").toDouble() - player->width()) <= 1);
+    QVERIFY(std::abs(native.value("windowFrameHeight").toDouble() - player->height()) <= 1);
+    if (fullscreenParent) {
+        QVERIFY2(native.value("fullscreenAuxiliary").toBool(),
+                 "Fullscreen host must not leave a newly opened ordinary player eligible for automatic native fullscreen");
+        QVERIFY(!native.value("fullscreenPrimary").toBool());
+        QVERIFY(native.value("windowOnActiveSpace").toBool());
+        QVERIFY(ffplayTestVideoLayerGeometry(&main).value("nativeFullscreen").toBool());
+        if (qEnvironmentVariableIntValue("MAICHAT_CAPTURE_FULLSCREEN_PARENT") == 1) {
+            qInfo() << "owned-fullscreen-window-ready" << QCoreApplication::applicationPid();
+            QTest::qWait(5000); // 仅自有窗口截图取证时保留画面，正常回归不等待。
+        }
+        struct PlayerPhases { bool entered = false; bool exited = false; } phases;
+        auto* observer = maiObserveMacVideoFullscreen(player, &phases, [](void* value, MaiMacFullscreenPhase phase) {
+            auto* state = static_cast<PlayerPhases*>(value);
+            if (phase == MaiMacFullscreenPhase::DidEnter) state->entered = true;
+            if (phase == MaiMacFullscreenPhase::DidExit) state->exited = true;
+        });
+        const auto release = qScopeGuard([&] { maiReleaseMacVideoFullscreenObserver(observer); });
+        const QSize ordinarySize = player->size();
+        // 防自动全屏不能禁用用户主动全屏；退出后应回到原宿主Space和同一普通尺寸。
+        QVERIFY(player->sendCommand(QStringLiteral("fullscreen")));
+        QTRY_VERIFY_WITH_TIMEOUT(phases.entered, 10000);
+        QVERIFY(ffplayTestVideoLayerGeometry(player).value("nativeFullscreen").toBool());
+        QVERIFY(!ffplayTestVideoLayerGeometry(player).value("fullscreenAuxiliary").toBool());
+        QVERIFY(player->sendCommand(QStringLiteral("fullscreen")));
+        QTRY_VERIFY_WITH_TIMEOUT(phases.exited, 10000);
+        QTRY_VERIFY(!ffplayTestVideoLayerGeometry(player).value("nativeFullscreen").toBool());
+        QTRY_VERIFY(ffplayTestVideoLayerGeometry(player).value("fullscreenAuxiliary").toBool());
+        QTRY_VERIFY(ffplayTestVideoLayerGeometry(player).value("windowOnActiveSpace").toBool());
+        QCOMPARE(player->size(), ordinarySize);
+        QVERIFY(ffplayTestVideoLayerGeometry(&main).value("nativeFullscreen").toBool());
+    } else {
+        QVERIFY(native.value("fullscreenPrimary").toBool());
+    }
+#else
+    QSKIP("macOS initial window policy");
+#endif
 }
 
 void MaiFfplayVideoDialogTest::sliderKeepsTargetUntilSeekIsApplied_data() {

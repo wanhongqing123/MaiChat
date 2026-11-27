@@ -7,11 +7,12 @@ option(MAICHAT_SCREEN_FRAME_ARCHIVE_ENABLED "Build the screen frame archive API"
 if(NOT TARGET CURL::libcurl)
   find_package(CURL REQUIRED)
 endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/cmake/MaiCurlNetworkRoute.cmake")
 
 add_library(mai_curl_download STATIC MaiCurlDownload.cpp)
 target_compile_features(mai_curl_download PUBLIC cxx_std_17)
 target_include_directories(mai_curl_download PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(mai_curl_download PUBLIC CURL::libcurl)
+target_link_libraries(mai_curl_download PUBLIC CURL::libcurl mai_curl_network_route)
 set_target_properties(mai_curl_download PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(mai_cloud_vod STATIC MaiCloudVod.cpp)
@@ -49,7 +50,7 @@ target_include_directories(mai_cloud_drive_client PUBLIC "${CMAKE_CURRENT_SOURCE
           "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/openssl/include"
           ${MAI_OPENSSL_INCLUDE_DIR})
 target_link_libraries(mai_cloud_drive_client PUBLIC CURL::libcurl mai_curl_download
-  ${MAI_OPENSSL_CRYPTO_TARGET})
+  mai_curl_network_route ${MAI_OPENSSL_CRYPTO_TARGET})
 set_target_properties(mai_cloud_drive_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR MAICHAT_NETWORK_BUILD_TESTS OR

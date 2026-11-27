@@ -18,6 +18,7 @@ enum class MaiFileContentSearchMode { Lines, Files, Count };
 
 // 每次调用的协作式预算。时间检查不能抢占系统文件 I/O；正则匹配不使用回溯引擎。
 // maxEntries 限制一次建立目录快照的项数；超过时明确报告不完整，不能据此断言没有命中。
+// maxBytes 合计本次 .gitignore 和正文输入；忽略规则超出预算时停止建立不完整快照。
 // 其余工作量上限可以通过返回的游标继续；单文件过大则跳过并记录原因。
 struct MaiFileSearchBudget {
     std::size_t maxEntries = 50000;
@@ -142,7 +143,8 @@ struct MaiFileContentMatch {
 // 每个实例最多保留 8 个查询会话、总计 64 MiB（共享索引只计一次），空闲 120 秒淘汰。
 // 若当前会话本身无法保留，会返回 partial/cache_capacity 且不返回失效的 nextCursor。
 // 游标可重放同一页，进程退出后失效；取消不保存本次进度。
-// visitedEntries/searchedFiles/readBytes 是本次调用的工作量；缓存重放三项均为零。
+// visitedEntries/searchedFiles/readBytes 是本次调用的工作量；readBytes 包含忽略规则输入，
+// searchedFiles 只统计正文读取；缓存重放三项均为零。
 // canceled 保留已产生结果但不继续保存本次进度；调用方可重放原游标或发起新查询。
 struct MaiFileSearchPage {
     MaiError error;

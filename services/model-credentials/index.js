@@ -52,10 +52,11 @@ function createHandler(options = {}) {
       const deepseek = env.MAICHAT_DEEPSEEK_API_KEY || '';
       const minimax = env.MAICHAT_MINIMAX_API_KEY || '';
       const openrouter = env.MAICHAT_OPENROUTER_API_KEY || '';
-      if (!glm && !deepseek && !minimax && !openrouter)
+      const openai = env.MAICHAT_OPENAI_API_KEY || '';
+      if (!glm && !deepseek && !minimax && !openrouter && !openai)
         return jsonResponse(503, { error: 'Account models are not configured' });
       // 保留旧供应商字符串字段；未配置的新供应商用空串，不破坏旧客户端解码。
-      return jsonResponse(200, { api_keys: { glm, deepseek, minimax, openrouter } });
+      return jsonResponse(200, { api_keys: { glm, deepseek, minimax, openrouter, openai } });
     }
     if (route === '/temporary-credentials') {
       if (body?.action === 'bailian_video') {

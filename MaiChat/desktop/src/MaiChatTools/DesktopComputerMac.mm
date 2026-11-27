@@ -7,6 +7,7 @@
 #include <IOKit/hidsystem/IOLLEvent.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -288,6 +289,46 @@ bool axElementBelongsToWindow(AXUIElementRef element, AXUIElementRef window, pid
     return false;
 }
 
+// 原生动作名也是执行令牌；不自行翻译或补充 provider 未报告的动作。
+std::vector<std::string> axSecondaryActions(AXUIElementRef element) {
+    CFArrayRef rawActions = nullptr;
+    const AXError error = AXUIElementCopyActionNames(element, &rawActions);
+    const ScopedCFValue actions(rawActions);
+    std::vector<std::string> result;
+    if (error != kAXErrorSuccess || !rawActions || CFGetTypeID(rawActions) != CFArrayGetTypeID()) return result;
+    for (CFIndex index = 0; index < std::min(CFArrayGetCount(rawActions), CFIndex(32)); ++index) {
+        const auto value = CFArrayGetValueAtIndex(rawActions, index);
+        if (!value || CFGetTypeID(value) != CFStringGetTypeID() || CFEqual(value, kAXPressAction)) continue;
+        const std::string name = utf8(static_cast<CFStringRef>(value));
+        if (!name.empty()) result.push_back(name);
+    }
+    return result;
+}
+
+bool axElementIsSecure(AXUIElementRef element) {
+    const std::string role = attribute(element, kAXRoleAttribute);
+    const std::string subrole = attribute(element, kAXSubroleAttribute);
+    return role.empty() || role == "AXSecureTextField" || subrole == "AXSecureTextField" ||
+           subrole == "AXPasswordField";
+}
+
+// 超长字符串只截取 UTF-16 边界完整的前缀，避免把超限误报为未知或空文本。
+std::optional<std::string> boundedAXText(AXUIElementRef element, CFStringRef name, bool& truncated) {
+    const auto value = copiedAttribute(element, name);
+    if (!value || CFGetTypeID(value.get()) != CFStringGetTypeID()) return std::nullopt;
+    const auto text = static_cast<CFStringRef>(value.get());
+    CFIndex length = CFStringGetLength(text);
+    truncated = truncated || length > 16384;
+    length = std::min(length, CFIndex(16384));
+    if (length && CFStringIsSurrogateHighCharacter(CFStringGetCharacterAtIndex(text, length - 1))) --length;
+    std::vector<UInt8> bytes(std::size_t(length * 4 + 1), 0);
+    CFIndex count = 0;
+    if (CFStringGetBytes(text, CFRangeMake(0, length), kCFStringEncodingUTF8, 0, false, bytes.data(),
+                         CFIndex(bytes.size()), &count) != length)
+        return std::nullopt;
+    return std::string(reinterpret_cast<const char*>(bytes.data()), std::size_t(count));
+}
+
 bool readAXElement(AXUIElementRef value, AXUIElementRef window, const DesktopNativeWindow& owner,
                    DesktopNativeElement& result) {
     result.role = attribute(value, kAXRoleAttribute);
@@ -295,9 +336,9 @@ bool readAXElement(AXUIElementRef value, AXUIElementRef window, const DesktopNat
     if (result.label.empty()) result.label = attribute(value, kAXDescriptionAttribute);
     if (result.label.empty()) result.label = attribute(value, kAXPlaceholderValueAttribute);
     result.automationId = attribute(value, kAXIdentifierAttribute);
-    if (result.role.empty() || !bounds(value, result) || !std::isfinite(result.x) ||
-        !std::isfinite(result.y) || !std::isfinite(result.width) || !std::isfinite(result.height) ||
-        result.width <= 0 || result.height <= 0) return false;
+    if (result.role.empty() || !bounds(value, result) || !std::isfinite(result.x) || !std::isfinite(result.y) ||
+        !std::isfinite(result.width) || !std::isfinite(result.height) || result.width <= 0 || result.height <= 0)
+        return false;
     // AXEnabled is not required for windows. Unknown control state is kept
     // non-actionable instead of claiming that an unreadable control is enabled.
     result.enabled = false;
@@ -307,6 +348,7 @@ bool readAXElement(AXUIElementRef value, AXUIElementRef window, const DesktopNat
     if (!currentWindowFrame(owner, frame) || !axBoolean(window, kAXMinimizedAttribute, minimized)) return false;
     result.offscreen = minimized || !CGRectIntersectsRect(frame,
         CGRectMake(result.x, result.y, result.width, result.height));
+    result.secondaryActions = axSecondaryActions(value);
     return true;
 }
 
@@ -1371,49 +1413,100 @@ MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows() {
     return output;
 }
 
-MaiResult<DesktopNativeAccessibilitySnapshot> maiDesktopInspectElements(
-    const DesktopNativeWindow& window, const std::function<bool()>& isCanceled) {
+MaiResult<DesktopNativeAccessibilitySnapshot> maiDesktopInspectElements(const DesktopNativeWindow& window,
+                                                                        const std::function<bool()>& isCanceled) {
     if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility inspection canceled"};
     if (!validAXWindowIdentity(window)) return {MaiErrorCode::InvalidInput, "a valid observed window is required"};
     DesktopNativeAccessibilitySnapshot result;
     result.provider = "mac_ax";
     if (!AXIsProcessTrusted()) {
-        result.status = "unavailable"; result.limitReason = "not_authorized";
+        result.status = "unavailable";
+        result.limitReason = "not_authorized";
         return result;
     }
     const ScopedCFValue selected(accessibilityWindow(window, isCanceled, true));
     if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility inspection canceled"};
     if (!selected) {
-        result.status = "unavailable"; result.limitReason = "provider_error";
+        result.status = "unavailable";
+        result.limitReason = "provider_error";
         return result;
     }
     const auto root = static_cast<AXUIElementRef>(selected.get());
-    struct Node { ScopedCFValue value; int depth; };
+    struct Node {
+        ScopedCFValue value;
+        int depth;
+    };
     std::vector<Node> pending;
-    CFRetain(root); pending.push_back({ScopedCFValue(root), 0});
+    CFRetain(root);
+    pending.push_back({ScopedCFValue(root), 0});
     const ScopedCFValue visited(CFSetCreateMutable(kCFAllocatorDefault, 0, &kCFTypeSetCallBacks));
     const auto seen = static_cast<CFMutableSetRef>(const_cast<void*>(visited.get()));
     if (!seen) return {MaiErrorCode::NotSupported, "could not allocate accessibility traversal"};
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
     result.countsKnown = true;
     auto partial = [&](const char* reason) {
-        result.status = "partial"; result.truncated = true;
+        result.status = "partial";
+        result.truncated = true;
         if (result.limitReason.empty()) result.limitReason = reason;
     };
+    const ScopedCFValue system(AXUIElementCreateSystemWide());
+    const auto focused = system
+                             ? copiedAttribute(static_cast<AXUIElementRef>(system.get()), kAXFocusedUIElementAttribute)
+                             : ScopedCFValue();
+    const bool focusedInWindow =
+        sameProcessElement(focused.get(), pid_t(window.processId)) &&
+        axElementBelongsToWindow(static_cast<AXUIElementRef>(focused.get()), root, pid_t(window.processId), isCanceled);
     for (std::size_t index = 0; index < pending.size(); ++index) {
         if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility inspection canceled"};
-        if (std::chrono::steady_clock::now() >= deadline) { partial("time_limit"); break; }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            partial("time_limit");
+            break;
+        }
         const auto current = static_cast<AXUIElementRef>(pending[index].value.get());
-        if (!sameProcessElement(current, pid_t(window.processId))) { partial("provider_error"); continue; }
+        if (!sameProcessElement(current, pid_t(window.processId))) {
+            partial("provider_error");
+            continue;
+        }
         if (CFSetContainsValue(seen, current)) continue;
-        CFSetAddValue(seen, current); ++result.visitedNodes;
+        CFSetAddValue(seen, current);
+        ++result.visitedNodes;
         DesktopNativeElement element;
         const bool readable = readAXElement(current, root, window, element);
         if (!readable) partial("provider_error");
         if (readable) {
-            if (result.elements.size() >= 80) { partial("element_limit"); break; }
+            if (result.elements.size() >= 80) {
+                partial("element_limit");
+                break;
+            }
             auto reference = std::make_shared<MacAXElementReference>(current, root, window);
-            element.nativeId = reference->nativeId; element.reference = std::move(reference);
+            element.nativeId = reference->nativeId;
+            element.reference = std::move(reference);
+            element.depth = std::size_t(pending[index].depth);
+            if (focusedInWindow && CFEqual(current, focused.get())) result.focusedElement = element.nativeId;
+            bool isSelected = false;
+            if (axBoolean(current, kAXSelectedAttribute, isSelected)) {
+                if (!result.selectedElements) result.selectedElements.emplace();
+                if (isSelected) result.selectedElements->push_back(element.nativeId);
+            }
+            if (std::chrono::steady_clock::now() < deadline && !axElementIsSecure(current)) {
+                bool textTruncated = false;
+                if (focusedInWindow && CFEqual(current, focused.get()))
+                    result.selectedText = boundedAXText(current, kAXSelectedTextAttribute, textTruncated);
+                // 仅正文节点的原生值计入文档；窗口标题、URL 和控件标签不冒充正文。
+                if ((element.role == "AXTextArea" || element.role == "AXStaticText") &&
+                    std::chrono::steady_clock::now() < deadline) {
+                    const auto text = boundedAXText(current, kAXValueAttribute, textTruncated);
+                    if (text) {
+                        if (!result.documentText) result.documentText.emplace();
+                        if (result.documentText->size() + text->size() + 1 <= 65536) {
+                            if (!result.documentText->empty()) *result.documentText += "\n";
+                            *result.documentText += *text;
+                        } else
+                            textTruncated = true;
+                    }
+                }
+                if (textTruncated) partial("text_limit");
+            }
             result.elements.push_back(std::move(element));
         }
         if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility inspection canceled"};
@@ -1425,26 +1518,40 @@ MaiResult<DesktopNativeAccessibilitySnapshot> maiDesktopInspectElements(
             error = AXUIElementGetAttributeValueCount(current, name, &count);
         }
         if (error == kAXErrorAttributeUnsupported || error == kAXErrorNoValue) continue;
-        if (error != kAXErrorSuccess || count < 0) { partial("provider_error"); continue; }
+        if (error != kAXErrorSuccess || count < 0) {
+            partial("provider_error");
+            continue;
+        }
         if (!count) continue;
-        if (pending[index].depth >= 32) { partial("depth_limit"); continue; }
+        if (pending[index].depth >= 32) {
+            partial("depth_limit");
+            continue;
+        }
         const CFIndex remaining = CFIndex(250 - pending.size());
-        if (remaining <= 0) { partial("node_limit"); continue; }
+        if (remaining <= 0) {
+            partial("node_limit");
+            continue;
+        }
         const CFIndex requested = std::min(count, remaining);
         CFArrayRef values = nullptr;
         error = AXUIElementCopyAttributeValues(current, name, 0, requested, &values);
         const ScopedCFValue children(values);
         if (error != kAXErrorSuccess || !values || CFGetTypeID(values) != CFArrayGetTypeID()) {
-            partial("provider_error"); continue;
+            partial("provider_error");
+            continue;
         }
         if (CFArrayGetCount(values) != requested) partial("provider_error");
         if (count > requested) partial("node_limit");
         const int depth = pending[index].depth + 1;
         for (CFIndex child = 0; child < CFArrayGetCount(values) && pending.size() < 250; ++child) {
             const auto value = CFArrayGetValueAtIndex(values, child);
-            if (!sameProcessElement(value, pid_t(window.processId))) { partial("provider_error"); continue; }
+            if (!sameProcessElement(value, pid_t(window.processId))) {
+                partial("provider_error");
+                continue;
+            }
             if (CFSetContainsValue(seen, value)) continue;
-            CFRetain(value); pending.push_back({ScopedCFValue(value), depth});
+            CFRetain(value);
+            pending.push_back({ScopedCFValue(value), depth});
         }
     }
     if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility inspection canceled"};
@@ -1456,8 +1563,7 @@ MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(const DesktopNat
     // represent an unavailable provider alongside a coordinate-only snapshot.
     const MaiError permission = accessPermission();
     if (permission) return permission;
-    if (!validAXWindowIdentity(window))
-        return {MaiErrorCode::NotFound, "window is unavailable to macOS Accessibility"};
+    if (!validAXWindowIdentity(window)) return {MaiErrorCode::NotFound, "window is unavailable to macOS Accessibility"};
     auto result = maiDesktopInspectElements(window);
     if (!result) return result.error();
     if (result.value().status == "unavailable")
@@ -1465,9 +1571,9 @@ MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(const DesktopNat
     return std::move(result.value().elements);
 }
 
-MaiResult<DesktopNativeElement> maiDesktopResolveElement(
-    const DesktopNativeWindow& window, const DesktopNativeElement& observed,
-    const std::function<bool()>& isCanceled) {
+MaiResult<DesktopNativeElement> maiDesktopResolveElement(const DesktopNativeWindow& window,
+                                                         const DesktopNativeElement& observed,
+                                                         const std::function<bool()>& isCanceled) {
     if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility resolution canceled"};
     const MaiError permission = accessPermission();
     if (permission) return permission;
@@ -1477,40 +1583,137 @@ MaiResult<DesktopNativeElement> maiDesktopResolveElement(
         return {MaiErrorCode::NotFound, "the observed accessibility reference is no longer available"};
     const ScopedCFValue selected(accessibilityWindow(window, isCanceled, true));
     if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility resolution canceled"};
-    const bool belongs = selected && CFEqual(selected.get(), reference->window) &&
+    const bool belongs =
+        selected && CFEqual(selected.get(), reference->window) &&
         axElementBelongsToWindow(reference->element, reference->window, pid_t(window.processId), isCanceled);
     if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility resolution canceled"};
-    if (!belongs)
-        return {MaiErrorCode::NotFound, "the observed accessibility object left its selected window"};
+    if (!belongs) return {MaiErrorCode::NotFound, "the observed accessibility object left its selected window"};
     DesktopNativeElement result;
     if (!readAXElement(reference->element, reference->window, window, result))
         return {MaiErrorCode::NotFound, "the observed accessibility object is no longer readable"};
     if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native accessibility resolution canceled"};
     // Core compares these fresh fields and invalidates the snapshot if changed;
     // the adapter does not invent a second layout/label tolerance policy.
-    result.nativeId = reference->nativeId; result.reference = reference;
+    result.nativeId = reference->nativeId;
+    result.reference = reference;
+    result.depth = observed.depth;
     return result;
 }
 
+namespace {
+
+bool sameAXObservedElement(const DesktopNativeElement& current, const DesktopNativeElement& observed) {
+    return current.nativeId == observed.nativeId && current.role == observed.role && current.label == observed.label &&
+           current.automationId == observed.automationId && current.x == observed.x && current.y == observed.y &&
+           current.width == observed.width && current.height == observed.height &&
+           current.enabled == observed.enabled && current.offscreen == observed.offscreen;
+}
+
+bool sameAXAction(const std::string& left, const std::string& right) {
+    return QString::fromStdString(left).compare(QString::fromStdString(right), Qt::CaseInsensitive) == 0;
+}
+
+MaiError axElementMutationError(AXError status) {
+    if (status == kAXErrorInvalidUIElement)
+        return {MaiErrorCode::NotFound, "native element became unavailable; observe again"};
+    if (status == kAXErrorCannotComplete)
+        return {MaiErrorCode::Busy, "native element provider could not complete the operation; observe again"};
+    if (status == kAXErrorAPIDisabled)
+        return {MaiErrorCode::NotConfigured, "macOS Accessibility permission is unavailable"};
+    return {MaiErrorCode::NotSupported, "provider rejected the native element operation"};
+}
+
+// 值和动作共用已有 AX 引用、窗口归属和安全状态检查；不改变前台焦点。
+MaiError mutateAXObservedElement(const DesktopNativeWindow& window, const DesktopNativeElement& observed,
+                                 const std::function<bool()>& isCanceled,
+                                 const std::function<MaiError(AXUIElementRef)>& operation) {
+    const auto resolved = maiDesktopResolveElement(window, observed, isCanceled);
+    if (!resolved) return resolved.error();
+    if (!sameAXObservedElement(resolved.value(), observed))
+        return {MaiErrorCode::Busy, "observed accessibility element changed; observe again"};
+    if (!resolved.value().enabled || resolved.value().offscreen)
+        return {MaiErrorCode::NotSupported, "disabled or offscreen elements cannot be modified"};
+    if (!interactiveDesktopIsAvailable())
+        return {MaiErrorCode::NotConfigured, "the interactive desktop is unavailable"};
+    const auto reference = std::dynamic_pointer_cast<const MacAXElementReference>(resolved.value().reference);
+    if (!reference || axElementIsSecure(reference->element))
+        return {MaiErrorCode::NotSupported, "secure or unverified elements cannot be modified"};
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+    if (!axElementBelongsToWindow(reference->element, reference->window, pid_t(window.processId), isCanceled)) {
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+        return {MaiErrorCode::NotFound, "element left its selected window"};
+    }
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+    return operation(reference->element);
+}
+
+}  // namespace
+
+MaiError maiDesktopSetElementValue(const DesktopNativeWindow& window, const DesktopNativeElement& observed,
+                                   const std::string& value, const std::function<bool()>& isCanceled) {
+    if (value.size() > 65536 || value.find('\0') != std::string::npos)
+        return {MaiErrorCode::InvalidInput, "element value must be at most 65536 UTF-8 bytes without NUL"};
+    return mutateAXObservedElement(window, observed, isCanceled, [&](AXUIElementRef element) -> MaiError {
+        Boolean settable = false;
+        if (AXUIElementIsAttributeSettable(element, kAXValueAttribute, &settable) != kAXErrorSuccess || !settable)
+            return {MaiErrorCode::NotSupported, "element does not expose a writable native value"};
+        const ScopedCFValue replacement(CFStringCreateWithBytes(kCFAllocatorDefault,
+                                                                reinterpret_cast<const UInt8*>(value.data()),
+                                                                CFIndex(value.size()), kCFStringEncodingUTF8, false));
+        if (!replacement) return {MaiErrorCode::InvalidInput, "element value is not valid UTF-8"};
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+        const AXError status = AXUIElementSetAttributeValue(element, kAXValueAttribute, replacement.get());
+        if (status != kAXErrorSuccess) return axElementMutationError(status);
+        return {};
+    });
+}
+
+MaiError maiDesktopPerformSecondaryAction(const DesktopNativeWindow& window, const DesktopNativeElement& observed,
+                                          const std::string& action, const std::function<bool()>& isCanceled) {
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+    if (std::none_of(observed.secondaryActions.begin(), observed.secondaryActions.end(),
+                     [&](const auto& name) { return sameAXAction(name, action); }))
+        return {MaiErrorCode::NotSupported, "action was not reported by the observed element"};
+    return mutateAXObservedElement(window, observed, isCanceled, [&](AXUIElementRef element) -> MaiError {
+        const auto actions = axSecondaryActions(element);
+        const auto found =
+            std::find_if(actions.begin(), actions.end(), [&](const auto& name) { return sameAXAction(name, action); });
+        if (found == actions.end())
+            return {MaiErrorCode::NotSupported, "element no longer supports the observed secondary action"};
+        const ScopedCFValue name(CFStringCreateWithBytes(kCFAllocatorDefault,
+                                                         reinterpret_cast<const UInt8*>(found->data()),
+                                                         CFIndex(found->size()), kCFStringEncodingUTF8, false));
+        if (!name) return {MaiErrorCode::NotSupported, "native action name is unavailable"};
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native element operation canceled"};
+        const AXError status = AXUIElementPerformAction(element, static_cast<CFStringRef>(name.get()));
+        if (status != kAXErrorSuccess) return axElementMutationError(status);
+        return {};
+    });
+}
+
 MaiError maiDesktopSetWindowState(const DesktopNativeWindow& window, DesktopWindowStateAction action,
-                                   const std::function<bool()>& isCanceled) {
-    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native window state request canceled before dispatch"};
+                                  const std::function<bool()>& isCanceled) {
+    if (isCanceled && isCanceled())
+        return {MaiErrorCode::Canceled, "native window state request canceled before dispatch"};
     if (!validAXWindowIdentity(window)) return {MaiErrorCode::InvalidInput, "a valid observed window is required"};
     if (action != DesktopWindowStateAction::Minimize && action != DesktopWindowStateAction::Restore)
         return {MaiErrorCode::InvalidInput, "a valid minimized window state is required"};
     const MaiError permission = accessPermission();
     if (permission) return permission;
-    if (!interactiveDesktopIsAvailable()) return {MaiErrorCode::NotSupported, "interactive macOS desktop is unavailable"};
+    if (!interactiveDesktopIsAvailable())
+        return {MaiErrorCode::NotSupported, "interactive macOS desktop is unavailable"};
     const ScopedCFValue selected(accessibilityWindow(window, isCanceled, true));
-    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native window state request canceled before dispatch"};
+    if (isCanceled && isCanceled())
+        return {MaiErrorCode::Canceled, "native window state request canceled before dispatch"};
     if (!selected) return {MaiErrorCode::NotFound, "selected window cannot be uniquely resolved"};
     const auto target = static_cast<AXUIElementRef>(selected.get());
     Boolean settable = false;
     if (AXUIElementIsAttributeSettable(target, kAXMinimizedAttribute, &settable) != kAXErrorSuccess || !settable)
         return {MaiErrorCode::NotSupported, "the selected window does not support changing its minimized state"};
-    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native window state request canceled before dispatch"};
-    const AXError error = AXUIElementSetAttributeValue(target, kAXMinimizedAttribute,
-        action == DesktopWindowStateAction::Minimize ? kCFBooleanTrue : kCFBooleanFalse);
+    if (isCanceled && isCanceled())
+        return {MaiErrorCode::Canceled, "native window state request canceled before dispatch"};
+    const AXError error = AXUIElementSetAttributeValue(
+        target, kAXMinimizedAttribute, action == DesktopWindowStateAction::Minimize ? kCFBooleanTrue : kCFBooleanFalse);
     if (error != kAXErrorSuccess) return {MaiErrorCode::Busy, "macOS rejected the selected window state request"};
     // A dispatched OS request is not rolled back by cancellation. Core performs
     // its ordinary window readback rather than claiming synchronous completion.
@@ -1989,6 +2192,7 @@ class MacNativeInputSession final : public DesktopNativeInputSession {
                 hasResolved = true;
             }
             std::lock_guard<std::mutex> lock(mutex_);
+            pointerClicks_ = {};
             if (hasResolved && (scope_ ? scope_->ownedModifiers() : 0) != flagsAtResolution)
                 return finish({MaiErrorCode::Busy,
                                "held modifiers changed while resolving the key; observe again"});
@@ -2026,6 +2230,138 @@ class MacNativeInputSession final : public DesktopNativeInputSession {
                     "native input failed; owned synthetic holds were released"};
         }
     }
+    MaiError inputEvents(const std::vector<DesktopInputEvent>& events, const DesktopNativeInput& input,
+                         const DesktopInputPort& port, const DesktopInputOptions& options) override {
+        // 先检查整个原生批次；不支持的事件不能在此前产生一次移动或按下。
+        if (const MaiError invalid = maiDesktopValidateInputEvents(events)) return invalid;
+        if (const MaiError invalid = maiDesktopValidateInputOptions(options)) return invalid;
+        for (const auto& event : events) {
+            if (event.kind != DesktopInputEventKind::AbsoluteMove && event.kind != DesktopInputEventKind::MouseButton &&
+                event.kind != DesktopInputEventKind::Wheel)
+                return {MaiErrorCode::NotSupported,
+                        "macOS typed input supports absolute movement, mouse buttons and wheel only"};
+            if (event.delayMs)
+                return {MaiErrorCode::InvalidInput, "native input requires a prepared event with consumed delay"};
+            const bool release = event.kind == DesktopInputEventKind::MouseButton && event.release;
+            const bool neutral = event.kind == DesktopInputEventKind::Wheel && !event.wheelDelta120;
+            if (!release && !neutral && !options.mouseEnabled)
+                return {MaiErrorCode::NotConfigured, "mouse input is disabled"};
+            if (event.kind == DesktopInputEventKind::AbsoluteMove &&
+                (!std::isfinite(port.x) || !std::isfinite(port.y) || !std::isfinite(port.width) ||
+                 !std::isfinite(port.height) || port.width < 1 || port.height < 1 ||
+                 !validPoint(port.x + event.x * (port.width - 1), port.y + event.y * (port.height - 1))))
+                return {MaiErrorCode::InvalidInput, "absolute movement requires a valid observed viewport"};
+            if (event.kind == DesktopInputEventKind::Wheel && !options.highResolutionScroll &&
+                event.wheelDelta120 % 120)
+                return {MaiErrorCode::NotSupported, "fractional wheel input requires high resolution scrolling"};
+        }
+        const bool needsTarget = std::any_of(events.begin(), events.end(), [](const auto& event) {
+            return !(event.kind == DesktopInputEventKind::MouseButton && event.release) &&
+                   !(event.kind == DesktopInputEventKind::Wheel && !event.wheelDelta120);
+        });
+        if (needsTarget && (input.expectedWindowId == 0) != (input.expectedProcessId == 0))
+            return {MaiErrorCode::InvalidInput, "expected window and process identities must be provided together"};
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto request = input;
+            request.kind = DesktopNativeInputKind::Move;
+            bool begun = false;
+            for (const auto& event : events) {
+                const auto button = event.button == 1   ? DesktopMouseButton::Left
+                                    : event.button == 2 ? DesktopMouseButton::Middle
+                                    : event.button == 3 ? DesktopMouseButton::Right
+                                    : event.button == 4 ? DesktopMouseButton::Back
+                                                        : DesktopMouseButton::Forward;
+                const std::string tag = "mouse:" + mouseName(button);
+                if (event.kind == DesktopInputEventKind::MouseButton && event.release) {
+                    // 清理只使用本会话已登记的 up；取消、失焦和禁用不阻止释放。
+                    if (scope_) scope_->releaseTag(tag);
+                    continue;
+                }
+                if (event.kind == DesktopInputEventKind::Wheel && !event.wheelDelta120) continue;
+                if (!begun) {
+                    if (!scope_)
+                        scope_ = std::make_unique<InputScope>(request);
+                    else if (const MaiError binding = scope_->begin(request))
+                        return finish(binding);
+                    begun = true;
+                }
+                if (const MaiError ready = scope_->validate()) return finish(ready);
+                if (hasUnexpectedModifiers(nullptr))
+                    return finish({MaiErrorCode::Busy, "release modifiers that are not part of the requested action"});
+                for (int number = 0; number < 5; ++number) {
+                    if (CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, CGMouseButton(number)) &&
+                        !scope_->owns(false, number))
+                        return finish({MaiErrorCode::Busy, "a mouse button is already held by the user"});
+                }
+                if (event.kind == DesktopInputEventKind::AbsoluteMove) {
+                    const CGPoint point =
+                        CGPointMake(port.x + event.x * (port.width - 1), port.y + event.y * (port.height - 1));
+                    if (const MaiError moved = scope_->move(point)) return finish(moved);
+                    continue;
+                }
+                const ScopedCFValue cursor(CGEventCreate(nullptr));
+                if (!cursor) return finish({MaiErrorCode::Internal, "could not read native pointer position"});
+                const CGPoint point = CGEventGetLocation(static_cast<CGEventRef>(const_cast<void*>(cursor.get())));
+                if (event.kind == DesktopInputEventKind::Wheel) {
+                    // 源单位是每档 120；Quartz 行单位及 16.16 字段保留小数，不声称物理像素等价。
+                    std::int64_t remaining =
+                        event.horizontal ? -std::int64_t(event.wheelDelta120) : std::int64_t(event.wheelDelta120);
+                    // 16.16 的有符号原生字段比 DTO 窄；分段保留 INT32 两端，逐段检查取消和归属。
+                    constexpr std::int64_t maximumDelta = 32767 * 120;
+                    while (remaining) {
+                        const auto delta = (std::max)(-maximumDelta, (std::min)(maximumDelta, remaining));
+                        const CGEventRef wheel =
+                            event.horizontal
+                                ? CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, 0, int(delta / 120))
+                                : CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 1, int(delta / 120));
+                        const ScopedCFValue owner(wheel);
+                        if (!wheel) return finish({MaiErrorCode::Internal, "could not create native wheel event"});
+                        CGEventSetIntegerValueField(wheel,
+                                                    event.horizontal ? kCGScrollWheelEventFixedPtDeltaAxis2
+                                                                     : kCGScrollWheelEventFixedPtDeltaAxis1,
+                                                    delta * 65536 / 120);
+                        CGEventSetLocation(wheel, point);
+                        if (const MaiError posted = scope_->post(wheel)) return finish(posted);
+                        remaining -= delta;
+                    }
+                    pointerClicks_ = {};
+                    continue;
+                }
+                if (scope_->containsTag(tag)) {
+                    if (const MaiError ready = scope_->validatePointer(point)) return finish(ready);
+                    continue;
+                }
+                const int number = mouseNumber(button);
+                const CGEventType downType = number == 0   ? kCGEventLeftMouseDown
+                                             : number == 1 ? kCGEventRightMouseDown
+                                                           : kCGEventOtherMouseDown;
+                const CGEventType upType = number == 0   ? kCGEventLeftMouseUp
+                                           : number == 1 ? kCGEventRightMouseUp
+                                                         : kCGEventOtherMouseUp;
+                const CGEventRef down = CGEventCreateMouseEvent(nullptr, downType, point, CGMouseButton(number));
+                const CGEventRef up = CGEventCreateMouseEvent(nullptr, upType, point, CGMouseButton(number));
+                const ScopedCFValue downOwner(down), upOwner(up);
+                if (!down || !up) return finish({MaiErrorCode::Internal, "could not create native mouse events"});
+                const auto now = std::chrono::steady_clock::now();
+                auto& click = pointerClicks_[std::size_t(number)];
+                const bool consecutive =
+                    click.count && click.point.x == point.x && click.point.y == point.y &&
+                    std::chrono::duration<double>(now - click.when).count() <= [NSEvent doubleClickInterval];
+                const std::int64_t count = consecutive ? (std::min)(click.count + 1, std::int64_t(256)) : 1;
+                CGEventSetIntegerValueField(down, kCGMouseEventClickState, count);
+                CGEventSetIntegerValueField(up, kCGMouseEventClickState, count);
+                if (const MaiError held = scope_->hold(down, up, 0, 0, mouseName(button), tag)) return finish(held);
+                click = {point, now, count};
+            }
+            return finish({});
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (scope_) scope_->releaseAll();
+            pointerClicks_ = {};
+            return {MaiErrorCode::Internal, "native mouse input failed; owned synthetic holds were released"};
+        }
+    }
     DesktopNativeInputState state() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         return scope_ ? scope_->state() : DesktopNativeInputState{};
@@ -2036,42 +2372,45 @@ class MacNativeInputSession final : public DesktopNativeInputSession {
     }
     MaiError releaseAll() override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (scope_)
-            scope_->releaseAll();
+        if (scope_) scope_->releaseAll();
+        pointerClicks_ = {};
         return {};
     }
 
-  private:
+private:
     MaiError finish(MaiError result) {
         if (scope_) {
             scope_->finish();
             if (!result && scope_->hardwareConflict())
-                result = {MaiErrorCode::Busy, "hardware input overlapped a synthetic "
-                                              "hold; owned holds were released"};
-            if (result)
-                scope_->releaseAll();
+                result = {MaiErrorCode::Busy,
+                          "hardware input overlapped a synthetic "
+                          "hold; owned holds were released"};
+            if (result) scope_->releaseAll();
         }
+        if (result) pointerClicks_ = {};
         return result;
     }
+    struct MouseClickSequence {
+        CGPoint point{};
+        std::chrono::steady_clock::time_point when{};
+        std::int64_t count = 0;
+    };
     mutable std::mutex mutex_;
     std::unique_ptr<InputScope> scope_;
+    std::array<MouseClickSequence, 5> pointerClicks_{};
 };
-} // namespace
+}  // namespace
 
 std::shared_ptr<DesktopNativeInputSession> maiDesktopCreateInputSession() {
     return std::make_shared<MacNativeInputSession>();
 }
 
 MaiError maiDesktopInput(const DesktopNativeInput& input) {
-    if (input.kind == DesktopNativeInputKind::MouseDown ||
-        input.kind == DesktopNativeInputKind::MouseUp ||
-        input.kind == DesktopNativeInputKind::KeyDown ||
-        input.kind == DesktopNativeInputKind::KeyUp)
-        return {MaiErrorCode::InvalidInput,
-                "independent down/up requires a DesktopNativeInputSession"};
+    if (input.kind == DesktopNativeInputKind::MouseDown || input.kind == DesktopNativeInputKind::MouseUp ||
+        input.kind == DesktopNativeInputKind::KeyDown || input.kind == DesktopNativeInputKind::KeyUp)
+        return {MaiErrorCode::InvalidInput, "independent down/up requires a DesktopNativeInputSession"};
     const MaiError permission = accessPermission();
-    if (permission)
-        return permission;
+    if (permission) return permission;
     InputScope scope(input);
     return performNativeInput(input, scope);
 }
@@ -2079,18 +2418,16 @@ MaiError maiDesktopInput(const DesktopNativeInput& input) {
 MaiResult<std::string> maiDesktopFocusedText(const DesktopNativeWindow& window) {
     const auto active = maiDesktopWindowIsFocused(window);
     if (!active) return active.error();
-    if (!active.value())
-        return {MaiErrorCode::Busy, "selected window does not have foreground focus"};
+    if (!active.value()) return {MaiErrorCode::Busy, "selected window does not have foreground focus"};
     AXUIElementRef selected = accessibilityWindow(window);
     if (!selected) return {MaiErrorCode::NotFound, "selected window is unavailable"};
     AXUIElementRef system = AXUIElementCreateSystemWide();
     if (system) AXUIElementSetMessagingTimeout(system, 0.1f);
     CFTypeRef focusedValue = nullptr;
-    const AXError found = system ? AXUIElementCopyAttributeValue(system,
-        kAXFocusedUIElementAttribute, &focusedValue) : kAXErrorFailure;
+    const AXError found =
+        system ? AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute, &focusedValue) : kAXErrorFailure;
     if (system) CFRelease(system);
-    if (found != kAXErrorSuccess || !focusedValue ||
-        CFGetTypeID(focusedValue) != AXUIElementGetTypeID()) {
+    if (found != kAXErrorSuccess || !focusedValue || CFGetTypeID(focusedValue) != AXUIElementGetTypeID()) {
         if (focusedValue) CFRelease(focusedValue);
         CFRelease(selected);
         return {MaiErrorCode::NotConfigured, "focused input is unavailable to Accessibility"};
@@ -2099,9 +2436,9 @@ MaiResult<std::string> maiDesktopFocusedText(const DesktopNativeWindow& window) 
     pid_t pid = 0;
     CFTypeRef owner = nullptr;
     const bool belongs = AXUIElementGetPid(focused, &pid) == kAXErrorSuccess &&
-        std::uint64_t(pid) == window.processId &&
-        AXUIElementCopyAttributeValue(focused, kAXWindowAttribute, &owner) == kAXErrorSuccess &&
-        owner && CFGetTypeID(owner) == AXUIElementGetTypeID() && CFEqual(owner, selected);
+                         std::uint64_t(pid) == window.processId &&
+                         AXUIElementCopyAttributeValue(focused, kAXWindowAttribute, &owner) == kAXErrorSuccess &&
+                         owner && CFGetTypeID(owner) == AXUIElementGetTypeID() && CFEqual(owner, selected);
     if (owner) CFRelease(owner);
     CFRelease(selected);
     if (!belongs) {
@@ -2110,8 +2447,7 @@ MaiResult<std::string> maiDesktopFocusedText(const DesktopNativeWindow& window) 
     }
     const std::string role = attribute(focused, kAXRoleAttribute);
     const std::string subrole = attribute(focused, kAXSubroleAttribute);
-    if (role.empty() || role == "AXSecureTextField" || subrole == "AXSecureTextField" ||
-        subrole == "AXPasswordField") {
+    if (role.empty() || role == "AXSecureTextField" || subrole == "AXSecureTextField" || subrole == "AXPasswordField") {
         CFRelease(focused);
         return {MaiErrorCode::NotSupported, "secure or unverified focused input cannot be read"};
     }

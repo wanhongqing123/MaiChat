@@ -6,6 +6,7 @@ import java.io.IOException;
 import org.json.JSONObject;
 
 final class AIAssistantModelSettings {
+    static final String OPENAI_MODEL = "gpt-6.1-sol";
     static final String LOCAL_MODEL_ID = "builtin-qwen3.5-2b-q4_k_m";
     static final String OPENROUTER_MODEL = "anthropic/claude-fable-5.2";
     static final String OPUS_MODEL = "anthropic/claude-opus-5.5";
@@ -29,10 +30,11 @@ final class AIAssistantModelSettings {
         if (!provider.equals("remote") && !provider.equals("llama"))
             throw new IllegalArgumentException("主模型来源不受支持，原设置已保留");
         boolean local = provider.equals("llama");
-        String cloud = saved.optString("cloudModel", local ? "deepseek-flash"
-            : saved.optString("model", "deepseek-flash"));
+        String cloud = restoredCloudModel(saved.optString("cloudModel", local ? "deepseek-flash"
+            : saved.optString("model", "deepseek-flash")));
         if (!supportedCloud(cloud)) cloud = "deepseek-flash";
-        if (!local && supportedCloud(saved.optString("model"))) cloud = saved.optString("model");
+        if (!local && supportedCloud(restoredCloudModel(saved.optString("model"))))
+            cloud = restoredCloudModel(saved.optString("model"));
         String policy = saved.optString("policy", "on-request");
         if (!supportedPolicy(policy)) policy = "on-request";
         String effort = saved.optString("reasoningEffort", "high");
@@ -44,6 +46,10 @@ final class AIAssistantModelSettings {
         return new AIAssistantModelSettings(local, cloud, policy, effort);
     }
     boolean isLocal() { return local; }
+    // 仅升级旧型号的设置投影；不修改传入 JSON、历史正文或 Flash 的独立型号。
+    static String restoredCloudModel(String model) {
+        return "glm-5.3".equals(model) ? "glm-5.4" : model;
+    }
     String model() { return local ? "local:" + LOCAL_MODEL_ID : cloudModel; }
     String baseUrl() { return local ? "" : baseUrlForModel(cloudModel); }
     String wire() { return local ? "local" : "responses"; }
@@ -51,10 +57,11 @@ final class AIAssistantModelSettings {
     // This is the host's endpoint projection only. Shared native routes own execution,
     // capabilities and request serialization for the same exact cloud model identifiers.
     static String baseUrlForModel(String model) {
+        if (OPENAI_MODEL.equals(model)) return "https://api.openai.com/v1";
         if (isOpenRouterModel(model)) return "https://openrouter.ai/api/v1";
         if ("deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model))
             return "https://api.deepseek.com";
-        if ("glm-5.3".equals(model) || "glm-5.3-flash".equals(model))
+        if ("glm-5.4".equals(model) || "glm-5.3-flash".equals(model))
             return "https://open.bigmodel.cn/api/v1";
         return "";
     }
@@ -93,7 +100,7 @@ final class AIAssistantModelSettings {
 
     static boolean supportedCloud(String model) {
         return "deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model)
-            || "glm-5.3".equals(model) || "glm-5.3-flash".equals(model) || isOpenRouterModel(model);
+            || OPENAI_MODEL.equals(model) || "glm-5.4".equals(model) || "glm-5.3-flash".equals(model) || isOpenRouterModel(model);
     }
     // Exact product identifiers use the current account's OpenRouter route;
     // aliases or the paid Particle endpoint must not borrow this credential.
@@ -107,11 +114,11 @@ final class AIAssistantModelSettings {
     // unsupported explicit input is rejected before any compatibility normalization.
     static boolean supportedEffortForModel(String model, String effort) {
         return "".equals(effort) || "low".equals(effort) || "high".equals(effort) || "max".equals(effort)
-            || ((OPENROUTER_MODEL.equals(model) || OPUS_MODEL.equals(model))
+            || ((OPENROUTER_MODEL.equals(model) || OPUS_MODEL.equals(model) || OPENAI_MODEL.equals(model))
                 && ("medium".equals(effort) || "xhigh".equals(effort)));
     }
     static String normalizeEffortForModel(String model, String effort) {
-        return !OPENROUTER_MODEL.equals(model) && !OPUS_MODEL.equals(model)
+        return !OPENROUTER_MODEL.equals(model) && !OPUS_MODEL.equals(model) && !OPENAI_MODEL.equals(model)
             && ("medium".equals(effort) || "xhigh".equals(effort))
             ? "high" : effort;
     }

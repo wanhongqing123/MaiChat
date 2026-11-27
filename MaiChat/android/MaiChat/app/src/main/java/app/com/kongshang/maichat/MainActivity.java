@@ -364,6 +364,7 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
     private long renderedConversationFingerprint;
     private String pendingNotificationPeerUserId = "";
     private volatile boolean activityInForeground;
+    private MaiAndroidNetworkRouter networkRouter;
     private final Set<String> collapsedContactGroups = new HashSet<>();
 
     @Override
@@ -372,6 +373,8 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         Object retained = getLastCustomNonConfigurationInstance();
         if (retained instanceof RetainedAppearanceState) retainedAppearance = (RetainedAppearanceState) retained;
         MarkdownRenderer.initialize(getApplicationContext());
+        // 只发布逐请求路由事实，不绑定整个进程；网络回调随宿主销毁而注销。
+        networkRouter = MaiAndroidNetworkRouter.start(this);
         diagnostics = new MainThreadMonitor(getWindow(), new File(getFilesDir(), "diagnostics"));
         updateWindowAppearance();
         androidx.core.view.WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
@@ -412,6 +415,7 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
     @Override
     protected void onResume() {
         super.onResume();
+        if (networkRouter != null) networkRouter.setForeground(true);
         MobileScreenCaptureService.setAppForeground(true);
         activityInForeground = true;
         if (session != null) session.setAppForeground(true);
@@ -456,6 +460,7 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
 
     @Override
     protected void onPause() {
+        if (networkRouter != null) networkRouter.setForeground(false);
         MobileScreenCaptureService.setAppForeground(false);
         activityInForeground = false;
         socialUiHandler.removeCallbacks(socialBindingTick);
@@ -510,6 +515,7 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
     @Override
     protected void onDestroy() {
         destroyed = true;
+        if (networkRouter != null) networkRouter.close();
         if (sessionIMBindingDialog != null) sessionIMBindingDialog.dismiss();
         if (sessionIMBindings != null) sessionIMBindings.close();
         if (session != null) session.setSessionIMBindings(null);

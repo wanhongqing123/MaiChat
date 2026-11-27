@@ -185,17 +185,17 @@ void test_tool_contract() {
     }
     CHECK(tool->description().find("mode=window") == std::string::npos);
     CHECK(tool->description().find("list_windows") == std::string::npos);
-    CHECK(!tool->isAvailableForModel("glm-5.3"));
+    CHECK(tool->isAvailableForModel("glm-5.4"));
     CHECK(!tool->isAvailableForModel("local:qa"));
     CHECK(tool->isAvailableForModel("glm-5.3-flash"));
     CHECK(tool->isAvailableForModel("deepseek-flash"));
 
     MaiToolContext textOnly;
-    textOnly.model = "glm-5.3";
+    textOnly.model = "local:qa";
     const MaiToolResult unsupported = tool->execute("{}", textOnly);
     CHECK(unsupported.hasError());
     CHECK(unsupported.error().code() == MaiErrorCode::NotSupported);
-    CHECK(unsupported.error().message().find("glm-5.3-flash") != std::string::npos);
+    CHECK(unsupported.error().message().find("image-capable") != std::string::npos);
 
     // 受控回调拒绝任何采集，避免门禁回归触碰用户显示器。
     MaiScreenshotTestWorkspace workspace;
@@ -251,7 +251,7 @@ void test_stop_needs_no_capture_or_workspace() {
     CHECK(!tool->requiresPerCallApproval(R"({"action":"stop"})"));
     std::atomic<bool> canceled{true};
     MaiToolContext context;
-    context.model = "glm-5.3";
+    context.model = "local:qa";
     context.cancel = &canceled;
     // stop 是清理操作，取消、缺少工作区或模型不能接收像素都不能阻止释放原生会话。
     for (int repeat = 0; repeat < 2; ++repeat) {
@@ -271,13 +271,14 @@ void test_builtin_registration_matches_platform_support() {
     registerMaiBuiltinTools(registry);
     CHECK((registry.find("screenshot") != nullptr) == maiIsScreenshotSupported());
     CHECK(registry.find("list_windows") == nullptr);
-    for (const std::string model : {"glm-5.3", "local:qa", "glm-5.3-flash", "deepseek-flash"}) {
+    for (const std::string model : {"glm-5.4", "local:qa", "glm-5.3-flash", "deepseek-flash"}) {
         const auto specs = registry.specs(model);
         const bool declared = std::any_of(specs.begin(), specs.end(), [](const MaiToolSpec& spec) {
             return spec.name == "screenshot";
         });
-        CHECK(declared == (maiIsScreenshotSupported() &&
-                           (model == "glm-5.3-flash" || model == "deepseek-flash")));
+        CHECK(declared ==
+              (maiIsScreenshotSupported() &&
+               (model == "glm-5.4" || model == "glm-5.3-flash" || model == "deepseek-flash")));
         CHECK((registry.findForModel("screenshot", model) != nullptr) == declared);
         CHECK(std::none_of(specs.begin(), specs.end(),
                            [](const MaiToolSpec& spec) { return spec.name == "list_windows"; }));

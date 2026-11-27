@@ -14,7 +14,7 @@
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiMemoryStore.h"
-#include "MaiShellTool.h"
+#include "MaiExecCommandTool.h"
 #include "MaiToolCallValidation.h"
 #include "MaiModelHttpFraming.h"
 
@@ -37,7 +37,7 @@ public:
         return respond(request, sink, ++requests);
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 };
 struct Probe {
@@ -112,7 +112,7 @@ private:
 };
 std::string create(MaiAgent& agent) {
     auto session = agent.submit(
-        MaiCreateSession{MaiFileSystem::temporaryDirectory().toUtf8(), "", "glm-5.3", ""});
+        MaiCreateSession{MaiFileSystem::temporaryDirectory().toUtf8(), "", "glm-5.4", ""});
     CHECK(session);
     return session ? session.value() : std::string{};
 }
@@ -323,14 +323,14 @@ void test_withdrawn_parallel_tool_does_not_start_after_placeholder_event() {
 }
 
 void test_shell_spelling_and_http_framing_fail_closed() {
-    auto shell = makeMaiShellTool();
+    auto shell = makeMaiExecCommandTool();
     for (const auto& command : std::vector<std::string>{
              "/tmp/owned/cat file", "./git status", "cat.cmd file", "echo hello\rdel owned",
              "echo %OWNED%", "echo !OWNED!", std::string("echo ok\0hidden", 14)}) {
-        CHECK(maiShellCommandRequiresApproval(command));
-        CHECK(shell->requiresApproval(nlohmann::json{{"command", command}}.dump()));
+        CHECK(maiExecCommandRequiresApproval(command));
+        CHECK(shell->requiresApproval(nlohmann::json{{"cmd", command}}.dump()));
     }
-    CHECK(!maiShellCommandRequiresApproval("echo owned"));
+    CHECK(!maiExecCommandRequiresApproval("echo owned"));
     MaiModelHttpFraming framing;
     framing.onHeader("HTTP/1.1 200 OK\r\n");
     framing.onHeader("Content-Length: 4\r\n");

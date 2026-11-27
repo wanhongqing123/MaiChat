@@ -1,11 +1,5 @@
-// 文件作用：验证“解析并应用受权限控制的补丁修改”的正确行为和边界条件。
-// 验证入口：test_updates_several_places_in_one_file、test_one_patch_can_touch_several_files、
-// test_nothing_is_written_when_any_part_fails；检查可观察结果而非实现细节。
-// apply_patch 的测试。
-//
-// 这个工具和 edit 的区别就在「全有或全无」上，所以用例的重心是**失败的那一半**：
-// 一批改动里有一处对不上，剩下的必须一个字节都没落盘。半应用的补丁比不应用糟得多——
-// 模型和用户都说不清当前是什么状态，而 git diff 里会混着真改动和半截改动。
+// 文件作用：用真实文件验证 Codex 补丁语法、逐文件执行、字节结果和失败边界。
+// 普通 maiApplyPatch 与模型工具共用核心；预期来自固定上游实现，不声称跨文件事务。
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
@@ -14,6 +8,10 @@
 #include <string>
 
 #include <json.hpp>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include "MaiTool.h"
 #include "MaiApplyPatchTool.h"
@@ -46,27 +44,27 @@ struct Workspace {
     }
 
     void write(const std::string& name, const std::string& body) const {
-        const fs::path target = root / name;
+        const fs::path target = root / fs::u8path(name);
         fs::create_directories(target.parent_path());
         std::ofstream out(target, std::ios::binary);
         out << body;
     }
 
     std::string read(const std::string& name) const {
-        std::ifstream in(root / name, std::ios::binary);
+        std::ifstream in(root / fs::u8path(name), std::ios::binary);
         std::ostringstream buffer;
         buffer << in.rdbuf();
         return buffer.str();
     }
 
     bool has(const std::string& name) const {
-        return fs::exists(root / name);
+        return fs::exists(root / fs::u8path(name));
     }
 
     MaiToolContext context() const {
         MaiToolContext c;
         c.sessionId = "ses_patch";
-        c.root = root.string();
+        c.root = root.u8string();
         return c;
     }
 };
@@ -119,9 +117,8 @@ void test_one_patch_can_touch_several_files() {
     CHECK(workspace.read("two.txt") == "new\n");
 }
 
-void test_nothing_is_written_when_any_part_fails() {
-    // **这条是这个工具存在的理由。** 第一个文件改得动，第二个对不上，
-    // 那第一个也不许落盘。
+void test_earlier_hunks_remain_applied_when_a_later_hunk_fails() {
+    // 和 Codex 一样按块顺序提交：第二个上下文失败时，先前成功操作保持落盘。
     Workspace workspace;
     workspace.write("good.txt", "old\n");
     workspace.write("bad.txt", "something else\n");
@@ -139,10 +136,10 @@ void test_nothing_is_written_when_any_part_fails() {
                                                          "*** End Patch\n"),
                                                workspace.context());
     CHECK(result.hasError());
-    CHECK(workspace.read("good.txt") == "old\n");
+    CHECK(workspace.read("good.txt") == "new\n");
     CHECK(workspace.read("bad.txt") == "something else\n");
-    // 报错要说清是哪一处对不上，并且明说什么都没改。
-    CHECK(result.error().message().find("Nothing was changed") != std::string::npos);
+    // 报错列出已经落盘的操作，不能诱导模型盲目重放整份补丁。
+    CHECK(result.error().message().find("M good.txt") != std::string::npos);
 }
 
 void test_add_and_delete_files() {
@@ -165,8 +162,8 @@ void test_add_and_delete_files() {
     CHECK(result.output().find("D gone.txt") != std::string::npos);
 }
 
-void test_add_refuses_to_clobber_an_existing_file() {
-    // Add 撞上已有文件时静默覆盖的话，一整个文件的内容就没了。
+void test_add_overwrites_an_existing_file_like_codex() {
+    // Codex Add 的行为是创建或覆盖；工具说明和授权必须如实描述。
     Workspace workspace;
     workspace.write("there.txt", "precious\n");
     auto tool = makeMaiApplyPatchTool();
@@ -176,9 +173,8 @@ void test_add_refuses_to_clobber_an_existing_file() {
                                                          "+overwritten\n"
                                                          "*** End Patch\n"),
                                                workspace.context());
-    CHECK(result.hasError());
-    CHECK(workspace.read("there.txt") == "precious\n");
-    CHECK(result.error().message().find("already exists") != std::string::npos);
+    CHECK(!result.hasError());
+    CHECK(workspace.read("there.txt") == "overwritten\n");
 }
 
 void test_move_writes_the_new_path_and_removes_the_old() {
@@ -220,7 +216,7 @@ void test_crlf_files_keep_their_line_endings() {
 
 void test_context_is_matched_leniently_on_whitespace() {
     // 模型抄上下文时最常见的偏差就是行尾空格。一次都不让步的话大部分补丁都会失败，
-    // 而失败的理由（少了一个空格）它自己看不出来。三级放松和 codex 的 seek_sequence 一致。
+    // 而失败的理由（少了一个空格）它自己看不出来。空白匹配和 Codex seek_sequence 一致，Unicode 标点放松另有用例。
     Workspace workspace;
     workspace.write("ws.txt", "keep   \n  target\nafter\n");
     auto tool = makeMaiApplyPatchTool();
@@ -305,7 +301,7 @@ void test_apply_patch_always_needs_approval() {
     auto tool = makeMaiApplyPatchTool();
     CHECK(tool->requiresApproval(patchArgs("*** Begin Patch\n*** End Patch\n")));
     CHECK(tool->requiresApproval("not json at all"));
-    CHECK(tool->approvalKey(patchArgs("anything")) == "file_patch");
+    CHECK(tool->approvalKey(patchArgs("anything")) == "apply_patch");
 }
 
 void test_delete_and_move_require_approval_for_each_affected_file() {
@@ -330,6 +326,332 @@ void test_delete_and_move_require_approval_for_each_affected_file() {
           keys.end());
 }
 
+// 以固定 Codex 源码的 parser/file_update/text_file/seek_sequence 为预期，
+// 使用真实文件核对落盘字节，而不是复述本工具的返回文本。
+void test_codex_name_is_available_to_the_bootstrap_catalog() {
+    auto tool = makeMaiApplyPatchTool();
+    CHECK(tool->name() == "apply_patch");
+}
+
+void test_change_context_selects_the_named_function() {
+    Workspace workspace;
+    workspace.write("anchor.txt", "first\nold\nsecond\nold\n");
+    auto tool = makeMaiApplyPatchTool();
+    const auto result = tool->execute(patchArgs("*** Begin Patch\n*** Update File: anchor.txt\n"
+                                                "@@ second\n-old\n+new\n*** End Patch\n"),
+                                      workspace.context());
+    CHECK(!result.hasError());
+    CHECK(workspace.read("anchor.txt") == "first\nold\nsecond\nnew\n");
+}
+
+void test_add_only_chunk_appends_and_terminates_the_last_line() {
+    Workspace workspace;
+    workspace.write("append.txt", "before");
+    auto tool = makeMaiApplyPatchTool();
+    const auto result = tool->execute(patchArgs("*** Begin Patch\n*** Update File: append.txt\n"
+                                                "@@\n+after\n*** End Patch\n"),
+                                      workspace.context());
+    CHECK(!result.hasError());
+    CHECK(workspace.read("append.txt") == "before\nafter\n");
+}
+
+void test_end_of_file_does_not_match_a_middle_occurrence() {
+    Workspace workspace;
+    workspace.write("eof.txt", "match\nlast\n");
+    auto tool = makeMaiApplyPatchTool();
+    const auto result = tool->execute(patchArgs("*** Begin Patch\n*** Update File: eof.txt\n"
+                                                "@@\n-match\n+bad\n*** End of File\n"
+                                                "*** End Patch\n"),
+                                      workspace.context());
+    CHECK(result.hasError());
+    CHECK(workspace.read("eof.txt") == "match\nlast\n");
+}
+
+void test_context_bytes_and_mixed_line_endings_are_retained() {
+    Workspace workspace;
+    workspace.write("mixed.txt", "keep   \r\nold\nlast\r");
+    auto tool = makeMaiApplyPatchTool();
+    const auto result = tool->execute(patchArgs("*** Begin Patch\n*** Update File: mixed.txt\n"
+                                                "@@\n keep\n-old\n+new\n last\n"
+                                                "*** End Patch\n"),
+                                      workspace.context());
+    CHECK(!result.hasError());
+    CHECK(workspace.read("mixed.txt") == "keep   \r\nnew\r\nlast\r");
+}
+
+void test_unicode_context_normalization_preserves_original_context() {
+    Workspace workspace;
+    const std::string original = u8"title \u2014 \u201cquote\u201d\nold\n";
+    workspace.write("unicode.txt", original);
+    auto tool = makeMaiApplyPatchTool();
+    const auto result = tool->execute(patchArgs("*** Begin Patch\n*** Update File: unicode.txt\n"
+                                                "@@\n title - \"quote\"\n-old\n+new\n"
+                                                "*** End Patch\n"),
+                                      workspace.context());
+    CHECK(!result.hasError());
+    CHECK(workspace.read("unicode.txt") == u8"title \u2014 \u201cquote\u201d\nnew\n");
+}
+
+void test_update_header_looking_context_remains_context() {
+    Workspace workspace;
+    workspace.write("markers.txt", "*** Update File: untouched.txt\nold\n");
+    auto tool = makeMaiApplyPatchTool();
+    const auto result = tool->execute(patchArgs("*** Begin Patch\n*** Update File: markers.txt\n"
+                                                "@@\n *** Update File: untouched.txt\n-old\n+new\n"
+                                                "*** End Patch\n"),
+                                      workspace.context());
+    CHECK(!result.hasError());
+    CHECK(workspace.read("markers.txt") == "*** Update File: untouched.txt\nnew\n");
+    CHECK(!workspace.has("untouched.txt"));
+}
+
+void test_codex_rejects_malformed_hunks_before_writing() {
+    const std::string patches[] = {
+        "*** Begin Patch\n*** Add File: new.txt\n+x\n*** End Patch\ngarbage\n",
+        "*** Begin Patch\n*** Update File: original.txt\n*** End Patch\n",
+        "*** Begin Patch\n*** Update File: original.txt\n@@\n*** End Patch\n",
+        "*** Begin Patch\n*** Update File: original.txt\n@@\n@@\n-old\n+new\n*** End Patch\n",
+        "*** Begin Patch\n*** Update File: original.txt\n@@@\n-old\n+new\n*** End Patch\n",
+        "*** Begin Patch\n*** Add File: new.txt\n+x\n\n*** End Patch\n",
+        "*** Begin Patch\n*** Update File: original.txt\n@@\n-old\n+new\n*** Move to: "
+        "moved.txt\n*** End Patch\n",
+    };
+    for (const auto& patch : patches) {
+        Workspace workspace;
+        workspace.write("original.txt", "old\n");
+        auto tool = makeMaiApplyPatchTool();
+        const auto result = tool->execute(patchArgs(patch), workspace.context());
+        CHECK(result.hasError());
+        CHECK(workspace.read("original.txt") == "old\n");
+        CHECK(!workspace.has("new.txt"));
+        CHECK(!workspace.has("moved.txt"));
+    }
+}
+
+void test_sequential_add_then_update_uses_the_created_file() {
+    Workspace workspace;
+    auto tool = makeMaiApplyPatchTool();
+    const auto result = tool->execute(patchArgs("*** Begin Patch\n*** Add File: new.txt\n+old\n"
+                                                "*** Update File: new.txt\n@@\n-old\n+new\n"
+                                                "*** End Patch\n"),
+                                      workspace.context());
+    CHECK(!result.hasError());
+    CHECK(workspace.read("new.txt") == "new\n");
+}
+
+void test_missing_final_newline_is_added_on_update() {
+    Workspace workspace;
+    workspace.write("last.txt", "old");
+    auto tool = makeMaiApplyPatchTool();
+    const auto result = tool->execute(patchArgs("*** Begin Patch\n*** Update File: last.txt\n"
+                                                "@@\n-old\n+new\n*** End Patch\n"),
+                                      workspace.context());
+    CHECK(!result.hasError());
+    CHECK(workspace.read("last.txt") == "new\n");
+}
+
+void test_cr_only_files_are_logical_lines() {
+    Workspace workspace;
+    workspace.write("cr.txt", "keep\rold\rlast\r");
+    auto tool = makeMaiApplyPatchTool();
+    const auto result = tool->execute(patchArgs("*** Begin Patch\n*** Update File: cr.txt\n"
+                                                "@@\n-old\n+new\n*** End Patch\n"),
+                                      workspace.context());
+    CHECK(!result.hasError());
+    CHECK(workspace.read("cr.txt") == "keep\rnew\rlast\r");
+}
+
+MaiPatchOptions ordinaryOptions(const Workspace& workspace) {
+    MaiPatchOptions options;
+    options.root = workspace.root.u8string();
+    return options;
+}
+
+void test_ordinary_result_records_only_successful_changes_before_failure() {
+    Workspace workspace;
+    workspace.write("good.txt", "old\n");
+    workspace.write("bad.txt", "different\n");
+    const auto result = maiApplyPatch(
+        "*** Begin Patch\n*** Update File: good.txt\n@@\n-old\n+new\n"
+        "*** Update File: bad.txt\n@@\n-old\n+new\n*** End Patch\n",
+        ordinaryOptions(workspace));
+    CHECK(result.error.hasError());
+    CHECK(result.failurePath == "bad.txt");
+    CHECK(!result.failedWriteMayHaveChangedFile);
+    CHECK(result.appliedChanges.size() == 1);
+    if (!result.appliedChanges.empty()) {
+        CHECK(result.appliedChanges[0].path == "good.txt");
+        CHECK(result.appliedChanges[0].status == 'M');
+        CHECK(result.appliedChanges[0].bytesWritten == 4);
+        CHECK(fs::u8path(result.appliedChanges[0].resolvedPath) == workspace.root / "good.txt");
+    }
+    CHECK(workspace.read("good.txt") == "new\n");
+    CHECK(workspace.read("bad.txt") == "different\n");
+}
+
+void test_move_overwrites_destination_then_later_hunk_uses_it() {
+    Workspace workspace;
+    workspace.write("from.txt", "old\n");
+    workspace.write("to.txt", "overwritten\n");
+    const auto result = maiApplyPatch(
+        "*** Begin Patch\n*** Update File: from.txt\n"
+        "*** Move to: to.txt\n@@\n-old\n+middle\n"
+        "*** Update File: to.txt\n@@\n-middle\n+final\n*** End Patch\n",
+        ordinaryOptions(workspace));
+    CHECK(!result.error.hasError());
+    CHECK(result.failurePath.empty());
+    CHECK(result.appliedChanges.size() == 3);
+    CHECK(workspace.read("to.txt") == "final\n");
+    CHECK(!workspace.has("from.txt"));
+}
+
+void test_add_only_and_later_chunks_match_the_original_source() {
+    Workspace workspace;
+    workspace.write("source.txt", "a\nb\n");
+    const auto result = maiApplyPatch(
+        "*** Begin Patch\n*** Update File: source.txt\n@@\n+tail\n"
+        "@@\n-b\n+B\n*** End Patch\n",
+        ordinaryOptions(workspace));
+    CHECK(!result.error.hasError());
+    CHECK(workspace.read("source.txt") == "a\nB\ntail\n");
+}
+
+void test_trailing_empty_context_is_an_optional_newline_sentinel() {
+    Workspace workspace;
+    workspace.write("sentinel.txt", "old\n");
+    const auto result = maiApplyPatch(
+        "*** Begin Patch\n*** Update File: sentinel.txt\n"
+        "@@\n-old\n+new\n \n*** End of File\n*** End Patch\n",
+        ordinaryOptions(workspace));
+    CHECK(!result.error.hasError());
+    CHECK(workspace.read("sentinel.txt") == "new\n");
+}
+
+void test_utf8_bom_is_literal_source_text_like_codex() {
+    Workspace workspace;
+    const std::string bom = "\xef\xbb\xbf";
+    workspace.write("bom.txt", bom + "header\nold\n");
+    const auto result = maiApplyPatch("*** Begin Patch\n*** Update File: bom.txt\n@@\n " + bom +
+                                          "header\n-old\n+new\n*** End Patch\n",
+                                      ordinaryOptions(workspace));
+    CHECK(!result.error.hasError());
+    CHECK(workspace.read("bom.txt") == bom + "header\nnew\n");
+    const auto missingBom = maiApplyPatch(
+        "*** Begin Patch\n*** Update File: bom.txt\n"
+        "@@\n-header\n+changed\n*** End Patch\n",
+        ordinaryOptions(workspace));
+    CHECK(missingBom.error.hasError());
+    CHECK(workspace.read("bom.txt") == bom + "header\nnew\n");
+}
+
+void test_non_utf8_update_is_rejected_without_writing() {
+    Workspace workspace;
+    const std::string invalid = std::string("old\n") + char(0xff);
+    workspace.write("invalid.txt", invalid);
+    const auto result = maiApplyPatch(
+        "*** Begin Patch\n*** Update File: invalid.txt\n"
+        "@@\n-old\n+new\n*** End Patch\n",
+        ordinaryOptions(workspace));
+    CHECK(result.error.hasError());
+    CHECK(result.appliedChanges.empty());
+    CHECK(workspace.read("invalid.txt") == invalid);
+}
+
+void test_unicode_paths_work_for_add_move_and_delete() {
+    Workspace workspace;
+    const std::string first = u8"\u8865\u4e01/\u539f\u6587.txt";
+    const std::string second = u8"\u8865\u4e01/\u79fb\u52a8.txt";
+    const auto result =
+        maiApplyPatch("*** Begin Patch\n*** Add File: " + first +
+                          "\n+old\n"
+                          "*** Update File: " +
+                          first + "\n*** Move to: " + second + "\n@@\n-old\n+new\n*** End Patch\n",
+                      ordinaryOptions(workspace));
+    CHECK(!result.error.hasError());
+    CHECK(!workspace.has(first));
+    CHECK(workspace.read(second) == "new\n");
+    const auto removed =
+        maiApplyPatch("*** Begin Patch\n*** Delete File: " + second + "\n*** End Patch\n",
+                      ordinaryOptions(workspace));
+    CHECK(!removed.error.hasError());
+    CHECK(!workspace.has(second));
+}
+
+void test_write_failure_reports_known_changes_and_unknown_failed_write() {
+    Workspace workspace;
+    fs::create_directories(workspace.root / "occupied");
+    workspace.write("occupied/keep.txt", "retained\n");
+    const auto result = maiApplyPatch(
+        "*** Begin Patch\n*** Add File: good.txt\n+done\n"
+        "*** Add File: occupied\n+cannot-write-directory\n*** End Patch\n",
+        ordinaryOptions(workspace));
+    CHECK(result.error.hasError());
+    CHECK(result.appliedChanges.size() == 1);
+    CHECK(result.failurePath == "occupied");
+    CHECK(result.failedWriteMayHaveChangedFile);
+    CHECK(workspace.read("good.txt") == "done\n");
+    CHECK(workspace.read("occupied/keep.txt") == "retained\n");
+}
+
+void test_ordinary_and_model_entries_use_the_same_patch_behavior() {
+    Workspace ordinary;
+    Workspace model;
+    ordinary.write("source.txt", "old\r\n");
+    model.write("source.txt", "old\r\n");
+    const std::string patch =
+        "*** Begin Patch\n*** Update File: source.txt\n@@\n-old\n+new\n"
+        "*** Add File: added.txt\n+added\n*** End Patch\n";
+    const auto result = maiApplyPatch(patch, ordinaryOptions(ordinary));
+    auto tool = makeMaiApplyPatchTool();
+    const auto modelResult = tool->execute(patchArgs(patch), model.context());
+    CHECK(!result.error.hasError());
+    CHECK(!modelResult.hasError());
+    CHECK(ordinary.read("source.txt") == model.read("source.txt"));
+    CHECK(ordinary.read("added.txt") == model.read("added.txt"));
+}
+
+void test_heredoc_wrapper_is_accepted_like_codex_lenient_parser() {
+    const std::string wrappers[] = {"<<EOF", "<<'EOF'", "<<\"EOF\""};
+    for (const auto& wrapper : wrappers) {
+        Workspace workspace;
+        const auto result = maiApplyPatch(wrapper +
+                                              "\n*** Begin Patch\n*** Add File: new.txt\n"
+                                              "+new\n*** End Patch\nEOF\n",
+                                          ordinaryOptions(workspace));
+        CHECK(!result.error.hasError());
+        CHECK(workspace.read("new.txt") == "new\n");
+    }
+}
+
+#if defined(_WIN32)
+void test_failed_source_delete_retains_successful_move_destination() {
+    Workspace workspace;
+    workspace.write("from.txt", "old\n");
+    const auto path = workspace.root / "from.txt";
+    // 原生共享模式阻止删除而允许读写，真实覆盖“目标写成功，源删除失败”的阶段。
+    const HANDLE held =
+        ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(held != INVALID_HANDLE_VALUE);
+    if (held == INVALID_HANDLE_VALUE) return;
+    const auto result = maiApplyPatch(
+        "*** Begin Patch\n*** Update File: from.txt\n"
+        "*** Move to: to.txt\n@@\n-old\n+new\n*** End Patch\n",
+        ordinaryOptions(workspace));
+    ::CloseHandle(held);
+    CHECK(result.error.hasError());
+    CHECK(result.failurePath == "from.txt");
+    CHECK(!result.failedWriteMayHaveChangedFile);
+    CHECK(result.appliedChanges.size() == 1);
+    if (!result.appliedChanges.empty()) {
+        CHECK(result.appliedChanges[0].path == "to.txt");
+        CHECK(result.appliedChanges[0].bytesWritten == 4);
+    }
+    CHECK(workspace.read("to.txt") == "new\n");
+    CHECK(workspace.read("from.txt") == "old\n");
+}
+#endif
+
 }  // namespace
 
 #define RUN(f)                      \
@@ -340,11 +662,37 @@ void test_delete_and_move_require_approval_for_each_affected_file() {
     } while (0)
 
 int main() {
+    RUN(test_ordinary_result_records_only_successful_changes_before_failure);
+    RUN(test_move_overwrites_destination_then_later_hunk_uses_it);
+    RUN(test_add_only_and_later_chunks_match_the_original_source);
+    RUN(test_trailing_empty_context_is_an_optional_newline_sentinel);
+    RUN(test_utf8_bom_is_literal_source_text_like_codex);
+    RUN(test_non_utf8_update_is_rejected_without_writing);
+    RUN(test_unicode_paths_work_for_add_move_and_delete);
+    RUN(test_write_failure_reports_known_changes_and_unknown_failed_write);
+    RUN(test_ordinary_and_model_entries_use_the_same_patch_behavior);
+    RUN(test_heredoc_wrapper_is_accepted_like_codex_lenient_parser);
+#if defined(_WIN32)
+    RUN(test_failed_source_delete_retains_successful_move_destination);
+#endif
+
+    RUN(test_codex_name_is_available_to_the_bootstrap_catalog);
+    RUN(test_change_context_selects_the_named_function);
+    RUN(test_add_only_chunk_appends_and_terminates_the_last_line);
+    RUN(test_end_of_file_does_not_match_a_middle_occurrence);
+    RUN(test_context_bytes_and_mixed_line_endings_are_retained);
+    RUN(test_unicode_context_normalization_preserves_original_context);
+    RUN(test_update_header_looking_context_remains_context);
+    RUN(test_codex_rejects_malformed_hunks_before_writing);
+    RUN(test_sequential_add_then_update_uses_the_created_file);
+    RUN(test_missing_final_newline_is_added_on_update);
+    RUN(test_cr_only_files_are_logical_lines);
+
     RUN(test_updates_several_places_in_one_file);
     RUN(test_one_patch_can_touch_several_files);
-    RUN(test_nothing_is_written_when_any_part_fails);
+    RUN(test_earlier_hunks_remain_applied_when_a_later_hunk_fails);
     RUN(test_add_and_delete_files);
-    RUN(test_add_refuses_to_clobber_an_existing_file);
+    RUN(test_add_overwrites_an_existing_file_like_codex);
     RUN(test_move_writes_the_new_path_and_removes_the_old);
     RUN(test_crlf_files_keep_their_line_endings);
     RUN(test_context_is_matched_leniently_on_whitespace);

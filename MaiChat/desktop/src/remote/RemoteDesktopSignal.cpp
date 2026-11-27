@@ -2,6 +2,7 @@
 // 实现边界：与 RemoteDesktopSignal 的公开声明配套，调用方通过相应接口进入。
 #include "remote/RemoteDesktopSignal.h"
 
+#include <QCryptographicHash>
 #include <QJsonDocument>
 #include <QJsonObject>
 
@@ -17,17 +18,31 @@ const QString kMarker = QStringLiteral("[remote-desktop]");
 
 QString typeToString(Type type) {
     switch (type) {
-        case Type::Invite: return QStringLiteral("invite");
-        case Type::Accept: return QStringLiteral("accept");
-        case Type::Reject: return QStringLiteral("reject");
-        case Type::Stop:   return QStringLiteral("stop");
-        case Type::Notice: return QStringLiteral("notice");
-        case Type::Unknown: break;
+    case Type::Discover:
+        return QStringLiteral("discover");
+    case Type::Device:
+        return QStringLiteral("device");
+    case Type::Invite:
+        return QStringLiteral("invite");
+    case Type::Accept:
+        return QStringLiteral("accept");
+    case Type::Reject:
+        return QStringLiteral("reject");
+    case Type::Stop:
+        return QStringLiteral("stop");
+    case Type::Notice:
+        return QStringLiteral("notice");
+    case Type::Unknown:
+        break;
     }
     return QString();
 }
 
 Type typeFromString(const QString& value) {
+    if (value == QStringLiteral("discover"))
+        return Type::Discover;
+    if (value == QStringLiteral("device"))
+        return Type::Device;
     if (value == QStringLiteral("invite")) return Type::Invite;
     if (value == QStringLiteral("accept")) return Type::Accept;
     if (value == QStringLiteral("reject")) return Type::Reject;
@@ -111,6 +126,19 @@ const char kSecureDesktopEntered[] = "secure-desktop-entered";
 const char kSecureDesktopLeft[] = "secure-desktop-left";
 }  // namespace NoticeCodes
 
+QString mediaUserId(const QString &ownerUserId, const QString &deviceId) {
+    if (ownerUserId.isEmpty() || deviceId.isEmpty())
+        return {};
+    QByteArray input("maichat-remote-v2");
+    input.append(char(0));
+    input.append(ownerUserId.toUtf8());
+    input.append(char(0));
+    input.append(deviceId.toUtf8());
+    return QStringLiteral("rd_") +
+           QString::fromLatin1(
+               QCryptographicHash::hash(input, QCryptographicHash::Sha256).toHex().left(24));
+}
+
 QString signalPrefix() {
     return kInvisiblePrefix + kMarker;
 }
@@ -124,8 +152,18 @@ QString encodeSignal(const Signal& signal) {
     if (type.isEmpty()) return QString();
 
     QJsonObject object;
-    object.insert(QStringLiteral("v"), kProtocolVersion);
+    object.insert(QStringLiteral("v"), signal.protocolVersion);
     object.insert(QStringLiteral("type"), type);
+    if (!signal.sourceDeviceId.isEmpty())
+        object.insert(QStringLiteral("sourceDeviceId"), signal.sourceDeviceId);
+    if (!signal.targetDeviceId.isEmpty())
+        object.insert(QStringLiteral("targetDeviceId"), signal.targetDeviceId);
+    if (signal.type == Type::Device) {
+        object.insert(QStringLiteral("deviceName"), signal.deviceName.left(80));
+        object.insert(QStringLiteral("platform"), signal.platform.left(24));
+        object.insert(QStringLiteral("canShareScreen"), signal.canShareScreen);
+        object.insert(QStringLiteral("available"), signal.available);
+    }
     if (!signal.sessionId.isEmpty()) object.insert(QStringLiteral("sessionId"), signal.sessionId);
     if (!signal.roomId.isEmpty()) object.insert(QStringLiteral("roomId"), signal.roomId);
     if (!signal.authProof.isEmpty()) object.insert(QStringLiteral("authProof"), signal.authProof);
@@ -154,7 +192,9 @@ Signal decodeSignal(const QString& text) {
 
     const QJsonObject object = document.object();
     // 版本不认识就当普通消息处理：未来协议升级时老客户端不会误解语义。
-    if (object.value(QStringLiteral("v")).toInt(0) != kProtocolVersion) return signal;
+    const int version = object.value(QStringLiteral("v")).toInt(0);
+    if (version != 1 && version != kProtocolVersion)
+        return signal;
 
     const Type type = typeFromString(object.value(QStringLiteral("type")).toString());
     if (type == Type::Unknown) return signal;
@@ -166,7 +206,13 @@ Signal decodeSignal(const QString& text) {
 
     signal.type = type;
     signal.noticeCode = noticeCode;
-    signal.protocolVersion = kProtocolVersion;
+    signal.protocolVersion = version;
+    signal.sourceDeviceId = object.value(QStringLiteral("sourceDeviceId")).toString();
+    signal.targetDeviceId = object.value(QStringLiteral("targetDeviceId")).toString();
+    signal.deviceName = object.value(QStringLiteral("deviceName")).toString().left(80);
+    signal.platform = object.value(QStringLiteral("platform")).toString().left(24);
+    signal.canShareScreen = object.value(QStringLiteral("canShareScreen")).toBool();
+    signal.available = object.value(QStringLiteral("available")).toBool();
     signal.sessionId = object.value(QStringLiteral("sessionId")).toString();
     signal.roomId = object.value(QStringLiteral("roomId")).toString();
     signal.authProof = object.value(QStringLiteral("authProof")).toString();

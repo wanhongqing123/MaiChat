@@ -46,6 +46,10 @@ private:
     void showSessionModelFailure(const QString& ownerKey, const QString& message);
     void invalidateReplacedModelOwner(const QJsonObject& owner);
     void updateSessionModelControls();
+    // Display only the exact owner's typed measurement; absence stays unknown.
+    void updateContextUsage(const QJsonObject& payload = {});
+    void observeOwnerBusy(bool busy);
+    void requestContextRefresh();
     void positionActionPanel();
     void requestHistory(const QString& before, int limit);
     void sendOrStop();

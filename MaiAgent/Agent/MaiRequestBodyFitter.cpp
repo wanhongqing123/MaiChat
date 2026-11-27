@@ -134,7 +134,6 @@ struct FitPlan {
     bool dropContinuations = false;
     std::size_t textCap = std::numeric_limits<std::size_t>::max();
     std::size_t lateImages = 0;  // 从 late 列表头部省略的数量
-    std::size_t currentCap = std::numeric_limits<std::size_t>::max();
 };
 
 class Fitter {
@@ -177,11 +176,9 @@ public:
             const auto& message = messages[index];
             if (index != mLatestAssistant && message.continuation) mHasOldContinuation = true;
             if (message.role == MaiModelRole::System) continue;
-            if (index == mCurrentUser) {
-                mCurrentTextBytes = message.content.size();
-                continue;
-            }
-            mMaxBlob = std::max(mMaxBlob, message.content.size());
+            if (index == mCurrentUser) continue;
+            if (message.role == MaiModelRole::ToolResult)
+                mMaxBlob = std::max(mMaxBlob, message.content.size());
             if (index != mLatestAssistant) mMaxBlob = std::max(mMaxBlob, message.reasoning.size());
             for (const auto& call : message.invocations)
                 mMaxBlob = std::max(mMaxBlob, call.arguments.size());
@@ -219,12 +216,16 @@ public:
                 ++dropped;
             }
             if (message.role == MaiModelRole::System) continue;
-            const std::size_t cap = index == mCurrentUser ? plan.currentCap : plan.textCap;
+            const std::size_t cap = plan.textCap;
             if (cap == std::numeric_limits<std::size_t>::max()) continue;
             const bool toolOutput = message.role == MaiModelRole::ToolResult;
-            const auto before = message.content.size();
-            message.content = truncateMiddle(message.content, cap, locatorFor(message), toolOutput);
-            if (message.content.size() != before) ++truncated;
+            // 正文属于对话本身，即使请求体超限也不能拿“原文在库”替代逐字保留。
+            // 只截工具回执，不能凭用户 JSON 的 type 字段把普通正文当工具观察裁掉。
+            if (toolOutput) {
+                const auto before = message.content.size();
+                message.content = truncateMiddle(message.content, cap, locatorFor(message), true);
+                if (message.content.size() != before) ++truncated;
+            }
             if (index != mCurrentUser) {
                 if (index != mLatestAssistant && message.reasoning.size() > cap) {
                     message.reasoning = truncateMiddle(message.reasoning, cap, {}, false);
@@ -260,7 +261,6 @@ public:
     std::vector<ImageRef> mEarly;
     std::vector<ImageRef> mLate;
     std::size_t mMaxBlob = 0;
-    std::size_t mCurrentTextBytes = 0;
     bool mHasOldContinuation = false;
     bool mMeasured = true;
 };
@@ -352,7 +352,6 @@ MaiResult<MaiRequestBodyFitResult> maiFitRequestBody(MaiModelClient& model,
     if (!done && !canceled()) done = searchCap(&FitPlan::textCap, fitter.mMaxBlob);
     if (!done && !canceled() && !fitter.mLate.empty())
         done = searchCount(&FitPlan::lateImages, fitter.mLate.size());
-    if (!done && !canceled()) done = searchCap(&FitPlan::currentCap, fitter.mCurrentTextBytes);
     if (canceled()) return MaiError{MaiErrorCode::Canceled, "Request-body fitting was canceled."};
 
     result.request = fitter.build(plan, &result);

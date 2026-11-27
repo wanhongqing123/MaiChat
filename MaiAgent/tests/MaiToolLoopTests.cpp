@@ -113,7 +113,7 @@ public:
         return R"({"type":"object","properties":{},"additionalProperties":false})";
     }
     MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
-        if (context.model != "glm-5.3") {
+        if (context.model != "glm-5.4") {
             return MaiToolResult::failure(MaiErrorCode::Internal,
                                           "tool did not receive the active model name");
         }
@@ -229,7 +229,7 @@ AgentUnderTest makeAgent(std::vector<MaiFakeModelClient::Turn> script,
         tools = std::make_unique<MaiToolRegistry>();
         registerMaiBuiltinTools(*tools);
     }
-    if (options.defaultModel.empty()) options.defaultModel = "glm-5.3";
+    if (options.defaultModel.empty()) options.defaultModel = "glm-5.4";
     return {std::make_unique<MaiAgent>(makeMaiMemoryStore(), std::move(model), std::move(tools),
                                        options),
             observer};
@@ -243,7 +243,7 @@ AgentUnderTest makeAgentWithImageTool(std::vector<MaiFakeModelClient::Turn> scri
     tools->add(std::make_unique<ImageResultTool>(imagePath));
     tools->add(std::make_unique<TextResultTool>());
     MaiAgent::Options options;
-    options.defaultModel = "glm-5.3";
+    options.defaultModel = "glm-5.4";
     return {std::make_unique<MaiAgent>(makeMaiMemoryStore(), std::move(model), std::move(tools),
                                        options),
             observer};
@@ -1074,7 +1074,7 @@ void test_model_exception_becomes_a_session_error() {
         }
 
         MaiWireApi wireApi() const override {
-            return MaiWireApi::ChatCompletions;
+            return MaiWireApi::Responses;
         }
     };
 
@@ -1330,7 +1330,7 @@ public:
         return respond(request, sink, static_cast<int>(requests.size()));
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 };
 
@@ -1534,7 +1534,7 @@ void test_failed_or_canceled_partial_text_does_not_produce_a_commit_receipt() {
             return MaiError::make(mCode, "owned incomplete response");
         }
         MaiWireApi wireApi() const override {
-            return MaiWireApi::ChatCompletions;
+            return MaiWireApi::Responses;
         }
 
     private:
@@ -1893,7 +1893,7 @@ void test_steer_during_final_text_is_consumed_before_turn_completion() {
             return cancel.load() ? MaiError::make(MaiErrorCode::Canceled, "canceled") : MaiError{};
         }
         MaiWireApi wireApi() const override {
-            return MaiWireApi::ChatCompletions;
+            return MaiWireApi::Responses;
         }
         std::mutex mutex;
         std::condition_variable wake;
@@ -2398,7 +2398,7 @@ void test_large_tool_results_keep_published_prefix(bool sqlite, bool knownWindow
         Observation& observation;
         bool known;
         MaiWireApi wireApi() const override {
-            return MaiWireApi::ChatCompletions;
+            return MaiWireApi::Responses;
         }
         MaiModelContextLimits contextLimits(const std::string&) const override {
             return known ? MaiModelContextLimits{1048576, 8192} : MaiModelContextLimits{};

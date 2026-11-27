@@ -3210,7 +3210,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         }
     }
 
-    func requestRemoteDesktopView(of contact: RemoteIMContact) async {
+    func requestRemoteDesktopView(of contact: RemoteIMContact, targetDeviceID: String, ownDevices: Bool = false) async {
         guard connectionState == .connected else {
             logIM(
                 level: .warning,
@@ -3234,17 +3234,18 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         let localUserID = masterUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             let identity = remoteDiagnosticsIdentity
-            guard let credential = try await accountAuth.credentialIfAvailable(
-                expectedUserID: localUserID
-            ) else { throw MaiChatAuthError.sessionExpired }
+            let credential = try await accountAuth.remoteDesktopCredential(
+                deviceID: remoteDesktop.localDeviceID, expectedUserID: localUserID)
             guard credential.sdkAppId == sdkAppID else {
                 throw MaiChatAuthError.invalidServerResponse
             }
             guard remoteDiagnosticsIdentity == identity else { return }
             await remoteDesktop.requestView(
-                peerUserID: contact.userID,
+                peerUserID: ownDevices ? localUserID : contact.userID,
+                targetDeviceID: targetDeviceID,
                 sdkAppID: sdkAppID,
                 localUserID: localUserID,
+                mediaUserID: credential.userId,
                 userSig: credential.userSig
             )
             errorMessage = nil

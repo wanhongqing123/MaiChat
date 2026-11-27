@@ -1,6 +1,7 @@
 // 文件作用：通过真实移动 C ABI 验证运行中补充输入的模型读取与工具批次边界。
 // 所有账号资料、模型与工具均为本进程合成数据；网络只使用环回假模型端点。
 #include "MaiMobileAgent.h"
+#include "MaiResponsesFixture.h"
 
 #include <atomic>
 #include <chrono>
@@ -86,11 +87,6 @@ void releaseHost(void* context) {
     static_cast<HeldHost*>(context)->destroyed = true;
 }
 
-std::string frame(const Json& delta, const char* finish) {
-    return "data: " +
-           Json{{"choices", Json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", finish}}})}}.dump() +
-           "\n\ndata: [DONE]\n\n";
-}
 }  // namespace
 
 int main() {
@@ -103,7 +99,7 @@ int main() {
     std::atomic<bool> windowTailSent{false};
     std::atomic<bool> windowReleased{false};
     std::atomic<bool> windowQuestionReplanned{false};
-    server.Post("/chat/completions", [&](const httplib::Request& request, httplib::Response& response) {
+    server.Post("/responses", [&](const httplib::Request& request, httplib::Response& response) {
         const Json body = Json::parse(request.body);
         std::size_t index;
         {
@@ -112,25 +108,24 @@ int main() {
             requests.push_back(body);
         }
         std::string lastUser;
-        for (const auto& message : body.at("messages"))
-            if (message.value("role", "") == "user" && message.value("content", Json{}).is_string())
-                lastUser = message.at("content");
+        for (const auto& message : body.at("input"))
+            if (message.value("role", "") == "user")
+                lastUser = MaiResponsesFixture::inputText(message);
         if (lastUser == "Native old-window stream") {
             response.set_chunked_content_provider("text/event-stream", [&](std::size_t, httplib::DataSink& sink) {
-                const auto writeDelta = [&](const Json& delta, const Json& finish) {
-                    const auto bytes =
-                        "data: " +
-                        Json{{"choices", Json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", finish}}})}}
-                            .dump() +
-                        "\n\n";
+                const auto writeText = [&](const std::string& text) {
+                    const auto bytes = MaiResponsesFixture::event({{"type", "response.output_text.delta"},
+                        {"output_index", 0}, {"content_index", 0}, {"delta", text}});
                     return sink.write(bytes.data(), bytes.size());
                 };
-                if (!writeDelta({{"content", std::string(1100, 'P')}}, nullptr)) return false;
+                std::string streamed = std::string(1100, 'P');
+                if (!writeText(streamed)) return false;
                 windowEntered = true;
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
                 while (!windowReleased && sink.is_writable() && std::chrono::steady_clock::now() < deadline) {
                     if (windowEmitTail.exchange(false)) {
-                        if (!writeDelta({{"content", " Native live tail outside latest twenty"}}, nullptr))
+                        streamed += " Native live tail outside latest twenty";
+                        if (!writeText(" Native live tail outside latest twenty"))
                             return false;
                         windowTailSent = true;
                     }
@@ -138,40 +133,35 @@ int main() {
                 }
                 if (!windowReleased) return false;
                 const Json tool{
-                    {"index", 0},
-                    {"id", "native-outside-page-question"},
-                    {"type", "function"},
-                    {"function",
-                     {{"name", "question"}, {"arguments", R"({"question":"Keep the native old result?"})"}}}};
-                if (!writeDelta({{"tool_calls", Json::array({tool})}}, "tool_calls")) return false;
-                sink.write("data: [DONE]\n\n", 14);
+                    {"call_id", "native-outside-page-question"},
+                    {"type", "function_call"},
+                    {"name", "question"}, {"arguments", R"({"question":"Keep the native old result?"})"}};
+                const auto terminal = MaiResponsesFixture::completed(Json::array({
+                    MaiResponsesFixture::message(streamed), tool}));
+                if (!sink.write(terminal.data(), terminal.size())) return false;
                 sink.done();
                 return true;
             });
         } else if (lastUser == "Native accepted supplement 20" && !windowQuestionReplanned.exchange(true)) {
             // 新输入已被真实下一次模型请求读取，重新提出的问题不再属于被取消的旧计划。
             const Json tool{
-                {"index", 0},
-                {"id", "native-replanned-question"},
-                {"type", "function"},
-                {"function",
-                 {{"name", "question"}, {"arguments", R"({"question":"Keep the reviewed native result?"})"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({tool})}}, "tool_calls"), "text/event-stream");
+                {"call_id", "native-replanned-question"},
+                {"type", "function_call"},
+                {"name", "question"}, {"arguments", R"({"question":"Keep the reviewed native result?"})"}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({tool})), "text/event-stream");
         } else if (index == 0) {
-            const Json tool{{"index", 0},
-                            {"id", "synthetic-profile"},
-                            {"type", "function"},
-                            {"function", {{"name", "maichat_get_current_account"}, {"arguments", "{}"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({tool})}}, "tool_calls"), "text/event-stream");
+            const Json tool{{"call_id", "synthetic-profile"},
+                            {"type", "function_call"},
+                            {"name", "maichat_get_current_account"}, {"arguments", "{}"}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({tool})), "text/event-stream");
         } else if (index == 2 || index == 4 || index == 6) {
             const Json tool{
-                {"index", 0},
-                {"id", "synthetic-question"},
-                {"type", "function"},
-                {"function", {{"name", "question"}, {"arguments", R"({"question":"Which result should be kept?"})"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({tool})}}, "tool_calls"), "text/event-stream");
+                {"call_id", "synthetic-question"},
+                {"type", "function_call"},
+                {"name", "question"}, {"arguments", R"({"question":"Which result should be kept?"})"}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({tool})), "text/event-stream");
         } else {
-            response.set_content(frame({{"content", "Current result ready."}}, "stop"), "text/event-stream");
+            response.set_content(MaiResponsesFixture::text("Current result ready."), "text/event-stream");
         }
     });
     const int port = server.bind_to_any_port("127.0.0.1");
@@ -349,11 +339,11 @@ int main() {
         {
             std::lock_guard<std::mutex> lock(requestsMutex);
             check(requests.size() == 2, "accepted steering did not reach exactly one follow-up model request");
-            const auto& messages = requests.back().at("messages");
+            const auto& messages = requests.back().at("input");
             check(messages.size() >= 5, "follow-up model history was incomplete");
             const std::size_t last = messages.size() - 1;
             check(
-                messages[last].at("role") == "user" && messages[last].at("content") == "Show the current result first",
+                messages[last].at("role") == "user" && MaiResponsesFixture::inputText(messages[last]) == "Show the current result first",
                 "model did not read the accepted user input");
             std::size_t invocationIndex = messages.size(), resultIndex = messages.size();
             std::vector<std::string> observedInputs;
@@ -366,18 +356,18 @@ int main() {
                 const Json& message = messages[index];
                 const std::string role = message.value("role", "");
                 std::printf(" %zu:%s", index, role.c_str());
-                if (role == "assistant" && message.contains("tool_calls"))
-                    for (const auto& tool : message.at("tool_calls"))
-                        if (tool.value("id", "") == "synthetic-profile") {
-                            check(invocationIndex == messages.size(), "tool invocation was duplicated");
-                            invocationIndex = index;
-                        }
-                if (role == "tool" && message.value("tool_call_id", "") == "synthetic-profile") {
+                if (message.value("type", "") == "function_call" &&
+                    message.value("call_id", "") == "synthetic-profile") {
+                    check(invocationIndex == messages.size(), "tool invocation was duplicated");
+                    invocationIndex = index;
+                }
+                if (message.value("type", "") == "function_call_output" &&
+                    message.value("call_id", "") == "synthetic-profile") {
                     check(resultIndex == messages.size(), "tool result was duplicated");
                     resultIndex = index;
                 }
-                if (role == "user" && message.value("content", Json{}).is_string()) {
-                    const std::string text = message.at("content");
+                if (role == "user") {
+                    const std::string text = MaiResponsesFixture::inputText(message);
                     if (text.rfind("Synthetic queued supplement ", 0) == 0 || text == "Show the current result first") {
                         check(resultIndex < index, "user input appeared before the complete tool call/result pair");
                         observedInputs.push_back(text);

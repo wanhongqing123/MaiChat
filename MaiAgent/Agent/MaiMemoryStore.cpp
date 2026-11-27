@@ -17,6 +17,29 @@ namespace {
 
 class MemoryStore final : public MaiSessionStore {
 public:
+    MaiResult<std::string> getSessionContext(const std::string& sessionId,
+                                             const std::string& name) const override {
+        if (const auto error = maiValidateSessionContextKey(sessionId, name)) return error;
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mSessions.count(sessionId) == 0)
+            return {MaiErrorCode::NotFound, "Session context owner is unavailable."};
+        const auto found = mSessionContexts.find({sessionId, name});
+        if (found == mSessionContexts.end())
+            return {MaiErrorCode::NotFound, "Fixed session context is unavailable."};
+        return found->second;
+    }
+
+    MaiResult<std::string> saveSessionContext(const std::string& sessionId, const std::string& name,
+                                              const std::string& content) override {
+        if (const auto error = maiValidateSessionContextKey(sessionId, name)) return error;
+        if (const auto error = maiValidateSessionContextContent(content)) return error;
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mSessions.count(sessionId) == 0)
+            return {MaiErrorCode::NotFound, "Session context owner is unavailable."};
+        // 第一次已发送的字节获胜，后来的目录候选不能改写缓存前缀。
+        return mSessionContexts.emplace(std::make_pair(sessionId, name), content).first->second;
+    }
+
     MaiResult<std::string> getToolModelOutput(const MaiToolModelOutputKey& key) const override {
         std::lock_guard<std::mutex> lock(mMutex);
         if (!ownsToolModelOutputLocked(key))
@@ -289,6 +312,7 @@ public:
         clearImportsLocked(id);
         mContextCheckpoints.erase(id);
         clearToolOutputsLocked(id);
+        clearSessionContextsLocked(id);
         for (auto it = mSpecialistTasks.begin(); it != mSpecialistTasks.end();) {
             if (it->second.ownerSessionId == id) {
                 it = mSpecialistTasks.erase(it);
@@ -305,6 +329,7 @@ public:
         clearImportsLocked(sessionId);
         mContextCheckpoints.erase(sessionId);
         clearToolOutputsLocked(sessionId);
+        clearSessionContextsLocked(sessionId);
         for (auto it = mSpecialistTasks.begin(); it != mSpecialistTasks.end();) {
             if (it->second.ownerSessionId == sessionId) {
                 it = mSpecialistTasks.erase(it);
@@ -745,6 +770,15 @@ public:
     }
 
 private:
+    void clearSessionContextsLocked(const std::string& sessionId) {
+        for (auto entry = mSessionContexts.begin(); entry != mSessionContexts.end();) {
+            if (entry->first.first == sessionId)
+                entry = mSessionContexts.erase(entry);
+            else
+                ++entry;
+        }
+    }
+
     struct ImportSnapshot {
         MaiContextImportSpec spec;
         MaiContextImportProgress progress;
@@ -860,6 +894,7 @@ private:
     }
 
     std::map<ModelOutputKey, std::string> mToolModelOutputs;
+    std::map<std::pair<std::string, std::string>, std::string> mSessionContexts;
     std::unordered_map<std::string, MaiSession> mSessions;
     std::unordered_map<std::string, std::vector<MaiMessage>> mMessages;
     std::unordered_map<std::string, MaiContextCheckpoint> mContextCheckpoints;

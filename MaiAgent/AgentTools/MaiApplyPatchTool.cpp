@@ -1,583 +1,669 @@
-// 文件作用：解析并应用受权限控制的补丁修改。
-// 直接依赖：MaiFilePath.h、MaiFileSystem.h；本文件在这些接口之间完成调用与结果转换。
-#include <json.hpp>
+// 文件作用：实现 Codex 补丁语法、文本替换及逐文件落盘，共用普通和模型入口。
+#include "MaiApplyPatchTool.h"
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "MaiFilePath.h"
-#include "MaiFileSystem.h"
-#include "MaiApplyPatchTool.h"
+#include <json.hpp>
 
-// file_patch：一次提交多处改动。
-//
-// ── 和 file_edit 的分工 ─────────────────────────────────────────
-//
-// file_edit 一次换一处。改五个地方就要调五次，每次都要用户点一次头，而且中间任何一次
-// 失败都会留下**改了一半**的文件——模型和用户都说不清当前是什么状态。
-//
-// file_patch 把整批改动当一个事务：**全部能应用才落盘，任何一处对不上就整批不动**。
-// 跨文件的改动（改接口同时改所有调用方）只有这个能做对。
-//
-// ── 格式 ────────────────────────────────────────────────────────
-//
-// 照抄 codex 的 apply-patch，不自己发明：
-//
-//   *** Begin Patch
-//   *** Update File: src/a.cpp
-//   @@
-//    context line
-//   -removed
-//   +added
-//   @@
-//    more context
-//   -old
-//   +new
-//   *** Add File: src/b.cpp
-//   +first line
-//   +second line
-//   *** Delete File: src/c.cpp
-//   *** Update File: src/d.cpp
-//   *** Move to: src/e.cpp
-//   @@
-//   -x
-//   +y
-//   *** End Patch
-//
-// 行首那个字符是有意义的：空格 = 保持不变的上下文，`-` = 删掉，`+` = 加上。
-// 上下文行**必须带那个前导空格**，不带的话没法和 `@@` 之类的标记区分开。
+#include "MaiFilePath.h"
+#include "MaiCloudModelCatalog.h"
+#include "MaiFileSystem.h"
+#include "MaiPathGuard.h"
 
 namespace {
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxFileBytes = 8 * 1024 * 1024;
+// OpenAI Codex rust-v0.172.0 apply_patch.lark（Apache-2.0）。原生文本输入与解析器
+// 使用同一补丁语法；兼容供应商仍走下方 patch 字符串参数，不增加另一套执行核心。
+constexpr const char* kApplyPatchGrammar = R"lark(start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
 
-json parseArguments(const std::string& raw) {
-    json parsed = json::parse(raw, nullptr, false);
-    return parsed.is_object() ? parsed : json::object();
-}
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
 
-// 一段连续的改动。
-struct Chunk {
-    // 要在文件里找到的那一段：上下文行 + 被删掉的行，按原顺序。
-    std::vector<std::string> pattern;
-    // 换成什么：上下文行 + 新加的行。
-    std::vector<std::string> replacement;
-    // 这一段标了 *** End of File，应该贴着文件末尾找。
-    bool anchoredAtEnd = false;
+filename: /(.+)/
+add_line: "+" /(.*)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+
+%import common.LF
+)lark";
+
+// 对齐 codex 3d86e43b 的 parser/streaming_parser、file_update、text_file 和 seek_sequence。
+// 这里保留宿主授权边界；不引入远端环境路由，也不声称多文件写入具备事务性。
+struct MaiPatchChunk {
+    std::optional<std::string> changeContext;
+    std::vector<std::string> oldLines;
+    std::vector<std::string> newLines;
+    std::vector<std::pair<std::size_t, std::size_t>> contextIndices;
+    bool atEnd = false;
 };
 
-struct Operation {
+struct MaiPatchOperation {
     enum class Kind { Add, Delete, Update };
     Kind kind = Kind::Update;
-    std::string path;      // 模型给的相对路径，报错时要原样回显
-    std::string movePath;  // Update 带 *** Move to 时的新路径
-    std::string addContent;
-    std::vector<Chunk> chunks;
+    std::string path;
+    std::optional<std::string> movePath;
+    std::string contents;
+    std::vector<MaiPatchChunk> chunks;
+};
+
+struct MaiParsedPatch {
+    MaiError error;
+    std::vector<MaiPatchOperation> operations;
+    std::optional<std::string> environmentId;
 };
 
 bool startsWith(const std::string& text, const char* prefix) {
-    const std::size_t length = std::char_traits<char>::length(prefix);
-    return text.size() >= length && text.compare(0, length, prefix) == 0;
+    return text.compare(0, std::char_traits<char>::length(prefix), prefix) == 0;
 }
 
-std::string afterPrefix(const std::string& text, const char* prefix) {
-    std::string rest = text.substr(std::char_traits<char>::length(prefix));
-    const std::size_t begin = rest.find_first_not_of(" \t");
-    if (begin == std::string::npos) return std::string();
-    const std::size_t end = rest.find_last_not_of(" \t\r");
-    return rest.substr(begin, end - begin + 1);
+// 逐码点读取并校验 UTF-8，避免以当前 C locale 判断 Unicode 空白或接受无效文本。
+// 同时用于匹配 Codex 的 Rust str::trim 和 read_to_string 的 UTF-8 约束。
+bool nextCodePoint(const std::string& text, std::size_t& at, std::uint32_t& value) {
+    if (at >= text.size()) return false;
+    const auto first = static_cast<unsigned char>(text[at++]);
+    if (first < 0x80) {
+        value = first;
+        return true;
+    }
+    const unsigned count = first >= 0xc2 && first <= 0xdf   ? 1
+                           : first >= 0xe0 && first <= 0xef ? 2
+                           : first >= 0xf0 && first <= 0xf4 ? 3
+                                                            : 0;
+    if (count == 0 || at + count > text.size()) return false;
+    value = first & ((1u << (6 - count)) - 1);
+    for (unsigned index = 0; index < count; ++index) {
+        const auto byte = static_cast<unsigned char>(text[at++]);
+        if ((byte & 0xc0) != 0x80) return false;
+        value = (value << 6) | (byte & 0x3f);
+    }
+    const std::uint32_t minimum = count == 1 ? 0x80 : count == 2 ? 0x800 : 0x10000;
+    return value >= minimum && value <= 0x10ffff && !(value >= 0xd800 && value <= 0xdfff);
 }
 
-// 按 \n 切行，把每行末尾的 \r 摘掉，同时记下这个文件本来用的是哪种换行。
-//
-// **换行必须原样还回去。** 把一个 CRLF 的文件写成 LF，git 会把整个文件报成改动过，
-// 真正的那几行改动就淹没了——这是 Windows 上最容易踩的一脚。
-std::vector<std::string> splitLines(const std::string& text, std::string& ending,
-                                    bool& endsWithNewline) {
-    ending = text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
-    endsWithNewline = !text.empty() && text.back() == '\n';
-    std::vector<std::string> lines;
-    std::size_t cursor = 0;
-    while (cursor <= text.size()) {
-        const std::size_t newlineAt = text.find('\n', cursor);
-        if (newlineAt == std::string::npos) {
-            if (cursor < text.size()) lines.push_back(text.substr(cursor));
-            break;
+bool isUtf8(const std::string& text) {
+    std::size_t at = 0;
+    std::uint32_t value = 0;
+    while (at < text.size()) {
+        if (!nextCodePoint(text, at, value)) return false;
+    }
+    return true;
+}
+
+bool isWhitespace(std::uint32_t value) {
+    return (value >= 9 && value <= 13) || value == 0x20 || value == 0x85 || value == 0xa0 ||
+           value == 0x1680 || (value >= 0x2000 && value <= 0x200a) || value == 0x2028 ||
+           value == 0x2029 || value == 0x202f || value == 0x205f || value == 0x3000;
+}
+
+std::string trimWhitespace(const std::string& text, bool trimStart = true) {
+    std::size_t begin = text.size();
+    std::size_t end = 0;
+    std::size_t at = 0;
+    while (at < text.size()) {
+        const std::size_t previous = at;
+        std::uint32_t value = 0;
+        if (!nextCodePoint(text, at, value)) return text;
+        if (!isWhitespace(value)) {
+            if (begin == text.size()) begin = previous;
+            end = at;
         }
-        std::string line = text.substr(cursor, newlineAt - cursor);
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        lines.push_back(line);
-        cursor = newlineAt + 1;
+    }
+    if (end == 0) return {};
+    return text.substr(trimStart ? begin : 0, end - (trimStart ? begin : 0));
+}
+
+std::string normalizeContext(const std::string& text) {
+    const std::string trimmed = trimWhitespace(text);
+    std::string normalized;
+    std::size_t at = 0;
+    while (at < trimmed.size()) {
+        const std::size_t previous = at;
+        std::uint32_t value = 0;
+        if (!nextCodePoint(trimmed, at, value)) return trimmed;
+        if ((value >= 0x2010 && value <= 0x2015) || value == 0x2212)
+            normalized += '-';
+        else if (value >= 0x2018 && value <= 0x201b)
+            normalized += '\'';
+        else if (value >= 0x201c && value <= 0x201f)
+            normalized += '"';
+        else if (value == 0xa0 || (value >= 0x2002 && value <= 0x200a) || value == 0x202f ||
+                 value == 0x205f || value == 0x3000)
+            normalized += ' ';
+        else
+            normalized.append(trimmed, previous, at - previous);
+    }
+    return normalized;
+}
+
+// 补丁按 Rust str::lines 处理 LF/CRLF；裸 CR 只在源文件中作为换行。
+std::vector<std::string> patchLines(const std::string& patch) {
+    std::vector<std::string> lines;
+    std::size_t at = 0;
+    while (at < patch.size()) {
+        const std::size_t end = patch.find('\n', at);
+        std::string line = patch.substr(at, end == std::string::npos ? end : end - at);
+        if (end != std::string::npos && !line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(std::move(line));
+        if (end == std::string::npos) break;
+        at = end + 1;
     }
     return lines;
 }
 
-std::string joinLines(const std::vector<std::string>& lines, const std::string& ending,
-                      bool endsWithNewline) {
-    std::string text;
-    for (std::size_t i = 0; i < lines.size(); ++i) {
-        text += lines[i];
-        if (i + 1 < lines.size() || endsWithNewline) text += ending;
+MaiError invalidPatch(std::string message) {
+    return {MaiErrorCode::InvalidInput, "invalid patch: " + std::move(message)};
+}
+
+MaiParsedPatch parsePatch(const std::string& patch) {
+    MaiParsedPatch parsed;
+    if (!isUtf8(patch)) {
+        parsed.error = invalidPatch("patch text is not valid UTF-8");
+        return parsed;
     }
-    return text;
-}
+    auto lines = patchLines(trimWhitespace(patch));
+    // Codex 兼容 local_shell 曾把 heredoc 作为单个实参发送的三种 EOF 包装。
+    if (lines.size() >= 4 &&
+        (lines.front() == "<<EOF" || lines.front() == "<<'EOF'" || lines.front() == "<<\"EOF\"") &&
+        lines.back().size() >= 3 && lines.back().compare(lines.back().size() - 3, 3, "EOF") == 0) {
+        lines.erase(lines.begin());
+        lines.pop_back();
+    }
+    if (lines.empty() || trimWhitespace(lines.front()) != "*** Begin Patch") {
+        parsed.error = invalidPatch("The first line of the patch must be '*** Begin Patch'");
+        return parsed;
+    }
+    if (trimWhitespace(lines.back()) != "*** End Patch") {
+        parsed.error = invalidPatch("The last line of the patch must be '*** End Patch'");
+        return parsed;
+    }
 
-std::string trimEnd(const std::string& text) {
-    const std::size_t end = text.find_last_not_of(" \t");
-    return end == std::string::npos ? std::string() : text.substr(0, end + 1);
-}
-
-std::string trimBoth(const std::string& text) {
-    const std::size_t begin = text.find_first_not_of(" \t");
-    if (begin == std::string::npos) return std::string();
-    const std::size_t end = text.find_last_not_of(" \t");
-    return text.substr(begin, end - begin + 1);
-}
-
-// 在 lines 里从 start 开始找 pattern，返回起始下标，找不到返回 npos。
-//
-// 严格程度**逐级放松**：先精确比，再忽略行尾空白，最后两头空白都忽略。
-// 模型抄上下文时最常见的偏差就是缩进和行尾空格，一次都不让步的话
-// 大部分补丁都会失败，而失败的理由（"少了一个空格"）它自己看不出来。
-// 这三级和 codex 的 seek_sequence 一致。
-std::size_t findSequence(const std::vector<std::string>& lines,
-                         const std::vector<std::string>& pattern, std::size_t start,
-                         bool anchoredAtEnd) {
-    if (pattern.empty()) return start;
-    if (pattern.size() > lines.size()) return std::string::npos;
-
-    const std::size_t limit = lines.size() - pattern.size();
-    // 标了 End of File 的先贴着末尾试一次：模型想往文件尾巴上加东西时，
-    // 它给的那点上下文常常在文件中间也能匹配上。
-    if (anchoredAtEnd && limit >= start) {
-        bool same = true;
-        for (std::size_t i = 0; i < pattern.size(); ++i) {
-            if (lines[limit + i] != pattern[i]) {
-                same = false;
-                break;
+    const auto fail = [&](std::size_t index, const std::string& message) {
+        parsed.error = {MaiErrorCode::InvalidInput,
+                        "invalid hunk at line " + std::to_string(index + 1) + ", " + message};
+    };
+    const auto emptyUpdate = [&]() {
+        if (parsed.operations.empty()) return false;
+        const auto& operation = parsed.operations.back();
+        return operation.kind == MaiPatchOperation::Kind::Update &&
+               (operation.chunks.empty() || (operation.chunks.back().oldLines.empty() &&
+                                             operation.chunks.back().newLines.empty()));
+    };
+    bool ended = false;
+    for (std::size_t index = 1; index < lines.size(); ++index) {
+        const auto& line = lines[index];
+        const bool updating = !parsed.operations.empty() &&
+                              parsed.operations.back().kind == MaiPatchOperation::Kind::Update;
+        // Update 中行首空格是上下文标记，不能 trim 后误认成另一个文件头。
+        const std::string marker = trimWhitespace(line, !updating || index + 1 == lines.size());
+        if (ended) {
+            if (!trimWhitespace(line).empty()) {
+                parsed.error = invalidPatch("The last line of the patch must be '*** End Patch'");
+                return parsed;
+            }
+            continue;
+        }
+        if (marker == "*** End Patch") {
+            if (emptyUpdate()) {
+                fail(index, "Update file hunk does not contain any lines");
+                return parsed;
+            }
+            ended = true;
+            continue;
+        }
+        std::optional<MaiPatchOperation::Kind> kind;
+        const char* prefix = nullptr;
+        if (startsWith(marker, "*** Add File: ")) {
+            kind = MaiPatchOperation::Kind::Add;
+            prefix = "*** Add File: ";
+        } else if (startsWith(marker, "*** Delete File: ")) {
+            kind = MaiPatchOperation::Kind::Delete;
+            prefix = "*** Delete File: ";
+        } else if (startsWith(marker, "*** Update File: ")) {
+            kind = MaiPatchOperation::Kind::Update;
+            prefix = "*** Update File: ";
+        }
+        if (kind) {
+            if (emptyUpdate()) {
+                fail(index, "Update file hunk does not contain any lines");
+                return parsed;
+            }
+            MaiPatchOperation operation;
+            operation.kind = *kind;
+            operation.path = marker.substr(std::char_traits<char>::length(prefix));
+            parsed.operations.push_back(std::move(operation));
+            continue;
+        }
+        if (parsed.operations.empty()) {
+            if (startsWith(marker, "*** Environment ID: ")) {
+                const std::string environment = trimWhitespace(marker.substr(20));
+                if (parsed.environmentId || environment.empty()) {
+                    parsed.error =
+                        invalidPatch("apply_patch environment_id must be nonempty and unique");
+                    return parsed;
+                }
+                parsed.environmentId = environment;
+                continue;
+            }
+            fail(index, "expected an Add File, Delete File, or Update File header");
+            return parsed;
+        }
+        auto& operation = parsed.operations.back();
+        if (operation.kind == MaiPatchOperation::Kind::Add) {
+            if (line.empty() || line[0] != '+') {
+                fail(index, "lines in an Add File hunk must start with '+'");
+                return parsed;
+            }
+            operation.contents += line.substr(1) + '\n';
+            continue;
+        }
+        if (operation.kind == MaiPatchOperation::Kind::Delete) {
+            fail(index, "Delete File does not take any lines");
+            return parsed;
+        }
+        if (!operation.chunks.empty() && operation.chunks.back().atEnd) {
+            if (marker.empty()) continue;
+            if (marker != "@@" && !startsWith(marker, "@@ ")) {
+                fail(index, "expected an @@ context marker after End of File");
+                return parsed;
             }
         }
-        if (same) return limit;
+        if (operation.chunks.empty() && !operation.movePath &&
+            startsWith(marker, "*** Move to: ")) {
+            operation.movePath = marker.substr(13);
+            continue;
+        }
+        if (marker == "@@" || startsWith(marker, "@@ ")) {
+            if (emptyUpdate() && !operation.chunks.empty()) {
+                fail(index, "Update hunk does not contain any lines");
+                return parsed;
+            }
+            MaiPatchChunk chunk;
+            if (startsWith(marker, "@@ ")) chunk.changeContext = marker.substr(3);
+            operation.chunks.push_back(std::move(chunk));
+            continue;
+        }
+        if (marker == "*** End of File") {
+            if (emptyUpdate() && !operation.chunks.empty()) {
+                fail(index, "Update hunk does not contain any lines");
+                return parsed;
+            }
+            if (!operation.chunks.empty()) operation.chunks.back().atEnd = true;
+            continue;
+        }
+        if (!line.empty() && line[0] != ' ' && line[0] != '+' && line[0] != '-') {
+            fail(index, "every update line must start with a space, '+' or '-': " + line);
+            return parsed;
+        }
+        if (operation.chunks.empty()) operation.chunks.emplace_back();
+        auto& chunk = operation.chunks.back();
+        const char type = line.empty() ? ' ' : line[0];
+        const std::string body = line.empty() ? std::string{} : line.substr(1);
+        if (type == ' ') {
+            chunk.contextIndices.emplace_back(chunk.oldLines.size(), chunk.newLines.size());
+            chunk.oldLines.push_back(body);
+            chunk.newLines.push_back(body);
+        } else if (type == '-') {
+            chunk.oldLines.push_back(body);
+        } else {
+            chunk.newLines.push_back(body);
+        }
     }
+    if (!ended) parsed.error = invalidPatch("The last line of the patch must be '*** End Patch'");
+    return parsed;
+}
 
-    for (int strictness = 0; strictness < 3; ++strictness) {
-        for (std::size_t at = start; at <= limit; ++at) {
+std::size_t findSequence(const std::vector<std::string>& lines,
+                         const std::vector<std::string>& pattern, std::size_t start, bool atEnd) {
+    if (pattern.empty()) return start;
+    if (pattern.size() > lines.size()) return std::string::npos;
+    const std::size_t limit = lines.size() - pattern.size();
+    const std::size_t first = atEnd ? std::max(start, limit) : start;
+    for (int pass = 0; pass < 4; ++pass) {
+        for (std::size_t index = first; index <= limit; ++index) {
             bool same = true;
-            for (std::size_t i = 0; i < pattern.size(); ++i) {
-                const std::string& have = lines[at + i];
-                const std::string& want = pattern[i];
-                const bool equal = strictness == 0   ? have == want
-                                   : strictness == 1 ? trimEnd(have) == trimEnd(want)
-                                                     : trimBoth(have) == trimBoth(want);
+            for (std::size_t offset = 0; offset < pattern.size(); ++offset) {
+                const auto& have = lines[index + offset];
+                const auto& want = pattern[offset];
+                const bool equal = pass == 0 ? have == want
+                                   : pass == 1
+                                       ? trimWhitespace(have, false) == trimWhitespace(want, false)
+                                   : pass == 2 ? trimWhitespace(have) == trimWhitespace(want)
+                                               : normalizeContext(have) == normalizeContext(want);
                 if (!equal) {
                     same = false;
                     break;
                 }
             }
-            if (same) return at;
+            if (same) return index;
         }
     }
     return std::string::npos;
 }
 
-struct ParseOutcome {
-    bool ok = false;
-    std::string message;
-    std::vector<Operation> operations;
+struct MaiPatchSourceLine {
+    std::string text;
+    std::string ending;
 };
 
-// 按补丁语法解析文件块、上下文和增删行。
-// 先验证结构再执行文件修改，不接受不完整或越界的补丁。
-ParseOutcome parsePatch(const std::string& patch) {
-    ParseOutcome outcome;
-    std::string ending;
-    bool endsWithNewline = false;
-    const std::vector<std::string> lines = splitLines(patch, ending, endsWithNewline);
+struct MaiPatchSource {
+    std::vector<MaiPatchSourceLine> lines;
+    std::string preferredEnding = "\n";
+};
 
-    std::size_t at = 0;
-    while (at < lines.size() && trimBoth(lines[at]).empty()) ++at;
-    if (at >= lines.size() || trimBoth(lines[at]) != "*** Begin Patch") {
-        outcome.message = "the patch must start with \"*** Begin Patch\"";
-        return outcome;
+MaiPatchSource parseSource(const std::string& contents) {
+    MaiPatchSource source;
+    bool hasEnding = false;
+    std::size_t start = 0;
+    for (std::size_t at = 0; at < contents.size(); ++at) {
+        if (contents[at] != '\r' && contents[at] != '\n') continue;
+        const std::size_t length =
+            contents[at] == '\r' && at + 1 < contents.size() && contents[at + 1] == '\n' ? 2 : 1;
+        std::string ending = contents.substr(at, length);
+        if (!hasEnding) source.preferredEnding = ending;
+        hasEnding = true;
+        source.lines.push_back({contents.substr(start, at - start), std::move(ending)});
+        at += length - 1;
+        start = at + 1;
     }
-    ++at;
-
-    Operation current;
-    bool hasCurrent = false;
-    Chunk chunk;
-    bool hasChunk = false;
-    bool sawEnd = false;
-
-    const auto closeChunk = [&]() {
-        if (hasChunk && (!chunk.pattern.empty() || !chunk.replacement.empty())) {
-            current.chunks.push_back(chunk);
-        }
-        chunk = Chunk{};
-        hasChunk = false;
-    };
-    const auto closeOperation = [&]() {
-        closeChunk();
-        if (hasCurrent) outcome.operations.push_back(current);
-        current = Operation{};
-        hasCurrent = false;
-    };
-
-    for (; at < lines.size(); ++at) {
-        const std::string& line = lines[at];
-        const std::string trimmed = trimBoth(line);
-
-        if (trimmed == "*** End Patch") {
-            sawEnd = true;
-            break;
-        }
-        if (startsWith(trimmed, "*** Update File:")) {
-            closeOperation();
-            current.kind = Operation::Kind::Update;
-            current.path = afterPrefix(trimmed, "*** Update File:");
-            hasCurrent = true;
-            continue;
-        }
-        if (startsWith(trimmed, "*** Add File:")) {
-            closeOperation();
-            current.kind = Operation::Kind::Add;
-            current.path = afterPrefix(trimmed, "*** Add File:");
-            hasCurrent = true;
-            continue;
-        }
-        if (startsWith(trimmed, "*** Delete File:")) {
-            closeOperation();
-            current.kind = Operation::Kind::Delete;
-            current.path = afterPrefix(trimmed, "*** Delete File:");
-            hasCurrent = true;
-            continue;
-        }
-        if (startsWith(trimmed, "*** Move to:")) {
-            if (!hasCurrent || current.kind != Operation::Kind::Update) {
-                outcome.message = "\"*** Move to:\" must follow an \"*** Update File:\" line";
-                return outcome;
-            }
-            current.movePath = afterPrefix(trimmed, "*** Move to:");
-            continue;
-        }
-        if (trimmed == "*** End of File") {
-            chunk.anchoredAtEnd = true;
-            continue;
-        }
-        if (!hasCurrent) {
-            if (trimmed.empty()) continue;
-            outcome.message =
-                "every change must come after an \"*** Add File:\", \"*** Update File:\" or "
-                "\"*** Delete File:\" line";
-            return outcome;
-        }
-
-        if (current.kind == Operation::Kind::Add) {
-            // 新建文件的每一行都要带 `+`，和 Update 里的加行保持一致。
-            if (!line.empty() && line[0] == '+') {
-                current.addContent += line.substr(1);
-                current.addContent += "\n";
-            } else if (trimmed.empty()) {
-                current.addContent += "\n";
-            } else {
-                outcome.message = "lines in \"*** Add File:\" must start with \"+\"";
-                return outcome;
-            }
-            continue;
-        }
-        if (current.kind == Operation::Kind::Delete) {
-            if (trimmed.empty()) continue;
-            outcome.message = "\"*** Delete File:\" does not take any lines";
-            return outcome;
-        }
-
-        if (startsWith(line, "@@")) {
-            closeChunk();
-            hasChunk = true;
-            continue;
-        }
-        if (line.empty()) {
-            // 补丁里的空行代表原文里的空上下文行。
-            if (!hasChunk) hasChunk = true;
-            chunk.pattern.push_back(std::string());
-            chunk.replacement.push_back(std::string());
-            continue;
-        }
-        if (!hasChunk) hasChunk = true;
-        const char marker = line[0];
-        const std::string body = line.substr(1);
-        if (marker == ' ') {
-            chunk.pattern.push_back(body);
-            chunk.replacement.push_back(body);
-        } else if (marker == '-') {
-            chunk.pattern.push_back(body);
-        } else if (marker == '+') {
-            chunk.replacement.push_back(body);
-        } else {
-            outcome.message =
-                "every change line must start with a space, \"-\" or \"+\", but got: " + line;
-            return outcome;
-        }
-    }
-
-    if (!sawEnd) {
-        outcome.message = "the patch must end with \"*** End Patch\"";
-        return outcome;
-    }
-    closeOperation();
-    if (outcome.operations.empty()) {
-        outcome.message = "the patch does not contain any file changes";
-        return outcome;
-    }
-    outcome.ok = true;
-    return outcome;
+    if (start < contents.size()) source.lines.push_back({contents.substr(start), {}});
+    return source;
 }
 
-// 一次落盘计划。**先全部算完再写**，算的过程中任何一处失败就整批不动。
-struct PlannedWrite {
-    std::string resolvedPath;
-    std::string contents;
-    bool remove = false;
-    char status = 'M';  // 报给模型看：A 新增 / M 修改 / D 删除
-    std::string reportedPath;
+struct MaiPatchReplacement {
+    std::size_t start = 0;
+    std::size_t count = 0;
+    std::vector<std::string> lines;
 };
 
-class ApplyPatchTool final : public MaiTool {
+MaiResult<std::string> updateContents(const std::string& contents,
+                                      const MaiPatchOperation& operation) {
+    if (!isUtf8(contents))
+        return {MaiErrorCode::InvalidInput, "file to update is not valid UTF-8: " + operation.path};
+    const auto source = parseSource(contents);
+    std::vector<std::string> originalLines;
+    for (const auto& line : source.lines) originalLines.push_back(line.text);
+    std::vector<MaiPatchReplacement> replacements;
+    std::size_t cursor = 0;
+    for (const auto& chunk : operation.chunks) {
+        if (chunk.changeContext) {
+            const auto found = findSequence(originalLines, {*chunk.changeContext}, cursor, false);
+            if (found == std::string::npos)
+                return {MaiErrorCode::NotFound, "Failed to find context '" + *chunk.changeContext +
+                                                    "' in " + operation.path};
+            cursor = found + 1;
+        }
+        // Codex 中没有旧行的块是文件末尾追加，即使它带了 @@ 上下文也如此。
+        if (chunk.oldLines.empty()) {
+            replacements.push_back({originalLines.size(), 0, chunk.newLines});
+            continue;
+        }
+        auto pattern = chunk.oldLines;
+        auto updated = chunk.newLines;
+        auto found = findSequence(originalLines, pattern, cursor, chunk.atEnd);
+        if (found == std::string::npos && !pattern.empty() && pattern.back().empty()) {
+            pattern.pop_back();
+            if (!updated.empty() && updated.back().empty()) updated.pop_back();
+            found = findSequence(originalLines, pattern, cursor, chunk.atEnd);
+        }
+        if (found == std::string::npos)
+            return {MaiErrorCode::NotFound, "Failed to find expected lines in " + operation.path};
+        // 只替换实际增删段，保留模糊匹配的上下文原字节和每行原换行符。
+        std::size_t oldStart = 0;
+        std::size_t newStart = 0;
+        const auto append = [&](std::size_t oldEnd, std::size_t newEnd) {
+            if (oldStart != oldEnd || newStart != newEnd)
+                replacements.push_back(
+                    {found + oldStart, oldEnd - oldStart,
+                     std::vector<std::string>(
+                         updated.begin() + static_cast<std::ptrdiff_t>(newStart),
+                         updated.begin() + static_cast<std::ptrdiff_t>(newEnd))});
+        };
+        for (const auto& context : chunk.contextIndices) {
+            if (context.first >= pattern.size() || context.second >= updated.size()) break;
+            append(context.first, context.second);
+            oldStart = context.first + 1;
+            newStart = context.second + 1;
+        }
+        append(pattern.size(), updated.size());
+        cursor = found + pattern.size();
+    }
+    std::stable_sort(replacements.begin(), replacements.end(),
+                     [](const auto& left, const auto& right) { return left.start < right.start; });
+    std::string output;
+    std::size_t originalIndex = 0;
+    const auto appendOriginal = [&](std::size_t index) {
+        const auto& line = source.lines[index];
+        output += line.text;
+        output += line.ending.empty() ? source.preferredEnding : line.ending;
+    };
+    for (const auto& replacement : replacements) {
+        if (replacement.start < originalIndex)
+            return {MaiErrorCode::InvalidInput, "overlapping changes in " + operation.path};
+        while (originalIndex < replacement.start) appendOriginal(originalIndex++);
+        for (const auto& line : replacement.lines) output += line + source.preferredEnding;
+        originalIndex += replacement.count;
+    }
+    while (originalIndex < source.lines.size()) appendOriginal(originalIndex++);
+    return output;
+}
+
+std::string resolvePath(const MaiPatchOptions& options, const std::string& candidate) {
+    if (candidate.empty() || options.root.empty()) return {};
+    return options.resolvePath ? options.resolvePath(candidate)
+                               : maiResolvePathWithinRoot(options.root, candidate);
+}
+
+std::string appliedReport(const std::vector<MaiPatchChange>& changes) {
+    std::string report;
+    for (const auto& change : changes) {
+        report += change.status;
+        report += ' ';
+        report += change.path;
+        report += " (" + std::to_string(change.bytesWritten) + " bytes written)\n";
+    }
+    return report;
+}
+
+json parseArguments(const std::string& arguments) {
+    auto parsed = json::parse(arguments, nullptr, false);
+    return parsed.is_object() ? parsed : json::object();
+}
+
+class MaiApplyPatchTool final : public MaiTool {
 public:
+    MaiToolSpec specForModel(const std::string& model) const override {
+        MaiToolSpec spec{name(), description(), parametersSchema(), {}};
+        const auto capability = maiCloudModelInfo(model);
+        if (capability && capability->provider == "openai") {
+            spec.description =
+                "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, "
+                "so do not wrap the patch in JSON.";
+            spec.inputGrammar = kApplyPatchGrammar;
+        }
+        return spec;
+    }
     std::string name() const override {
-        return "file_patch";
+        return "apply_patch";
     }
 
     std::string description() const override {
-        // 多文件或多处修改时一次性应用补丁；比连续逐段替换更容易保证原子性和可审阅性。
-        return "Apply a patch that changes several places, or several files, at once. Use it "
-               "instead of repeated file_edit calls when a change spans multiple files, such as "
-               "renaming something and updating every caller. Either the whole patch applies or "
-               "nothing does. Format:\n"
-               "*** Begin Patch\n"
-               "*** Update File: path\n"
-               "@@\n"
-               " unchanged context line\n"
-               "-line to remove\n"
-               "+line to add\n"
-               "*** Add File: path\n"
-               "+new file content\n"
-               "*** Delete File: path\n"
-               "*** End Patch\n"
-               "Context lines must start with a single space and must be copied exactly from the "
-               "file.";
+        // 整份先解析语法，再顺序执行文件块；失败可能已经写入此前文件，不提供整体回滚。
+        // @@ 文本缩小定位范围，纯新增块追加到文件尾。移动先写目标再删除源文件。
+        return "Apply a Codex-format text patch. File hunks run in order; a later failure can "
+               "leave "
+               "earlier changes applied. Inspect the reported paths and current files before "
+               "retrying. "
+               "Add File replaces existing content; Update File supports @@ or @@ context, "
+               "*** End of File, and *** Move to:. A chunk containing only additions appends at "
+               "EOF. "
+               "Format:\n*** Begin Patch\n*** Update File: path\n@@\n unchanged context\n"
+               "-removed line\n+added line\n*** Add File: new-path\n+content\n"
+               "*** Delete File: old-path\n*** End Patch\n"
+               "Prefix context with a space and copy it from the file.";
     }
 
     std::string parametersSchema() const override {
-        // patch 字段是一份完整补丁，必须包含 Begin Patch 到 End Patch 的全部内容。
-        return R"({"type":"object","properties":{)"
-               R"("patch":{"type":"string","description":"The whole patch, from *** Begin Patch to *** End Patch"}},)"
-               R"("required":["patch"]})";
+        // patch 必须含完整 Begin/End 标记；解析器校验全部语法后才开始修改。
+        return R"({"type":"object","properties":{"patch":{"type":"string","description":"The whole patch, from *** Begin Patch to *** End Patch"}},"required":["patch"]})";
     }
 
-    // 改文件，一律要问。危险程度不随参数变。
-    bool requiresApproval(const std::string& argumentsJson) const override {
-        (void)argumentsJson;
+    bool requiresApproval(const std::string&) const override {
         return true;
     }
 
-    std::vector<std::string> approvalKeys(const std::string& argumentsJson,
+    std::vector<std::string> approvalKeys(const std::string& arguments,
                                           const MaiToolContext& context) const override {
-        const json args = parseArguments(argumentsJson);
+        const auto args = parseArguments(arguments);
         if (!args.contains("patch") || !args["patch"].is_string())
-            return MaiTool::approvalKeys(argumentsJson, context);
-        const ParseOutcome parsed = parsePatch(args["patch"].get<std::string>());
-        if (!parsed.ok) return MaiTool::approvalKeys(argumentsJson, context);
+            return MaiTool::approvalKeys(arguments, context);
+        const auto parsed = parsePatch(args["patch"].get<std::string>());
+        if (parsed.error || parsed.environmentId) return MaiTool::approvalKeys(arguments, context);
         std::set<std::string> paths;
-        for (const Operation& operation : parsed.operations) {
-            const std::string source = context.resolvePath(operation.path);
-            if (source.empty()) return MaiTool::approvalKeys(argumentsJson, context);
+        for (const auto& operation : parsed.operations) {
+            const auto source = context.resolvePath(operation.path);
+            if (source.empty()) return MaiTool::approvalKeys(arguments, context);
             paths.insert("file:" + source);
-            if (!operation.movePath.empty()) {
-                const std::string destination = context.resolvePath(operation.movePath);
-                if (destination.empty()) return MaiTool::approvalKeys(argumentsJson, context);
+            if (operation.movePath) {
+                const auto destination = context.resolvePath(*operation.movePath);
+                if (destination.empty()) return MaiTool::approvalKeys(arguments, context);
                 paths.insert("file:" + destination);
             }
         }
-        return paths.empty() ? MaiTool::approvalKeys(argumentsJson, context)
+        return paths.empty() ? MaiTool::approvalKeys(arguments, context)
                              : std::vector<std::string>(paths.begin(), paths.end());
     }
 
-    // 解析模型提供的参数并解析并应用工作区补丁。
-    // 成功和失败都转成明确的工具结果；中间状态不能冒充最终产物。
-    MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
-        const json args = parseArguments(raw);
-        const std::string patch = args.contains("patch") && args["patch"].is_string()
-                                      ? args["patch"].get<std::string>()
-                                      : std::string{};
-        if (patch.empty()) {
+    MaiToolResult execute(const std::string& arguments, const MaiToolContext& context) override {
+        const auto args = parseArguments(arguments);
+        if (!args.contains("patch") || !args["patch"].is_string() ||
+            args["patch"].get<std::string>().empty())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                           "missing required parameter: patch");
+        MaiPatchOptions options;
+        options.root = context.root;
+        options.resolvePath = [&context](const auto& path) { return context.resolvePath(path); };
+        const auto result = maiApplyPatch(args["patch"].get<std::string>(), options);
+        if (result.error) {
+            std::string message = result.error.message();
+            if (!result.appliedChanges.empty())
+                message += "\nChanges already applied (no rollback):\n" +
+                           appliedReport(result.appliedChanges);
+            else if (!result.failedWriteMayHaveChangedFile)
+                message += "\nNo completed file changes were recorded.";
+            if (result.failedWriteMayHaveChangedFile)
+                message += "\nThe failed write may have changed " + result.failurePath +
+                           "; its written-byte count is unknown.";
+            message +=
+                "\nInspect current files before retrying; do not blindly resubmit the whole patch.";
+            return MaiToolResult::failure(result.error.code(), std::move(message));
         }
-        if (context.root.empty()) {
-            return MaiToolResult::failure(
-                MaiErrorCode::InvalidInput,
-                "this session has no working directory, so file tools are unavailable");
-        }
-
-        const ParseOutcome parsed = parsePatch(patch);
-        if (!parsed.ok) {
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput, parsed.message);
-        }
-
-        std::vector<PlannedWrite> plan;
-        for (const Operation& operation : parsed.operations) {
-            const MaiToolResult failure = planOne(operation, context, plan);
-            if (failure.hasError()) return failure;
-        }
-
-        // 到这儿为止一个字节都没落盘。下面才真正写。
-        //
-        // 写的过程还是可能失败（磁盘满、只读文件），那种情况没法完全回滚——
-        // 要做到那一步得先把每个文件备份一份。现在的做法是**把能提前查出来的
-        // 全在上面查掉**，所以走到这儿失败的概率已经很低了。
-        std::string report;
-        for (const PlannedWrite& write : plan) {
-            const MaiFilePath path = MaiFilePath::fromUtf8(write.resolvedPath);
-            if (write.remove) {
-                const MaiError error = MaiFileSystem::removeFile(path);
-                if (error.hasError()) {
-                    return MaiToolResult::failure(
-                        error.code(),
-                        "could not delete " + write.reportedPath + ": " + error.message());
-                }
-            } else {
-                const MaiFilePath parent = path.dirName();
-                if (!parent.isEmpty() && parent != path) {
-                    const MaiError error = MaiFileSystem::createDirectories(parent);
-                    if (error.hasError()) {
-                        return MaiToolResult::failure(
-                            error.code(), "could not create parent directory for " +
-                                              write.reportedPath + ": " + error.message());
-                    }
-                }
-                const MaiError error = MaiFileSystem::writeFile(path, write.contents);
-                if (error.hasError()) {
-                    return MaiToolResult::failure(
-                        error.code(),
-                        "could not write " + write.reportedPath + ": " + error.message());
-                }
-            }
-            report += write.status;
-            report += ' ';
-            report += write.reportedPath;
-            report += '\n';
-        }
-        return MaiToolResult::success("Applied the patch:\n" + report);
-    }
-
-private:
-    // 把一个操作算成一次落盘计划。失败时返回带错误的结果，成功时返回空结果。
-    MaiToolResult planOne(const Operation& operation, const MaiToolContext& context,
-                          std::vector<PlannedWrite>& plan) {
-        if (operation.path.empty()) {
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "a file header is missing its path");
-        }
-        const std::string resolved = context.resolvePath(operation.path);
-        if (resolved.empty()) {
-            return MaiToolResult::failure(
-                MaiErrorCode::InvalidInput,
-                "path is outside the area accessible to this host: " + operation.path);
-        }
-        const MaiFilePath path = MaiFilePath::fromUtf8(resolved);
-
-        if (operation.kind == Operation::Kind::Add) {
-            if (MaiFileSystem::exists(path)) {
-                return MaiToolResult::failure(
-                    MaiErrorCode::InvalidInput,
-                    "\"*** Add File\" but " + operation.path +
-                        " already exists. Use \"*** Update File\" to change it.");
-            }
-            plan.push_back({resolved, operation.addContent, false, 'A', operation.path});
-            return {};
-        }
-
-        if (!MaiFileSystem::exists(path)) {
-            return MaiToolResult::failure(MaiErrorCode::NotFound,
-                                          "file does not exist: " + operation.path);
-        }
-        if (MaiFileSystem::isDirectory(path)) {
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "that is a directory, not a file: " + operation.path);
-        }
-
-        if (operation.kind == Operation::Kind::Delete) {
-            plan.push_back({resolved, std::string(), true, 'D', operation.path});
-            return {};
-        }
-
-        std::string contents;
-        bool readTruncated = false;
-        const MaiError readError =
-            MaiFileSystem::readFile(path, contents, kMaxFileBytes, &readTruncated);
-        if (readError.hasError()) {
-            return MaiToolResult::failure(readError.code(), readError.message());
-        }
-        if (readTruncated) {
-            // 截断过的内容写回去会把文件尾巴砍掉。宁可不改。
-            return MaiToolResult::failure(
-                MaiErrorCode::InvalidInput,
-                "this file is too large to patch safely; it would be truncated: " + operation.path);
-        }
-
-        std::string ending;
-        bool endsWithNewline = false;
-        std::vector<std::string> lines = splitLines(contents, ending, endsWithNewline);
-
-        std::size_t searchFrom = 0;
-        for (std::size_t index = 0; index < operation.chunks.size(); ++index) {
-            const Chunk& chunk = operation.chunks[index];
-            const std::size_t at =
-                findSequence(lines, chunk.pattern, searchFrom, chunk.anchoredAtEnd);
-            if (at == std::string::npos) {
-                // 这句话要能让模型自己改对。它最常犯的是凭记忆写上下文，
-                // 而不是从 read 的结果里逐字抄。
-                return MaiToolResult::failure(
-                    MaiErrorCode::NotFound,
-                    "could not find the context of change " + std::to_string(index + 1) + " in " +
-                        operation.path +
-                        ". Copy the context lines exactly from the file, including indentation. "
-                        "Read the file again if you are not sure. Nothing was changed.");
-            }
-            lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(at),
-                        lines.begin() + static_cast<std::ptrdiff_t>(at + chunk.pattern.size()));
-            lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(at), chunk.replacement.begin(),
-                         chunk.replacement.end());
-            searchFrom = at + chunk.replacement.size();
-        }
-
-        const std::string updated = joinLines(lines, ending, endsWithNewline);
-        if (operation.movePath.empty()) {
-            plan.push_back({resolved, updated, false, 'M', operation.path});
-            return {};
-        }
-
-        const std::string destination = context.resolvePath(operation.movePath);
-        if (destination.empty()) {
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "\"*** Move to\" path is outside the accessible area, "
-                                          "which is not allowed: " +
-                                              operation.movePath);
-        }
-        // 先写新的再删旧的：顺序反了的话中间失败会把内容弄丢。
-        plan.push_back({destination, updated, false, 'A', operation.movePath});
-        plan.push_back({resolved, std::string(), true, 'D', operation.path});
-        return {};
+        return MaiToolResult::success("Applied the patch:\n" +
+                                      appliedReport(result.appliedChanges));
     }
 };
 
 }  // namespace
 
+MaiPatchResult maiApplyPatch(const std::string& patch, const MaiPatchOptions& options) {
+    MaiPatchResult result;
+    if (options.root.empty()) {
+        result.error = {MaiErrorCode::InvalidInput,
+                        "this session has no working directory, so file tools are unavailable"};
+        return result;
+    }
+    const auto parsed = parsePatch(patch);
+    if (parsed.error) {
+        result.error = parsed.error;
+        return result;
+    }
+    if (parsed.environmentId) {
+        result.error = {MaiErrorCode::NotSupported,
+                        "apply_patch environment_id is not supported by this in-process host"};
+        return result;
+    }
+    if (parsed.operations.empty()) {
+        result.error = {MaiErrorCode::InvalidInput, "No files were modified."};
+        return result;
+    }
+    for (const auto& operation : parsed.operations) {
+        result.failurePath = operation.path;
+        const auto resolved = resolvePath(options, operation.path);
+        if (resolved.empty()) {
+            result.error = {MaiErrorCode::InvalidInput,
+                            "path is outside the area accessible to this host: " + operation.path};
+            return result;
+        }
+        const auto path = MaiFilePath::fromUtf8(resolved);
+        if (operation.kind == MaiPatchOperation::Kind::Delete) {
+            result.error = MaiFileSystem::removeFile(path);
+            if (result.error) return result;
+            result.appliedChanges.push_back({operation.path, resolved, 'D', 0});
+            continue;
+        }
+        std::string contents = operation.contents;
+        if (operation.kind == MaiPatchOperation::Kind::Update) {
+            result.error = MaiFileSystem::readFile(path, contents);
+            if (result.error) return result;
+            const auto updated = updateContents(contents, operation);
+            if (!updated) {
+                result.error = updated.error();
+                return result;
+            }
+            contents = updated.value();
+        }
+        const std::string reported = operation.movePath ? *operation.movePath : operation.path;
+        // 在写目标前完成该目标的授权检查；整个调用不保存跨次缓存或读取旧计划。
+        const auto destination = operation.movePath ? resolvePath(options, reported) : resolved;
+        result.failurePath = reported;
+        if (destination.empty()) {
+            result.error = {
+                MaiErrorCode::InvalidInput,
+                "Move to path is outside the area accessible to this host: " + reported};
+            return result;
+        }
+        const auto target = MaiFilePath::fromUtf8(destination);
+        if (operation.kind == MaiPatchOperation::Kind::Add || operation.movePath) {
+            result.error = MaiFileSystem::createDirectories(target.dirName());
+            if (result.error) return result;
+        }
+        // 与 Codex write_file 一致，此处不是全文件原子替换。失败时不能伪称目标未改变。
+        result.error = MaiFileSystem::writeFile(target, contents);
+        if (result.error) {
+            result.failedWriteMayHaveChangedFile = true;
+            return result;
+        }
+        result.appliedChanges.push_back(
+            {reported, destination,
+             operation.kind == MaiPatchOperation::Kind::Add || operation.movePath ? 'A' : 'M',
+             static_cast<std::uint64_t>(contents.size())});
+        if (operation.movePath) {
+            result.failurePath = operation.path;
+            result.error = MaiFileSystem::removeFile(path);
+            if (result.error) return result;
+            result.appliedChanges.push_back({operation.path, resolved, 'D', 0});
+        }
+    }
+    result.failurePath.clear();
+    return result;
+}
+
 std::unique_ptr<MaiTool> makeMaiApplyPatchTool() {
-    return std::make_unique<ApplyPatchTool>();
+    return std::make_unique<MaiApplyPatchTool>();
 }

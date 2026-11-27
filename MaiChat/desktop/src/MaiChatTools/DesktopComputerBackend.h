@@ -11,6 +11,9 @@ class DesktopComputerBackend {
 public:
     virtual ~DesktopComputerBackend() = default;
     virtual MaiResult<std::vector<DesktopNativeWindow>> windows() = 0;
+    virtual MaiResult<std::vector<DesktopNativeApplication>> applications(const std::function<bool()>& isCanceled = {});
+    virtual MaiResult<std::string> applicationId(const DesktopNativeWindow& window);
+    virtual MaiError launchApplication(const std::string& app, const std::function<bool()>& isCanceled = {});
     virtual MaiResult<std::vector<DesktopNativeDisplay>> displays();
     virtual MaiError captureDisplay(const DesktopNativeDisplay& display, MaiScreenshot& output);
     struct CaptureOptions {
@@ -25,13 +28,18 @@ public:
     virtual MaiResult<std::vector<DesktopNativeElement>> elements(const DesktopNativeWindow& window) = 0;
     // Legacy backends retain elements(); richer providers report bounded
     // coverage and re-resolve the exact observed native identity before input.
-    virtual MaiResult<DesktopNativeAccessibilitySnapshot> inspectElements(
-        const DesktopNativeWindow& window, const std::function<bool()>& isCanceled = {});
-    virtual MaiResult<DesktopNativeElement> resolveElement(
-        const DesktopNativeWindow& window, const DesktopNativeElement& observedElement,
-        const std::function<bool()>& isCanceled = {});
+    virtual MaiResult<DesktopNativeAccessibilitySnapshot> inspectElements(const DesktopNativeWindow& window,
+                                                                          const std::function<bool()>& isCanceled = {});
+    virtual MaiResult<DesktopNativeElement> resolveElement(const DesktopNativeWindow& window,
+                                                           const DesktopNativeElement& observedElement,
+                                                           const std::function<bool()>& isCanceled = {});
+    virtual MaiError setElementValue(const DesktopNativeWindow& window, const DesktopNativeElement& observedElement,
+                                     const std::string& value, const std::function<bool()>& isCanceled = {});
+    virtual MaiError performSecondaryAction(const DesktopNativeWindow& window,
+                                            const DesktopNativeElement& observedElement, const std::string& action,
+                                            const std::function<bool()>& isCanceled = {});
     virtual MaiError setWindowState(const DesktopNativeWindow& window, DesktopWindowStateAction action,
-                                     const std::function<bool()>& isCanceled = {});
+                                    const std::function<bool()>& isCanceled = {});
     virtual MaiError capture(const DesktopNativeWindow& window, MaiScreenshot& output) = 0;
     virtual MaiError activate(const DesktopNativeWindow& window) = 0;
     virtual MaiError activate(const DesktopNativeWindow& window, const std::function<bool()>& isCanceled);

@@ -4,6 +4,7 @@
 // 直接依赖：DesktopCurlAuthTransport、SecureRefreshTokenStore；界面状态由 LoginDialog 决定。
 #include "auth/DesktopAuthClient.h"
 #include "auth/DesktopCurlAuthTransport.h"
+#include "remote/RemoteDesktopSignal.h"
 
 #include <QCryptographicHash>
 #include <QFutureWatcher>
@@ -1068,8 +1069,12 @@ void DesktopAuthClient::fetchAccountModelKeysImpl(AccountModelKeysCompletion com
             return;
         }
         const QJsonObject keys = result.body.value(QStringLiteral("api_keys")).toObject();
-        if (!keys.value(QStringLiteral("glm")).isString() || !keys.value(QStringLiteral("deepseek")).isString() ||
+        // Older account services omit optional providers; present values must
+        // still be strings. OpenAI-only accounts need no legacy-provider key.
+        if ((keys.contains(QStringLiteral("glm")) && !keys.value(QStringLiteral("glm")).isString()) ||
+            (keys.contains(QStringLiteral("deepseek")) && !keys.value(QStringLiteral("deepseek")).isString()) ||
             (keys.contains(QStringLiteral("minimax")) && !keys.value(QStringLiteral("minimax")).isString()) ||
+            (keys.contains(QStringLiteral("openai")) && !keys.value(QStringLiteral("openai")).isString()) ||
             (keys.contains(QStringLiteral("openrouter")) && !keys.value(QStringLiteral("openrouter")).isString())) {
             if (completion)
                 completion({}, QStringLiteral("账号服务返回的模型凭据无效"));
@@ -1079,10 +1084,12 @@ void DesktopAuthClient::fetchAccountModelKeysImpl(AccountModelKeysCompletion com
         const QString deepseek = keys.value(QStringLiteral("deepseek")).toString();
         const QString minimax = keys.value(QStringLiteral("minimax")).toString();
         const QString openrouter = keys.value(QStringLiteral("openrouter")).toString();
+        const QString openai = keys.value(QStringLiteral("openai")).toString();
         if ((!glm.isEmpty() && !validModelApiKey(glm)) || (!deepseek.isEmpty() && !validModelApiKey(deepseek)) ||
             (!minimax.isEmpty() && !validModelApiKey(minimax)) ||
             (!openrouter.isEmpty() && !validModelApiKey(openrouter)) ||
-            (glm.isEmpty() && deepseek.isEmpty() && minimax.isEmpty() && openrouter.isEmpty())) {
+            (!openai.isEmpty() && !validModelApiKey(openai)) ||
+            (glm.isEmpty() && deepseek.isEmpty() && minimax.isEmpty() && openrouter.isEmpty() && openai.isEmpty())) {
             if (completion)
                 completion({}, QStringLiteral("账号服务返回的模型凭据无效"));
             return;
@@ -1092,6 +1099,7 @@ void DesktopAuthClient::fetchAccountModelKeysImpl(AccountModelKeysCompletion com
         if (!deepseek.isEmpty()) available.insert(QStringLiteral("deepseek"), deepseek);
         if (!minimax.isEmpty()) available.insert(QStringLiteral("minimax"), minimax);
         if (!openrouter.isEmpty()) available.insert(QStringLiteral("openrouter"), openrouter);
+        if (!openai.isEmpty()) available.insert(QStringLiteral("openai"), openai);
         if (completion) completion(available, {});
     });
 }
@@ -1176,4 +1184,36 @@ void DesktopAuthClient::setCredentialUpdatedHandler(
 void DesktopAuthClient::setSessionInvalidatedHandler(
     std::function<void(const QString&)> handler) {
     sessionInvalidated_ = std::move(handler);
+}
+
+void DesktopAuthClient::fetchRemoteDesktopCredential(const QString &deviceId,
+                                                     RemoteDesktopCredentialCompletion completion) {
+    const QString owner = userId_;
+    authorizedRequest(
+        QStringLiteral("remote-desktop/credential"), "POST",
+        {{QStringLiteral("device_id"), deviceId}},
+        [this, owner, deviceId, completion = std::move(completion)](const HttpResult &result) {
+            DesktopImCredential credential;
+            if (result.status != 200 || userId_ != owner || loggingOut_) {
+                if (completion)
+                    completion({}, QStringLiteral("远控设备凭据暂不可用"));
+                return;
+            }
+            credential.sdkAppId = result.body.value(QStringLiteral("sdk_app_id")).toInt();
+            credential.userId = result.body.value(QStringLiteral("user_id")).toString();
+            credential.userSig = result.body.value(QStringLiteral("user_sig")).toString();
+            credential.expiresAt = QDateTime::fromSecsSinceEpoch(
+                result.body.value(QStringLiteral("expires_at")).toVariant().toLongLong(), Qt::UTC);
+            if (!credential.isValid() || credential.sdkAppId != imCredential_.sdkAppId ||
+                result.body.value(QStringLiteral("owner_user_id")).toString() != owner ||
+                result.body.value(QStringLiteral("device_id")).toString() != deviceId ||
+                credential.userId != RemoteDesktopSignals::mediaUserId(owner, deviceId)) {
+                if (completion)
+                    completion({}, QStringLiteral("远控设备凭据与当前账号不一致"));
+                return;
+            }
+            if (completion)
+                completion(credential, {});
+        },
+        true, accountGeneration_);
 }

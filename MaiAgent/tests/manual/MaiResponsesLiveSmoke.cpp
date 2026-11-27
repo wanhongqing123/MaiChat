@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "MaiOpenAiClient.h"
+#include "MaiResponsesClient.h"
 
 // 手工在线烟测要求调用者显式提供凭据；普通路径和工具往返分开执行，避免测试意外产生额外请求。
 int main(int argc, char** argv) {

@@ -17,21 +17,20 @@
 
 // ── 中立的模型抽象 ──────────────────────────────────────────────
 // 这里的结构**不是** OpenAI 的线格式，是我们自己的中间表示。
-// 网络 wire 实现（Chat Completions / Responses）负责翻译供应商请求/响应，
+// 网络 Responses 实现负责翻译供应商请求/响应，
 // 本地实现负责 GGUF 原生聊天模板与输出解析；它们共享完整历史、流式和工具调用契约。
 //
 // 之前这一层直接长成了 OpenAI 的形状（tool_calls 原样照搬），那样加第二个供应商时要么污染这个头，
 // 要么在上层写一堆 if。
 
 enum class MaiWireApi {
-    ChatCompletions,
-    Responses,
+    Responses = 1,
     // 进程内模型复用同一消息/流式/工具契约，没有 HTTP 端点或 API Key。
     // 宿主必须通过 makeMaiLlamaModelClient 装配本地文件配置，远端工厂拒绝此项。
-    Local,
+    Local = 2,
     // 仅用于组合客户端的目录描述，不是可发送的传输配置。
     // 实际会话必须查询 wireApiForModel；远端工厂拒绝 Mixed，不能猜协议或回退供应商。
-    Mixed,
+    Mixed = 3,
 };
 
 const char* maiWireApiToString(MaiWireApi wire);
@@ -69,7 +68,7 @@ enum class MaiModelRole {
     System,  // 某一圈临时追加的系统指令，不属于对话历史
     User,
     Assistant,
-    ToolResult,  // 一次工具调用的结果。Chat 是 role="tool"；Responses 是 function_call_output。
+    ToolResult,  // 一次工具调用的结果，对应 Responses function_call_output。
 };
 
 // 发给模型的一条消息。
@@ -80,7 +79,7 @@ enum class MaiModelRole {
 // 这些差异就得靠"某些字段在某些场景下不填"来表达，很快就没人说得清了。
 //
 // 谁来填：MaiContextBuilder 把历史 MaiMessage 翻成这个。谁来读：
-// Chat、Responses 与本地 wire 实现翻成各自的线格式。
+// Responses 与本地运行时翻译为各自的输入。
 struct MaiModelImage {
     // 相对路径必须在工作目录内；绝对路径只允许宿主在用户明确选择附件后传入，
     // 或由已获批准的宿主工具创建。线格式实现负责读取并编码。
@@ -97,15 +96,15 @@ struct MaiModelMessage {
     // 有原始 continuation 时必须优先它，不能从此文本伪造签名/加密 reasoning。
     std::string reasoning;
     std::vector<MaiModelImage> images;
-    // ToolResult 时**必填**：这条结果对应哪次调用。Chat 线上字段名为 tool_call_id，
-    // Responses 使用 call_id；两种格式都必须原样配对，见 MaiModelClientTests。
+    // ToolResult 时必填：这条结果对应哪次调用。Responses 使用 call_id 原样配对，
+    // 见 MaiModelClientTests；不能用显示名称替代服务端的调用身份。
     std::string toolCallId;
     // Assistant 发起调用时填。一条消息可以同时发起多个调用。
     std::vector<MaiToolInvocation> invocations;
     // 原成功 response 的续接状态。wire 匹配来源后使用它替代本消息的显示投影，
     // 不能同时再次编码 content/invocations；不同 provider/model 不得收到该状态。
     std::optional<MaiModelContinuationState> continuation;
-    // 仅供宿主固定工具结果表示的精确来源；不参与供应商线格式或模型输入正文。
+    // 宿主固定工具结果表示及原始输入增量记录的精确来源；不参与供应商线格式或正文。
     // 不能用可能重复的 toolCallId 替代这两个稳定身份。
     std::string sourceMessageId;
     std::string sourcePartId;
@@ -119,9 +118,15 @@ struct MaiToolSpec {
     std::string name;
     std::string description;
     // JSON Schema 原文。
-    // 这一层不校验它合不合法——序列化时解析失败会退化成空对象（见 MaiOpenAiClient 的 buildRequestBod
+    // 这一层不校验它合不合法——序列化时解析失败会退化成空对象（见 MaiResponsesClient 的 buildRequestBod
     // y）。
     std::string parametersJson;
+    // 可选的 Lark 输入语法。非空表示工具可以接收模型原生文本；当前仅 apply_patch
+    // 在已知 OpenAI 型号使用 custom grammar，已知兼容型号沿用 parametersJson 函数声明。
+    // 适配器先缓冲原始输入并校验整个成功响应，再转换为既有工具的 JSON 参数；
+    // 不改变普通代码入口或工具执行核心。空值保留 JSON 函数语义。
+    // 追加字段保留旧聚合初始化；修改布局后所有 C++ 消费者必须统一重新编译。
+    std::string inputGrammar;
 };
 
 // 一次请求的全部内容。每一轮对话会发好几次——模型每调一次工具就要重新问一遍，
@@ -129,12 +134,11 @@ struct MaiToolSpec {
 struct MaiModelRequest {
     // 模型名。会话上配了就用会话的，否则用 MaiAgent::Options::defaultModel。
     std::string model;
-    // 空串使用供应商默认；显式值按型号校验，Fable 五档，其余产品型号保留 low/high/max。
+    // 空串使用供应商默认；显式值按型号校验，Sol/Claude 五档，其余型号保留 low/high/max。
     // Responses 对不支持的显式值返回 InvalidInput，不能静默省略或误发给其它型号。
     // 此值仅影响本次请求，不修改持久化会话。
     std::string reasoningEffort;
-    // 模型的基础指令。它独立于历史：Chat Completions 在线协议边界转成首条 system 消息，
-    // Responses 实现应直接映射到顶层 instructions 字段。
+    // 模型的基础指令，独立于历史。Responses 映射到顶层 instructions 字段。
     std::string baseInstructions;
     // 相对图片路径从这个目录解析，且不能越过它。桌面端由用户明确选择的图片可以传绝对路径，
     // 因而允许位于工作区之外；移动端应先复制进自己的稳定沙盒目录，再传相对路径。
@@ -176,10 +180,37 @@ struct MaiModelContextLimits {
     std::size_t defaultOutputReserveTokens = 0;
 };
 
+// 缺失与供应商明确返回的零值不同；Derived 仅表示由已知字段算术推导，
+// 不代表本地 tokenizer 估算。显示和日志必须保留这一来源等级。
+enum class MaiUsageValueSource { Missing, Provider, Derived };
+
+const char* maiUsageValueSourceToString(MaiUsageValueSource source);
+
 struct MaiModelUsage {
     // 仅由供应商实际返回的 usage 填写；没有 usage 就不触发 onUsage，不能用估计值补齐。
     std::size_t inputTokens = 0;
     std::size_t outputTokens = 0;
+    std::size_t totalTokens = 0;
+    std::size_t cachedInputTokens = 0;
+    std::size_t cacheWriteInputTokens = 0;
+    std::size_t reasoningOutputTokens = 0;
+    // 保留原有两字段聚合回调契约：自定义客户端调用 onUsage 时前两项是实测值。
+    // 协议解析器遇到字段缺失时显式写 Missing，不能靠默认零值冒充供应商零值。
+    MaiUsageValueSource inputSource = MaiUsageValueSource::Provider;
+    MaiUsageValueSource outputSource = MaiUsageValueSource::Provider;
+    MaiUsageValueSource totalSource = MaiUsageValueSource::Missing;
+    MaiUsageValueSource cachedInputSource = MaiUsageValueSource::Missing;
+    MaiUsageValueSource cacheWriteInputSource = MaiUsageValueSource::Missing;
+    MaiUsageValueSource reasoningOutputSource = MaiUsageValueSource::Missing;
+    // wire 所有的原始 usage 快照，供联合日志保存供应商细分字段（例如缓存 TTL）。
+    // 不包含请求、凭据或响应正文；不能把未知明细字段猜成标准计数。
+    std::string sourcePayload;
+    // 原始响应的供应商 ID；缺失保持空，不能用本地 ID 冒充。
+    // 用量日志用它关联一次请求，不将它混入提示正文或用于跨供应商续接。
+    std::string responseId;
+    // 无凭据的不透明配置来源指纹，供计量与当前路由核对；不是请求授权或缓存身份。
+    // 未实现此查询的自定义客户端保持空，重开时不能冒称来源已匹配。
+    std::string provider;
 };
 
 // 仅匹配已核对的官方地址与模型，不将同名代理/自托管 endpoint 当作官方容量。
@@ -192,7 +223,7 @@ MaiModelContextLimits maiOfficialModelContextLimits(const std::string& baseUrl,
 MaiModelTokenEstimate maiEstimateModelInputTokens(const MaiModelRequest& request);
 
 // 可见 assistant 发言的阶段，和不可见的推理内容无关。
-// Unspecified 用于未提供阶段的 Chat Completions、本地模型和兼容供应商。
+// Unspecified 用于未提供阶段的本地模型和兼容供应商。
 enum class MaiModelTextPhase { Unspecified, Commentary, PartialAnswer, FinalAnswer };
 
 struct MaiModelTextItem {
@@ -211,6 +242,15 @@ struct MaiModelTextItem {
 // 控制台的渲染线程就是这么做的（见 cli/MaiConsoleMain.cpp）。
 //
 // 回调可以为空，实现方调用前要判。比如只关心最终文本的调用方可以不设 onReasoning。
+struct MaiModelOutputItem {
+    // 已完成原始 item 的规范 UTF-8 全对象；保留未知字段，不代表执行授权。
+    // index 只在当前响应内有效；不透明身份缺失时保持空串。
+    int index = -1;
+    std::string id;
+    std::string type;
+    std::string payload;
+};
+
 struct MaiStreamSink {
     // 正文增量。**只带这次新增的部分**，不是累计值——调用方自己往后拼。每秒会被调几十次。
     //
@@ -228,7 +268,8 @@ struct MaiStreamSink {
     //     {index:0,             function:{arguments:"{\"pa"}}
     //     {index:0,             function:{arguments:"th\":\"a.txt\"}"}}
     // 不同服务端分片时机不一样，有的整块给，有的一个字符一个字符给。中途交付会是半截 JSON，
-    // 所以攒到流结束再一次性给。
+    // 所以攒到整个响应成功并完成终态校验后再一次性给。
+    // 原生文本工具也遵守同一闸门；适配器先将完整文本转换为工具现有的 JSON 参数。
     std::function<void(const MaiToolInvocation&)> onToolCall;
 
     // 可选的可见发言边界。Responses 的每个 message 独立开始/完成，
@@ -239,7 +280,7 @@ struct MaiStreamSink {
     std::function<void(const MaiModelTextItem&)> onTextItemStarted;
     std::function<void(const MaiModelTextItem&)> onTextItemCompleted;
     // 需要保留 item 身份的调用方可接此增量；实现方有 item 时优先调用它，
-    // 否则调用原 onText。两者不重复交付同一正文，Chat/local 仍可只用 onText。
+    // 否则调用原 onText。两者不重复交付同一正文，本地运行时仍可只用 onText。
     // 完成快照可能为此前 item 补尾，调用方必须按 index 定位原片段。
     std::function<void(const MaiModelTextItem&, std::string_view)> onTextItemDelta;
     // 供应商实际返回的输入/输出 token。与其他流回调使用相同线程和引用生命周期。
@@ -249,6 +290,10 @@ struct MaiStreamSink {
     // 调用方在回调返回前复制并持久化；失败/取消/incomplete/缺终态不发布可重放状态。
     // 快照可能只有加密字段、没有可见文本，仍需独立落库，不依赖文本字节增量触发保存。
     std::function<void(const MaiModelContinuationState&)> onContinuationState;
+    // 真实 output_item.done 在显示投影之后发布，后续响应失败不撤销该事实。
+    // terminal-only 实现在成功终态校验后发布；相同快照只发布一次。
+    // 回调不能执行工具；整批终态校验和取消闸门仍独立生效。引用只在回调期间有效。
+    std::function<void(const MaiModelOutputItem&)> onOutputItemCompleted;
 };
 
 using MaiModelImagePreparer =
@@ -270,7 +315,7 @@ struct MaiModelConfig {
     std::string baseUrl;
     // 放进 Authorization: Bearer 头。
     std::string apiKey;
-    MaiWireApi wire = MaiWireApi::ChatCompletions;
+    MaiWireApi wire = MaiWireApi::Responses;
     long connectTimeoutSeconds = 20;
     // 0 = 不限。流式对话可能跑很久（模型想很长时间，或者输出很长），设了上限就会在半截把人掐掉。
     // 真要停用 cancel，那个干净得多。
@@ -303,9 +348,6 @@ struct MaiModelConfig {
     // 按实际选中模型提供窗口；空时只查询 maiOfficialModelContextLimits 的已核官方目录。
     // 回调可能在多会话工作线程并发调用，必须线程安全，不得访问用户会话或发模型请求。
     std::function<MaiModelContextLimits(const std::string&)> contextLimits;
-    // Chat Completions 是否声明 stream_options.include_usage。只有宿主/供应商确认支持时开启；
-    // 无论是否开启，都解析实际到达的 usage 帧。Responses 自带完成 usage，不使用这个开关。
-    bool includeStreamUsage = false;
 };
 
 // 模型客户端。一个接口，多个 wire 实现。
@@ -339,7 +381,14 @@ public:
     // 0 表示此实现无法测量，调用方不得把未知当作零字节或据此重发已拒绝请求。
     // 文件/图片编码错误原样返回。默认实现不读取文件，未知的自定义传输保持兼容。
     virtual MaiResult<std::size_t> requestBodyBytes(const MaiModelRequest& request);
+    // 无网络/凭据的纯查询，可并发；返回同型号实际路由的无凭据来源指纹。
+    // 默认空表示无法验证来源，不能用它把旧模型/供应商计量当作当前窗口。
+    virtual std::string usageProviderForModel(const std::string& model) const;
 };
 
-// 工厂在 MaiOpenAiClient.h——那是**实现**，这里是接口。
+// 仅对远端配置的 scheme/host/port 做稳定摘要，不保存 URL、路径、查询或凭据。
+// 不访问网络、凭据提供器或模型；本地/非法配置返回空，由宿主实现本地来源身份。
+std::string maiModelUsageProviderForConfig(const MaiModelConfig& config);
+
+// 工厂在 MaiResponsesClient.h——那是**实现**，这里是接口。
 // 自己接别的供应商的人只需要这个文件，不该被迫看见我们碰巧提供了哪一种实现。

@@ -49,6 +49,13 @@ RemoteDesktopController::RemoteDesktopController(Config config,
       engine_(std::move(engine)),
       sendSignal_(std::move(sendSignal)),
       idGenerator_(defaultId) {
+    discoveryTimer_ = new QTimer(this);
+    discoveryTimer_->setSingleShot(true);
+    discoveryTimer_->setInterval(5000);
+    connect(discoveryTimer_, &QTimer::timeout, this, [this] {
+        cancelDiscovery();
+        emit discoveryFinished();
+    });
     if (engine_) {
         engine_->setCustomMessageCallback(
             [this](const QString& userId, int cmdId, const QByteArray& payload) {
@@ -56,9 +63,14 @@ RemoteDesktopController::RemoteDesktopController(Config config,
             });
         // 状态机回调必须跟控制器同生命周期，不能依赖 UI 何时注册观察者。
         // 否则进房期间先到的画面通知会丢失，状态永远停在 Connecting。
-        engine_->setRemoteVideoCallback([this](const QString& userId, bool available) {
-            if (available) setViewerState(viewerOnFirstFrame(viewerState_).nextState);
-            if (remoteVideoHandler_) remoteVideoHandler_(userId, available);
+        engine_->setRemoteVideoCallback([this](const QString &userId, bool available) {
+            if (viewerSessionId_.isEmpty() ||
+                userId != RemoteDesktopSignals::mediaUserId(viewerPeerId_, viewerPeerDeviceId_))
+                return;
+            if (available)
+                setViewerState(viewerOnFirstFrame(viewerState_).nextState);
+            if (remoteVideoHandler_)
+                remoteVideoHandler_(viewerPeerId_, available);
         });
     }
     // 被控端默认装上真实的注入器与探针；测试用 setInputSink / setSecureDesktopProbe
@@ -262,7 +274,8 @@ void RemoteDesktopController::handleCustomMessage(const QString& fromUserId, int
     // 门禁在状态机里，这里只执行结论——"什么情况下别人能操作我的电脑"
     // 必须只有一个地方需要读。
     const auto verdict = RemoteDesktop::remoteInputVerdict(
-        hostState_, settings_.allowRemoteControl, hostSessionId_, hostPeerId_, packet.sessionId,
+        hostState_, settings_.allowRemoteControl, hostSessionId_,
+        RemoteDesktopSignals::mediaUserId(hostPeerId_, hostPeerDeviceId_), packet.sessionId,
         fromUserId);
     traceLastVerdict_ = verdict;
     if (verdict != RemoteDesktop::InputVerdict::Accepted) {
@@ -297,7 +310,10 @@ void RemoteDesktopController::setRemoteVideoSizeHandler(
                 << QStringLiteral("[remote-input] viewer receiver encoded frame: %1x%2")
                        .arg(width)
                        .arg(height);
-            if (handler) handler(userId, width, height);
+            if (!viewerSessionId_.isEmpty() &&
+                userId == RemoteDesktopSignals::mediaUserId(viewerPeerId_, viewerPeerDeviceId_) &&
+                handler)
+                handler(viewerPeerId_, width, height);
         });
 }
 
@@ -306,7 +322,9 @@ void RemoteDesktopController::setErrorHandler(ITrtcEngine::ErrorCallback handler
 }
 
 void RemoteDesktopController::bindRemoteView(const QString& userId, void* renderWindow) {
-    if (engine_) engine_->bindRemoteView(userId, renderWindow);
+    if (engine_ && userId == viewerPeerId_ && !viewerPeerDeviceId_.isEmpty())
+        engine_->bindRemoteView(RemoteDesktopSignals::mediaUserId(userId, viewerPeerDeviceId_),
+                                renderWindow);
 }
 
 HostState RemoteDesktopController::hostState() const { return hostState_; }
@@ -325,7 +343,22 @@ void RemoteDesktopController::send(const QString& peerId,
         if (completion) completion();
         return;
     }
-    const QString text = RemoteDesktopSignals::encodeSignal(signal);
+    Signal addressed = signal;
+    addressed.protocolVersion = RemoteDesktopSignals::kProtocolVersion;
+    addressed.sourceDeviceId = config_.localDeviceId;
+    if (addressed.targetDeviceId.isEmpty() && addressed.type != Type::Discover) {
+        if (addressed.sessionId == viewerSessionId_ && peerId == viewerPeerId_)
+            addressed.targetDeviceId = viewerPeerDeviceId_;
+        else if (addressed.sessionId == hostSessionId_ && peerId == hostPeerId_)
+            addressed.targetDeviceId = hostPeerDeviceId_;
+    }
+    if (addressed.sourceDeviceId.isEmpty() ||
+        (addressed.type != Type::Discover && addressed.targetDeviceId.isEmpty())) {
+        if (completion)
+            completion();
+        return;
+    }
+    const QString text = RemoteDesktopSignals::encodeSignal(addressed);
     if (text.isEmpty()) {
         if (completion) completion();
         return;
@@ -336,9 +369,11 @@ void RemoteDesktopController::send(const QString& peerId,
 TrtcRoomParams RemoteDesktopController::roomParams(const QString& roomId) const {
     TrtcRoomParams params;
     params.sdkAppId = config_.sdkAppId;
-    params.userId = config_.localUserId;
+    params.userId = RemoteDesktopSignals::mediaUserId(config_.localUserId, config_.localDeviceId);
     params.roomId = roomId;
-    if (config_.userSigProvider) params.userSig = config_.userSigProvider(config_.localUserId);
+    if (mediaUserId_ == params.userId && mediaExpiresAt_ > QDateTime::currentSecsSinceEpoch())
+        params.userSig = mediaSignature_;
+
     return params;
 }
 
@@ -350,6 +385,56 @@ bool RemoteDesktopController::handleIncomingText(const QString& fromUserId, cons
     // 前缀对但解析失败：仍然消费掉，避免半截协议文本泄漏到聊天记录里。
     if (signal.type == Type::Unknown) return true;
 
+    // v1 的账号广播不能安全判断目标；旧端静默消费 v2，新端也不回退到广播邀请。
+    if (signal.protocolVersion != RemoteDesktopSignals::kProtocolVersion ||
+        fromUserId.trimmed().isEmpty() || signal.sourceDeviceId.isEmpty() ||
+        signal.sourceDeviceId.size() > 128 || signal.sessionId.isEmpty() ||
+        config_.localDeviceId.isEmpty())
+        return true;
+    if (signal.type == Type::Discover) {
+        if (!signal.targetDeviceId.isEmpty() ||
+            (fromUserId == config_.localUserId && signal.sourceDeviceId == config_.localDeviceId))
+            return true;
+        Signal device;
+        device.type = Type::Device;
+        device.sessionId = signal.sessionId;
+        device.targetDeviceId = signal.sourceDeviceId;
+        device.deviceName = config_.localDeviceName;
+        device.platform = config_.platform;
+        device.canShareScreen = engine_ && engine_->initializationError().isEmpty();
+        device.available = device.canShareScreen && !roomParams(QString()).userSig.isEmpty() &&
+                           settings_.effectiveMode() != HostMode::Disabled &&
+                           hostState_ == HostState::Idle && canStartInvite(viewerState_);
+        send(fromUserId, device);
+        return true;
+    }
+    if (signal.targetDeviceId != config_.localDeviceId)
+        return true;
+    if (signal.type == Type::Device) {
+        if (fromUserId != discoveryPeerId_ || signal.sessionId != discoveryId_ ||
+            !signal.canShareScreen)
+            return true;
+        for (auto &device : devices_) {
+            if (device.sourceDeviceId == signal.sourceDeviceId) {
+                device = signal;
+                emit devicesChanged();
+                return true;
+            }
+        }
+        if (devices_.size() < 64) {
+            devices_.append(signal);
+            emit devicesChanged();
+        }
+        return true;
+    }
+    if (signal.type != Type::Invite) {
+        const bool viewer = fromUserId == viewerPeerId_ && signal.sessionId == viewerSessionId_ &&
+                            signal.sourceDeviceId == viewerPeerDeviceId_;
+        const bool host = fromUserId == hostPeerId_ && signal.sessionId == hostSessionId_ &&
+                          signal.sourceDeviceId == hostPeerDeviceId_;
+        if (!viewer && !host)
+            return true;
+    }
     switch (signal.type) {
         case Type::Invite:
             handleInvite(fromUserId, signal);
@@ -366,7 +451,9 @@ bool RemoteDesktopController::handleIncomingText(const QString& fromUserId, cons
                 // 先通知 UI 创建原生渲染窗口。TRTC 的回调可能在 startViewing
                 // 内同步到达，晚切状态会让首帧落在 Inviting 并被永久忽略。
                 setViewerState(transition.nextState, transition.failureReason);
-                if (!engine_ || !engine_->startViewing(roomParams(viewerRoomId_), nullptr)) {
+                const auto params = roomParams(viewerRoomId_);
+                if (!engine_ || params.userSig.isEmpty() ||
+                    !engine_->startViewing(params, nullptr)) {
                     inputSender_.setCaptureGeometry(std::nullopt);
                     setViewerState(ViewerState::Failed, QStringLiteral("远程画面启动失败"));
                     return true;
@@ -398,6 +485,8 @@ bool RemoteDesktopController::handleIncomingText(const QString& fromUserId, cons
             }
             return true;
         }
+        case Type::Discover:
+        case Type::Device:
         case Type::Unknown:
             break;
     }
@@ -416,7 +505,18 @@ void RemoteDesktopController::handleInvite(const QString& fromUserId, const Sign
     input.authProofValid = RemoteDesktopAuth::verifyAuthProof(
         settings_.secret, signal.authProof, signal.sessionId, signal.roomId, fromUserId);
 
+    if (!canStartInvite(viewerState_))
+        input.currentState = HostState::Sharing;
     const HostDecision decision = decideOnInvite(input);
+    if (decision.action != HostAction::RejectInvite && roomParams(QString()).userSig.isEmpty()) {
+        Signal rejected;
+        rejected.type = Type::Reject;
+        rejected.sessionId = signal.sessionId;
+        rejected.targetDeviceId = signal.sourceDeviceId;
+        rejected.reason = QStringLiteral("远控连接准备失败，请稍后重试");
+        send(fromUserId, rejected);
+        return;
+    }
     recordAuthAttempt(input, decision);
 
     // 拒绝只回复本次邀请，不接管正在等待确认或共享中的会话上下文。
@@ -426,10 +526,12 @@ void RemoteDesktopController::handleInvite(const QString& fromUserId, const Sign
         reject.type = Type::Reject;
         reject.sessionId = signal.sessionId;
         reject.reason = decision.reason;
+        reject.targetDeviceId = signal.sourceDeviceId;
         send(fromUserId, reject);
         return;
     }
 
+    hostPeerDeviceId_ = signal.sourceDeviceId;
     hostSessionId_ = signal.sessionId;
     hostRoomId_ = signal.roomId;
     applyHostDecision(decision, fromUserId);
@@ -465,7 +567,8 @@ void RemoteDesktopController::applyHostDecision(const HostDecision& decision,
             break;
         case HostAction::AcceptAndShare: {
             hostPeerId_ = peerId;
-            const bool started = engine_->startScreenShare(roomParams(hostRoomId_));
+            const auto params = roomParams(hostRoomId_);
+            const bool started = !params.userSig.isEmpty() && engine_->startScreenShare(params);
             if (!started) {
                 // 进房失败要如实回拒，不能让对方停在"连接中"。
                 hostState_ = HostState::Idle;
@@ -527,8 +630,17 @@ void RemoteDesktopController::applyHostDecision(const HostDecision& decision,
     }
 }
 
-void RemoteDesktopController::requestView(const QString& peerId, const QString& password) {
-    if (!canStartInvite(viewerState_)) return;
+void RemoteDesktopController::requestView(const QString &peerId, const QString &password,
+                                          const QString &targetDeviceId) {
+    if (!canStartInvite(viewerState_) || peerId.isEmpty() || targetDeviceId.isEmpty() ||
+        config_.localDeviceId.isEmpty() || hostState_ != HostState::Idle)
+        return;
+    if (roomParams(QString()).userSig.isEmpty()) {
+        setViewerState(ViewerState::Failed, QStringLiteral("远控连接准备失败，请稍后重试"));
+        return;
+    }
+    cancelDiscovery();
+    viewerPeerDeviceId_ = targetDeviceId;
 
     // 新会话在 Accept 到来前不能沿用上一台机器的采集坐标系。
     inputSender_.setCaptureGeometry(std::nullopt);
@@ -548,8 +660,8 @@ void RemoteDesktopController::requestView(const QString& peerId, const QString& 
         invite.authProof = RemoteDesktopAuth::makeAuthProof(
             secret, invite.sessionId, invite.roomId, config_.localUserId);
     }
-    send(peerId, invite);
     setViewerState(ViewerState::Inviting);
+    send(peerId, invite);
 }
 
 void RemoteDesktopController::resolveConsent(bool accepted) {
@@ -558,7 +670,8 @@ void RemoteDesktopController::resolveConsent(bool accepted) {
 }
 
 void RemoteDesktopController::stopSession(SignalSendCompletion completion) {
-    const bool stopHost = hostState_ == HostState::Sharing;
+    cancelDiscovery();
+    const bool stopHost = hostState_ != HostState::Idle;
     const bool stopViewer = viewerState_ != ViewerState::Idle;
     const int sendCount = static_cast<int>(stopHost) + static_cast<int>(stopViewer);
     if (sendCount == 0) {
@@ -621,4 +734,45 @@ void RemoteDesktopController::setViewerState(ViewerState state, const QString& f
         inputSender_.endSession();
     }
     emit viewerStateChanged(state, failureReason);
+}
+
+void RemoteDesktopController::discoverDevices(const QString &peerId) {
+    cancelDiscovery();
+    devices_.clear();
+    emit devicesChanged();
+    if (peerId.isEmpty() || config_.localDeviceId.isEmpty() || !canStartInvite(viewerState_) ||
+        hostState_ != HostState::Idle) {
+        emit discoveryFinished();
+        return;
+    }
+    discoveryPeerId_ = peerId;
+    discoveryId_ = idGenerator_();
+    Signal query;
+    query.type = Type::Discover;
+    query.sessionId = discoveryId_;
+    discoveryTimer_->start();
+    send(peerId, query);
+}
+void RemoteDesktopController::cancelDiscovery() {
+    if (discoveryTimer_)
+        discoveryTimer_->stop();
+    discoveryPeerId_.clear();
+    discoveryId_.clear();
+}
+QVector<Signal> RemoteDesktopController::discoveredDevices() const { return devices_; }
+QString RemoteDesktopController::viewerDeviceId() const { return viewerPeerDeviceId_; }
+
+QString RemoteDesktopController::localDeviceId() const { return config_.localDeviceId; }
+QString RemoteDesktopController::localUserId() const { return config_.localUserId; }
+void RemoteDesktopController::setMediaCredential(const QString &userId, const QString &signature,
+                                                 qint64 expiresAt) {
+    mediaUserId_.clear();
+    mediaSignature_.clear();
+    mediaExpiresAt_ = 0;
+    if (userId != RemoteDesktopSignals::mediaUserId(config_.localUserId, config_.localDeviceId) ||
+        signature.isEmpty() || expiresAt <= QDateTime::currentSecsSinceEpoch())
+        return;
+    mediaUserId_ = userId;
+    mediaSignature_ = signature;
+    mediaExpiresAt_ = expiresAt;
 }

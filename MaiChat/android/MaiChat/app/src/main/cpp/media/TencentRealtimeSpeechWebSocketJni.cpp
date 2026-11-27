@@ -2,9 +2,11 @@
 // 单个原生 I/O 线程独占 curl 句柄；Java 工作线程只操作有界发送队列和取消信号。
 #include <curl/curl.h>
 #include <jni.h>
+#include "MaiCurlNetworkRoute.h"
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <fcntl.h>
@@ -301,16 +303,28 @@ int runSocket(JNIEnv* env, jobject owner, SocketState* state, const std::string&
     }
     if (setup != CURLE_OK) return static_cast<int>(setup);
     if (state->cancelled.load()) return kCancelled;
-    // CONNECT_ONLY=2 在收到 101 后交还控制权；禁止复用会关闭升级连接。
-    CURLcode result = curl_easy_perform(curl.value);
+    // ASR 握手复用模型/下载的逐请求 DNS/socket 租约；不改变已连接的录音流。
+    const auto routingStarted = std::chrono::steady_clock::now();
+    MaiCurlNetworkRoute networkRoute;
+    CURLcode result = static_cast<CURLcode>(
+        networkRoute.prepare(curl.value, url, proxyType != 0, 5000, [&] { return state->cancelled.load(); }));
+    if (result != CURLE_OK) return static_cast<int>(result);
+    const auto remaining =
+        6000 - std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - routingStarted)
+                   .count();
+    if (remaining <= 0) return static_cast<int>(CURLE_OPERATION_TIMEDOUT);
+    // CONNECT_ONLY=2 在收到 101 后交还控制权；FORBID_REUSE 会关闭升级连接。
+    // 此处句柄从不进连接池，独占直到录音结束，因此允许继续使用本次新建的 socket。
+    result = curl_easy_setopt(curl.value, CURLOPT_FORBID_REUSE, 0L);
+    if (result == CURLE_OK) result = curl_easy_setopt(curl.value, CURLOPT_TIMEOUT_MS, static_cast<long>(remaining));
+    if (result == CURLE_OK) result = curl_easy_perform(curl.value);
     if (state->cancelled.load()) return kCancelled;
     if (result != CURLE_OK) return static_cast<int>(result);
     // 六秒上限只约束握手；连接建立后可能持续整个录音过程。
     result = curl_easy_setopt(curl.value, CURLOPT_TIMEOUT_MS, 0L);
     if (result != CURLE_OK) return static_cast<int>(result);
     long status = 0;
-    if (curl_easy_getinfo(curl.value, CURLINFO_RESPONSE_CODE, &status) != CURLE_OK || status != 101)
-        return kBadMessage;
+    if (curl_easy_getinfo(curl.value, CURLINFO_RESPONSE_CODE, &status) != CURLE_OK || status != 101) return kBadMessage;
     curl_socket_t socket = CURL_SOCKET_BAD;
     if (curl_easy_getinfo(curl.value, CURLINFO_ACTIVESOCKET, &socket) != CURLE_OK ||
         socket == CURL_SOCKET_BAD) return kNoActiveSocket;

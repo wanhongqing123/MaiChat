@@ -1,11 +1,14 @@
 // 文件作用：实现 OpenAI Responses 协议的请求和流式解析。
 // 直接依赖：MaiFilePath.h、MaiFileSystem.h、MaiPathGuard.h；本文件在这些接口之间完成调用与结果转换。
 #include "MaiResponsesClient.h"
+#include "MaiCurlNetworkRoute.h"
 
 #include <curl/curl.h>
 #include <json.hpp>
+#include <openssl/evp.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -60,6 +63,72 @@ std::string stringField(const Json& object, const char* field) {
     return object.is_object() && object.contains(field) && object[field].is_string()
                ? object[field].get<std::string>()
                : std::string{};
+}
+
+// 部分供应商用 HTTP 200 返回业务错误。只识别错误信封，不能把合法响应
+// 中恰好叫 code 的普通字段当作失败；未知业务码保持 Protocol，不猜重试策略。
+MaiError businessError(const Json& object, bool isGlm) {
+    if (!isGlm || !object.is_object() || !object.contains("code") || !object.contains("msg") ||
+        !stringField(object, "type").empty())
+        return {};
+    const auto& code = object["code"];
+    if (code == 0 || code == "0") return {};
+    const bool authentication = code == 1001 || code == "1001";
+    return {authentication ? MaiErrorCode::NotConfigured : MaiErrorCode::Protocol,
+            "GLM business error " + code.dump() + ": " + stringField(object, "msg")};
+}
+
+void readUsageCount(const Json& object, const char* field, std::size_t& count,
+                    MaiUsageValueSource& source) {
+    source = MaiUsageValueSource::Missing;
+    count = 0;
+    if (!object.is_object()) return;
+    const auto value = object.find(field);
+    if (value == object.end() || !value->is_number_integer()) return;
+    if (value->is_number_unsigned()) {
+        const auto raw = value->get<std::uint64_t>();
+        if (raw > std::numeric_limits<std::size_t>::max()) return;
+        count = static_cast<std::size_t>(raw);
+    } else {
+        const auto raw = value->get<std::int64_t>();
+        if (raw < 0 || static_cast<std::uint64_t>(raw) > std::numeric_limits<std::size_t>::max())
+            return;
+        count = static_cast<std::size_t>(raw);
+    }
+    source = MaiUsageValueSource::Provider;
+}
+
+std::optional<MaiModelUsage> responseUsage(const Json& object) {
+    if (!object.is_object()) return std::nullopt;
+    MaiModelUsage result;
+    readUsageCount(object, "input_tokens", result.inputTokens, result.inputSource);
+    readUsageCount(object, "output_tokens", result.outputTokens, result.outputSource);
+    readUsageCount(object, "total_tokens", result.totalTokens, result.totalSource);
+    const Json inputDetails = object.value("input_tokens_details", Json{});
+    readUsageCount(inputDetails, "cached_tokens", result.cachedInputTokens,
+                   result.cachedInputSource);
+    readUsageCount(inputDetails, "cache_write_tokens", result.cacheWriteInputTokens,
+                   result.cacheWriteInputSource);
+    const Json outputDetails = object.value("output_tokens_details", Json{});
+    readUsageCount(outputDetails, "reasoning_tokens", result.reasoningOutputTokens,
+                   result.reasoningOutputSource);
+    if (result.inputSource == MaiUsageValueSource::Missing &&
+        result.outputSource == MaiUsageValueSource::Missing &&
+        result.totalSource == MaiUsageValueSource::Missing)
+        return std::nullopt;
+    // 仅两项都来自供应商时才可推导总数；缺失不是零，reasoning 已含在 output 内，
+    // cached/cache_write 是 input 的明细，均不能再加一遍。
+    if (result.totalSource == MaiUsageValueSource::Missing &&
+        result.inputSource == MaiUsageValueSource::Provider &&
+        result.outputSource == MaiUsageValueSource::Provider) {
+        const auto maximum = std::numeric_limits<std::size_t>::max();
+        if (result.outputTokens <= maximum - result.inputTokens) {
+            result.totalTokens = result.inputTokens + result.outputTokens;
+            result.totalSource = MaiUsageValueSource::Derived;
+        }
+    }
+    result.sourcePayload = object.dump();
+    return result;
 }
 
 class LineBuffer {
@@ -189,12 +258,15 @@ MaiError validateOutput(const Json& output) {
         if (!item.is_object() || stringField(item, "type").empty())
             return {MaiErrorCode::Protocol, "Responses output needs typed objects"};
         const std::string type = stringField(item, "type");
-        if (type == "function_call") {
+        if (type == "function_call" || type == "custom_tool_call") {
             const std::string callId = stringField(item, "call_id");
-            if (callId.empty() || stringField(item, "name").empty() ||
-                !item.contains("arguments") || !item["arguments"].is_string() ||
-                !callIds.insert(callId).second)
-                return {MaiErrorCode::Protocol, "Responses returned an incomplete function call"};
+            const char* inputField = type == "custom_tool_call" ? "input" : "arguments";
+            if (callId.empty() || stringField(item, "name").empty() || !item.contains(inputField) ||
+                !item[inputField].is_string() || !callIds.insert(callId).second)
+                return {MaiErrorCode::Protocol, "Responses returned an incomplete tool call"};
+            if (type == "custom_tool_call" && item.contains("status") &&
+                stringField(item, "status") != "completed")
+                return {MaiErrorCode::Protocol, "Responses custom call is not completed"};
         } else if (type == "reasoning") {
             for (const char* field : {"content", "summary"}) {
                 const auto parts = item.find(field);
@@ -220,7 +292,7 @@ MaiError validateOutput(const Json& output) {
 // 工具结果引用原调用标识；图像准备失败时直接返回错误，不能发送缺媒体的请求。
 MaiResult<std::string> buildBody(const MaiModelRequest& request,
                                  const MaiModelImagePreparer& prepareImage) {
-    // 显式档位按选中型号校验；不能静默丢弃不支持值，也不能把 Fable 的五档压回旧三档。
+    // 显式档位按选中型号校验；不能静默丢弃不支持值或把 Sol/Claude 五档压回旧三档。
     if (!maiIsValidReasoningEffortForModel(request.model, request.reasoningEffort))
         return {MaiErrorCode::InvalidInput, "Unsupported reasoning effort for the selected model"};
     // 路由身份只接受有界不透明标识，不回显非法值，也不以正文或路径生成替代身份。
@@ -230,6 +302,9 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
         return {MaiErrorCode::InvalidInput, "Invalid model request session identifier"};
     Json input = Json::array();
     const auto capability = maiCloudModelInfo(request.model);
+    const bool isOpenAi = capability && capability->provider == "openai";
+    // 调用类型属于历史调用身份；最后一轮可能不再提供 tools，不能据当前声明猜结果类型。
+    std::set<std::string> customCallIds;
     std::size_t latestUser = request.messages.size();
     for (std::size_t index = 0; index < request.messages.size(); ++index)
         if (request.messages[index].role == MaiModelRole::User) latestUser = index;
@@ -251,7 +326,15 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
                 return {MaiErrorCode::Protocol, "Responses continuation format is unsupported"};
             const Json output = Json::parse(state.payload, nullptr, false);
             if (const MaiError error = validateOutput(output)) return error;
-            for (const Json& item : output) input.push_back(item);
+            for (const Json& item : output) {
+                if (stringField(item, "type") == "custom_tool_call") {
+                    if (!isOpenAi || stringField(item, "name") != "apply_patch")
+                        return {MaiErrorCode::Protocol,
+                                "Responses custom continuation is unsupported"};
+                    customCallIds.insert(stringField(item, "call_id"));
+                }
+                input.push_back(item);
+            }
             continue;
         }
 
@@ -279,15 +362,19 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
         }
 
         if (message.role == MaiModelRole::ToolResult) {
-            input.push_back(Json{{"type", "function_call_output"},
-                                 {"call_id", message.toolCallId},
-                                 {"output", std::move(content)}});
+            input.push_back(
+                Json{{"type", customCallIds.count(message.toolCallId) ? "custom_tool_call_output"
+                                                                      : "function_call_output"},
+                     {"call_id", message.toolCallId},
+                     {"output", std::move(content)}});
             continue;
         }
-        // OpenRouter 的 signed/encrypted thinking 只能由原 output 回放，显示文本不能代替签名。
+        // OpenAI/OpenRouter 的加密推理只能由原 output 回放，显示文本不能代替原生状态。
         // 仅无续接状态的旧 GLM/DeepSeek 记录保留文本兼容；来源不匹配的现代状态只回放普通投影。
         if (message.role == MaiModelRole::Assistant && !message.continuation &&
-            !message.reasoning.empty() && (!capability || capability->provider != "openrouter")) {
+            !message.reasoning.empty() &&
+            (!capability ||
+             (capability->provider != "openrouter" && capability->provider != "openai"))) {
             input.push_back(Json{{"type", "reasoning"},
                                  {"content", Json::array({Json{{"type", "reasoning_text"},
                                                                {"text", message.reasoning}}})}});
@@ -299,15 +386,34 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
         for (const MaiToolInvocation& call : message.invocations) {
             if (call.id.empty() || call.name.empty())
                 return {MaiErrorCode::Protocol, "a function call needs an ID and name"};
-            input.push_back(Json{{"type", "function_call"},
-                                 {"call_id", call.id},
-                                 {"name", call.name},
-                                 {"arguments", call.arguments}});
+            if (isOpenAi && call.name == "apply_patch") {
+                // 413 恢复可移除不透明续接；普通执行参数仍保留完整补丁，重建原生调用。
+                const Json arguments = Json::parse(call.arguments, nullptr, false);
+                if (!arguments.is_object() || arguments.size() != 1 ||
+                    !arguments.contains("patch") || !arguments["patch"].is_string())
+                    return {MaiErrorCode::Protocol, "Historical apply_patch input is invalid"};
+                customCallIds.insert(call.id);
+                input.push_back(Json{{"type", "custom_tool_call"},
+                                     {"call_id", call.id},
+                                     {"name", call.name},
+                                     {"input", arguments["patch"]}});
+            } else {
+                input.push_back(Json{{"type", "function_call"},
+                                     {"call_id", call.id},
+                                     {"name", call.name},
+                                     {"arguments", call.arguments}});
+            }
         }
     }
 
     Json body{
         {"model", request.model}, {"input", std::move(input)}, {"stream", true}, {"store", false}};
+    if (capability && capability->provider == "openai") {
+        // 无状态响应默认返回 encrypted_content；显式 include 仍受官方支持，兼容旧接口行为。
+        // 原始 output 继续作为唯一续接来源，不依赖服务端保存的 response ID。
+        // https://developers.openai.com/api/docs/guides/reasoning#preserve-reasoning-without-stored-responses
+        body["include"] = Json::array({"reasoning.encrypted_content"});
+    }
     if (!request.sessionId.empty() && capability) {
         // 仅映射型号目录明确声明的供应商字段；不把会话 ID 填进终端用户隔离字段。
         // 空身份保留旧普通调用；自动缓存提示不改变原 input/instructions/tools 或输出预算。
@@ -317,7 +423,9 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
             if (request.model == "anthropic/claude-fable-5.2" ||
                 request.model == "anthropic/claude-opus-5.5")
                 body["cache_control"] = Json{{"type", "ephemeral"}};
-        } else if (capability->provider == "glm") {
+        } else if (capability->provider == "glm" || capability->provider == "openai") {
+            // OpenAI 接受稳定缓存标识；沿用会话身份，不设置额外缓存模式或保留时长。
+            // https://developers.openai.com/api/docs/guides/prompt-caching
             body["prompt_cache_key"] = request.sessionId;
         }
         // DeepSeek 自动管理上下文缓存；不发送其明确不支持的缓存路由参数。
@@ -339,6 +447,20 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
     if (!request.tools.empty()) {
         Json tools = Json::array();
         for (const MaiToolSpec& tool : request.tools) {
+            if (!tool.inputGrammar.empty()) {
+                if (tool.name != "apply_patch" || !capability)
+                    return {MaiErrorCode::InvalidInput,
+                            "The native tool input format is unsupported"};
+                if (isOpenAi) {
+                    tools.push_back(Json{{"type", "custom"},
+                                         {"name", tool.name},
+                                         {"description", tool.description},
+                                         {"format", Json{{"type", "grammar"},
+                                                         {"syntax", "lark"},
+                                                         {"definition", tool.inputGrammar}}}});
+                    continue;
+                }
+            }
             Json parameters = Json::parse(tool.parametersJson, nullptr, false);
             if (parameters.is_discarded()) parameters = Json::object();
             tools.push_back(Json{{"type", "function"},
@@ -352,17 +474,23 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
 }
 
 struct PendingCall {
+    std::string type;
     std::string id;
+    std::string itemId;
     std::string name;
     std::string arguments;
     bool complete = false;
+    bool invalid = false;
+    bool hasInput = false;
 };
 
 struct StreamContext {
     const MaiStreamSink* sink = nullptr;
+    std::string usageProvider;
     const std::atomic<bool>* cancel = nullptr;
     LineBuffer lines;
     std::map<int, PendingCall> calls;
+    std::set<std::string> customTools;
     struct TextItem {
         MaiModelTextItem info;
         std::map<int, std::string> content;
@@ -373,11 +501,15 @@ struct StreamContext {
     // 显示累计和原始快照分开；done/terminal 可以补尾，不能靠“见过”标记丢弃完整尾部。
     std::map<std::tuple<int, int, bool>, std::string> reasoningContent;
     std::map<int, Json> completedOutput;
+    std::map<int, std::string> publishedCompletedOutput;
     std::set<int> observedOutputIndices;
     Json terminalOutput;
     bool hasTerminalOutput = false;
+    bool malformedEvent = false;
     std::string rawBody;
     std::string terminalError;
+    MaiError businessFailure;
+    bool isGlm = false;
     MaiModelHttpFraming framing;
     bool transientStreamError = false;
     bool contextLengthError = false;
@@ -419,16 +551,42 @@ int eventIndex(const Json& event, const char* name, int fallback) {
     return static_cast<int>(index);
 }
 
-void mergeCall(PendingCall& call, const Json& item) {
+void mergeCall(PendingCall& call, const Json& item, bool finalSnapshot = false) {
     if (!item.is_object()) return;
+    if (call.type == "custom_tool_call" || stringField(item, "type") == "custom_tool_call")
+        for (const char* field : {"call_id", "id", "name"})
+            if (item.contains(field) && !item[field].is_string()) call.invalid = true;
     const std::string id = stringField(item, "call_id");
     const std::string name = stringField(item, "name");
-    if (!id.empty()) call.id = id;
-    if (!name.empty()) call.name = name;
-    if (item.contains("arguments") && item["arguments"].is_string()) {
-        const std::string full = item["arguments"].get<std::string>();
-        if (!full.empty() || call.arguments.empty()) call.arguments = full;
-    }
+    // 完成快照可补齐增量尾部，不能改写已观察的调用身份、输入前缀或已完成输入。
+    const auto mergeIdentity = [&](std::string& stored, const std::string& value) {
+        if (value.empty()) return;
+        if (!stored.empty() && stored != value) call.invalid = true;
+        stored = value;
+    };
+    mergeIdentity(call.type, stringField(item, "type"));
+    mergeIdentity(call.id, id);
+    mergeIdentity(call.itemId, stringField(item, "id"));
+    mergeIdentity(call.name, name);
+    const char* field = call.type == "custom_tool_call" ? "input" : "arguments";
+    if (item.contains(field)) {
+        if (!item[field].is_string()) {
+            call.invalid = true;
+            return;
+        }
+        const std::string full = item[field].get<std::string>();
+        // added 通常用空串作为输入占位；完成帧的空串则是实际完整输入。
+        if (finalSnapshot || !full.empty() || call.arguments.empty() || call.complete) {
+            if ((!call.arguments.empty() &&
+                 (full.size() < call.arguments.size() ||
+                  full.compare(0, call.arguments.size(), call.arguments) != 0)) ||
+                (call.complete && call.hasInput && full != call.arguments))
+                call.invalid = true;
+            call.arguments = full;
+            call.hasInput = true;
+        }
+    } else if (finalSnapshot)
+        call.invalid = true;
 }
 
 void updateTextItem(StreamContext::TextItem& state, const Json& item) {
@@ -513,14 +671,24 @@ void emitReasoningItemSnapshot(StreamContext& context, int outputIndex, const Js
     }
 }
 
+void publishCompletedOutput(StreamContext& context, int index, const Json& item) {
+    if (!item.is_object() || !context.sink->onOutputItemCompleted) return;
+    const std::string payload = item.dump(-1, ' ', false, Json::error_handler_t::replace);
+    auto& previous = context.publishedCompletedOutput[index];
+    if (previous == payload) return;
+    previous = payload;
+    context.sink->onOutputItemCompleted(
+        MaiModelOutputItem{index, stringField(item, "id"), stringField(item, "type"), payload});
+}
+
 void emitFullOutput(StreamContext& context, const Json& response) {
     if (!response.is_object() || !response.value("output", Json{}).is_array()) return;
     const Json& output = response["output"];
     for (std::size_t index = 0; index < output.size(); ++index) {
         const Json& item = output[index];
         const std::string type = stringField(item, "type");
-        if (type == "function_call") {
-            mergeCall(context.calls[static_cast<int>(index)], item);
+        if (type == "function_call" || type == "custom_tool_call") {
+            mergeCall(context.calls[static_cast<int>(index)], item, true);
             context.calls[static_cast<int>(index)].complete = true;
             continue;
         }
@@ -536,8 +704,16 @@ void emitFullOutput(StreamContext& context, const Json& response) {
 // 解析单条模型流事件，更新当前请求的增量内容与完成状态。
 // 异常或未知事件不能污染已确认的消息和工具调用片段。
 void handleEvent(StreamContext& context, const Json& event) {
+    if (const auto error = businessError(event, context.isGlm)) {
+        context.businessFailure = error;
+        context.done = true;
+        return;
+    }
     const std::string type = stringField(event, "type");
-    if (type.empty()) return;
+    if (type.empty()) {
+        context.malformedEvent = true;
+        return;
+    }
     // 生命周期帧可以没有内容索引；缺失/空索引不能让异常越过 curl 的 C 回调边界。
     const int outputIndex = eventIndex(event, "output_index", -1);
     const int contentIndex = eventIndex(event, "content_index", 0);
@@ -568,17 +744,6 @@ void handleEvent(StreamContext& context, const Json& event) {
         if (outputIndex >= 0)
             noteProtocolProgress(context, type, outputIndex,
                                  eventIndex(event, "summary_index", contentIndex));
-        return;
-    }
-    if (type == "response.custom_tool_call_input.delta") {
-        // 当前工具协议不消费自定义工具内容，仍承认非空协议增量，不伪装成工具结果。
-        if (!stringField(event, "delta").empty())
-            context.lastModelProgress = std::chrono::steady_clock::now();
-        return;
-    }
-    if (type == "response.custom_tool_call_input.done") {
-        noteProtocolProgress(context, type, outputIndex,
-                             eventIndex(event, "summary_index", contentIndex));
         return;
     }
     if (type == "response.output_text.delta" || type == "response.reasoning_text.delta" ||
@@ -623,6 +788,17 @@ void handleEvent(StreamContext& context, const Json& event) {
     if (type == "response.output_item.added" || type == "response.output_item.done") {
         const Json item = event.value("item", Json::object());
         const std::string itemType = stringField(item, "type");
+        if (!item.is_object() || itemType.empty()) context.malformedEvent = true;
+        if (itemType == "custom_tool_call" && outputIndex < 0) {
+            context.terminalError = "Responses custom call needs an output index";
+            return;
+        }
+        if (itemType == "custom_tool_call" && type == "response.output_item.done") {
+            // done 本身已宣告完整，后续终态不能替缺字段或错误状态的完成帧补办资格。
+            if (const MaiError error = validateOutput(Json::array({item}))) {
+                context.terminalError = error.message();
+            }
+        }
         if (type == "response.output_item.done" && outputIndex >= 0) {
             // 记录完整 item，包含晚于正文到达的签名。快照重复只替换同一槽位，不重复追加。
             context.completedOutput[outputIndex] = item;
@@ -631,9 +807,9 @@ void handleEvent(StreamContext& context, const Json& event) {
                                  itemType == "function_call" || itemType == "custom_tool_call" ||
                                  itemType == "web_search_call" || itemType == "tool_search_call"))
             noteProtocolProgress(context, type, outputIndex);
-        if (stringField(item, "type") == "function_call" && outputIndex >= 0) {
+        if ((itemType == "function_call" || itemType == "custom_tool_call") && outputIndex >= 0) {
             PendingCall& call = context.calls[outputIndex];
-            mergeCall(call, item);
+            mergeCall(call, item, type == "response.output_item.done");
             if (type == "response.output_item.done") call.complete = true;
             context.sawOutput = true;
         } else if (itemType == "message" && outputIndex >= 0) {
@@ -645,22 +821,53 @@ void handleEvent(StreamContext& context, const Json& event) {
                    type == "response.output_item.done") {
             emitReasoningItemSnapshot(context, outputIndex, item);
         }
+        // 原始完成事实与整批执行资格分开；先补齐显示投影，再保存完整不透明 item。
+        if (type == "response.output_item.done" && outputIndex >= 0)
+            publishCompletedOutput(context, outputIndex, item);
         return;
     }
-    if (type == "response.function_call_arguments.delta" && outputIndex >= 0) {
+    if (type == "response.function_call_arguments.delta" ||
+        type == "response.custom_tool_call_input.delta") {
+        if (outputIndex < 0) {
+            context.terminalError = "Responses tool input needs an output index";
+            return;
+        }
         PendingCall& call = context.calls[outputIndex];
+        if (type == "response.custom_tool_call_input.delta" && event.contains("item_id") &&
+            !event["item_id"].is_string())
+            call.invalid = true;
+        mergeCall(call,
+                  Json{{"type", type == "response.custom_tool_call_input.delta" ? "custom_tool_call"
+                                                                                : "function_call"},
+                       {"id", stringField(event, "item_id")}});
         const std::string delta = stringField(event, "delta");
+        if (!event.contains("delta") || !event["delta"].is_string()) call.invalid = true;
         if (!call.complete && !delta.empty()) {
             call.arguments += delta;
+            call.hasInput = true;
             context.lastModelProgress = std::chrono::steady_clock::now();
-        }
+        } else if (call.complete && !delta.empty())
+            call.invalid = true;
         context.sawOutput = true;
         return;
     }
-    if (type == "response.function_call_arguments.done" && outputIndex >= 0) {
+    if (type == "response.function_call_arguments.done" ||
+        type == "response.custom_tool_call_input.done") {
+        if (outputIndex < 0) {
+            context.terminalError = "Responses tool input needs an output index";
+            return;
+        }
         PendingCall& call = context.calls[outputIndex];
-        const std::string full = stringField(event, "arguments");
-        if (!full.empty() || call.arguments.empty()) call.arguments = full;
+        if (type == "response.custom_tool_call_input.done" && event.contains("item_id") &&
+            !event["item_id"].is_string())
+            call.invalid = true;
+        const bool custom = type == "response.custom_tool_call_input.done";
+        const char* field = custom ? "input" : "arguments";
+        if (!event.contains(field) || !event[field].is_string()) call.invalid = true;
+        Json snapshot{{"type", custom ? "custom_tool_call" : "function_call"},
+                      {"id", stringField(event, "item_id")}};
+        if (event.contains(field)) snapshot[field] = event[field];
+        mergeCall(call, snapshot, true);
         call.complete = true;
         context.sawOutput = true;
         noteProtocolProgress(context, type, outputIndex);
@@ -680,6 +887,12 @@ void handleEvent(StreamContext& context, const Json& event) {
             context.done = true;
             return;
         }
+        const std::string status = stringField(response, "status");
+        if (type == "response.completed" && response.contains("status") && status != "completed") {
+            context.terminalError = "Responses terminal status contradicts its completed event";
+            context.done = true;
+            return;
+        }
         if (response.contains("output")) {
             context.terminalOutput = response["output"];
             context.hasTerminalOutput = true;
@@ -689,12 +902,11 @@ void handleEvent(StreamContext& context, const Json& event) {
                 return;
             }
         }
-        const Json usage = response.value("usage", Json{});
-        if (usage.is_object() && context.sink->onUsage) {
-            const auto input = usage.value("input_tokens", Json{});
-            const auto output = usage.value("output_tokens", Json{});
-            if (input.is_number_unsigned() && output.is_number_unsigned())
-                context.sink->onUsage({input.get<std::size_t>(), output.get<std::size_t>()});
+        if (auto usage = responseUsage(response.value("usage", Json{}));
+            usage && context.sink->onUsage) {
+            usage->responseId = stringField(response, "id");
+            usage->provider = context.usageProvider;
+            context.sink->onUsage(*usage);
         }
         emitFullOutput(context, response);
         // 有些兼容服务只发送正文增量而不发送 item.done 或终止 output。
@@ -725,7 +937,10 @@ void handleLine(StreamContext& context, const std::string& line) {
     std::string payload = line.substr(5);
     if (!payload.empty() && payload.front() == ' ') payload.erase(0, 1);
     const Json event = Json::parse(payload, nullptr, false);
-    if (event.is_object()) handleEvent(context, event);
+    if (event.is_object())
+        handleEvent(context, event);
+    else if (payload != "[DONE]")
+        context.malformedEvent = true;
 }
 
 // 402 的既有诊断契约只记录已校验的数字秒，不扩大付费错误元数据。
@@ -881,6 +1096,10 @@ public:
                                      : maiOfficialModelContextLimits(mConfig.baseUrl, model);
     }
 
+    std::string usageProviderForModel(const std::string&) const override {
+        return maiModelUsageProviderForConfig(mConfig);
+    }
+
     // 建立 Responses 流并逐事件更新上层，保留取消与传输失败的明确结果。
     // 只在供应商确认完成后结束流，不从连接关闭推断模型已经完成。
     MaiResult<std::size_t> requestBodyBytes(const MaiModelRequest& request) override {
@@ -905,16 +1124,18 @@ public:
         std::string url = mConfig.baseUrl;
         if (!url.empty() && url.back() == '/') url.pop_back();
         url += "/responses";
-        const std::string originalOrigin = mConfig.proxyResolver ? modelOrigin(url) : std::string();
+        const std::string originalOrigin = modelOrigin(url);
         if (mConfig.proxyResolver && originalOrigin.empty())
             return MaiError::make(MaiErrorCode::InvalidInput, "model URL is invalid");
         for (int attempt = 0;; ++attempt) {
+            const auto networkGeneration = MaiCurlNetworkRoute::generation();
             std::string currentUrl = url;
             bool post = true;
             const auto attemptStarted = std::chrono::steady_clock::now();
             auto lastStreamActivity = attemptStarted;
             auto lastModelProgress = attemptStarted;
             StreamContext context;
+            const auto requestCapability = maiCloudModelInfo(request.model);
             char transportError[CURL_ERROR_SIZE] = {};
             CURLcode transfer = CURLE_OK;
             long status = 0;
@@ -930,18 +1151,24 @@ public:
                         return MaiError::make(MaiErrorCode::Network,
                                               "model proxy selection failed");
                 }
-                auto connection = mConnections.acquire();
+                MaiCurlNetworkRoute networkRoute;
+                auto connection = mConnections.acquire(networkRoute.capturedGeneration());
                 CURL* curl = static_cast<CURL*>(connection.nativeHandle());
                 if (!curl) return MaiError::make(MaiErrorCode::Internal, "curl_easy_init failed");
                 curl_slist* headers = nullptr;
                 headers = curl_slist_append(headers, "Content-Type: application/json");
                 headers = curl_slist_append(headers, "Accept: text/event-stream");
                 headers = curl_slist_append(headers, "Cache-Control: no-cache");
-                if (!mConfig.apiKey.empty() &&
-                    (!mConfig.proxyResolver || modelOrigin(currentUrl) == originalOrigin))
+                if (!mConfig.apiKey.empty() && modelOrigin(currentUrl) == originalOrigin)
                     headers = curl_slist_append(
                         headers, ("Authorization: Bearer " + mConfig.apiKey).c_str());
                 context = StreamContext{};
+                context.usageProvider = usageProviderForModel(request.model);
+                context.isGlm = requestCapability && requestCapability->provider == "glm";
+                if (requestCapability && requestCapability->provider == "openai")
+                    for (const auto& tool : request.tools)
+                        if (tool.name == "apply_patch" && !tool.inputGrammar.empty())
+                            context.customTools.insert(tool.name);
                 context.manualRedirects = bool(mConfig.proxyResolver);
                 context.sink = &sink;
                 context.cancel = &cancel;
@@ -1006,12 +1233,25 @@ public:
                 curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
                 curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
                 curl_easy_setopt(curl, CURLOPT_USERAGENT, "MaiAgent/0.1");
-                transfer = curl_easy_perform(curl);
+                auto routeCode = static_cast<CURLcode>(networkRoute.prepare(
+                    curl, currentUrl, !proxy.url.empty(), mConfig.connectTimeoutSeconds * 1000L,
+                    [&] { return cancel.load(std::memory_order_relaxed); }));
+                if (routeCode == CURLE_OK && mConfig.totalTimeoutSeconds > 0) {
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - attemptStarted).count();
+                    const auto remaining = mConfig.totalTimeoutSeconds * 1000LL - elapsed;
+                    routeCode = remaining > 0
+                        ? curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(remaining))
+                        : CURLE_OPERATION_TIMEDOUT;
+                }
+                const bool manualRedirects = mConfig.proxyResolver || networkRoute.networkHandle();
+                context.manualRedirects = manualRedirects;
+                transfer = routeCode == CURLE_OK ? curl_easy_perform(curl) : routeCode;
                 std::string remainder;
                 if (context.lines.takeRemainder(remainder)) handleLine(context, remainder);
                 curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
                 char* target = nullptr;
-                if (mConfig.proxyResolver) curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &target);
+                if (manualRedirects) curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &target);
                 const std::string nextUrl = target ? target : "";
                 lastStreamActivity = context.lastStreamActivity;
                 lastModelProgress = context.lastModelProgress;
@@ -1019,7 +1259,7 @@ public:
                 connection.finish(transfer == CURLE_OK ||
                                   (context.done && transfer == CURLE_WRITE_ERROR &&
                                    !cancel.load(std::memory_order_relaxed)));
-                if (!mConfig.proxyResolver || transfer != CURLE_OK || nextUrl.empty() ||
+                if (!manualRedirects || transfer != CURLE_OK || nextUrl.empty() ||
                     cancel.load(std::memory_order_relaxed))
                     break;
                 // 与 curl 默认限制一致：最多 30 跳，且只允许默认重定向协议。
@@ -1042,7 +1282,9 @@ public:
             const bool canRetry = MaiModelRetry::isTransient(
                 status, transfer != CURLE_OK && isRetryable(transfer), context.rawBody);
             const auto advise = [&](MaiError error, bool retryable) {
-                return retryable
+                // 网络通知只影响下一次用户请求。失败的 POST 可能已被供应商接收，
+                // 即使尚无文本输出，也不能因换网产生新的自动重投建议。
+                return retryable && networkGeneration == MaiCurlNetworkRoute::generation()
                            ? MaiModelRetry::advise(std::move(error), mConfig, context.sawOutput,
                                                    context.retryAfterDelayMs)
                            : error;
@@ -1103,6 +1345,9 @@ public:
                     }
                     return advise(MaiError::make(code, message), canRetry);
                 }
+                if (context.businessFailure) return context.businessFailure;
+                const Json businessBody = Json::parse(context.rawBody, nullptr, false);
+                if (const auto error = businessError(businessBody, context.isGlm)) return error;
                 if (!context.done)
                     return advise(MaiError::make(MaiErrorCode::Protocol,
                                                  "Responses stream ended without a terminal event"),
@@ -1159,19 +1404,25 @@ public:
                 }
             }
             for (const auto& [_, call] : context.calls) {
-                if (!call.complete || call.id.empty() || call.name.empty())
+                if (!call.complete || call.invalid || !call.hasInput || call.id.empty() ||
+                    call.name.empty() ||
+                    (call.type == "custom_tool_call" &&
+                     (!context.customTools.count(call.name) || context.malformedEvent)) ||
+                    (call.type == "function_call" && context.customTools.count(call.name)))
                     return MaiError::make(MaiErrorCode::Protocol,
-                                          "Responses returned an incomplete function call");
+                                          "Responses returned an invalid or undeclared tool call");
             }
             if (hasReplayableOutput) {
                 std::size_t callIndex = 0;
                 auto projected = context.calls.begin();
                 for (const Json& item : output) {
-                    if (stringField(item, "type") != "function_call") continue;
-                    if (projected == context.calls.end() ||
+                    const std::string type = stringField(item, "type");
+                    if (type != "function_call" && type != "custom_tool_call") continue;
+                    if (projected == context.calls.end() || projected->second.type != type ||
                         projected->second.id != stringField(item, "call_id") ||
                         projected->second.name != stringField(item, "name") ||
-                        projected->second.arguments != stringField(item, "arguments"))
+                        projected->second.arguments !=
+                            stringField(item, type == "custom_tool_call" ? "input" : "arguments"))
                         return {MaiErrorCode::Protocol,
                                 "Responses output does not match its function calls"};
                     ++projected;
@@ -1181,6 +1432,14 @@ public:
                     return {MaiErrorCode::Protocol,
                             "Responses output does not contain every function call"};
             }
+            if (cancel.load(std::memory_order_relaxed))
+                return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
+            // 只有终态快照的供应商在完整校验后补交原始完成项。
+            // 已交付的 item.done 由规范快照去重，不重复记录相同对象。
+            if (hasReplayableOutput)
+                for (std::size_t index = 0; index < output.size(); ++index)
+                    publishCompletedOutput(context, static_cast<int>(index), output[index]);
+            // 原始完成事实的持久化回调也可能触发取消；此后不能再发布可重放成功状态。
             if (cancel.load(std::memory_order_relaxed))
                 return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
             const auto capability = maiCloudModelInfo(request.model);
@@ -1196,7 +1455,10 @@ public:
                 if (cancel.load(std::memory_order_relaxed))
                     return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
                 if (sink.onToolCall)
-                    sink.onToolCall(MaiToolInvocation{call.id, call.name, call.arguments});
+                    sink.onToolCall(MaiToolInvocation{call.id, call.name,
+                                                      call.type == "custom_tool_call"
+                                                          ? Json{{"patch", call.arguments}}.dump()
+                                                          : call.arguments});
             }
             return {};
         }
@@ -1242,5 +1504,60 @@ private:
 }  // namespace
 
 std::unique_ptr<MaiModelClient> makeMaiResponsesClient(MaiModelConfig config) {
+    // libcurl 的全局初始化在所有远端入口共用，不能依赖已经移除的旧协议工厂。
+    struct CurlGlobal {
+        CurlGlobal() {
+            curl_global_init(CURL_GLOBAL_DEFAULT);
+        }
+        ~CurlGlobal() {
+            curl_global_cleanup();
+        }
+    };
+    static const CurlGlobal global;
+    (void)global;
+    if (config.wire != MaiWireApi::Responses) {
+        class InvalidRemoteConfiguration final : public MaiModelClient {
+        public:
+            explicit InvalidRemoteConfiguration(MaiWireApi wire) : mWire(wire) {}
+            MaiWireApi wireApi() const override {
+                return mWire;
+            }
+            MaiError stream(const MaiModelRequest&, const MaiStreamSink&,
+                            const std::atomic<bool>& cancel) override {
+                if (cancel.load()) return {MaiErrorCode::Canceled, "Model request canceled."};
+                return mWire == MaiWireApi::Local
+                           ? MaiError{MaiErrorCode::NotConfigured,
+                                      "Local models require makeMaiLlamaModelClient and a GGUF "
+                                      "file."}
+                           : MaiError{MaiErrorCode::InvalidInput,
+                                      "Mixed describes routes, not a remote transport."};
+            }
+
+        private:
+            MaiWireApi mWire;
+        };
+        return std::make_unique<InvalidRemoteConfiguration>(config.wire);
+    }
     return std::make_unique<ResponsesClient>(std::move(config));
+}
+
+std::unique_ptr<MaiModelClient> makeMaiModelClient(MaiModelConfig config) {
+    return makeMaiResponsesClient(std::move(config));
+}
+
+std::string maiModelUsageProviderForConfig(const MaiModelConfig& config) {
+    if (config.wire != MaiWireApi::Responses) return {};
+    const auto origin = modelOrigin(config.baseUrl);
+    if (origin.empty()) return {};
+    std::array<unsigned char, EVP_MAX_MD_SIZE> bytes{};
+    unsigned int count = 0;
+    if (EVP_Digest(origin.data(), origin.size(), bytes.data(), &count, EVP_sha256(), nullptr) != 1)
+        return {};
+    constexpr char hexadecimal[] = "0123456789abcdef";
+    std::string result = "origin-sha256:";
+    for (unsigned int index = 0; index < count; ++index) {
+        result += hexadecimal[bytes[index] >> 4];
+        result += hexadecimal[bytes[index] & 15];
+    }
+    return result;
 }

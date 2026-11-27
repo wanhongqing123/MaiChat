@@ -63,14 +63,14 @@ static void test_session_crud_and_events() {
         if (e.type == MaiEventType::SessionDeleted) ++deleted;
     });
 
-    const std::string a = agent.submit(MaiCreateSession{"/tmp/a", "Session A", "glm-5.3"}).value();
+    const std::string a = agent.submit(MaiCreateSession{"/tmp/a", "Session A", "glm-5.4"}).value();
     CHECK(!a.empty());
     CHECK(created == 1);
 
     MaiSession s;
     CHECK(agent.getSession(a, s));
     CHECK(s.title == "Session A");
-    CHECK(s.model == "glm-5.3");
+    CHECK(s.model == "glm-5.4");
     CHECK(s.agent == "build");
 
     agent.submit(MaiUpdateSession{a, "Renamed", "", "", "/tmp/moved"});
@@ -117,7 +117,7 @@ static std::vector<MaiSession> model_effort_session_contract(
             expectedPersisted.push_back(session);
         }
     }
-    for (const auto& model : {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+    for (const auto& model : {"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
                               "anthropic/claude-fable-5.2-preview", "fixture"}) {
         for (const auto& effort : {"medium", "xhigh"}) {
             const auto rejected =
@@ -147,7 +147,7 @@ static std::vector<MaiSession> model_effort_session_contract(
             session.reasoningEffort = effort;
             expectedPersisted.push_back(session);
         }
-        for (const auto& target : {"deepseek-flash", "glm-5.3"}) {
+        for (const auto& target : {"deepseek-flash", "glm-5.4"}) {
             const auto created =
                 agent.submit(MaiCreateSession{"", "Original title", expandedModel, "high"});
             CHECK(created);
@@ -677,7 +677,7 @@ public:
     }
 
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 
 private:

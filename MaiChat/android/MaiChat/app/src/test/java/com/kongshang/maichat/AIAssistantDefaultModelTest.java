@@ -9,7 +9,8 @@ public final class AIAssistantDefaultModelTest {
     @Test public void freshOrInvalidSettingsSelectDeepseekWithoutOverwritingExplicitChoice() {
         assertEquals("deepseek-flash", AIAssistantController.supportedModelOrDefault(""));
         assertEquals("deepseek-flash", AIAssistantController.supportedModelOrDefault("legacy"));
-        assertEquals("glm-5.3", AIAssistantController.supportedModelOrDefault("glm-5.3"));
+        assertEquals("glm-5.4", AIAssistantController.supportedModelOrDefault("glm-5.4"));
+        assertEquals("glm-5.4", AIAssistantController.supportedModelOrDefault("glm-5.3"));
         assertEquals("glm-5.3-flash",
             AIAssistantController.supportedModelOrDefault("glm-5.3-flash"));
         assertEquals("deepseek-flash",

@@ -59,6 +59,14 @@ bool contains(const Json& values, const char* expected) {
     return false;
 }
 
+Json fixtureWindow(std::uint64_t id = 101) {
+    return {{"app", "Fixture"}, {"id", id}};
+}
+
+std::string computerCall(const char* method, Json parameters = Json::object()) {
+    return Json{{"method", method}, {"parameters", std::move(parameters)}}.dump();
+}
+
 std::int64_t fixtureClockMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
         .count();
@@ -618,7 +626,7 @@ void verifyCanceledToolObservationReleasesOnlyItsTurn() {
             auto controller =
                 std::shared_ptr<DesktopComputerController>(&fixture.controller, [](DesktopComputerController*) {});
             registerDesktopComputerTools(registry, controller);
-            MaiTool* tool = registry.find("desktop_computer");
+            MaiTool* tool = registry.find("computer");
             CHECK(tool);
             if (!tool) continue;
             std::atomic<bool> cancel{true};
@@ -627,9 +635,8 @@ void verifyCanceledToolObservationReleasesOnlyItsTurn() {
             context.turnId = observingCurrentTurn ? "turn-new" : "turn-old";
             context.root = fixture.workspace.path().toUtf8().toStdString();
             context.cancel = &cancel;
-            const auto canceled = tool->execute(display ? R"({"action":"observe","target":"display","display_id":"22"})"
-                                                        : R"({"action":"observe","target":"window","window_id":"101"})",
-                                                context);
+            const auto canceled = tool->execute(computerCall("get_window_state", {{"window", fixtureWindow()},
+                {"include_screenshot", false}, {"include_text", true}}), context);
             CHECK(canceled.hasError());
             if (canceled.hasError()) CHECK(canceled.error().code() == MaiErrorCode::Canceled);
             CHECK(native->state().empty() == observingCurrentTurn);
@@ -1311,7 +1318,7 @@ struct DisplayToolFixture {
         context.root = workspace.path().toUtf8().toStdString();
         context.model = "deepseek-flash";
         registerDesktopComputerTools(registry, controller);
-        tool = registry.find("desktop_computer");
+        tool = registry.find("computer");
         CHECK(tool);
     }
 };
@@ -1629,89 +1636,40 @@ void verifyRevokedObservationCannotBeResurrectedBySuccessor() {
     CHECK(fixture.backend->inputs.size() == 1);
 }
 
-void verifyDisplayExecutionWindowToolContract() {
-    DisplayToolFixture fixture;
-    if (!fixture.tool) return;
-    const auto scene = executionWindowScenes().front();
-    useExecutionWindowScene(*fixture.backend, scene);
-    const Json observe{
-        {"action", "observe"}, {"target", "display"}, {"display_id", "11"}, {"execution_window_id", "101"}};
-    const auto observed = fixture.tool->execute(observe.dump(), fixture.context);
-    CHECK(!observed.hasError());
-    if (observed.hasError()) return;
-    const auto output = Json::parse(observed.output());
-    Json click{{"action", "click"},         {"target", "display"},
-               {"display_id", "11"},        {"snapshot_id", output["snapshot_id"]},
-               {"x_ratio", scene.outsideX}, {"y_ratio", scene.outsideY}};
-    auto overrideReceiver = click;
-    overrideReceiver["execution_window_id"] = "202";
-    CHECK(fixture.tool->execute(overrideReceiver.dump(), fixture.context).error().code() == MaiErrorCode::InvalidInput);
-    overrideReceiver = click;
-    overrideReceiver["execution_window_process_id"] = "5001";
-    CHECK(fixture.tool->execute(overrideReceiver.dump(), fixture.context).error().code() == MaiErrorCode::InvalidInput);
-    const auto rejected = fixture.tool->execute(click.dump(), fixture.context);
-    CHECK(rejected.hasError());
-    if (rejected.hasError()) {
-        CHECK(rejected.error().code() == MaiErrorCode::InvalidInput);
-        const auto detail = Json::parse(rejected.error().message(), nullptr, false);
-        CHECK(detail.is_object());
-        if (detail.is_object()) {
-            CHECK(detail.value("reason", std::string()) == "point_outside_target");
-            CHECK(detail.contains("target_bounds") && detail.contains("requested_px"));
-            CHECK(detail.contains("execution_window_id"));
-        }
-        CHECK(rejected.error().message().find("point_outside_target") != std::string::npos);
-        CHECK(rejected.error().message().find("bounds") != std::string::npos);
-        CHECK(rejected.error().message().find("requested") != std::string::npos);
-    }
-    CHECK(fixture.backend->inputs.empty() && fixture.backend->activationCount == 0);
-    auto mixed = observe;
-    mixed["target"] = "window";
-    mixed["window_id"] = "101";
-    mixed.erase("display_id");
-    CHECK(fixture.tool->execute(mixed.dump(), fixture.context).error().code() == MaiErrorCode::InvalidInput);
-}
 
 void verifyWindowObservationImageOption() {
     DisplayToolFixture fixture;
     if (!fixture.tool) return;
-    const Json metadata{{"action", "observe"}, {"target", "window"}, {"window_id", "101"}};
-    for (const bool explicitFalse : {false, true}) {
-        auto request = metadata;
-        if (explicitFalse) request["include_image"] = false;
-        const auto observed = fixture.tool->execute(request.dump(), fixture.context);
-        CHECK(!observed.hasError());
-        CHECK(observed.images().empty());
-        if (!observed.hasError()) {
-            const auto output = Json::parse(observed.output());
-            CHECK(output["has_image"] == false && output["image_width"] == 0 && output["image_height"] == 0);
-        }
+    // The replacement flagship supports both text observations and pixels.
+    fixture.context.model = "glm-5.4";
+    const auto metadata = computerCall("get_window_state", {{"window", fixtureWindow()},
+        {"include_screenshot", false}, {"include_text", true}});
+    const auto observed = fixture.tool->execute(metadata, fixture.context);
+    CHECK(!observed.hasError() && observed.images().empty());
+    if (!observed.hasError()) {
+        const auto output = Json::parse(observed.output());
+        CHECK(output["screenshots"].empty());
+        CHECK(output.contains("accessibility"));
     }
     CHECK(fixture.backend->captureCount == 0);
-    auto image = metadata;
-    image["include_image"] = true;
-    const auto captured = fixture.tool->execute(image.dump(), fixture.context);
-    CHECK(!captured.hasError());
-    CHECK(captured.images().size() == 1);
-        if (!captured.hasError()) {
-            const auto picture = Json::parse(captured.output());
-#if defined(Q_OS_WIN)
-            CHECK(picture.value("image_coordinates_usable_for_input", false));
-#else
-            CHECK(!picture.value("image_coordinates_usable_for_input", true));
-#endif
-        }
+    const auto image = computerCall("get_window_state", {{"window", fixtureWindow()}});
+    const auto captured = fixture.tool->execute(image, fixture.context);
+    CHECK(!captured.hasError() && captured.images().size() == 1);
     if (!captured.hasError()) {
         const auto output = Json::parse(captured.output());
-        CHECK(output["has_image"] == true && output["image_width"] == 20 && output["image_height"] == 20);
-        CHECK(output.value("snapshot_id", std::string()).size() > 0);
-        CHECK(!output.value("image_path", std::string()).empty());
+        CHECK(output["accessibility"].is_null());
+        CHECK(output["screenshots"].size() == 1);
+        if (output["screenshots"].size() == 1) {
+            CHECK(!output["screenshots"][0]["id"].get<std::string>().empty());
+            CHECK(output["screenshots"][0].value("image_attachment_index", -1) == 0);
+            CHECK(!output["screenshots"][0].contains("url"));
+        }
     }
     CHECK(fixture.backend->captureCount == 1 && fixture.backend->activationCount == 0);
     CHECK(fixture.backend->inputs.empty());
-    for (const char* model : {"glm-5.3", "deepseek-v4-pro", "local:owned-text-model"}) {
+    for (const char* model : {"deepseek-v4-pro", "local:owned-text-model"}) {
         fixture.context.model = model;
-        const auto textOnly = fixture.tool->execute(image.dump(), fixture.context);
+        const auto textOnly = fixture.tool->execute(image, fixture.context);
         CHECK(textOnly.hasError() && textOnly.error().code() == MaiErrorCode::NotSupported);
         CHECK(textOnly.images().empty());
         CHECK(fixture.backend->captureCount == 1);
@@ -1719,252 +1677,27 @@ void verifyWindowObservationImageOption() {
 }
 
 void verifyExecutionWindowContracts() {
+    std::fprintf(stderr, "  running verifyRevokedObservationCannotBeResurrectedBySuccessor\n");
     verifyRevokedObservationCannotBeResurrectedBySuccessor();
+    std::fprintf(stderr, "  running verifySuccessorCannotAdoptRecycledExecutionWindow\n");
     verifySuccessorCannotAdoptRecycledExecutionWindow();
+    std::fprintf(stderr, "  running verifyDisplayExecutionWindowBoundsAndCompatibility\n");
     verifyDisplayExecutionWindowBoundsAndCompatibility();
+    std::fprintf(stderr, "  running verifyDisplayExecutionWindowBindingAndSuccessor\n");
     verifyDisplayExecutionWindowBindingAndSuccessor();
+    std::fprintf(stderr, "  running verifyDisplayExecutionWindowHeldTargetAndRelease\n");
     verifyDisplayExecutionWindowHeldTargetAndRelease();
-    verifyDisplayExecutionWindowToolContract();
+    std::fprintf(stderr, "  running verifyWindowObservationImageOption\n");
     verifyWindowObservationImageOption();
 }
 
-void verifyDisplayToolWaitAndCancel() {
-    {
-        DisplayToolFixture fixture;
-        const auto start = std::chrono::steady_clock::now();
-        fixture.backend->onDisplayCapture = [&] {
-            CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(60));
-        };
-        const auto image = fixture.tool->execute(
-            R"({"action":"observe","target":"display","display_id":"22","wait_ms":60})", fixture.context);
-        CHECK(!image.hasError());
-        CHECK(fixture.backend->displayCaptureCount == 1);
-        CHECK(fixture.backend->inputs.empty());
-    }
-    {
-        DisplayToolFixture fixture;
-        std::atomic<bool> canceled{false};
-        fixture.context.cancel = &canceled;
-        std::thread canceler([&] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            canceled = true;
-        });
-        const auto start = std::chrono::steady_clock::now();
-        const auto image = fixture.tool->execute(
-            R"({"action":"observe","target":"display","display_id":"22","wait_ms":4000})", fixture.context);
-        canceler.join();
-        CHECK(image.hasError());
-        if (image.hasError()) CHECK(image.error().code() == MaiErrorCode::Canceled);
-        CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
-        CHECK(fixture.backend->displayCaptureCount == 0);
-    }
-    for (const Json& value : {Json(-1), Json(5001), Json(1.5), Json("10")}) {
-        DisplayToolFixture fixture;
-        const auto invalid = fixture.tool->execute(
-            Json{{"action", "observe"}, {"target", "display"}, {"display_id", "22"}, {"wait_ms", value}}.dump(),
-            fixture.context);
-        CHECK(invalid.hasError());
-        CHECK(fixture.backend->displayCaptureCount == 0);
-    }
-}
 
-void verifyDisplayToolSchema() {
-    DisplayToolFixture fixture;
-    if (!fixture.tool) return;
-    const Json schema = Json::parse(fixture.tool->parametersSchema(), nullptr, false);
-    CHECK(schema.is_object());
-    if (!schema.is_object()) return;
-    const Json properties = schema.value("properties", Json::object());
-    const Json actions = properties.value("action", Json::object()).value("enum", Json{});
-    CHECK(contains(actions, "list_displays"));
-    CHECK(contains(actions, "move"));
-    CHECK(properties.value("display_id", Json::object()).value("type", std::string()) == "string");
-    const Json targets = properties.value("target", Json::object()).value("enum", Json{});
-    CHECK(contains(targets, "display"));
-    CHECK(contains(targets, "window"));
-}
 
-void verifyDisplayToolObservationAndActionChain() {
-    DisplayToolFixture fixture;
-    if (!fixture.tool) return;
-    fixture.backend->visible.clear();
-    fixture.backend->focused = false;
-    const auto listed = fixture.tool->execute(R"({"action":"list_displays"})", fixture.context);
-    CHECK(!listed.hasError());
-    if (!listed.hasError()) {
-        const Json output = Json::parse(listed.output(), nullptr, false);
-        CHECK(output.is_object());
-        if (output.is_object()) {
-            const Json displays = output.value("displays", Json::array());
-            CHECK(displays.is_array());
-            CHECK(displays.size() == 2);
-            if (displays.is_array() && displays.size() == 2) {
-                CHECK(displays[0].value("display_id", std::string()) == "11");
-                CHECK(displays[0].value("primary", false));
-                CHECK(displays[1].value("display_id", std::string()) == "22");
-                CHECK(!displays[1].value("primary", true));
-                CHECK(displays[1]["bounds"]["x"] == -1280);
-                CHECK(displays[1]["bounds"]["height"] == 1024);
-            }
-        }
-        CHECK(listed.images().empty());
-    }
-    CHECK(fixture.backend->displayCaptureCount == 0);
-    const auto observed =
-        fixture.tool->execute(R"({"action":"observe","target":"display","display_id":"22"})", fixture.context);
-    CHECK(!observed.hasError());
-    if (observed.hasError()) return;
-    const Json first = Json::parse(observed.output(), nullptr, false);
-    CHECK(first.is_object());
-    if (!first.is_object()) return;
-    CHECK(first.value("target", std::string()) == "display");
-    CHECK(first.value("display_id", std::string()) == "22");
-    CHECK(first["image_width"] == 320);
-    CHECK(first["image_height"] == 256);
-    CHECK(first["frame_sequence"] == 41);
-    CHECK(first["frame_received_at_ms"] == 1700000000001LL);
-    const std::string firstToken = first.value("snapshot_id", std::string());
-    CHECK(!firstToken.empty());
-    CHECK(observed.images().size() == 1);
-    if (observed.images().size() == 1) {
-        CHECK(observed.images()[0].mimeType == "image/png");
-        CHECK(QImage(QString::fromStdString(observed.images()[0].path)).size() == QSize(320, 256));
-        CHECK(QFileInfo(QString::fromStdString(observed.images()[0].path)).canonicalFilePath() ==
-              QFileInfo(fixture.workspace.filePath(QString::fromStdString(first.value("image_path", std::string()))))
-                  .canonicalFilePath());
-    }
-    const Json key{
-        {"action", "key"}, {"target", "display"}, {"display_id", "22"}, {"snapshot_id", firstToken}, {"key", "Meta"}};
-    const auto opened = fixture.tool->execute(key.dump(), fixture.context);
-    CHECK(!opened.hasError());
-    if (opened.hasError()) return;
-    const Json keyReceipt = Json::parse(opened.output(), nullptr, false);
-    CHECK(keyReceipt.is_object());
-    if (!keyReceipt.is_object()) return;
-    CHECK(keyReceipt.value("dispatched", false));
-    CHECK(!keyReceipt.value("verified", true));
-    CHECK(keyReceipt.value("state", std::string()) == "dispatched");
-    const Json second = keyReceipt.value("observation", Json::object());
-    CHECK(second.is_object());
-    CHECK(second.value("display_id", std::string()) == "22");
-    CHECK(second["frame_sequence"] == fixture.backend->lastProducedFrameSequence);
-    CHECK(second["frame_received_at_ms"] == fixture.backend->lastProducedFrameReceivedAtMs);
-    const std::string secondToken = second.value("snapshot_id", std::string());
-    CHECK(!secondToken.empty());
-    CHECK(secondToken != firstToken);
-    CHECK(opened.images().size() == 1);
-    CHECK(fixture.backend->inputs.size() == 1);
-    if (!fixture.backend->inputs.empty()) {
-        CHECK(fixture.backend->inputs[0].desktopScope);
-        CHECK(fixture.backend->inputs[0].expectedWindowId == 0);
-        CHECK(fixture.backend->inputs[0].kind == DesktopNativeInputKind::Key);
-        CHECK(fixture.backend->inputs[0].key == "Meta");
-    }
-    const auto replayed = fixture.tool->execute(key.dump(), fixture.context);
-    CHECK(replayed.hasError());
-    CHECK(fixture.backend->inputs.size() == 1);
-    const auto moved = fixture.tool->execute(Json{{"action", "move"},
-                                                  {"target", "display"},
-                                                  {"display_id", "22"},
-                                                  {"snapshot_id", secondToken},
-                                                  {"x_ratio", 0.25},
-                                                  {"y_ratio", 0.5}}
-                                                 .dump(),
-                                             fixture.context);
-    CHECK(!moved.hasError());
-    if (!moved.hasError()) {
-        const Json moveReceipt = Json::parse(moved.output(), nullptr, false);
-        CHECK(moveReceipt.is_object());
-        if (moveReceipt.is_object()) {
-            CHECK(moveReceipt.value("dispatched", false));
-            CHECK(moveReceipt["observation"]["frame_sequence"] == fixture.backend->lastProducedFrameSequence);
-            CHECK(moveReceipt["observation"]["frame_received_at_ms"] == fixture.backend->lastProducedFrameReceivedAtMs);
-            CHECK(moveReceipt["observation"].value("snapshot_id", std::string()) != secondToken);
-        }
-        CHECK(moved.images().size() == 1);
-    }
-    CHECK(fixture.backend->inputs.size() == 2);
-    if (fixture.backend->inputs.size() == 2) {
-        CHECK(fixture.backend->inputs[1].kind == DesktopNativeInputKind::Move);
-        CHECK(std::abs(fixture.backend->inputs[1].x - (-960.25)) < 0.01);
-        CHECK(std::abs(fixture.backend->inputs[1].y - 391.5) < 0.01);
-    }
-    CHECK(fixture.backend->displayCaptureCount == 3);
-    CHECK(fixture.backend->activationCount == 0);
-    CHECK(fixture.backend->captureCount == 0);
-}
 
-void verifyDisplayToolCaptureFailureRetainsReceipt() {
-    DisplayToolFixture fixture;
-    if (!fixture.tool) return;
-    const auto observed =
-        fixture.tool->execute(R"({"action":"observe","target":"display","display_id":"22"})", fixture.context);
-    CHECK(!observed.hasError());
-    if (observed.hasError()) return;
-    const Json first = Json::parse(observed.output(), nullptr, false);
-    CHECK(first.is_object());
-    if (!first.is_object()) return;
-    fixture.backend->displayCaptureError = {MaiErrorCode::NotSupported, "fixture next frame unavailable"};
-    const Json click{{"action", "click"},  {"target", "display"},
-                     {"display_id", "22"}, {"snapshot_id", first.value("snapshot_id", std::string())},
-                     {"x_ratio", 0.5},     {"y_ratio", 0.5}};
-    const auto clicked = fixture.tool->execute(click.dump(), fixture.context);
-    CHECK(!clicked.hasError());
-    if (!clicked.hasError()) {
-        const Json receipt = Json::parse(clicked.output(), nullptr, false);
-        CHECK(receipt.is_object());
-        if (receipt.is_object()) {
-            CHECK(receipt.value("dispatched", false));
-            CHECK(receipt.value("state", std::string()) == "dispatched_observation_failed");
-            CHECK(receipt.value("observation_error", std::string()).find("fixture next frame unavailable") !=
-                  std::string::npos);
-            CHECK(!receipt.contains("observation") || receipt["observation"].empty());
-        }
-        CHECK(clicked.images().empty());
-    }
-    CHECK(fixture.backend->inputs.size() == 1);
-    CHECK(fixture.tool->execute(click.dump(), fixture.context).hasError());
-    CHECK(fixture.backend->inputs.size() == 1);
-}
 
-void verifyDisplayToolRejectsMixedTargetsAndInvalidIds() {
-    DisplayToolFixture fixture;
-    if (!fixture.tool) return;
-    const Json mixed[] = {
-        {{"action", "observe"}, {"target", "display"}, {"display_id", "22"}, {"window_id", "101"}},
-        {{"action", "observe"}, {"target", "display"}, {"display_id", "22"}, {"window_title", "Isolated editor"}},
-        {{"action", "click"},
-         {"target", "display"},
-         {"display_id", "22"},
-         {"window_id", "101"},
-         {"snapshot_id", "no-token"},
-         {"x_ratio", 0.5},
-         {"y_ratio", 0.5}},
-        {{"action", "observe"}, {"target", "window"}, {"display_id", "22"}, {"window_id", "101"}}};
-    for (const auto& parameters : mixed) {
-        const auto result = fixture.tool->execute(parameters.dump(), fixture.context);
-        CHECK(result.hasError());
-        if (result.hasError()) CHECK(result.error().code() == MaiErrorCode::InvalidInput);
-    }
-    for (const Json& invalidId :
-         {Json(""), Json("0"), Json("-1"), Json("22x"), Json("18446744073709551616"), Json(22), Json(nullptr)}) {
-        const auto result = fixture.tool->execute(
-            Json{{"action", "observe"}, {"target", "display"}, {"display_id", invalidId}}.dump(), fixture.context);
-        CHECK(result.hasError());
-        if (result.hasError()) CHECK(result.error().code() == MaiErrorCode::InvalidInput);
-    }
-    const auto absent =
-        fixture.tool->execute(R"({"action":"observe","target":"display","display_id":"99"})", fixture.context);
-    CHECK(absent.hasError());
-    if (absent.hasError()) CHECK(absent.error().code() == MaiErrorCode::NotFound);
-    CHECK(fixture.backend->displayCaptureCount == 0);
-    CHECK(fixture.backend->captureCount == 0);
-    CHECK(fixture.backend->inputs.empty());
-    CHECK(fixture.backend->activationCount == 0);
-}
 
 void verifyDisplayToolRejectsTextModelsBeforeNativeAccess() {
-    for (const std::string model : {"glm-5.3", "deepseek-v4-pro", "local:qa"}) {
+    for (const std::string model : {"deepseek-v4-pro", "local:qa"}) {
         DisplayToolFixture fixture;
         if (!fixture.tool) continue;
         // Seed a valid ordinary observation: failure must be the model gate,
@@ -1980,19 +1713,10 @@ void verifyDisplayToolRejectsTextModelsBeforeNativeAccess() {
         const auto events = fixture.backend->events.size();
         const int windows = fixture.backend->windowsCount;
         const int captureOptions = fixture.backend->captureOptionsCount;
-        const auto deniedObserve =
-            fixture.tool->execute(R"({"action":"observe","target":"display","display_id":"22"})", fixture.context);
+        const auto deniedObserve = fixture.tool->execute(
+            computerCall("get_window_state", {{"window", fixtureWindow()}}), fixture.context);
         CHECK(deniedObserve.hasError());
         if (deniedObserve.hasError()) CHECK(deniedObserve.error().code() == MaiErrorCode::NotSupported);
-        const auto deniedInput = fixture.tool->execute(Json{{"action", "key"},
-                                                            {"target", "display"},
-                                                            {"display_id", "22"},
-                                                            {"snapshot_id", first.value("snapshot_id", std::string())},
-                                                            {"key", "Meta"}}
-                                                           .dump(),
-                                                       fixture.context);
-        CHECK(deniedInput.hasError());
-        if (deniedInput.hasError()) CHECK(deniedInput.error().code() == MaiErrorCode::NotSupported);
         CHECK(fixture.backend->displayCaptureCount == captures);
         CHECK(fixture.backend->captureOptionsCount == captureOptions);
         CHECK(fixture.backend->windowsCount == windows);
@@ -2001,46 +1725,14 @@ void verifyDisplayToolRejectsTextModelsBeforeNativeAccess() {
         CHECK(fixture.backend->activationCount == 0);
         // Metadata-only window observation remains usable by these models.
         const auto window =
-            fixture.tool->execute(R"({"action":"observe","window_id":"101","include_elements":true})", fixture.context);
+            fixture.tool->execute(computerCall("get_window_state", {{"window", fixtureWindow()},
+                {"include_screenshot", false}, {"include_text", true}}), fixture.context);
         CHECK(!window.hasError());
         CHECK(window.images().empty());
         CHECK(fixture.backend->captureCount == 0);
     }
 }
 
-void verifyDisplayToolWorkspaceChangeRejectsOldToken() {
-    for (const bool clearWorkspace : {false, true}) {
-        DisplayToolFixture fixture;
-        QTemporaryDir differentWorkspace;
-        CHECK(differentWorkspace.isValid());
-        if (!fixture.tool) continue;
-        const auto observed =
-            fixture.tool->execute(R"({"action":"observe","target":"display","display_id":"22"})", fixture.context);
-        CHECK(!observed.hasError());
-        if (observed.hasError()) continue;
-        const Json first = Json::parse(observed.output(), nullptr, false);
-        CHECK(first.is_object());
-        if (!first.is_object()) continue;
-        const auto originalFiles = QDir(fixture.workspace.filePath(QStringLiteral("computer"))).entryList(QDir::Files);
-        fixture.context.root = clearWorkspace ? std::string() : differentWorkspace.path().toUtf8().toStdString();
-        const auto result = fixture.tool->execute(Json{{"action", "click"},
-                                                       {"target", "display"},
-                                                       {"display_id", "22"},
-                                                       {"snapshot_id", first.value("snapshot_id", std::string())},
-                                                       {"x_ratio", 0.5},
-                                                       {"y_ratio", 0.5}}
-                                                      .dump(),
-                                                  fixture.context);
-        CHECK(result.hasError());
-        if (result.hasError()) CHECK(result.error().code() == MaiErrorCode::InvalidInput);
-        CHECK(result.images().empty());
-        CHECK(fixture.backend->inputs.empty());
-        CHECK(fixture.backend->activationCount == 0);
-        CHECK(fixture.backend->displayCaptureCount == 1);
-        CHECK(QDir(fixture.workspace.filePath(QStringLiteral("computer"))).entryList(QDir::Files) == originalFiles);
-        CHECK(!QFileInfo::exists(differentWorkspace.filePath(QStringLiteral("computer"))));
-    }
-}
 
 void verifyOwnedPopupInput() {
     Fixture fixture;
@@ -2401,63 +2093,6 @@ void verifyKeyIdentityAndCatalog() {
         CHECK(std::find(names.begin(), names.end(), name) != names.end());
 }
 
-void verifyKeyCatalogTool() {
-    auto backend = std::make_shared<RecordingBackend>();
-    auto controller = std::make_shared<DesktopComputerController>(backend);
-    MaiToolRegistry registry;
-    registerDesktopComputerTools(registry, controller);
-    MaiTool* tool = registry.find("desktop_computer");
-    CHECK(tool);
-    if (!tool) return;
-    const auto schema = Json::parse(tool->parametersSchema(), nullptr, false);
-    CHECK(schema.is_object());
-    if (schema.is_object()) {
-        CHECK(contains(schema["properties"]["action"]["enum"], "list_keys"));
-        CHECK(schema["properties"]["key"].value("maxLength", 0) == 128);
-    }
-    MaiToolContext context;
-    context.sessionId = "catalog-no-observation";
-    // Capabilities are ordinary metadata: no observation token, workspace,
-    // display, window enumeration, capture, activation or native input is needed.
-    const auto catalog = tool->execute(R"({"action":"list_keys"})", context);
-    CHECK(!catalog.hasError());
-    CHECK(catalog.images().empty());
-    CHECK(!catalog.isTruncated());
-    if (!catalog.hasError()) {
-        const auto output = Json::parse(catalog.output(), nullptr, false);
-        CHECK(output.is_object());
-        if (output.is_object()) {
-            for (const char* name : {"ControlRight", "NumpadEnter", "Equal", "Plus", "VolumeMute"})
-                CHECK(contains(output.value("key_names", Json::array()), name));
-            CHECK(output.value("text_action", std::string()) == "type");
-            CHECK(output.value("native_support_checked_at_dispatch", false));
-        }
-    }
-    for (const auto& extra : {Json{{"text", "do not type"}}, Json{{"key", "Enter"}}, Json{{"target", "display"}},
-                              Json{{"window_id", "1"}}, Json{{"snapshot_id", "unused"}}}) {
-        Json arguments{{"action", "list_keys"}};
-        arguments.update(extra);
-        const auto rejected = tool->execute(arguments.dump(), context);
-        CHECK(rejected.hasError());
-        if (rejected.hasError()) CHECK(rejected.error().code() == MaiErrorCode::InvalidInput);
-    }
-    std::atomic<bool> canceled{true};
-    context.cancel = &canceled;
-    const auto stopped = tool->execute(R"({"action":"list_keys"})", context);
-    CHECK(stopped.hasError());
-    if (stopped.hasError()) CHECK(stopped.error().code() == MaiErrorCode::Canceled);
-    context.cancel = nullptr;
-    context.sessionId.clear();
-    const auto ownerless = tool->execute(R"({"action":"list_keys"})", context);
-    CHECK(ownerless.hasError());
-    if (ownerless.hasError()) CHECK(ownerless.error().code() == MaiErrorCode::NotConfigured);
-    CHECK(backend->windowsCount == 0);
-    CHECK(backend->activationCount == 0);
-    CHECK(backend->captureCount == 0);
-    CHECK(backend->displayCaptureCount == 0);
-    CHECK(backend->inputs.empty());
-    CHECK(backend->events.empty());
-}
 
 void makeWindowUnavailable(DesktopNativeWindow& window, int state) {
     if (state == 0) window.minimized = true;
@@ -2481,38 +2116,33 @@ void verifyWindowDiscoveryMetadataAndUntitledSelection() {
     auto controller = std::make_shared<DesktopComputerController>(backend);
     MaiToolRegistry registry;
     registerDesktopComputerTools(registry, controller);
-    const auto tool = registry.find("desktop_computer");
+    const auto tool = registry.find("computer");
     CHECK(tool);
     if (!tool) return;
     MaiToolContext context;
     context.sessionId = "window-discovery";
-    const auto result = tool->execute(R"({"action":"list"})", context);
+    const auto result = tool->execute(computerCall("list_windows"), context);
     CHECK(!result.hasError());
     if (!result.hasError()) {
-        const auto output = Json::parse(result.output(), nullptr, false);
-        CHECK(output.is_object());
-        CHECK(output.value("count", 0) == 205);
-        CHECK(!output.contains("complete") && !output.contains("truncated"));
-        const auto windows = output.value("windows", Json::array());
-        CHECK(windows.size() == 205);
-        if (windows.size() == 205) {
-            const auto first = windows[0];
-            CHECK(first.value("title", std::string()) == "");
-            CHECK(first.value("class_name", std::string()) == "OwnedUntitledProbe");
-            CHECK(first.value("owner_window_id", std::string()) == "9007199254740993");
-            CHECK(first.value("tool_window", false));
-            CHECK(first.contains("minimized") && !first.value("minimized", true));
-            CHECK(first.contains("cloaked") && !first.value("cloaked", true));
-            CHECK(first.contains("bounds_available") && first.value("bounds_available", false));
-            CHECK(windows[1].value("minimized", false));
-            CHECK(windows[2].value("cloaked", false));
-            CHECK(windows[3].contains("bounds_available") && !windows[3].value("bounds_available", true));
-            CHECK(windows.back().value("window_id", std::string()) == "205");
+        const auto windows = Json::parse(result.output(), nullptr, false);
+        CHECK(windows.is_array() && windows.size() == 205);
+        if (windows.is_array() && windows.size() == 205) {
+            CHECK(windows[0]["title"] == "" && windows[0]["app"] == "Fixture");
+            CHECK(windows[0]["id"] == 1 && windows.back()["id"] == 205);
         }
+    }
+    // Native discovery retains facts omitted by the narrower Sky Window DTO.
+    const auto native = backend->windows();
+    CHECK(native && native.value().size() == 205);
+    if (native && native.value().size() == 205) {
+        CHECK(native.value()[0].className == "OwnedUntitledProbe");
+        CHECK(native.value()[0].ownerId == 9007199254740993ULL);
+        CHECK(native.value()[0].toolWindow && !native.value()[0].minimized && !native.value()[0].cloaked);
+        CHECK(native.value()[1].minimized && native.value()[2].cloaked && !native.value()[3].boundsAvailable);
     }
     CHECK(backend->captureCount == 0 && backend->activationCount == 0 && backend->inputSessionCreations == 0);
     CHECK(backend->inputs.empty());
-    const auto extra = tool->execute(R"({"action":"list","limit":10})", context);
+    const auto extra = tool->execute(computerCall("list_windows", {{"limit", 10}}), context);
     CHECK(extra.hasError());
     if (extra.hasError()) CHECK(extra.error().code() == MaiErrorCode::InvalidInput);
     QTemporaryDir workspace;
@@ -2520,12 +2150,12 @@ void verifyWindowDiscoveryMetadataAndUntitledSelection() {
     CHECK(ordinary);
     if (ordinary) CHECK(!Json::parse(ordinary.value().json).value("snapshot_id", std::string()).empty());
     context.root = workspace.path().toUtf8().toStdString();
-    const auto byId = tool->execute(R"({"action":"observe","window_id":"1","include_elements":false})", context);
+    const auto byId = tool->execute(computerCall("get_window_state", {{"window", fixtureWindow(1)}, {"include_screenshot", false}, {"include_text", true}}), context);
     CHECK(!byId.hasError());
     if (!byId.hasError()) {
         const auto output = Json::parse(byId.output());
-        CHECK(output.value("title", std::string()) == "");
-        CHECK(!output.value("snapshot_id", std::string()).empty());
+        CHECK(output["window"]["title"] == "");
+        CHECK(output["window"]["id"] == 1 && output["screenshots"].empty());
     }
     CHECK(backend->captureCount == 0 && backend->activationCount == 0 && backend->inputSessionCreations == 0);
     CHECK(backend->inputs.empty());
@@ -2549,13 +2179,13 @@ void verifyUnobservableDiscoveryCannotIssueWindowToken() {
         auto controller = std::make_shared<DesktopComputerController>(fixture.backend);
         MaiToolRegistry registry;
         registerDesktopComputerTools(registry, controller);
-        const auto tool = registry.find("desktop_computer");
+        const auto tool = registry.find("computer");
         CHECK(tool);
         if (!tool) continue;
         MaiToolContext context;
         context.sessionId = "unobservable-window";
         context.root = fixture.workspace.path().toUtf8().toStdString();
-        const auto result = tool->execute(R"({"action":"observe","window_id":"101","include_elements":false})", context);
+        const auto result = tool->execute(computerCall("get_window_state", {{"window", fixtureWindow()}, {"include_screenshot", false}, {"include_text", true}}), context);
         CHECK(result.hasError() == (state == 2));
         if (result.hasError()) CHECK(result.error().code() == MaiErrorCode::Busy ||
                                      result.error().code() == MaiErrorCode::InvalidInput);
@@ -2824,30 +2454,28 @@ void verifyElementToolValidationAndFailureFacts() {
     auto controller = std::shared_ptr<DesktopComputerController>(&fixture.controller, [](DesktopComputerController*) {});
     MaiToolRegistry registry;
     registerDesktopComputerTools(registry, controller);
-    const auto tool = registry.find("desktop_computer");
+    const auto tool = registry.find("computer");
     CHECK(tool);
     if (!tool) return;
     MaiToolContext context;
     context.sessionId = "owner";
     context.root = fixture.workspace.path().toUtf8().toStdString();
-    const auto observed = tool->execute(R"({"action":"observe","window_id":"101"})", context);
+    const auto observed = tool->execute(computerCall("get_window_state", {{"window", fixtureWindow()}, {"include_screenshot", false}, {"include_text", true}}), context);
     CHECK(!observed.hasError());
     if (observed.hasError()) return;
-    const auto output = Json::parse(observed.output());
-    Json args{{"action", "click"}, {"window_id", "101"}, {"snapshot_id", output["snapshot_id"]},
-              {"element_id", output["elements"][0].value("element_id", std::string())}};
+    Json args{{"window", fixtureWindow()}, {"element_index", 0}};
     for (int bad = 0; bad < 4; ++bad) {
         auto invalid = args;
-        if (bad == 0) invalid["x_ratio"] = 0.5;
-        if (bad == 1) { invalid["x_ratio"] = 0.5; invalid["y_ratio"] = 0.5; }
-        if (bad == 2) invalid["element_id"] = 2;
-        if (bad == 3) invalid["element_id"] = "";
-        const auto result = tool->execute(invalid.dump(), context);
+        if (bad == 0) invalid["x"] = 0.5;
+        if (bad == 1) { invalid["x"] = 0.5; invalid["y"] = 0.5; }
+        if (bad == 2) invalid["element_index"] = "0";
+        if (bad == 3) invalid["element_index"] = -1;
+        const auto result = tool->execute(computerCall("click", invalid), context);
         CHECK(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput);
     }
     CHECK(fixture.backend->inputs.empty() && fixture.backend->activationCount == 0);
     fixture.backend->inputError = {MaiErrorCode::Busy, "fixture partial input"};
-    const auto failed = tool->execute(args.dump(), context);
+    const auto failed = tool->execute(computerCall("click", args), context);
     CHECK(failed.hasError() && failed.error().code() == MaiErrorCode::Busy);
     const auto facts = Json::parse(failed.error().message(), nullptr, false);
     CHECK(facts.is_object());
@@ -2855,15 +2483,12 @@ void verifyElementToolValidationAndFailureFacts() {
         CHECK(facts["input_dispatch_attempted"] == true);
         CHECK(facts["window_operation_attempted"] == true);
         CHECK(facts["needs_observation"] == true);
-        CHECK(facts.contains("input_state") && !facts.contains("accepted_events"));
+        CHECK(!facts.contains("accepted_events"));
     }
-    for (const auto& invalid : {Json{{"action", "observe"}, {"target", "display"}, {"display_id", "bad"}},
-                                Json{{"action", "observe"}, {"target", "display"}, {"display_id", "11"},
-                                     {"element_window_id", "bad"}}}) {
-        const auto result = tool->execute(invalid.dump(), context);
-        CHECK(result.hasError());
-        if (result.hasError()) CHECK(result.error().message().find(invalid.contains("element_window_id") ?
-                                     "element_window_id" : "display_id") != std::string::npos);
+    for (const auto& invalid : {Json{{"window", fixtureWindow()}, {"element_index", 0}, {"display_id", "bad"}},
+                                 Json{{"window", fixtureWindow()}, {"element_index", 0}, {"element_window_id", "bad"}}}) {
+        const auto result = tool->execute(computerCall("click", invalid), context);
+        CHECK(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput);
     }
 }
 
@@ -2913,7 +2538,7 @@ void verifyElementStateChangesAtDispatchAndMissingDisplaySource() {
     }
 }
 
-void verifyCanceledStateDryRunStillReleasesStoppedTurn() {
+void verifyCanceledWindowToolStillReleasesStoppedTurn() {
     Fixture fixture;
     const auto native = holdControl(fixture, false, "dry-state-turn");
     auto action = fixture.observe("restore");
@@ -2921,7 +2546,7 @@ void verifyCanceledStateDryRunStillReleasesStoppedTurn() {
     auto controller = std::shared_ptr<DesktopComputerController>(&fixture.controller, [](DesktopComputerController*) {});
     MaiToolRegistry registry;
     registerDesktopComputerTools(registry, controller);
-    const auto tool = registry.find("desktop_computer");
+    const auto tool = registry.find("computer");
     CHECK(tool && native);
     if (!tool || !native) return;
     std::atomic<bool> canceled{true};
@@ -2929,8 +2554,7 @@ void verifyCanceledStateDryRunStillReleasesStoppedTurn() {
     context.sessionId = "owner";
     context.turnId = action.turnId;
     context.cancel = &canceled;
-    const auto result = tool->execute(Json{{"action", "restore"}, {"window_id", "101"},
-        {"snapshot_id", action.snapshotId}, {"dry_run", true}}.dump(), context);
+    const auto result = tool->execute(computerCall("activate_window", {{"window", fixtureWindow()}}), context);
     CHECK(result.hasError() && result.error().code() == MaiErrorCode::Canceled);
     CHECK(native->releaseCalls() > 0 && native->state().empty());
     CHECK(fixture.backend->stateCalls == 0);
@@ -2950,61 +2574,30 @@ void verifyInvalidatedEvidenceProgressAndObserveDiagnostics() {
     auto controller = std::shared_ptr<DesktopComputerController>(&fixture.controller, [](DesktopComputerController*) {});
     MaiToolRegistry registry;
     registerDesktopComputerTools(registry, controller);
-    const auto tool = registry.find("desktop_computer");
+    const auto tool = registry.find("computer");
     CHECK(tool);
     if (!tool) return;
     MaiToolContext context;
     context.sessionId = "owner";
     context.root = fixture.workspace.path().toUtf8().toStdString();
-    const std::vector<std::pair<Json, std::string>> invalid{
-        {Json{{"action", "observe"}, {"window_id", "101"}, {"bogus", 1}}, "bogus"},
-        {Json{{"action", "observe"}, {"window_id", "101"}, {"include_elements", "true"}}, "include_elements"},
-        {Json{{"action", "observe"}, {"window_id", "101"}, {"window_title", "Isolated editor"}}, "exactly one"},
-        {Json{{"action", "observe"}, {"window_id", "101"}, {"workspace", context.root}}, "workspace"},
-        {Json{{"action", "observe"}, {"target", "display"}, {"display_id", 22}}, "display_id"},
-        {Json{{"action", "observe"}, {"target", "display"}, {"display_id", "22"}, {"wait_ms", "0"}}, "wait_ms"}};
-    for (const auto& entry : invalid) {
-        const auto result = tool->execute(entry.first.dump(), context);
-        CHECK(result.hasError() && result.error().message().find(entry.second) != std::string::npos);
+    const std::vector<Json> invalid{
+        {{"window", fixtureWindow()}, {"bogus", 1}},
+        {{"window", fixtureWindow()}, {"include_text", "true"}},
+        {{"window", fixtureWindow()}, {"window_title", "Isolated editor"}},
+        {{"window", fixtureWindow()}, {"workspace", context.root}},
+        {{"window", fixtureWindow()}, {"display_id", 22}},
+        {{"window", fixtureWindow()}, {"wait_ms", "0"}}};
+    for (const auto& args : invalid) {
+        const auto result = tool->execute(computerCall("get_window_state", args), context);
+        CHECK(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput);
     }
-    context.root.clear();
-    const auto host = tool->execute(R"({"action":"observe","window_id":"101"})", context);
-    CHECK(host.hasError() && host.error().message().find("host workspace") != std::string::npos);
     CHECK(fixture.backend->events.empty() && fixture.backend->windowsCount == 0);
+    context.root.clear();
+    const auto host = tool->execute(computerCall("get_window_state", {{"window", fixtureWindow()}}), context);
+    CHECK(host.hasError() && host.error().code() == MaiErrorCode::InvalidInput);
+    CHECK(fixture.backend->captureCount == 0 && fixture.backend->inputs.empty());
 }
 
-void verifyMissingSnapshotFieldIsDiagnosedBeforeBackendAccess() {
-    for (const bool display : {false, true}) {
-        Fixture fixture;
-        const auto action = display ? observeNativeElement(fixture, true) : fixture.observe("restore");
-        auto controller = std::shared_ptr<DesktopComputerController>(&fixture.controller,
-                                                                     [](DesktopComputerController*) {});
-        MaiToolRegistry registry;
-        registerDesktopComputerTools(registry, controller);
-        const auto tool = registry.find("desktop_computer");
-        CHECK(tool);
-        if (!tool) continue;
-        MaiToolContext context;
-        context.sessionId = "owner";
-        context.root = fixture.workspace.path().toUtf8().toStdString();
-        const Json args = display ? Json{{"action", "click"}, {"target", "display"},
-                                         {"display_id", "11"}, {"element_id", action.elementId}}
-                                  : Json{{"action", "restore"}, {"window_id", "101"}};
-        const auto windows = fixture.backend->windowsCount;
-        const auto captures = fixture.backend->captureCount;
-        const auto displayCaptures = fixture.backend->displayCaptureCount;
-        const auto elementReads = fixture.backend->elementReads;
-        fixture.backend->events.clear();
-        const auto result = tool->execute(args.dump(), context);
-        CHECK(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput);
-        CHECK(result.error().message().find("snapshot_id is required") != std::string::npos);
-        CHECK(fixture.backend->events.empty() && fixture.backend->inputs.empty());
-        CHECK(fixture.backend->windowsCount == windows && fixture.backend->captureCount == captures &&
-              fixture.backend->displayCaptureCount == displayCaptures && fixture.backend->elementReads == elementReads);
-        CHECK(fixture.backend->activationCount == 0 && fixture.backend->stateCalls == 0 &&
-              fixture.backend->inputSessionCreations == 0);
-    }
-}
 
 void verifyWindowDiscoveryStateChangeDuringObservation() {
     for (int state = 0; state < 3; ++state) {
@@ -3096,8 +2689,7 @@ void verifyWindowSelection() {
 
 void verifyScreenshotHandoff() {
     Fixture fixture;
-    // The ordinary API retains a controlled native-fixture capture for host
-    // integration; model-facing observe is metadata only.
+    // 普通入口和模型入口共享窗口采集；独立截图不是电脑观察的前置工具。
     MaiToolContext context;
     context.sessionId = "screenshot-delivery";
     context.root = fixture.workspace.path().toUtf8().toStdString();
@@ -3122,6 +2714,38 @@ void verifyScreenshotHandoff() {
         CHECK(receipt["type"] == "image");
     }
     CHECK(fixture.backend->captureCount == 1);
+    CHECK(fixture.backend->inputs.empty());
+}
+
+void verifyComputerWindowObservationNeedsNoScreenshotTool() {
+    Fixture fixture;
+    MaiToolRegistry registry;
+    auto controller = std::make_shared<DesktopComputerController>(fixture.backend);
+    registerDesktopComputerTools(registry, controller);
+    CHECK(!registry.find("screenshot") && !registry.find("desktop_computer"));
+    auto* tool = registry.find("computer");
+    CHECK(tool);
+    if (!tool) return;
+    MaiToolContext context;
+    context.sessionId = "self-contained-window-observation";
+    context.root = fixture.workspace.path().toUtf8().toStdString();
+    context.model = "gpt-6.1-sol";
+    const auto image = tool->execute(computerCall("get_window_state", {{"window", fixtureWindow()}}), context);
+    CHECK(!image.hasError() && image.images().size() == 1);
+    CHECK(fixture.backend->captureCount == 1 && fixture.backend->displayCaptureCount == 0);
+    if (!image.hasError()) {
+        const auto output = Json::parse(image.output());
+        CHECK(output["window"]["id"] == 101 && output["screenshots"].size() == 1);
+        if (output["screenshots"].size() == 1) {
+            CHECK(!output["screenshots"][0]["id"].get<std::string>().empty());
+            CHECK(output["screenshots"][0].value("image_attachment_index", -1) == 0);
+            CHECK(!output["screenshots"][0].contains("url"));
+        }
+    }
+    const auto text = tool->execute(computerCall("get_window_state", {{"window", fixtureWindow()},
+        {"include_screenshot", false}, {"include_text", true}}), context);
+    CHECK(!text.hasError() && text.images().empty());
+    CHECK(fixture.backend->captureCount == 1 && fixture.backend->displayCaptureCount == 0);
     CHECK(fixture.backend->inputs.empty());
 }
 
@@ -3202,53 +2826,33 @@ void verifyObservationWithoutImage() {
     MaiToolRegistry registry;
     auto controller = std::make_shared<DesktopComputerController>(fixture.backend);
     registerDesktopComputerTools(registry, controller);
-    MaiTool* tool = registry.find("desktop_computer");
+    MaiTool* tool = registry.find("computer");
     CHECK(tool);
     if (!tool) return;
     MaiToolContext context;
     context.sessionId = "element-only-tool-session";
     context.root = fixture.workspace.path().toUtf8().toStdString();
-    context.model = "deepseek-flash";
-    const auto result = tool->execute(R"({"action":"observe","window_id":"101","include_elements":true})", context);
-    CHECK(!result.hasError());
-    CHECK(result.images().empty());
-    if (!result.hasError()) {
-        const Json output = Json::parse(result.output());
-        CHECK(output["has_image"] == false);
-        CHECK(!output.contains("image_path"));
-        CHECK(output["elements"].size() == 1);
-        CHECK(!output.value("snapshot_id", std::string()).empty());
-        CHECK(output.value("snapshot_id", std::string()) != firstSnapshot);
-    }
-    // Text-only and image-capable models receive the same metadata contract.
-    for (const std::string model : {"glm-5.3", "local:qa"}) {
+    const Json request{{"window", fixtureWindow()}, {"include_screenshot", false}, {"include_text", true}};
+    // Both text-only and image-capable models may explicitly request text.
+    for (const std::string model : {"deepseek-flash", "glm-5.4", "local:qa", "gpt-6.1-sol"}) {
         context.model = model;
-        const auto defaultResult =
-            tool->execute(R"({"action":"observe","window_id":"101","include_elements":true})", context);
-        CHECK(!defaultResult.hasError());
-        CHECK(defaultResult.images().empty());
-        if (!defaultResult.hasError()) {
-            const Json output = Json::parse(defaultResult.output());
-            CHECK(output["has_image"] == false);
-            CHECK(!output.contains("image_path"));
-            CHECK(output["elements"].size() == 1);
+        const auto result = tool->execute(computerCall("get_window_state", request), context);
+        CHECK(!result.hasError() && result.images().empty());
+        if (!result.hasError()) {
+            const auto output = Json::parse(result.output());
+            CHECK(output["screenshots"].empty());
+            CHECK(output["accessibility"].is_object() && output["accessibility"]["tree"].is_string());
+            CHECK(!output.contains("snapshot_id"));
+        }
+        for (const Json flag : {Json(nullptr), Json("false")}) {
+            auto invalid = request;
+            invalid["include_screenshot"] = flag;
+            const auto rejected = tool->execute(computerCall("get_window_state", invalid), context);
+            CHECK(rejected.hasError() && rejected.error().code() == MaiErrorCode::InvalidInput);
+            CHECK(rejected.images().empty());
         }
     }
-    for (const std::string model : {"deepseek-flash", "glm-5.3", "local:qa"}) {
-        context.model = model;
-        const auto explicitMetadata =
-            tool->execute(Json{{"action", "observe"}, {"window_id", "101"}, {"include_image", false}}.dump(), context);
-        CHECK(!explicitMetadata.hasError() && explicitMetadata.images().empty());
-        for (const Json includeImage : {Json(nullptr), Json("false")}) {
-            const auto unsupportedImage = tool->execute(
-                Json{{"action", "observe"}, {"window_id", "101"}, {"include_image", includeImage}}.dump(), context);
-            CHECK(unsupportedImage.hasError());
-            CHECK(unsupportedImage.error().code() == MaiErrorCode::InvalidInput);
-            CHECK(unsupportedImage.images().empty());
-        }
-    }
-    CHECK(fixture.backend->captureCount == 0);
-    CHECK(fixture.backend->activationCount == 0);
+    CHECK(fixture.backend->captureCount == 0 && fixture.backend->activationCount == 0);
     CHECK(fixture.backend->inputs.empty());
     CHECK(!QFileInfo::exists(fixture.workspace.filePath(QStringLiteral("computer"))));
 }
@@ -3525,13 +3129,12 @@ void verifyReadOnlyAndDryRunNeverCreateNativeSession() {
         MaiToolRegistry registry;
         auto controller = std::shared_ptr<DesktopComputerController>(&fixture.controller, [](DesktopComputerController*) {});
         registerDesktopComputerTools(registry, controller);
-        auto* tool = registry.find("desktop_computer");
+        auto* tool = registry.find("computer");
         CHECK(tool);
         if (!tool) continue;
         MaiToolContext context;
         context.sessionId = "owner";
-        for (const char* query : {R"({"action":"input_capabilities"})", R"({"action":"list_keys"})",
-                                 R"({"action":"input_state"})"})
+        for (const auto& query : {computerCall("list_windows"), computerCall("get_window", {{"id", 101}})})
             CHECK(!tool->execute(query, context).hasError());
         CHECK(fixture.backend->inputSessionCreations == 0 && !fixture.backend->lastInputSession);
     }
@@ -3633,8 +3236,8 @@ void verifyInputEventsLosslessParsing() {
 // Virtual profiles/driver selection, retained-pad reset and SDK feedback payloads
 // are explicitly deferred. Their exact former source is archived with the pre-migration
 // file in .cache/desktop-contracts-system-native-20261116; they are not claimed to pass.
-void verifyModelOptionsOmissionInheritsButOrdinaryDefaultsReset() {
-    for (const bool model : {true, false}) {
+void verifyOrdinaryOptionsInheritanceAndDefaultsReset() {
+    for (const bool inherit : {true, false}) {
         auto backend = std::make_shared<RecordingBackend>();
         backend->statefulInput = true;
         backend->composeInputSession = true;
@@ -3642,11 +3245,11 @@ void verifyModelOptionsOmissionInheritsButOrdinaryDefaultsReset() {
         QTemporaryDir workspace;
         MaiToolRegistry registry;
         registerDesktopComputerTools(registry, controller);
-        auto* tool = registry.find("desktop_computer");
+        auto* tool = registry.find("computer");
         CHECK(tool && workspace.isValid());
         if (!tool || !workspace.isValid()) continue;
         MaiToolContext context;
-        context.sessionId = model ? "inherited-model-options" : "explicit-ordinary-options";
+        context.sessionId = inherit ? "inherited-ordinary-options" : "explicit-ordinary-options";
         context.turnId = "configuration-turn";
         context.root = workspace.path().toUtf8().toStdString();
         const auto observe = [&] {
@@ -3666,16 +3269,8 @@ void verifyModelOptionsOmissionInheritsButOrdinaryDefaultsReset() {
         held.kind = DesktopInputEventKind::MouseButton;
         held.button = 1;
         first.events = {held};
-        if (model) {
-            const Json args{{"action", "input_events"}, {"window_id", "101"}, {"snapshot_id", snapshot},
-                {"events", Json::array({Json{{"type", "mouse_button"}, {"button", "left"}, {"release", false}}})},
-                {"input_options", {{"keyboard_repeat", false}, {"high_resolution_scroll", false},
-                    {"repeat_delay_ms", 73}, {"repeat_period_ms", 17}, {"key_bindings", {{65, 66}}}}}};
-            CHECK(!tool->execute(args.dump(), context).hasError());
-        } else {
-            CHECK(!first.inputOptions.inheritExisting);
-            CHECK(controller->perform(context.sessionId, first));
-        }
+        CHECK(!first.inputOptions.inheritExisting);
+        CHECK(controller->perform(context.sessionId, first));
         const auto native = backend->lastInputSession;
         CHECK(native && native->state().buttonsDown == std::vector<std::string>{"left"});
         if (!native) continue;
@@ -3683,24 +3278,20 @@ void verifyModelOptionsOmissionInheritsButOrdinaryDefaultsReset() {
         CHECK(native->options().repeatDelayMs == 73 && native->options().repeatPeriodMs == 17);
         CHECK(native->options().keyBindings == (std::vector<std::array<std::uint16_t, 2>>{{65, 66}}));
         snapshot = observe();
-        const Json move{{"action", "input_events"}, {"window_id", "101"}, {"snapshot_id", snapshot},
-            {"events", Json::array({Json{{"type", "relative_move"}, {"delta_x", 1}, {"delta_y", 0}}})}};
-        if (model) {
-            CHECK(!tool->execute(move.dump(), context).hasError());
+        DesktopComputerAction reset;
+        reset.action = "input_events"; reset.windowId = 101; reset.snapshotId = snapshot; reset.turnId = context.turnId;
+        DesktopInputEvent relative; relative.kind = DesktopInputEventKind::RelativeMove; relative.deltaX = 1;
+        reset.events = {relative};
+        CHECK(!reset.inputOptions.inheritExisting);
+        if (inherit) {
+            reset.inputOptions.inheritExisting = true;
+            CHECK(controller->perform(context.sessionId, reset));
             CHECK(!native->options().keyboardRepeat && !native->options().highResolutionScroll);
             CHECK(native->options().keyBindings == (std::vector<std::array<std::uint16_t, 2>>{{65, 66}}));
-            auto reset = move;
-            reset["snapshot_id"] = observe();
-            reset["input_options"] = Json::object();
-            CHECK(!tool->execute(reset.dump(), context).hasError());
-        } else {
-            DesktopComputerAction reset;
-            reset.action = "input_events"; reset.windowId = 101; reset.snapshotId = snapshot; reset.turnId = context.turnId;
-            DesktopInputEvent relative; relative.kind = DesktopInputEventKind::RelativeMove; relative.deltaX = 1;
-            reset.events = {relative};
-            CHECK(!reset.inputOptions.inheritExisting);
-            CHECK(controller->perform(context.sessionId, reset));
+            reset.snapshotId = observe();
+            reset.inputOptions = {};
         }
+        CHECK(controller->perform(context.sessionId, reset));
         CHECK(native->options().keyboardRepeat && native->options().highResolutionScroll);
         CHECK(native->options().repeatDelayMs == 500 && native->options().repeatPeriodMs == 1000.0 / 24.9);
         CHECK(native->options().keyBindings.empty() && !native->options().inheritExisting);
@@ -3773,7 +3364,7 @@ void verifyResetInputsRequiresNoObservationAndClearsKeysAndMouse() {
     QTemporaryDir workspace;
     MaiToolRegistry registry;
     registerDesktopComputerTools(registry, controller);
-    auto* tool = registry.find("desktop_computer");
+    auto* tool = registry.find("computer");
     CHECK(tool && workspace.isValid());
     if (!tool || !workspace.isValid()) return;
     MaiToolContext context;
@@ -3795,25 +3386,17 @@ void verifyResetInputsRequiresNoObservationAndClearsKeysAndMouse() {
     const int activations = backend->activationCount, captures = backend->captureCount;
     backend->focused = false; backend->secure = true;
     context.root.clear(); // Reset has no observation/workspace requirement.
-    const std::string reset = R"({"action":"reset_inputs"})";
-    CHECK(!tool->requiresPerCallApproval(reset));
-    CHECK(contains(Json::parse(tool->parametersSchema())["properties"]["action"]["enum"], "reset_inputs"));
-    auto oldTurn = context; oldTurn.turnId = "old-turn";
-    CHECK(!tool->execute(reset, oldTurn).hasError());
+    CHECK(!controller->resetInput(context.sessionId, "old-turn"));
     CHECK(native->resetCalls() == 0 && !native->state().empty());
-    const auto actual = tool->execute(reset, context);
-    CHECK(!actual.hasError());
-    if (!actual.hasError()) CHECK(Json::parse(actual.output())["state"] == "inputs_reset");
+    CHECK(!controller->resetInput(context.sessionId, context.turnId));
     CHECK(native->resetCalls() == 1 && native->state().empty() && controller->inputState(context.sessionId).empty());
     CHECK(backend->lastInputSession == native && backend->inputSessionCreations == 1);
     CHECK(backend->activationCount == activations && backend->captureCount == captures);
-    const auto bad = tool->execute(R"({"action":"reset_inputs","snapshot_id":"wrong"})", context);
-    CHECK(bad.hasError() && native->resetCalls() == 1);
-    CHECK(!tool->execute(R"({"action":"release_all"})", context).hasError());
+    CHECK(!controller->releaseInput(context.sessionId, context.turnId));
     CHECK(controller->inputState(context.sessionId).empty());
 }
 
-void verifyInputEventsControllerAndTool() {
+void verifyInputEventsController() {
     {
         Fixture fixture;
         fixture.backend->statefulInput = true;
@@ -3841,33 +3424,6 @@ void verifyInputEventsControllerAndTool() {
         }
         CHECK(fixture.backend->inputs.empty());  // Typed primitives never become legacy absolute moves.
         CHECK(!fixture.controller.perform("owner", action));
-    }
-    {
-        DisplayToolFixture fixture;
-        fixture.backend->statefulInput = true;
-        if (!fixture.tool) return;
-        const auto observed =
-            fixture.tool->execute(R"({"action":"observe","target":"display","display_id":"22"})", fixture.context);
-        CHECK(!observed.hasError());
-        if (observed.hasError()) return;
-        const auto snapshot = Json::parse(observed.output())["snapshot_id"];
-        Json args{{"action", "input_events"},
-                  {"target", "display"},
-                  {"display_id", "22"},
-                  {"snapshot_id", snapshot},
-                  {"events", Json::array({Json{{"type", "relative_move"}, {"delta_x", 3}, {"delta_y", -2}},
-                                          Json{{"type", "wheel"}, {"axis", "horizontal"}, {"delta_120", 30}}})}};
-        const auto result = fixture.tool->execute(args.dump(), fixture.context);
-        CHECK(!result.hasError());
-        if (!result.hasError()) {
-            const auto output = Json::parse(result.output());
-            CHECK(output["accepted_events"] == 2);
-            CHECK(output["observation"]["snapshot_id"] != snapshot);
-            CHECK(result.images().size() == 1);
-        }
-        CHECK(fixture.backend->displayCaptureCount == 2);
-        CHECK(fixture.backend->lastInputSession && fixture.backend->lastInputSession->batchCalls() == 1);
-        CHECK(fixture.backend->inputs.empty());
     }
     {
         Fixture fixture;
@@ -4001,205 +3557,214 @@ void verifyDeferredVirtualInputContract() {
     }
 }
 
-void verifyInputEventsProtocolDiscovery() {
+
+void verifyPublicContract() {
     auto backend = std::make_shared<RecordingBackend>();
     auto controller = std::make_shared<DesktopComputerController>(backend);
     MaiToolRegistry registry;
     registerDesktopComputerTools(registry, controller);
-    MaiTool* tool = registry.find("desktop_computer");
+    CHECK(!registry.find("desktop_computer"));
+    MaiTool* tool = registry.find("computer");
     CHECK(tool);
     if (!tool) return;
-
-    const auto schema = Json::parse(tool->parametersSchema(), nullptr, false);
-    CHECK(schema.is_object());
-    if (schema.is_object()) {
-        const auto properties = schema.value("properties", Json::object());
-        const auto actions = properties.value("action", Json::object()).value("enum", Json::array());
-        for (const char* action : {"input_events", "input_capabilities"}) CHECK(contains(actions, action));
-        CHECK(properties.value("events", Json::object()).value("type", std::string()) == "array");
-        Json eventNames = Json::array();
-        for (const auto& variant :
-             properties.value("events", Json::object()).value("items", Json::object()).value("oneOf", Json::array())) {
-            const auto names =
-                variant.value("properties", Json::object()).value("type", Json::object()).value("enum", Json::array());
-            if (names.size() == 1) eventNames.push_back(names[0]);
-        }
-        // Schema syntax includes the six ordinary primitives and two system
-        // candidates. It does not assert that touch/pen delivery is accepted.
-        CHECK(eventNames.size() == 8);
-        for (const char* name : {"absolute_move", "relative_move", "mouse_button", "wheel", "raw_key", "unicode_text", "touch", "pen"})
-            CHECK(contains(eventNames, name));
-        CHECK(!contains(actions, "feedback"));
-    }
-
-    MaiToolContext context;
-    context.sessionId = "input-protocol-without-observation";
-    // Capability discovery must report the connected backend's actual support
-    // without capturing, activating, or posting even a probe input event.
-    const auto capability = tool->execute(R"({"action":"input_capabilities"})", context);
-    CHECK(!capability.hasError());
-    CHECK(capability.images().empty());
-    if (!capability.hasError()) CHECK(Json::parse(capability.output(), nullptr, false).is_object());
-    CHECK(backend->events.empty());
-    CHECK(backend->inputs.empty());
-    CHECK(backend->activationCount == 0);
-    CHECK(backend->captureCount == 0);
-    CHECK(backend->displayCaptureCount == 0);
-
-    const auto extra = tool->execute(R"({"action":"input_capabilities","text":"unused"})", context);
-    CHECK(extra.hasError());
-    if (extra.hasError()) CHECK(extra.error().code() == MaiErrorCode::InvalidInput);
-    for (const char* deferred : {
-             R"({"action":"input_events","events":[{"type":"relative_move","delta_x":1,"delta_y":0},{"type":"gamepad_attach","controller_id":0}]})",
-             R"({"action":"input_events","events":[{"type":"relative_move","delta_x":1,"delta_y":0}],"input_options":{"driver":"auto"}})",
-             R"({"action":"feedback"})"}) {
-        const auto result = tool->execute(deferred, context);
-        CHECK(result.hasError());
-        if (result.hasError()) CHECK(result.error().code() == MaiErrorCode::NotSupported);
-    }
-    CHECK(backend->inputSessionCreations == 0);
-    CHECK(backend->events.empty() && backend->inputs.empty());
-    CHECK(backend->activationCount == 0 && backend->captureCount == 0 && backend->displayCaptureCount == 0);
-}
-
-void verifyPublicContract() {
-    MaiToolRegistry registry;
-    auto controller = std::make_shared<DesktopComputerController>();
-    registerDesktopComputerTools(registry, controller);
-    MaiTool* tool = registry.find("desktop_computer");
-    CHECK(tool);
-    if (!tool) return;
-
     const Json schema = Json::parse(tool->parametersSchema(), nullptr, false);
     CHECK(schema.is_object());
     if (!schema.is_object()) return;
-    const Json properties = schema.value("properties", Json::object());
-    CHECK(properties.value("include_image", Json::object()).value("type", std::string()) == "boolean");
-    CHECK(properties.value("execution_window_id", Json::object()).value("type", std::string()) == "string");
-    const Json actions = properties.value("action", Json::object()).value("enum", Json{});
-    // The public contract exposes routine desktop operations without needing a
-    // native session. Native dispatch belongs to the separate fixture test.
-    for (const char* action : {"list", "observe", "focus", "click", "double_click", "right_click", "drag", "type",
-                               "key", "scroll", "replace_text", "verify", "clear"}) {
-        if (!contains(actions, action)) {
-            std::fprintf(stderr, "desktop_computer schema is missing action: %s\n", action);
-            ++failures;
-        }
-    }
-
-    const Json key = properties.value("key", Json::object());
-    CHECK(key.value("type", std::string()) == "string");
-    // A fixed list of navigation keys prevents ordinary editing shortcuts such
-    // as Ctrl+A and Shift+Home from reaching the native key parser.
-    CHECK(!key.contains("enum"));
-
-    const Json text = properties.value("text", Json::object());
-    CHECK(text.value("type", std::string()) == "string");
-    CHECK(text.value("minLength", 0) == 0);
-    const std::string description = tool->description();
-    CHECK(description.find("whole-display screenshot ratios") != std::string::npos);
-    CHECK(description.find("screenshot does not refresh") != std::string::npos);
-    CHECK(description.find("clear only forgets") != std::string::npos);
-    CHECK(description.find("does not clear input text") != std::string::npos);
-
+    const auto properties = schema.value("properties", Json::object());
+    const auto methods = properties.value("method", Json::object()).value("enum", Json::array());
+    const std::vector<const char*> canonical{"list_windows", "get_window", "list_apps", "launch_app",
+        "get_window_state", "click", "press_key", "type_text", "scroll", "set_value", "drag",
+        "perform_secondary_action", "activate_window"};
+    CHECK(methods.size() == canonical.size());
+    for (const auto* method : canonical) CHECK(contains(methods, method));
+    CHECK(properties.size() == 2 && properties.contains("parameters") && !properties.contains("action"));
+    CHECK(schema["additionalProperties"] == false);
+    const auto arguments = properties["parameters"]["properties"];
+    CHECK(arguments["window"]["properties"]["id"]["type"] == "integer");
+    CHECK(arguments["include_screenshot"]["type"] == "boolean");
+    CHECK(arguments["include_text"]["type"] == "boolean");
+    CHECK(arguments["key"]["type"] == "string" && !arguments["key"].contains("enum"));
+    for (const char* removed : {"snapshot_id", "window_id", "display_id", "x_ratio", "events", "input_options"})
+        CHECK(!arguments.contains(removed));
+    const auto description = tool->description();
+    CHECK(description.find("{method,parameters}") != std::string::npos);
+    CHECK(description.find("window-relative logical pixels") != std::string::npos);
+    CHECK(description.find("include_screenshot(default true)") != std::string::npos);
+    CHECK(description.find("include_text(default false)") != std::string::npos);
     MaiToolContext context;
-    context.sessionId = "contract-without-observation";
-    // These deliberately unknown snapshots must be rejected before any native
-    // operation. NotFound proves valid empty replacement and shortcut arguments
-    // reached the shared controller rather than being rejected by tool parsing.
-    const auto emptyReplacement =
-        tool->execute(R"({"action":"replace_text","snapshot_id":"missing","window_id":"1","text":""})", context);
-    CHECK(emptyReplacement.error().code() == MaiErrorCode::NotFound);
-    const auto shortcut =
-        tool->execute(R"({"action":"key","snapshot_id":"missing","window_id":"1","key":"Ctrl+A"})", context);
-    CHECK(shortcut.error().code() == MaiErrorCode::NotFound);
+    context.sessionId = "canonical-contract";
+    const std::vector<std::string> invalid{
+        R"({"action":"observe","window_id":"101"})",
+        R"({"method":"list_windows"})", R"({"method":"list_windows","parameters":null})",
+        R"({"method":"list_windows","parameters":{},"action":"list"})",
+        computerCall("list_windows", {{"limit", 10}}), computerCall("get_window", {{"id", "101"}}),
+        computerCall("get_window", {{"id", true}}), computerCall("get_window", {{"id", 0}}),
+        computerCall("click", {{"window", fixtureWindow()}, {"element_index", -1}}),
+        computerCall("click", {{"window", fixtureWindow()}, {"mouse_button", "back"}}),
+        computerCall("get_window_state", {{"window", fixtureWindow()}, {"include_text", "true"}})};
+    for (const auto& args : invalid) {
+        const auto result = tool->execute(args, context);
+        CHECK(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(result.images().empty());
+    }
+    for (const char* removed : {"observe", "list_displays", "input_events", "input_capabilities", "list_keys",
+                                "input_state", "reset_inputs", "release_all", "feedback", "restore", "clear"}) {
+        const auto result = tool->execute(computerCall(removed), context);
+        CHECK(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput);
+    }
+    CHECK(backend->events.empty() && backend->windowsCount == 0);
+    CHECK(backend->captureCount == 0 && backend->displayCaptureCount == 0 && backend->activationCount == 0);
+    CHECK(backend->inputSessionCreations == 0 && backend->inputs.empty());
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     QCoreApplication app(argc, argv);
     if (argc == 2 && std::string(argv[1]) == "--execution-window") {
+        std::fprintf(stderr, "running verifyExecutionWindowContracts\n");
         verifyExecutionWindowContracts();
         std::fprintf(stderr, "execution-window contract failures: %d\n", failures);
         return failures == 0 ? 0 : 1;
     }
+    std::fprintf(stderr, "running verifyExecutionWindowContracts\n");
     verifyExecutionWindowContracts();
+    std::fprintf(stderr, "running verifyDisplayObservation\n");
     verifyDisplayObservation();
+    std::fprintf(stderr, "running verifyDisplayDispatchAndNextObservation\n");
     verifyDisplayDispatchAndNextObservation();
+    std::fprintf(stderr, "running verifyDisplayIdentityAndGeometry\n");
     verifyDisplayIdentityAndGeometry();
+    std::fprintf(stderr, "running verifyDisplayCaptureFailureRetainsDispatchReceipt\n");
     verifyDisplayCaptureFailureRetainsDispatchReceipt();
+    std::fprintf(stderr, "running verifyDisplayCancellationAndSecureInput\n");
     verifyDisplayCancellationAndSecureInput();
+    std::fprintf(stderr, "running verifyDisplayDryRunAndClear\n");
     verifyDisplayDryRunAndClear();
+    std::fprintf(stderr, "running verifyDesktopLauncherWithoutFocusedTextControl\n");
     verifyDesktopLauncherWithoutFocusedTextControl();
+    std::fprintf(stderr, "running verifyDisplayPostActionRequiresFreshNativeFrame\n");
     verifyDisplayPostActionRequiresFreshNativeFrame();
+    std::fprintf(stderr, "running verifyDisplayStaleNativeFrameCannotIssueActionableToken\n");
     verifyDisplayStaleNativeFrameCannotIssueActionableToken();
+    std::fprintf(stderr, "running verifyDisplayCaptureCancellationReachesSynchronousBackend\n");
     verifyDisplayCaptureCancellationReachesSynchronousBackend();
+    std::fprintf(stderr, "running verifyDisplayObservationFreshnessThresholdsAreIndependent\n");
     verifyDisplayObservationFreshnessThresholdsAreIndependent();
+    std::fprintf(stderr, "running verifyDisplayOrdinaryWorkspaceCannotChangeAfterObservation\n");
     verifyDisplayOrdinaryWorkspaceCannotChangeAfterObservation();
+    std::fprintf(stderr, "running verifyDisplayInputInvalidatesOtherSessionObservation\n");
     verifyDisplayInputInvalidatesOtherSessionObservation();
+    std::fprintf(stderr, "running verifyDisplayInputDuringInitialCaptureCannotPublishObservation\n");
     verifyDisplayInputDuringInitialCaptureCannotPublishObservation();
+    std::fprintf(stderr, "running verifyWindowActionInvalidatesDisplayObservation\n");
     verifyWindowActionInvalidatesDisplayObservation();
+    std::fprintf(stderr, "running verifyDisplayObservationRejectsAlreadyInFlightInput\n");
     verifyDisplayObservationRejectsAlreadyInFlightInput();
-    verifyDisplayToolSchema();
-    verifyDisplayToolWaitAndCancel();
-    verifyDisplayToolObservationAndActionChain();
-    verifyDisplayToolCaptureFailureRetainsReceipt();
-    verifyDisplayToolRejectsMixedTargetsAndInvalidIds();
+    std::fprintf(stderr, "running verifyDisplayToolRejectsTextModelsBeforeNativeAccess\n");
     verifyDisplayToolRejectsTextModelsBeforeNativeAccess();
-    verifyDisplayToolWorkspaceChangeRejectsOldToken();
+    std::fprintf(stderr, "running verifyReadOnlyAndDryRunNeverCreateNativeSession\n");
     verifyReadOnlyAndDryRunNeverCreateNativeSession();
+    std::fprintf(stderr, "running verifyOneShotNativeAdapterPreservesSpyAndRejectsIndependentHolds\n");
     verifyOneShotNativeAdapterPreservesSpyAndRejectsIndependentHolds();
+    std::fprintf(stderr, "running verifyInputEventsLosslessParsing\n");
     verifyInputEventsLosslessParsing();
-    verifyModelOptionsOmissionInheritsButOrdinaryDefaultsReset();
+    std::fprintf(stderr, "running verifyOrdinaryOptionsInheritanceAndDefaultsReset\n");
+    verifyOrdinaryOptionsInheritanceAndDefaultsReset();
+    std::fprintf(stderr, "running verifyResetIsBusyDuringRawKeyDispatch\n");
     verifyResetIsBusyDuringRawKeyDispatch();
+    std::fprintf(stderr, "running verifyResetInputsRequiresNoObservationAndClearsKeysAndMouse\n");
     verifyResetInputsRequiresNoObservationAndClearsKeysAndMouse();
-    verifyInputEventsControllerAndTool();
+    std::fprintf(stderr, "running verifyInputEventsController\n");
+    verifyInputEventsController();
+    std::fprintf(stderr, "running verifyDeferredVirtualInputContract\n");
     verifyDeferredVirtualInputContract();
+    std::fprintf(stderr, "running verifyFractionalRepeatConfigurationCodec\n");
     verifyFractionalRepeatConfigurationCodec();
-    verifyInputEventsProtocolDiscovery();
+    std::fprintf(stderr, "running verifyPublicContract\n");
     verifyPublicContract();
+    std::fprintf(stderr, "running verifyKeyGrammar\n");
     verifyKeyGrammar();
+    std::fprintf(stderr, "running verifyExpandedKeyGrammar\n");
     verifyExpandedKeyGrammar();
+    std::fprintf(stderr, "running verifyKeyIdentityAndCatalog\n");
     verifyKeyIdentityAndCatalog();
-    verifyKeyCatalogTool();
+    std::fprintf(stderr, "running verifySecureKeyboardInput\n");
     verifySecureKeyboardInput();
+    std::fprintf(stderr, "running verifyWindowDiscoveryMetadataAndUntitledSelection\n");
     verifyWindowDiscoveryMetadataAndUntitledSelection();
+    std::fprintf(stderr, "running verifyUnobservableDiscoveryCannotIssueWindowToken\n");
     verifyUnobservableDiscoveryCannotIssueWindowToken();
+    std::fprintf(stderr, "running verifyMinimizedMetadataObservationAndNoHoldsRelease\n");
     verifyMinimizedMetadataObservationAndNoHoldsRelease();
+    std::fprintf(stderr, "running verifyWindowStateOperations\n");
     verifyWindowStateOperations();
+    std::fprintf(stderr, "running verifySnapshotBoundElementActions\n");
     verifySnapshotBoundElementActions();
+    std::fprintf(stderr, "running verifyCompletedTurnReleasesSnapshotReferences\n");
     verifyCompletedTurnReleasesSnapshotReferences();
+    std::fprintf(stderr, "running verifyDefaultElementResolverRejectsIncompleteSnapshots\n");
     verifyDefaultElementResolverRejectsIncompleteSnapshots();
+    std::fprintf(stderr, "running verifyElementToolValidationAndFailureFacts\n");
     verifyElementToolValidationAndFailureFacts();
+    std::fprintf(stderr, "running verifyElementStateChangesAtDispatchAndMissingDisplaySource\n");
     verifyElementStateChangesAtDispatchAndMissingDisplaySource();
-    verifyCanceledStateDryRunStillReleasesStoppedTurn();
+    std::fprintf(stderr, "running verifyCanceledWindowToolStillReleasesStoppedTurn\n");
+    verifyCanceledWindowToolStillReleasesStoppedTurn();
+    std::fprintf(stderr, "running verifyInvalidatedEvidenceProgressAndObserveDiagnostics\n");
     verifyInvalidatedEvidenceProgressAndObserveDiagnostics();
-    verifyMissingSnapshotFieldIsDiagnosedBeforeBackendAccess();
+    std::fprintf(stderr, "running verifyWindowDiscoveryStateChangeDuringObservation\n");
     verifyWindowDiscoveryStateChangeDuringObservation();
+    std::fprintf(stderr, "running verifyWindowDiscoveryStateRevokesInputAndHeldControls\n");
     verifyWindowDiscoveryStateRevokesInputAndHeldControls();
+    std::fprintf(stderr, "running verifyWindowSelection\n");
     verifyWindowSelection();
+    std::fprintf(stderr, "running verifyScreenshotHandoff\n");
     verifyScreenshotHandoff();
+    std::fprintf(stderr, "running verifyComputerWindowObservationNeedsNoScreenshotTool\n");
+    verifyComputerWindowObservationNeedsNoScreenshotTool();
+    std::fprintf(stderr, "running verifyScreenshotDirectoryBoundary\n");
     verifyScreenshotDirectoryBoundary();
+    std::fprintf(stderr, "running verifyScreenshotDirectoryIsValidatedBeforeCapture\n");
     verifyScreenshotDirectoryIsValidatedBeforeCapture();
+    std::fprintf(stderr, "running verifyScreenshotCancellationDoesNotPublishPixels\n");
     verifyScreenshotCancellationDoesNotPublishPixels();
+    std::fprintf(stderr, "running verifyObservationWithoutImage\n");
     verifyObservationWithoutImage();
+    std::fprintf(stderr, "running verifyOwnedPopupInput\n");
     verifyOwnedPopupInput();
+    std::fprintf(stderr, "running verifyDispatchAndSnapshots\n");
     verifyDispatchAndSnapshots();
+    std::fprintf(stderr, "running verifyTextAndReadback\n");
     verifyTextAndReadback();
+    std::fprintf(stderr, "running verifyIdentityAndSyntaxFailures\n");
     verifyIdentityAndSyntaxFailures();
+    std::fprintf(stderr, "running verifyFailureAndCancellationBoundaries\n");
     verifyFailureAndCancellationBoundaries();
+    std::fprintf(stderr, "running verifyNativeInputFailureRequiresObservation\n");
     verifyNativeInputFailureRequiresObservation();
+    std::fprintf(stderr, "running verifyCanceledPerformReleasesHeldInput\n");
     verifyCanceledPerformReleasesHeldInput();
+    std::fprintf(stderr, "running verifyRejectedPerformReleasesHeldInput\n");
     verifyRejectedPerformReleasesHeldInput();
+    std::fprintf(stderr, "running verifyCanceledObservationReleasesOnlyItsSession\n");
     verifyCanceledObservationReleasesOnlyItsSession();
+    std::fprintf(stderr, "running verifyOldTurnCanceledObservationPreservesReplacementHold\n");
     verifyOldTurnCanceledObservationPreservesReplacementHold();
+    std::fprintf(stderr, "running verifyOldTurnCleanupPreservesReplacementHold\n");
     verifyOldTurnCleanupPreservesReplacementHold();
+    std::fprintf(stderr, "running verifyCanceledToolObservationReleasesOnlyItsTurn\n");
     verifyCanceledToolObservationReleasesOnlyItsTurn();
+    std::fprintf(stderr, "running verifyIndependentUpDryRunKeepsOwnedInput\n");
     verifyIndependentUpDryRunKeepsOwnedInput();
+    std::fprintf(stderr, "running verifyInvalidIndependentButtonCannotValidateWithoutAnOwner\n");
     verifyInvalidIndependentButtonCannotValidateWithoutAnOwner();
+    std::fprintf(stderr, "running verifyIndependentUpConsumesOnlyRealOwnedWindowToken\n");
     verifyIndependentUpConsumesOnlyRealOwnedWindowToken();
+    std::fprintf(stderr, "running verifyHeldLauncherModifiersDoNotRequireEditableFocus\n");
     verifyHeldLauncherModifiersDoNotRequireEditableFocus();
+    std::fprintf(stderr, "running verifyReleaseDoesNotWaitForObservedStateDuringPlatformWork\n");
     verifyReleaseDoesNotWaitForObservedStateDuringPlatformWork();
 
     if (failures != 0) {

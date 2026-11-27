@@ -3,8 +3,9 @@
 #include "MaiContextBuilder.h"
 #include "MaiContextCompactor.h"
 #include "MaiIdGenerator.h"
+#include "MaiMessage.h"
 #include "MaiMemoryStore.h"
-#include "MaiOpenAiClient.h"
+#include "MaiResponsesClient.h"
 #include "MaiRoutedModelClient.h"
 #include "MaiRequestBodyFitter.h"
 #include "MaiSessionTools.h"
@@ -37,6 +38,7 @@ public:
     bool rejectAlways = false;
     std::vector<std::size_t> sizes;
     std::vector<std::string> lastImagePaths;
+    std::vector<std::string> lastDialogue;
     MaiResult<std::size_t> requestBodyBytes(const MaiModelRequest& request) override {
         std::size_t bytes = 1000 + request.baseInstructions.size();
         for (const auto& m : request.messages) bytes += m.content.size() + m.images.size() * 10000;
@@ -48,6 +50,10 @@ public:
         const auto bytes = requestBodyBytes(request).value();
         sizes.push_back(bytes);
         lastImagePaths.clear();
+        lastDialogue.clear();
+        for (const auto& message : request.messages)
+            if (message.role == MaiModelRole::User || message.role == MaiModelRole::Assistant)
+                lastDialogue.push_back(message.content);
         for (const auto& message : request.messages)
             for (const auto& image : message.images) lastImagePaths.push_back(image.path);
         if (rejectAlways || bytes > limit) return rejection;
@@ -56,7 +62,7 @@ public:
         return {};
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
     MaiModelContextLimits contextLimits(const std::string&) const override {
         return {1000000, 128000};
@@ -89,7 +95,7 @@ public:
         return {};
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
     MaiModelContextLimits contextLimits(const std::string&) const override {
         return {32768, 4096};
@@ -120,7 +126,7 @@ public:
         return {};
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 };
 
@@ -147,8 +153,8 @@ static MaiModelRequest fitterFixture() {
     old.images.push_back({"old.png", "image/png"});
     request.messages.push_back(old);
     auto oldAnswer = textMessage(MaiModelRole::Assistant, std::string(6000, 'a'));
-    oldAnswer.continuation = MaiModelContinuationState{"responses.output.v1", "p", "m",
-                                                       std::string(8000, 'c')};
+    oldAnswer.continuation =
+        MaiModelContinuationState{"responses.output.v1", "p", "m", std::string(8000, 'c')};
     request.messages.push_back(oldAnswer);
     auto current = textMessage(MaiModelRole::User, "Current instruction");
     current.images.push_back({"current.png", "image/png"});
@@ -277,8 +283,7 @@ static void testLearnedLimits() {
               "HTTP 413: The provider rejected the request body (60000000 bytes). Request body "
               "too large. Maximum size is 52428800 bytes") == 52428800);
     CHECK(maiParseStatedRequestBodyLimit(
-              "HTTP 413: The provider rejected the request body (60000000 bytes). Too large") ==
-          0);
+              "HTTP 413: The provider rejected the request body (60000000 bytes). Too large") == 0);
     CHECK(maiParseStatedRequestBodyLimit("limit: 10485760 bytes") == 10485760);
     // 明确上限直接采用并留 2% 余量。
     const auto stated = maiLearnRequestBodyRejection(
@@ -295,19 +300,119 @@ static void testLearnedLimits() {
     CHECK(maiLearnedRequestBodyLimit("m") == 0);
 }
 
-int main() {
+static void testFitterKeepsDialogueBodies() {
+    MeasureModel model;
+    MaiModelRequest input;
+    input.model = "owned-preserve-dialogue";
+    input.messages.push_back(textMessage(
+        MaiModelRole::User,
+        nlohmann::json{{"type", "tool_output"}, {"body", std::string(4000, 'u')}}.dump()));
+    input.messages.push_back(textMessage(MaiModelRole::Assistant, std::string(6000, 'a')));
+    input.messages.push_back(textMessage(MaiModelRole::ToolResult, std::string(80000, 't')));
+    input.messages.push_back(textMessage(MaiModelRole::User, std::string(8000, 'c')));
+    std::atomic<bool> cancel{false};
+    for (std::size_t limit : {24000u, 6500u}) {
+        const auto result = maiFitRequestBody(model, input, limit, cancel);
+        CHECK(result);
+        if (!result) continue;
+        for (std::size_t index : {0u, 1u, 3u})
+            CHECK(result.value().request.messages[index].content == input.messages[index].content);
+        CHECK(result.value().request.messages[2].content.size() < input.messages[2].content.size());
+        if (limit == 24000)
+            CHECK(result.value().fits);
+        else
+            CHECK(!result.value().fits && result.value().exhausted);
+    }
+}
+
+static void testArchivedToolPreviewsCanFitWithoutClippingDialogue() {
+    maiResetLearnedRequestBodyLimits();
+    auto store = makeMaiMemoryStore();
+    auto* raw = store.get();
+    MaiSession session;
+    session.id = MaiIdGenerator::newSessionId();
+    session.title = "Owned archived tool byte fitting";
+    raw->putSession(session);
+    const auto append = [&](MaiRole role, std::string text) {
+        MaiMessage value;
+        value.id = MaiIdGenerator::newMessageId();
+        value.role = role;
+        value.created = value.completed = 1;
+        value.parts.push_back({MaiIdGenerator::newPartId(), MaiTextPart{std::move(text)}, 1});
+        raw->putMessage(session.id, value);
+        return value;
+    };
+    append(MaiRole::User, "ARCHIVE_EXACT_USER: keep the original requirement.");
+    auto done = append(MaiRole::Assistant, "ARCHIVE_EXACT_ASSISTANT: inspected, not published.");
+    MaiToolPart tool;
+    tool.tool = "owned_build_log";
+    tool.callId = "archived_old_tool";
+    tool.input = "{}";
+    tool.output = std::string(100000, 'l');
+    tool.state = MaiToolState::Completed;
+    done.parts.push_back({MaiIdGenerator::newPartId(), tool, 1});
+    raw->putMessage(session.id, done);
+    append(MaiRole::User, "Recent clarification.");
+    append(MaiRole::Assistant, "Recent exact answer.");
+    append(MaiRole::User, "Continue.");
+    auto registry = std::make_unique<MaiToolRegistry>();
+    registerMaiSessionTools(*registry, false);
+    auto model = std::make_unique<BodyModel>();
+    auto* observed = model.get();
+    MaiModelRequest input;
+    input.model = "owned-archived-byte-fit";
+    input.baseInstructions = "Preserve exact dialogue.";
+    input.tools = registry->specs(input.model);
+    MaiContextCompactor::Options policy;
+    policy.allowToolProjection = true;
+    policy.preserveDialogue = true;
+    policy.force = true;
+    const std::atomic<bool> cancel{false};
+    const auto first =
+        MaiContextCompactor(policy).prepare(*raw, *model, MaiContextBuilder{}, session.id,
+                                            raw->listMessages(session.id), input, cancel);
+    CHECK(first && first.value().advancedCheckpoint);
+    if (!first) return;
+    const auto beforeBytes = model->requestBodyBytes(first.value().request).value();
+    observed->limit = beforeBytes * 90 / 100;
+    maiLearnRequestBodyRejection(input.model, beforeBytes,
+                                 "Maximum size is " + std::to_string(observed->limit) + " bytes");
+    MaiAgent::Options options;
+    options.defaultModel = input.model;
+    options.baseInstructions = input.baseInstructions;
+    MaiAgent agent(std::move(store), std::move(model), std::move(registry), options);
+    CHECK(agent.submit(MaiSendPrompt{session.id, "Complete without losing dialogue."}));
+    agent.waitIdle();
+    CHECK(observed->recovered && observed->calls == 1);
+    MaiContextCheckpoint after;
+    CHECK(raw->getContextCheckpoint(session.id, after));
+    CHECK(after.revision == 2);
+    bool kept = false;
+    for (const auto& body : observed->lastDialogue)
+        kept |=
+            body.find("ARCHIVE_EXACT_ASSISTANT: inspected, not published.") != std::string::npos;
+    CHECK(kept);
+    std::printf("   archived-byte-fit before=%zu limit=%zu calls=%d recovered=%d\n", beforeBytes,
+                observed->limit, observed->calls, observed->recovered);
+    maiResetLearnedRequestBodyLimits();
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--archived-byte-tools") {
+        testArchivedToolPreviewsCanFitWithoutClippingDialogue();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--preserve-dialogue") {
+        testFitterKeepsDialogueBodies();
+        return failures ? 1 : 0;
+    }
+    testFitterKeepsDialogueBodies();
+    testArchivedToolPreviewsCanFitWithoutClippingDialogue();
     testFitterOrderAndStructure();
     testFitterUnmeasurableAndCancel();
     testLearnedLimits();
     httplib::Server server;
     std::atomic<std::size_t> transmitted{0};
-    server.Post("/chat/completions", [&](const httplib::Request& q, httplib::Response& r) {
-        transmitted = q.body.size();
-        r.status = 413;
-        r.set_content(
-            R"({"error":{"code":"request_too_large","message":"Request body too large. Maximum size is 52428800 bytes"}})",
-            "application/json");
-    });
     server.Post("/responses", [&](const httplib::Request& q, httplib::Response& r) {
         transmitted = q.body.size();
         r.status = 413;
@@ -322,7 +427,7 @@ int main() {
     for (int i = 0; i < 1000 && !server.is_running(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     MaiError rejection;
-    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
+    for (const auto wire : {MaiWireApi::Responses}) {
         MaiModelConfig config;
         config.baseUrl = "http://127.0.0.1:" + std::to_string(port);
         config.apiKey = "owned-local-key";
@@ -351,7 +456,7 @@ int main() {
         MaiModelRoute route;
         route.modelNames = {"owned-test"};
         route.config.baseUrl = "http://127.0.0.1:" + std::to_string(port);
-        route.config.wire = MaiWireApi::ChatCompletions;
+        route.config.wire = MaiWireApi::Responses;
         route.config.proxyResolver = [](const std::string&, MaiModelProxy& proxy) {
             proxy = {};
             return true;
@@ -495,11 +600,13 @@ int main() {
         CHECK(protectedAgent.submit(MaiSendPrompt{id, original}));
         protectedAgent.waitIdle();
         CHECK(!stuck->recovered);
-        // 供应商连最小请求也拒绝：持续缩小到下限（并额外整理一次）后才报错，次数有界。
-        CHECK(stuck->calls > 1 && stuck->calls <= 26);
+        // 纯正文不能靠截断来伪造适配；首次拒绝学到上限后，不再发送相同的超限请求。
+        CHECK(stuck->calls == 1);
         for (std::size_t i = 1; i < stuck->sizes.size(); ++i)
             CHECK(stuck->sizes[i] <= stuck->sizes[i - 1]);
-        CHECK(!stuck->sizes.empty() && stuck->sizes.back() < stuck->sizes.front());
+        CHECK(stuck->sizes.size() == 1);
+        CHECK(std::find(stuck->lastDialogue.begin(), stuck->lastDialogue.end(), original) !=
+              stuck->lastDialogue.end());
         const auto kept = protectedAgent.listMessages(id);
         CHECK(kept.size() == 2);
         bool preserved = false;
@@ -561,8 +668,8 @@ int main() {
         std::printf("summary recovery rejected=%d completed=%d outputLimit=%zu\n",
                     summary->rejected, summary->completed, summary->outputLimit);
     }
-    {
-        // 摘要请求无论多小都被 413 拒绝：强制整理也不能让准备失败，改为延后并保留原请求。
+    for (const bool overHardBudget : {false, true}) {
+        // 摘要始终被 413 拒绝：原请求仍适配才能延后，超过硬限必须失败且不推进窗口。
         auto summaryStore = makeMaiMemoryStore();
         auto* raw = summaryStore.get();
         auto summaryModel = std::make_unique<SummaryBodyModel>();
@@ -585,7 +692,8 @@ int main() {
             answer.role = MaiRole::Assistant;
             answer.created = answer.completed = 11 + i * 2;
             answer.parts.push_back({"prt_answer_" + std::to_string(i),
-                                    MaiTextPart{std::string(20000, 'A')}, answer.created});
+                                    MaiTextPart{std::string(overHardBudget ? 20000 : 8000, 'A')},
+                                    answer.created});
             raw->putMessage(id, answer);
         }
         const auto history = ownerAgent.listMessages(id);
@@ -593,20 +701,29 @@ int main() {
         MaiModelRequest input;
         input.model = "owned-test";
         input.messages = builder.build(history);
+        input.maxOutputTokens = 4096;
+        const auto beforeTokens = summary->estimateInputTokens(input).tokens;
+        CHECK((beforeTokens > 32768 - input.maxOutputTokens) == overHardBudget);
         MaiContextCompactor::Options policy;
         policy.force = true;
         std::atomic<bool> cancel{false};
         const auto prepared = MaiContextCompactor(policy).prepare(*raw, *summary, builder, id,
                                                                   history, input, cancel);
-        CHECK(prepared);
-        if (prepared) {
+        CHECK(bool(prepared) != overHardBudget);
+        if (prepared && !overHardBudget) {
             CHECK(prepared.value().deferredCompaction);
             CHECK(!prepared.value().advancedCheckpoint);
             CHECK(!prepared.value().request.messages.empty());
+        } else if (!prepared) {
+            CHECK(prepared.error().code() == MaiErrorCode::RequestBodyTooLarge);
         }
+        MaiContextCheckpoint unchanged;
+        CHECK(!raw->getContextCheckpoint(id, unchanged));
         CHECK(summary->completed == 0);
         CHECK(summary->rejected > 0 && summary->rejected <= 10);
         CHECK(ownerAgent.listMessages(id).size() == history.size());
+        CHECK(maiContextSourceFingerprint(id, ownerAgent.listMessages(id), history.size()) ==
+              maiContextSourceFingerprint(id, history, history.size()));
         if (!prepared)
             std::printf("summary always-413 error=%s: %s\n",
                         maiErrorCodeToString(prepared.error().code()),

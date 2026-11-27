@@ -28,6 +28,7 @@
 #include "agent/AgentController.h"
 #include "agent/DesktopAccountModelClient.h"
 #include "MaiScreenshot.h"
+#include "MaiFileTools.h"
 #include "MaiScreenshotTool.h"
 #include "MaiSessionSchedule.h"
 #include "MaiSqliteStore.h"
@@ -127,7 +128,7 @@ public:
         //
         // 这不是图省事：MaiStreamSink 的契约要求每次交付都是完整的 UTF-8。
         // 第一版这里写的是 substr(i, 1)，按字节切，
-        // 结果中文全成了问号——而真实的客户端不会这样（MaiOpenAiClient 交出去的是解析完的 JSON 字符
+        // 结果中文全成了问号——而真实的客户端不会这样（MaiResponsesClient 交出去的是解析完的 JSON 字符
         // 串值），所以那是假模型在造一个现实中不存在的输入。
         if (sink.onReasoning) {
             for (const std::string_view piece : splitUtf8(reasoning_)) {
@@ -145,7 +146,7 @@ public:
     }
 
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 
     Qt::HANDLE workerThread() const {
@@ -192,7 +193,7 @@ public:
             sink.onText("done");
         return {};
     }
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override { return MaiWireApi::Responses; }
 
 private:
     std::string arguments_;
@@ -222,7 +223,7 @@ public:
     }
 
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
 };
 
@@ -231,7 +232,7 @@ public:
 // the busy-session test deterministic without involving a network model.
 class SessionSelectionModel final : public MaiModelClient {
 public:
-    explicit SessionSelectionModel(MaiWireApi wire = MaiWireApi::ChatCompletions) : wire_(wire) {}
+    explicit SessionSelectionModel(MaiWireApi wire = MaiWireApi::Responses) : wire_(wire) {}
 
     std::atomic<bool> heldRequestStarted{false};
     std::atomic<bool> releaseHeldRequest{false};
@@ -273,8 +274,8 @@ private:
     QStringList efforts_;
 };
 
-// Accept both protocols so a wrong production route is observed as an actual
-// HTTP request, rather than being disguised by a fixture 404 or parse failure.
+// Record every route before returning native Responses events, so the request
+// assertions expose an incorrect production path independently of parsing.
 struct AccountRouteProbe {
     struct Request {
         QString path;
@@ -289,24 +290,25 @@ struct AccountRouteProbe {
     std::vector<Request> requests;
     int port = 0;
 
-    static void respond(const httplib::Request& request, httplib::Response& response) {
+    static void respond(httplib::Response& response) {
         response.set_header("Connection", "close");
-        if (QString::fromStdString(request.path).endsWith(QStringLiteral("/chat/completions"))) {
-            response.set_content(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"
-                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
-                "data: [DONE]\n\n", "text/event-stream");
-        } else {
-            response.set_content(
-                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{"
-                "\"id\":\"fixture-output\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n"
-                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,"
-                "\"item_id\":\"fixture-output\",\"delta\":\"ok\"}\n\n"
-                "data: {\"type\":\"response.completed\",\"response\":"
-                "{\"status\":\"completed\",\"output\":[{\"id\":\"fixture-output\",\"type\":\"message\","
-                "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n",
-                "text/event-stream");
-        }
+        response.set_content(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{"
+            "\"id\":\"fixture-output\",\"type\":\"message\",\"role\":\"assistant\","
+            "\"phase\":\"final_answer\",\"status\":\"in_progress\",\"content\":[]}}\n\n"
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,"
+            "\"item_id\":\"fixture-output\",\"delta\":\"ok\"}\n\n"
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,"
+            "\"item_id\":\"fixture-output\",\"text\":\"ok\"}\n\n"
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{"
+            "\"id\":\"fixture-output\",\"type\":\"message\",\"role\":\"assistant\","
+            "\"phase\":\"final_answer\",\"status\":\"completed\","
+            "\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\n"
+            "data: {\"type\":\"response.completed\",\"response\":"
+            "{\"status\":\"completed\",\"output\":[{\"id\":\"fixture-output\",\"type\":\"message\","
+            "\"role\":\"assistant\",\"phase\":\"final_answer\",\"status\":\"completed\","
+            "\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n",
+            "text/event-stream");
     }
 
     AccountRouteProbe() {
@@ -319,7 +321,7 @@ struct AccountRouteProbe {
                                     QString::fromStdString(request.get_header_value("Authorization")),
                                     QJsonDocument::fromJson(QByteArray::fromStdString(request.body)).object()});
             }
-            respond(request, response);
+            respond(response);
         });
         port = server.bind_to_any_port("127.0.0.1");
         if (port > 0) {
@@ -393,6 +395,8 @@ private slots:
     void accountModelClientUsesProviderProtocolAndProfile_data();
     void accountModelClientUsesProviderProtocolAndProfile();
     void accountModelClientRoutesBySelectedModelAndFreshKey();
+    void openAiAccountRouteUsesFreshCredentialsAndFiveEfforts();
+    void openAiSessionSelectionKeepsExistingDefault();
     void productGlmWebToolsStayIndependentOfPrimaryModel_data();
     void productGlmWebToolsStayIndependentOfPrimaryModel();
 #ifdef Q_OS_MACOS
@@ -467,7 +471,7 @@ void AgentControllerTest::selectedModelsStayWithTheirSessionsWhenSending() {
     const QString first = controller.createSession(directory.path(), QStringLiteral("first session"));
     const QString second = controller.createSession(directory.path(), QStringLiteral("second session"));
     QVERIFY(!first.isEmpty() && !second.isEmpty());
-    QVERIFY(controller.setModel(first, QStringLiteral("glm-5.3")));
+    QVERIFY(controller.setModel(first, QStringLiteral("glm-5.4")));
     QVERIFY(controller.setModel(second, QStringLiteral("deepseek-v4-pro")));
     QSignalSpy finished(&controller, &AgentController::turnFinished);
     QVERIFY(controller.sendPrompt(first, QStringLiteral("first request")));
@@ -477,13 +481,13 @@ void AgentControllerTest::selectedModelsStayWithTheirSessionsWhenSending() {
     QVERIFY(controller.sendPrompt(first, QStringLiteral("first request again")));
     QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 3, 10'000);
     QCOMPARE(recorded->requestedModels(),
-             (QStringList{QStringLiteral("glm-5.3"), QStringLiteral("deepseek-v4-pro"),
-                          QStringLiteral("glm-5.3")}));
+             (QStringList{QStringLiteral("glm-5.4"), QStringLiteral("deepseek-v4-pro"),
+                          QStringLiteral("glm-5.4")}));
     MaiSession firstStored;
     MaiSession secondStored;
     QVERIFY(controller.agent().getSession(first.toStdString(), firstStored));
     QVERIFY(controller.agent().getSession(second.toStdString(), secondStored));
-    QCOMPARE(QString::fromStdString(firstStored.model), QStringLiteral("glm-5.3"));
+    QCOMPARE(QString::fromStdString(firstStored.model), QStringLiteral("glm-5.4"));
     QCOMPARE(QString::fromStdString(secondStored.model), QStringLiteral("deepseek-v4-pro"));
 }
 
@@ -496,7 +500,7 @@ void AgentControllerTest::defaultModelOnlyAffectsSubsequentSessions() {
     const QString first = controller.createSession(directory.path(), QStringLiteral("existing first"));
     const QString second = controller.createSession(directory.path(), QStringLiteral("existing second"));
     QVERIFY(!first.isEmpty() && !second.isEmpty());
-    QVERIFY(controller.setModel(first, QStringLiteral("glm-5.3")));
+    QVERIFY(controller.setModel(first, QStringLiteral("glm-5.4")));
     QVERIFY(controller.setModel(second, QStringLiteral("deepseek-v4-pro")));
     QVERIFY(controller.setDefaultModel(QStringLiteral("glm-5.3-flash")));
     const QString next = controller.createSession(directory.path(), QStringLiteral("new default session"));
@@ -508,7 +512,7 @@ void AgentControllerTest::defaultModelOnlyAffectsSubsequentSessions() {
         QTRY_COMPARE_WITH_TIMEOUT(finished.count(), i + 1, 10'000);
     }
     QCOMPARE(recorded->requestedModels(),
-             (QStringList{QStringLiteral("glm-5.3"), QStringLiteral("deepseek-v4-pro"),
+             (QStringList{QStringLiteral("glm-5.4"), QStringLiteral("deepseek-v4-pro"),
                           QStringLiteral("glm-5.3-flash")}));
     MaiSession created;
     QVERIFY(controller.agent().getSession(next.toStdString(), created));
@@ -548,7 +552,7 @@ void AgentControllerTest::sqliteSessionModelsSurviveRestartAndNewDefault() {
         first = original.createSession(directory.path(), QStringLiteral("persisted first"));
         second = original.createSession(directory.path(), QStringLiteral("persisted second"));
         QVERIFY(!first.isEmpty() && !second.isEmpty());
-        QVERIFY(original.setModel(first, QStringLiteral("glm-5.3")));
+        QVERIFY(original.setModel(first, QStringLiteral("glm-5.4")));
         QVERIFY(original.setModel(second, QStringLiteral("deepseek-v4-pro")));
     }
     auto model = std::make_unique<SessionSelectionModel>();
@@ -559,7 +563,7 @@ void AgentControllerTest::sqliteSessionModelsSurviveRestartAndNewDefault() {
     MaiSession secondStored;
     QVERIFY(resumed.agent().getSession(first.toStdString(), firstStored));
     QVERIFY(resumed.agent().getSession(second.toStdString(), secondStored));
-    QCOMPARE(QString::fromStdString(firstStored.model), QStringLiteral("glm-5.3"));
+    QCOMPARE(QString::fromStdString(firstStored.model), QStringLiteral("glm-5.4"));
     QCOMPARE(QString::fromStdString(secondStored.model), QStringLiteral("deepseek-v4-pro"));
     QVERIFY(resumed.setDefaultModel(QStringLiteral("glm-5.3-flash")));
     QSignalSpy finished(&resumed, &AgentController::turnFinished);
@@ -568,10 +572,10 @@ void AgentControllerTest::sqliteSessionModelsSurviveRestartAndNewDefault() {
     QVERIFY(resumed.sendPrompt(second, QStringLiteral("resumed second request")));
     QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 2, 10'000);
     QCOMPARE(recorded->requestedModels(),
-             (QStringList{QStringLiteral("glm-5.3"), QStringLiteral("deepseek-v4-pro")}));
+             (QStringList{QStringLiteral("glm-5.4"), QStringLiteral("deepseek-v4-pro")}));
     QVERIFY(resumed.agent().getSession(first.toStdString(), firstStored));
     QVERIFY(resumed.agent().getSession(second.toStdString(), secondStored));
-    QCOMPARE(QString::fromStdString(firstStored.model), QStringLiteral("glm-5.3"));
+    QCOMPARE(QString::fromStdString(firstStored.model), QStringLiteral("glm-5.4"));
     QCOMPARE(QString::fromStdString(secondStored.model), QStringLiteral("deepseek-v4-pro"));
 }
 
@@ -664,15 +668,15 @@ void AgentControllerTest::busySessionSelectionIsRejectedWhileAnotherSessionCanCh
     const QString second = controller.createSession(directory.path(), QStringLiteral("idle second"));
     QVERIFY(!first.isEmpty() && !second.isEmpty());
     QVERIFY(controller.setModel(second, QStringLiteral("deepseek-flash")));
-    QVERIFY(controller.setModel(first, QStringLiteral("glm-5.3")));
+    QVERIFY(controller.setModel(first, QStringLiteral("glm-5.4")));
     QSignalSpy finished(&controller, &AgentController::turnFinished);
     QVERIFY(controller.sendPrompt(first, QStringLiteral("hold first session")));
     QTRY_VERIFY_WITH_TIMEOUT(recorded->heldRequestStarted.load(), 10'000);
     QVERIFY(controller.agent().isBusy(first.toStdString()));
     const bool unchangedAccepted = controller.setSessionModelConfiguration(
-        first, QStringLiteral("glm-5.3"), QStringLiteral("high"));
+        first, QStringLiteral("glm-5.4"), QStringLiteral("high"));
     const bool busyEffortChanged = controller.setSessionModelConfiguration(
-        first, QStringLiteral("glm-5.3"), QStringLiteral("low"));
+        first, QStringLiteral("glm-5.4"), QStringLiteral("low"));
     const bool busyChanged = controller.setModel(first, QStringLiteral("glm-5.3-flash"));
     const bool idleChanged = controller.setSessionModelConfiguration(
         second, QStringLiteral("deepseek-v4-pro"), QStringLiteral("max"));
@@ -689,12 +693,12 @@ void AgentControllerTest::busySessionSelectionIsRejectedWhileAnotherSessionCanCh
     QVERIFY2(!busyChanged, "A busy target must reject the model change.");
     QVERIFY(idleChanged);
     QVERIFY(firstFound && secondFound);
-    QCOMPARE(QString::fromStdString(firstStored.model), QStringLiteral("glm-5.3"));
+    QCOMPARE(QString::fromStdString(firstStored.model), QStringLiteral("glm-5.4"));
     QCOMPARE(QString::fromStdString(secondStored.model), QStringLiteral("deepseek-v4-pro"));
     QCOMPARE(QString::fromStdString(firstStored.reasoningEffort), QStringLiteral("high"));
     QCOMPARE(QString::fromStdString(secondStored.reasoningEffort), QStringLiteral("max"));
     QCOMPARE(recorded->requestedModels(),
-             (QStringList{QStringLiteral("glm-5.3"), QStringLiteral("deepseek-v4-pro")}));
+             (QStringList{QStringLiteral("glm-5.4"), QStringLiteral("deepseek-v4-pro")}));
     QCOMPARE(recorded->requestedEfforts(), (QStringList{QStringLiteral("high"), QStringLiteral("max")}));
 }
 
@@ -702,7 +706,7 @@ void AgentControllerTest::sessionEffortAndModelPersistTogetherAcrossRestart() {
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
     const QString database = QDir(directory.path()).filePath(QStringLiteral("session-effort.sqlite"));
-    const QStringList models{QStringLiteral("glm-5.3"),
+    const QStringList models{QStringLiteral("glm-5.4"),
                              QStringLiteral("glm-5.3-flash"),
                              QStringLiteral("deepseek-flash"),
                              QStringLiteral("deepseek-v4-pro"),
@@ -746,7 +750,7 @@ void AgentControllerTest::fableEffortModelChangesAreAtomic_data() {
     QTest::addColumn<QString>("effort");
     QTest::addColumn<QString>("target");
     for (const auto& effort : {QStringLiteral("medium"), QStringLiteral("xhigh")})
-        for (const auto& target : {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
+        for (const auto& target : {QStringLiteral("glm-5.4"), QStringLiteral("glm-5.3-flash"),
                                    QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")}) {
             const auto name = (effort + QLatin1Char('-') + target).toUtf8();
             QTest::newRow(name.constData()) << effort << target;
@@ -834,7 +838,7 @@ void AgentControllerTest::sessionConfigurationUsesFixedLegacyDefaultsAndAtomicVa
     QCOMPARE(config.model, QStringLiteral("deepseek-v4-pro"));
     QVERIFY(controller.setSessionModelConfiguration(next, QStringLiteral("custom-injected-model"),
                                                      QStringLiteral("max")));
-    QVERIFY(!controller.setSessionModelConfiguration(next, QStringLiteral("glm-5.3"),
+    QVERIFY(!controller.setSessionModelConfiguration(next, QStringLiteral("glm-5.4"),
                                                       QStringLiteral("invalid-effort")));
     const QString rejectedError = controller.lastError();
     QVERIFY(!rejectedError.isEmpty());
@@ -871,6 +875,7 @@ void AgentControllerTest::sessionConfigurationRejectsMissingProviderWithoutMutat
     // No server is needed: configuration projection must not open a connection.
     model.glmBaseUrl = QStringLiteral("http://127.0.0.1:1/glm-profile");
     model.deepseekBaseUrl = QStringLiteral("http://127.0.0.1:1/deepseek-profile");
+    // A restored preference uses the current flagship before any request.
     model.modelName = QStringLiteral("glm-5.3");
     model.reasoningEffort = QStringLiteral("low");
     model.accountModelKeyProvider = [&](const QString& provider) {
@@ -882,6 +887,7 @@ void AgentControllerTest::sessionConfigurationRejectsMissingProviderWithoutMutat
     QVERIFY(!session.isEmpty());
     MaiSession before;
     QVERIFY(controller.agent().getSession(session.toStdString(), before));
+    QCOMPARE(before.model, std::string("glm-5.4"));
     requestedProviders.clear();
     const bool changed = controller.setSessionModelConfiguration(
         session, QStringLiteral("deepseek-v4-pro"), QStringLiteral("max"));
@@ -982,7 +988,7 @@ void AgentControllerTest::sessionConfigurationWithoutClientRejectsUnknownModel()
              qPrintable(diagnostic));
     // Known cloud metadata remains readable without a client, but an actual
     // selection or effort change must not be persisted as configured success.
-    QVERIFY(!controller.setSessionModelConfiguration(session, QStringLiteral("glm-5.3"), QStringLiteral("low")));
+    QVERIFY(!controller.setSessionModelConfiguration(session, QStringLiteral("glm-5.4"), QStringLiteral("low")));
     QVERIFY(!controller.setSessionModelConfiguration(session, QString::fromStdString(before.model),
                                                       QStringLiteral("max")));
     QVERIFY(controller.agent().getSession(session.toStdString(), after));
@@ -1045,7 +1051,7 @@ void AgentControllerTest::credentialWaitDoesNotRetargetOtherSession() {
     const QString first = controller.createSession(directory.path(), QStringLiteral("waiting first"));
     const QString second = controller.createSession(directory.path(), QStringLiteral("selected second"));
     QVERIFY(!first.isEmpty() && !second.isEmpty());
-    QVERIFY(controller.setSessionModelConfiguration(first, QStringLiteral("glm-5.3"), QStringLiteral("low")));
+    QVERIFY(controller.setSessionModelConfiguration(first, QStringLiteral("glm-5.4"), QStringLiteral("low")));
     QVERIFY(controller.setSessionModelConfiguration(second, QStringLiteral("deepseek-v4-pro"), QStringLiteral("max")));
     QSignalSpy finished(&controller, &AgentController::turnFinished);
     keyWaitArmed.store(true);
@@ -1053,14 +1059,14 @@ void AgentControllerTest::credentialWaitDoesNotRetargetOtherSession() {
     QTRY_VERIFY_WITH_TIMEOUT(keyWaitStarted.load(), 10'000);
     AgentController::SessionModelConfiguration firstConfig;
     QVERIFY(controller.sessionModelConfiguration(first, firstConfig));
-    QCOMPARE(firstConfig.model, QStringLiteral("glm-5.3"));
+    QCOMPARE(firstConfig.model, QStringLiteral("glm-5.4"));
     QVERIFY(firstConfig.configured);
     glmKeyAvailable.store(false);
-    QVERIFY(controller.setSessionModelConfiguration(first, QStringLiteral("glm-5.3"), QStringLiteral("low")));
+    QVERIFY(controller.setSessionModelConfiguration(first, QStringLiteral("glm-5.4"), QStringLiteral("low")));
     QVERIFY(!controller.setSessionModelConfiguration(first, QStringLiteral("glm-5.3-flash"), QStringLiteral("max")));
     MaiSession heldSession;
     QVERIFY(controller.agent().getSession(first.toStdString(), heldSession));
-    QCOMPARE(QString::fromStdString(heldSession.model), QStringLiteral("glm-5.3"));
+    QCOMPARE(QString::fromStdString(heldSession.model), QStringLiteral("glm-5.4"));
     QCOMPARE(QString::fromStdString(heldSession.reasoningEffort), QStringLiteral("low"));
     glmKeyAvailable.store(true);
     QVERIFY(controller.setSessionModelConfiguration(second, QStringLiteral("deepseek-flash"), QStringLiteral("high")));
@@ -1072,7 +1078,7 @@ void AgentControllerTest::credentialWaitDoesNotRetargetOtherSession() {
     const auto secondRequests = deepseek.recordedRequests();
     QCOMPARE(firstRequests.size(), std::size_t(1));
     QCOMPARE(secondRequests.size(), std::size_t(1));
-    QCOMPARE(firstRequests.front().body.value(QStringLiteral("model")).toString(), QStringLiteral("glm-5.3"));
+    QCOMPARE(firstRequests.front().body.value(QStringLiteral("model")).toString(), QStringLiteral("glm-5.4"));
     QCOMPARE(firstRequests.front()
                  .body.value(QStringLiteral("reasoning"))
                  .toObject()
@@ -1089,7 +1095,7 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile_data(
     QTest::addColumn<QString>("provider");
     QTest::addColumn<QString>("effort");
     for (const QString& model :
-         {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
+         {QStringLiteral("glm-5.4"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
           QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2"),
           QStringLiteral("anthropic/claude-opus-5.5")}) {
         for (const QString& effort : {QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high"),
@@ -1129,7 +1135,10 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile() {
     };
     DesktopAccountModelClient client(config);
     QCOMPARE(client.wireApi(), MaiWireApi::Responses);
-    QCOMPARE(client.wireApiForModel("glm-5.3").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
+    QCOMPARE(client.wireApiForModel("glm-5.4").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
+    QVERIFY(!client.wireApiForModel("glm-5.3")); // Alias is restored at the settings boundary only.
+    QCOMPARE(client.contextLimits("glm-5.4").contextWindowTokens, std::size_t(1'048'576));
+    QCOMPARE(client.contextLimits("glm-5.4").maxOutputTokens, std::size_t(131'072));
     QCOMPARE(client.wireApiForModel("glm-5.3-flash").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
     QCOMPARE(client.wireApiForModel("deepseek-flash").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
     QCOMPARE(client.wireApiForModel("deepseek-v4-pro").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
@@ -1140,10 +1149,36 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile() {
     request.model = model.toStdString();
     request.reasoningEffort = effort.toStdString();
     request.messages.push_back(MaiModelMessage{MaiModelRole::User, "provider route probe"});
-    const MaiStreamSink sink;
+    // Verify the native item lifecycle as well as routing. Repeated done and
+    // terminal snapshots must not duplicate the streamed visible answer.
+    MaiStreamSink sink;
+    QStringList lifecycle;
+    std::vector<MaiModelTextItem> items;
+    std::string text;
+    sink.onTextItemStarted = [&](const MaiModelTextItem& item) {
+        lifecycle.push_back(QStringLiteral("started"));
+        items.push_back(item);
+    };
+    sink.onTextItemDelta = [&](const MaiModelTextItem& item, std::string_view delta) {
+        lifecycle.push_back(QStringLiteral("delta"));
+        items.push_back(item);
+        text.append(delta);
+    };
+    sink.onTextItemCompleted = [&](const MaiModelTextItem& item) {
+        lifecycle.push_back(QStringLiteral("completed"));
+        items.push_back(item);
+    };
     const std::atomic<bool> cancel{false};
     const MaiError error = client.stream(request, sink, cancel);
     QVERIFY2(!error, error.message().c_str());
+    QCOMPARE(text, std::string("ok"));
+    QCOMPARE(lifecycle, (QStringList{QStringLiteral("started"), QStringLiteral("delta"),
+                                   QStringLiteral("completed")}));
+    for (const auto& item : items) {
+        QCOMPARE(item.id, std::string("fixture-output"));
+        QCOMPARE(item.index, 0);
+        QCOMPARE(item.phase, MaiModelTextPhase::FinalAnswer);
+    }
     QCOMPARE(requestedProviders, (QStringList{provider}));
     const auto received = provider == QStringLiteral("glm")        ? glm.recordedRequests()
                           : provider == QStringLiteral("deepseek") ? deepseek.recordedRequests()
@@ -1156,6 +1191,11 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile() {
     QCOMPARE(received.front().path, QStringLiteral("/%1-profile/responses").arg(provider));
     QVERIFY(received.front().body.contains(QStringLiteral("input")));
     QVERIFY(!received.front().body.contains(QStringLiteral("messages")));
+    const auto input = received.front().body.value(QStringLiteral("input")).toArray();
+    QCOMPARE(input.size(), 1);
+    QCOMPARE(input.first().toObject().value(QStringLiteral("role")).toString(), QStringLiteral("user"));
+    QCOMPARE(input.first().toObject().value(QStringLiteral("content")).toString(),
+             QStringLiteral("provider route probe"));
     QCOMPARE(
         received.front().body.value(QStringLiteral("reasoning")).toObject().value(QStringLiteral("effort")).toString(),
         effort);
@@ -1164,7 +1204,7 @@ void AgentControllerTest::accountModelClientUsesProviderProtocolAndProfile() {
 void AgentControllerTest::productGlmWebToolsStayIndependentOfPrimaryModel_data() {
     QTest::addColumn<QString>("model");
     for (const auto* model :
-         {"anthropic/claude-fable-5.2", "deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash"})
+         {"anthropic/claude-fable-5.2", "deepseek-flash", "deepseek-v4-pro", "glm-5.4", "glm-5.3-flash"})
         QTest::newRow(model) << QString::fromLatin1(model);
 }
 
@@ -1225,6 +1265,82 @@ void AgentControllerTest::productGlmWebToolsStayIndependentOfPrimaryModel() {
     QCOMPARE(deepseekKeyReads.load(), 0U);
 }
 
+void AgentControllerTest::openAiSessionSelectionKeepsExistingDefault() {
+    AccountRouteProbe openai;
+    QVERIFY(openai.port > 0);
+    AgentController::ModelConfig config;
+    config.openaiBaseUrl = openai.baseUrl(QStringLiteral("openai-controller"));
+    config.accountModelKeyProvider = [](const QString& provider) {
+        return provider == QStringLiteral("openai") ? QStringLiteral("synthetic-openai-only") : QString();
+    };
+    AgentController controller(config, QString());
+    const auto selected = controller.createSession(QDir::currentPath());
+    const auto existing = controller.createSession(QDir::currentPath());
+    QVERIFY(!selected.isEmpty() && !existing.isEmpty());
+    AgentController::SessionModelConfiguration before;
+    QVERIFY(controller.sessionModelConfiguration(existing, before));
+    QCOMPARE(before.model, QStringLiteral("deepseek-flash"));
+    QVERIFY(controller.setSessionModelConfiguration(selected, QStringLiteral("gpt-6.1-sol"),
+                                                     QStringLiteral("medium")));
+    QSignalSpy finished(&controller, &AgentController::turnFinished);
+    QVERIFY(controller.sendPrompt(selected, QStringLiteral("owned session route probe")));
+    QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 10000);
+    const auto received = openai.recordedRequests();
+    QCOMPARE(received.size(), std::size_t(1));
+    QCOMPARE(received.front().path, QStringLiteral("/openai-controller/responses"));
+    QCOMPARE(received.front().authorization, QStringLiteral("Bearer synthetic-openai-only"));
+    QCOMPARE(received.front().body.value(QStringLiteral("model")).toString(), QStringLiteral("gpt-6.1-sol"));
+    QCOMPARE(received.front().body.value(QStringLiteral("reasoning")).toObject()
+                 .value(QStringLiteral("effort")).toString(), QStringLiteral("medium"));
+    for (const auto& session : {existing, controller.createSession(QDir::currentPath())}) {
+        AgentController::SessionModelConfiguration untouched;
+        QVERIFY(controller.sessionModelConfiguration(session, untouched));
+        QCOMPARE(untouched.model, before.model);
+        QCOMPARE(untouched.reasoningEffort, before.reasoningEffort);
+    }
+}
+
+void AgentControllerTest::openAiAccountRouteUsesFreshCredentialsAndFiveEfforts() {
+    AccountRouteProbe openai;
+    AccountRouteProbe fallback;
+    QVERIFY(openai.port > 0 && fallback.port > 0);
+    QString key = QStringLiteral("synthetic-openai-first");
+    QStringList providers;
+    DesktopAccountModelClient::Config config;
+    config.openaiBaseUrl = openai.baseUrl(QStringLiteral("openai-profile"));
+    config.deepseekBaseUrl = fallback.baseUrl(QStringLiteral("deepseek-profile"));
+    config.keyProvider = [&](const QString& provider) {
+        providers.append(provider);
+        return provider == QStringLiteral("openai") ? key : QStringLiteral("synthetic-fallback");
+    };
+    DesktopAccountModelClient client(config);
+    QCOMPARE(client.wireApiForModel("gpt-6.1-sol").value_or(MaiWireApi::Mixed), MaiWireApi::Responses);
+    QVERIFY(!client.usageProviderForModel("gpt-6.1-sol").empty());
+    QVERIFY(providers.isEmpty());  // Construction never snapshots account credentials.
+    MaiModelRequest request;
+    request.model = "gpt-6.1-sol";
+    request.messages.push_back(MaiModelMessage{MaiModelRole::User, "owned OpenAI route probe"});
+    const std::atomic<bool> cancel{false};
+    for (const auto* effort : {"low", "medium", "high", "xhigh", "max"}) {
+        request.reasoningEffort = effort;
+        const auto error = client.stream(request, {}, cancel);
+        QVERIFY2(!error, error.message().c_str());
+        const auto received = openai.recordedRequests().back();
+        QCOMPARE(received.path, QStringLiteral("/openai-profile/responses"));
+        QCOMPARE(received.authorization, QStringLiteral("Bearer ") + key);
+        QCOMPARE(received.body.value(QStringLiteral("model")).toString(), QStringLiteral("gpt-6.1-sol"));
+        QCOMPARE(received.body.value(QStringLiteral("reasoning")).toObject()
+                     .value(QStringLiteral("effort")).toString(), QString::fromLatin1(effort));
+        key = QStringLiteral("synthetic-openai-rotated-") + QString::fromLatin1(effort);
+    }
+    QCOMPARE(openai.recordedRequests().size(), std::size_t(5));
+    key.clear();
+    QCOMPARE(client.stream(request, {}, cancel).code(), MaiErrorCode::NotConfigured);
+    QCOMPARE(openai.recordedRequests().size(), std::size_t(5));
+    QVERIFY(fallback.recordedRequests().empty());
+    QCOMPARE(providers, QStringList(6, QStringLiteral("openai")));
+}
+
 void AgentControllerTest::accountModelClientRoutesBySelectedModelAndFreshKey() {
     AccountRouteProbe glm;
     AccountRouteProbe deepseek;
@@ -1249,7 +1365,7 @@ void AgentControllerTest::accountModelClientRoutesBySelectedModelAndFreshKey() {
     MaiStreamSink sink;
     const std::atomic<bool> cancel{false};
     request.reasoningEffort = "max";
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     QVERIFY(!client.stream(request, sink, cancel));
     request.model = "deepseek-flash";
     QVERIFY(!client.stream(request, sink, cancel));
@@ -1272,7 +1388,7 @@ void AgentControllerTest::accountModelClientRoutesBySelectedModelAndFreshKey() {
                           QStringLiteral("deepseek"), QStringLiteral("deepseek")}));
     keys.insert(QStringLiteral("deepseek"), QStringLiteral("restored-deepseek-key"));
     keys.insert(QStringLiteral("glm"), QStringLiteral("rotated-glm-key"));
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     QVERIFY(!client.stream(request, sink, cancel));
     QCOMPARE(glm.recordedRequests().size(), std::size_t(2));
     QCOMPARE(glm.recordedRequests().back().authorization, QStringLiteral("Bearer rotated-glm-key"));
@@ -1325,7 +1441,7 @@ void AgentControllerTest::accountModelClientUsesResolvedProxy() {
                     authorization = request.get_header_value("Authorization");
                     ++count;
                 }
-                AccountRouteProbe::respond(request, response);
+                AccountRouteProbe::respond(response);
             });
             port = server.bind_to_any_port("127.0.0.1");
             if (port > 0) {
@@ -1358,7 +1474,7 @@ void AgentControllerTest::accountModelClientUsesResolvedProxy() {
     };
     DesktopAccountModelClient client(config);
     MaiModelRequest request;
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     MaiStreamSink sink;
     const std::atomic<bool> cancel{false};
     QVERIFY(!client.stream(request, sink, cancel));
@@ -1384,7 +1500,9 @@ void AgentControllerTest::desktopReadsOutsideSessionWorkingDirectory() {
     const std::string arguments =
         QJsonDocument(QJsonObject{{QStringLiteral("path"), source}})
             .toJson(QJsonDocument::Compact).toStdString();
-    AgentController controller(std::make_unique<OutsideReadModel>(arguments), QString());
+    // 显式注入移动端共用文件工具，只验证宿主访问与审批，不代表桌面默认清单。
+    AgentController controller(std::make_unique<OutsideReadModel>(arguments), QString(),
+        [](MaiToolRegistry& tools) { registerMaiFileTools(tools); });
     const QString sessionId = controller.createSession(workspace.path());
     QVERIFY(controller.sendPrompt(sessionId, QStringLiteral("read the file")));
     controller.agent().waitIdle();
@@ -1411,7 +1529,8 @@ void AgentControllerTest::desktopWriteOutsideWaitsForApproval() {
         {QStringLiteral("path"), target}, {QStringLiteral("content"), QStringLiteral("approved")}})
                                       .toJson(QJsonDocument::Compact).toStdString();
     AgentController controller(
-        std::make_unique<OutsideReadModel>(arguments, "file_write"), QString());
+        std::make_unique<OutsideReadModel>(arguments, "file_write"), QString(),
+        [](MaiToolRegistry& tools) { registerMaiFileTools(tools); });
     const QString sessionId = controller.createSession(workspace.path());
     QVERIFY(controller.sendPrompt(sessionId, QStringLiteral("write outside")));
     QTRY_COMPARE(controller.agent().listPendingPermissions().size(), std::size_t(1));
@@ -1549,10 +1668,10 @@ void AgentControllerTest::registers_a_screenshot_tool_that_requires_approval_dat
     QTest::addColumn<QString>("expectedModel");
     QTest::addColumn<bool>("expectedViewImage");
     // 注册实例不等于对所有主模型开放。与核心的实际能力门禁保持一致，
-    // 默认 glm-5.3 和 local:* 不能接收像素，glm-5.3-flash 可以。
-    QTest::newRow("default-text-only") << QString() << QStringLiteral("glm-5.3") << false;
-    QTest::newRow("explicit-text-only")
-        << QStringLiteral("glm-5.3") << QStringLiteral("glm-5.3") << false;
+    // 默认 GLM-5.4 和 Flash 可接收像素；local:* 仍保持文本能力边界。
+    QTest::newRow("default-image-capable") << QString() << QStringLiteral("glm-5.4") << true;
+    QTest::newRow("flagship-image-capable")
+        << QStringLiteral("glm-5.4") << QStringLiteral("glm-5.4") << true;
     QTest::newRow("image-capable")
         << QStringLiteral("glm-5.3-flash") << QStringLiteral("glm-5.3-flash") << true;
     QTest::newRow("deepseek-cloud-image-capable")
@@ -1579,12 +1698,12 @@ void AgentControllerTest::registers_a_screenshot_tool_that_requires_approval() {
     QVERIFY(screenshotActions.contains(QStringLiteral("capture")));
     QVERIFY(screenshotActions.contains(QStringLiteral("stop")));
     MaiToolContext textModelContext;
-    textModelContext.model = "glm-5.3";
+    textModelContext.model = "local:qa";
     const MaiToolResult unsupported = screenshot->execute("{}", textModelContext);
     QVERIFY(unsupported.hasError());
     QCOMPARE(unsupported.error().code(), MaiErrorCode::NotSupported);
     QVERIFY(QString::fromStdString(unsupported.error().message()).contains(
-        QStringLiteral("glm-5.3-flash")));
+        QStringLiteral("image-capable")));
 
     auto model = std::make_unique<ScriptedModel>(std::string(), std::string(kText));
     ScriptedModel* scripted = model.get();
@@ -1640,7 +1759,9 @@ void AgentControllerTest::registers_host_tools_after_builtin_tools() {
     bool foundVideoMatting = false;
 #endif
     for (const MaiToolSpec& tool : scripted->lastRequest().tools) {
-        if (tool.name == "file_read") foundBuiltin = true;
+        // 桌面默认合同与移动端不同：文件操作通过终端和补丁，不能再发现 file_*。
+        QVERIFY2(tool.name.rfind("file_", 0) != 0, tool.name.c_str());
+        if (tool.name == "apply_patch") foundBuiltin = true;
         if (tool.name == "agent_send_media") foundAgentMedia = true;
         if (tool.name == "session_list") foundSessionList = true;
         if (tool.name == "session_create") {
@@ -1677,6 +1798,12 @@ void AgentControllerTest::registers_host_tools_after_builtin_tools() {
     QVERIFY(instructions.find("Seedance") == std::string::npos);
     QVERIFY(instructions.find("Seedream") == std::string::npos);
     QVERIFY(instructions.find("ark_assets") == std::string::npos);
+    // 模型必须能直接请求 computer 的目标窗口图片，不能被旧提示导向先调独立整屏工具。
+    QVERIFY(instructions.find("{method,parameters}") != std::string::npos);
+    QVERIFY(instructions.find("get_window_state") != std::string::npos);
+    QVERIFY(instructions.find("include_screenshot") != std::string::npos);
+    QVERIFY(instructions.find("action=observe") == std::string::npos);
+    QVERIFY(instructions.find("without a window image") == std::string::npos);
 #if defined(MAICHAT_TEST_CV_VIDEO_ANALYSIS)
     QVERIFY(foundSceneDetect);
     QVERIFY(foundMotionDetect);
@@ -1820,7 +1947,9 @@ void AgentControllerTest::messagePartEventsReadOnlyTheirOwner() {
     QVERIFY(reads.installed);
     AgentController controller(std::make_unique<ScriptedModel>("", ""), database);
     QVERIFY2(controller.openError().isEmpty(), qPrintable(controller.openError()));
-    QCOMPARE(reads.attachedConnections, 1);
+    // The formal backend first inspects the source read-only, then opens its
+    // writable index. Row counts below still verify the actual live connection.
+    QCOMPARE(reads.attachedConnections, 2);
     MaiMessage stored;
     reads.enabled = true;
     const bool found = controller.agent().getMessage(owner, target, stored);

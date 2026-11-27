@@ -417,9 +417,10 @@ test('main chat keys require a signed-in account', async () => {
 
 });
 
-test('all signed-in accounts receive OpenRouter through the existing model key route', async () => {
+test('all signed-in accounts receive OpenRouter and OpenAI through the existing model key route', async () => {
   let issued = 0;
-  const keys = { glm: '', deepseek: '', minimax: '', openrouter: 'openrouter-test-key' };
+  const keys = { glm: '', deepseek: '', minimax: '', openrouter: 'openrouter-test-key',
+    openai: 'openai-test-key' };
   const setup = fixture({ issueAccountModelKeys: createAccountModelKeyIssuer({
     MAICHAT_AUTH_SERVICE_TOKEN: 'abcdef0123456789abcdef0123456789'
   }, async () => {
@@ -1581,4 +1582,50 @@ test('already canceled-capable QR tables gain the claimed session column', () =>
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+
+test('remote desktop credentials bind the authenticated account and each device independently', async () => {
+  const setup = fixture();
+  const login = await signInWithSms(setup);
+  const token = login.body.access_token;
+  const owner = login.body.user.im_user_id;
+  const first = '0123456789abcdef0123456789abcdef';
+  const second = 'abcdef0123456789abcdef0123456789';
+  assert.equal((await setup.call('POST', '/v1/remote-desktop/credential', { device_id: first })).statusCode, 401);
+  const a = await setup.call('POST', '/v1/remote-desktop/credential', { device_id: first }, token);
+  const b = await setup.call('POST', '/v1/remote-desktop/credential', { device_id: second }, token);
+  assert.equal(a.statusCode, 200);
+  assert.equal(b.statusCode, 200);
+  assert.equal(a.headers['Cache-Control'], 'no-store');
+  assert.equal(a.body.owner_user_id, owner);
+  assert.equal(a.body.device_id, first);
+  assert.notEqual(a.body.user_id, b.body.user_id);
+  assert.notEqual(a.body.user_id, owner);
+  const expected = 'rd_' + createHash('sha256').update('maichat-remote-v2\0' + owner + '\0' + first).digest('hex').slice(0, 24);
+  assert.equal(a.body.user_id, expected);
+  const payload = JSON.parse(inflateSync(Buffer.from(a.body.user_sig.replace(/\*/g, '+').replace(/-/g, '/').replace(/_/g, '='), 'base64')));
+  assert.equal(payload['TLS.identifier'], a.body.user_id);
+  assert.equal(payload['TLS.expire'], 7 * 24 * 60 * 60);
+  assert.equal(a.body.expires_at, payload['TLS.time'] + 7 * 24 * 60 * 60);
+  for (const invalid of [{}, { device_id: 'short' }, { device_id: first, user_id: 'victim' },
+    { device_id: '../escape/device/name' }, { device_id: null }]) {
+    assert.equal((await setup.call('POST', '/v1/remote-desktop/credential', invalid, token)).statusCode, 400);
+  }
+  const repeat = await setup.call('POST', '/v1/remote-desktop/credential', { device_id: first }, token);
+  assert.equal(repeat.body.user_id, a.body.user_id);
+  const other = await signInWithSms(setup, '13900000002');
+  const otherCredential = await setup.call('POST', '/v1/remote-desktop/credential',
+    { device_id: first }, other.body.access_token);
+  assert.equal(otherCredential.statusCode, 200);
+  assert.equal(otherCredential.body.owner_user_id, other.body.user.im_user_id);
+  assert.notEqual(otherCredential.body.user_id, a.body.user_id);
+  setup.db.close();
+});
+
+
+test('remote desktop media identity uses the Qt and iOS shared wire vector', () => {
+  const { remoteDesktopUserId } = require('./remote-desktop-credential');
+  assert.equal(remoteDesktopUserId('owned_account', '0123456789abcdef0123456789abcdef'),
+    'rd_0f41444bc8e51e0eef0dba30');
 });

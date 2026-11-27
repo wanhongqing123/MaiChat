@@ -5,6 +5,7 @@
 #include "MaiMemoryStore.h"
 #include "MaiSessionStore.h"
 #include "MaiSqliteStore.h"
+#include "support/MaiLegacySessionFixture.h"
 
 #include <sqlite3.h>
 #include <cstdio>
@@ -123,14 +124,19 @@ int main() {
         CHECK(sqlite);
         contract(*sqlite.value(), path);
         sqlite.value().reset();
-        // 与原有 v2/v8/v9 升级回归相同，保留当前附加列并回放旧版本门禁。
-        // 新迁移须可重复检查列/表，不能因已有自己的列而拒绝打开全部旧历史。
+        // 版本门禁用另一份真实普通旧表夹具，不把正式生成列索引降级成旧库。
+        const auto legacyRoot = directory.append(MaiFilePath::fromUtf8("legacy-version-gate"));
+        CHECK(!MaiFileSystem::createDirectories(legacyRoot));
+        const auto legacyPath = legacyRoot.append(MaiFilePath::fromUtf8("agent.db")).toUtf8();
         sqlite3* legacy = nullptr;
-        CHECK(sqlite3_open(path.c_str(), &legacy) == SQLITE_OK);
-        CHECK(sqlite3_exec(legacy, "PRAGMA user_version=11", nullptr, nullptr, nullptr) ==
+        CHECK(sqlite3_open(legacyPath.c_str(), &legacy) == SQLITE_OK);
+        CHECK(sqlite3_exec(legacy, kMaiLegacySessionSchemaV15, nullptr, nullptr, nullptr) ==
               SQLITE_OK);
+        CHECK(sqlite3_exec(
+                  legacy, "INSERT INTO sessions(id) VALUES('owned-legacy');PRAGMA user_version=11;",
+                  nullptr, nullptr, nullptr) == SQLITE_OK);
         sqlite3_close(legacy);
-        auto reopened = makeMaiSqliteStore(path);
+        auto reopened = makeMaiSqliteStore(legacyPath);
         if (!reopened)
             std::fprintf(stderr, "Owned migration replay error: %s\n",
                          reopened.error().message().c_str());

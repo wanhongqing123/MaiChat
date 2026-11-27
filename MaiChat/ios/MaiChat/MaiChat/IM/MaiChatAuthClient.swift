@@ -3,6 +3,7 @@
 // 封装手机号验证、账号登录、刷新令牌及服务端 IM 凭据请求。
 import Foundation
 import UIKit
+import MaiChatCore
 
 extension Notification.Name {
     static let maiChatAccountSessionReplaced = Notification.Name("MaiChatAccountSessionReplaced")
@@ -161,6 +162,15 @@ private struct MaiChatDesktopLoginDecision: Decodable, Sendable {
 
 struct MaiChatIMCredential: Decodable, Sendable {
     let sdkAppId: Int
+    let userId: String
+    let userSig: String
+    let expiresAt: Int
+}
+
+struct MaiChatRemoteDesktopCredential: Decodable, Sendable {
+    let sdkAppId: Int
+    let ownerUserId: String
+    let deviceId: String
     let userId: String
     let userSig: String
     let expiresAt: Int
@@ -551,6 +561,28 @@ actor MaiChatAuthClient {
             )
         }
         guard credential.userId == expectedUserID else { throw MaiChatAuthError.identityMismatch }
+        return credential
+    }
+
+    func remoteDesktopCredential(deviceID: String, expectedUserID: String) async throws -> MaiChatRemoteDesktopCredential {
+        let generation = sessionVersion
+        let token = try await currentAccessToken()
+        let credential: MaiChatRemoteDesktopCredential
+        do {
+            credential = try await request("remote-desktop/credential", method: "POST",
+                body: ["device_id": deviceID], bearer: token)
+        } catch MaiChatAuthError.requestFailed("Authentication required") {
+            guard sessionVersion == generation else { throw MaiChatAuthError.identityMismatch }
+            accessToken = nil
+            let fresh = try await currentAccessToken()
+            credential = try await request("remote-desktop/credential", method: "POST",
+                body: ["device_id": deviceID], bearer: fresh)
+        }
+        guard sessionVersion == generation, credential.ownerUserId == expectedUserID,
+              credential.deviceId == deviceID,
+              credential.userId == RemoteDesktopSignal.mediaUserID(ownerUserID: expectedUserID, deviceID: deviceID),
+              credential.expiresAt > Int(Date().timeIntervalSince1970), !credential.userSig.isEmpty
+        else { throw MaiChatAuthError.identityMismatch }
         return credential
     }
 

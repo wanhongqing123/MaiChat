@@ -9,6 +9,24 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public final class AIAssistantModelSettingsTest {
+    @Test public void solFiveEffortsUseOpenAiAndSurviveSettingsReopen() throws Exception {
+        for (String effort : new String[]{"low", "medium", "high", "xhigh", "max"}) {
+            AIAssistantModelSettings settings = AIAssistantModelSettings.defaults()
+                .withOptions("gpt-6.1-sol", "on-request", effort);
+            JSONObject config = settings.configuration(null, "synthetic-openai-key");
+            assertEquals("gpt-6.1-sol", config.getString("model"));
+            assertEquals("https://api.openai.com/v1", config.getString("baseUrl"));
+            assertEquals("responses", config.getString("wire"));
+            assertEquals("synthetic-openai-key", config.getString("apiKey"));
+            AIAssistantModelSettings reopened = AIAssistantModelSettings.fromJson(settings.toJson());
+            assertEquals("gpt-6.1-sol", reopened.model());
+            assertEquals(effort, reopened.effort);
+        }
+        assertFalse(AIAssistantModelSettings.supportedCloud("gpt-6.1-sol-preview"));
+        assertFalse(AIAssistantModelSettings.isOpenRouterModel("gpt-6.1-sol"));
+        assertEquals("deepseek-flash", AIAssistantModelSettings.defaults().model());
+    }
+
     @Test public void opusFiveEffortsUseOpenRouterAndSurviveSettingsReopen() throws Exception {
         for (String effort : new String[]{"low", "medium", "high", "xhigh", "max"}) {
             String model = "anthropic/claude-opus-5.5";
@@ -28,7 +46,7 @@ public final class AIAssistantModelSettingsTest {
         assertFalse(AIAssistantModelSettings.supportedEffortForModel("deepseek-flash", "medium"));
     }
     @Test public void allFiveCloudChoicesUseResponsesAndTheirOwnEndpoint() throws Exception {
-        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+        for (String model : new String[]{"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
                 "anthropic/claude-fable-5.2"}) {
             AIAssistantModelSettings settings = AIAssistantModelSettings.fromJson(
                 new JSONObject().put("model", model));
@@ -62,7 +80,7 @@ public final class AIAssistantModelSettingsTest {
             JSONObject fable = new JSONObject().put("model", "anthropic/claude-fable-5.2")
                 .put("reasoningEffort", effort);
             assertEquals(effort, AIAssistantModelSettings.fromJson(fable).effort);
-            for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"}) {
+            for (String model : new String[]{"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"}) {
                 JSONObject saved = new JSONObject().put("model", model).put("reasoningEffort", effort);
                 assertEquals("high", AIAssistantModelSettings.fromJson(saved).effort);
                 assertEquals("Reading settings must not rewrite persisted source", effort,
@@ -74,7 +92,7 @@ public final class AIAssistantModelSettingsTest {
             }
         }
         for (String effort : new String[]{"low", "high", "max"})
-            for (String model : new String[]{"glm-5.3", "deepseek-flash", "anthropic/claude-fable-5.2"})
+            for (String model : new String[]{"glm-5.4", "deepseek-flash", "anthropic/claude-fable-5.2"})
                 assertEquals(effort, AIAssistantModelSettings.fromJson(new JSONObject()
                     .put("model", model).put("reasoningEffort", effort)).effort);
     }
@@ -86,7 +104,7 @@ public final class AIAssistantModelSettingsTest {
         AIAssistantModelSettings settings = AIAssistantModelSettings.fromJson(saved);
         assertTrue("Persisted local source must survive initialization", settings.isLocal());
         assertEquals("local:builtin-qwen3.5-2b-q4_k_m", settings.model());
-        assertEquals("glm-5.3", settings.cloudModel);
+        assertEquals("glm-5.4", settings.cloudModel);
         assertEquals("never", settings.policy);
         assertEquals("max", settings.effort);
         assertEquals("llama", settings.toJson().getString("modelProvider"));

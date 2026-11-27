@@ -95,7 +95,8 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
     const std::vector<MaiMessage>& history, std::size_t firstMessage, std::size_t firstPart,
     const std::string& preservedUserMessageId, bool preserveReasoning,
     const std::vector<std::string>& currentUserMessageIds,
-    const ToolOutputProjector& toolOutputProjector) const {
+    const ToolOutputProjector& toolOutputProjector,
+    const UserContextProjector& userContextProjector) const {
     std::vector<MaiModelMessage> out;
     if (firstMessage > history.size()) return out;
     if (firstPart != 0 &&
@@ -129,7 +130,14 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
             // 附件身份只取本消息的序号/part ID/路径，不按当前轮次或后续图片数改写。
             MaiModelMessage modelMessage;
             modelMessage.role = MaiModelRole::User;
+            modelMessage.sourceMessageId = message.id;
             modelMessage.content = message.text();
+            if (userContextProjector) {
+                const auto selectedContext = userContextProjector(message);
+                if (!selectedContext.empty())
+                    modelMessage.content =
+                        selectedContext + "\n\nUser message:\n" + modelMessage.content;
+            }
             std::size_t attachmentIndex = 0;
             for (const auto& part : message.parts) {
                 if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
@@ -226,6 +234,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
         // 下一轮会重复调同一个工具。
         MaiModelMessage pending;
         pending.role = MaiModelRole::Assistant;
+        pending.sourceMessageId = message.id;
         std::vector<const MaiToolPart*> batch;
 
         const auto flush_pending = [&] {
@@ -234,6 +243,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
                 out.push_back(std::move(pending));
             pending = MaiModelMessage{};
             pending.role = MaiModelRole::Assistant;
+            pending.sourceMessageId = message.id;
         };
 
         auto flush_batch = [&] {
@@ -249,6 +259,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
             out.push_back(pending);
             pending = MaiModelMessage{};
             pending.role = MaiModelRole::Assistant;
+            pending.sourceMessageId = message.id;
 
             // 再发每个调用的结果。toolCallId 必须对得上，否则模型认不出这是哪次调用的结果。
             for (const auto* toolPart : batch) {
@@ -303,6 +314,11 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
             if (!executions.empty()) {
                 MaiModelMessage observation;
                 observation.role = MaiModelRole::User;
+                observation.sourceMessageId = message.id;
+                // 同批观察由真实末项定位，不使用可能重复的供应商 callId 推测来源。
+                for (const auto& sourcePart : message.parts)
+                    if (std::get_if<MaiToolPart>(&sourcePart.body) == batch.back())
+                        observation.sourcePartId = sourcePart.id;
                 observation.content =
                     nlohmann::json{
                         {"type", "tool_execution_observation"},
@@ -331,6 +347,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
             if (const auto* text = std::get_if<MaiTextPart>(&part.body)) {
                 // 工具调用之后又开口说话了，说明上一批已经结束，先结算。
                 flush_batch();
+                if (pending.sourcePartId.empty()) pending.sourcePartId = part.id;
                 if (!pending.content.empty()) pending.content += "\n";
                 pending.content += text->text;
             } else if (const auto* toolResult = std::get_if<MaiReasoningPart>(&part.body)) {
@@ -346,6 +363,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
                     flush_batch();
                     if (pending.continuation) flush_pending();
                     pending.continuation = toolResult->continuation;
+                    if (pending.sourcePartId.empty()) pending.sourcePartId = part.id;
                 }
                 flush_batch();
                 if (preserveReasoning) {
@@ -366,12 +384,13 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
                     batch.push_back(toolPart);
                 }
             } else if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
-                // Chat Completions 只允许用户消息携带 image_url：
-                // 先保留工具调用与回执的相邻顺序，再把实际像素作为下一条观察消息。
+                // 先保留工具调用与回执的相邻顺序，再把工具产生的实际像素作为观察消息。
                 // 不在当前轮内部滑动删除截图；已发送的观察仅在压缩覆盖其 part 后移除。
                 flush_batch();
                 MaiModelMessage observation;
                 observation.role = MaiModelRole::User;
+                observation.sourceMessageId = message.id;
+                observation.sourcePartId = part.id;
                 observation.content = toolGroupObservation(
                     message, partIndex, messageIndex == firstMessage ? firstPart : 0);
                 if (!image->path.empty())

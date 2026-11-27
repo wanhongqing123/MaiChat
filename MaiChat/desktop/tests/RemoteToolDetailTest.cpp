@@ -9,10 +9,13 @@
 #include <QJsonDocument>
 #include <QLabel>
 #include <QPushButton>
+#include <QProgressBar>
 #include <QTemporaryDir>
 #include <QtTest>
 
 #include "agent/RemoteAgentPanel.h"
+#include "MaiSessionRecordCodec.h"
+#include "agent/AgentContextUsagePresentation.h"
 #include "agent/AgentToolGroupWidget.h"
 #include "agent/DesktopSessionSyncCoordinator.h"
 #include "markdown/MarkdownView.h"
@@ -51,6 +54,28 @@ struct Read {
     QJsonObject owner;
     QJsonObject command;
 };
+
+MaiModelContextUsage measuredContext() {
+    MaiModelContextUsage usage;
+    usage.model = "gpt-6.1-sol";
+    usage.provider = "owned-provider-fingerprint";
+    usage.latestSampling.total = {16000, MaiUsageValueSource::Provider};
+    usage.latestSampling.input = {15000, MaiUsageValueSource::Provider};
+    usage.latestSampling.output = {1000, MaiUsageValueSource::Provider};
+    usage.latestSampling.cachedInput = {14000, MaiUsageValueSource::Provider};
+    usage.turn.total = {48000, MaiUsageValueSource::Derived};
+    usage.thread.total = {999999, MaiUsageValueSource::Derived};
+    usage.windowTokens = 20000;
+    usage.windowSource = MaiContextWindowSource::Configuration;
+    usage.samplingValid = true;
+    return usage;
+}
+
+QJsonObject contextPage(const MaiModelContextUsage& usage) {
+    const auto encoded = MaiSessionRecordCodec::encodeContextUsage(usage);
+    return {{QStringLiteral("ok"), true},
+            {QStringLiteral("contextUsage"), encoded ? QString::fromStdString(encoded.value()) : QString()}};
+}
 
 struct Fixture {
     QTemporaryDir directory;
@@ -127,9 +152,15 @@ void deliver(RemoteAgentPanel& panel, const Read& read, const QJsonObject& resul
 class RemoteToolDetailTest final : public QObject {
     Q_OBJECT
 private slots:
+    void actualContextUsesOwnerSamplingAndPreservesUnknown();
+    void contextClearsAcrossSessionLoginAndAccount();
+    void terminalPresenceRequestsOwnerContextOnce();
+    void ownerContextCommandRejectsOldModelAndCoalescesToolBatches();
     void groupSummaryCategories_data();
     void groupSummaryCategories();
     void legacyGroupSummaryKeepsStatusPriority();
+    void unifiedExecDetailsKeepNativeFields_data();
+    void unifiedExecDetailsKeepNativeFields();
     void disclosureReadsOnlySelectedToolAndPagesOriginalSource();
     void expandedToolDetailsUseTheReadingColumn();
     void wrongBindingAndWrongPageDoNotConsumeTheCorrectRead();
@@ -145,6 +176,198 @@ private slots:
     void busyAndInvalidUtf8PagesRemainExplicit();
 };
 
+void RemoteToolDetailTest::actualContextUsesOwnerSamplingAndPreservesUnknown() {
+    Fixture fixture(false);
+    auto* label = fixture.panel.findChild<QLabel*>(QStringLiteral("remoteAgentContextSize"));
+    auto* bar = fixture.panel.findChild<QProgressBar*>(QStringLiteral("remoteAgentContextUsageBar"));
+    QVERIFY(label);
+    QVERIFY(bar);
+    auto usage = measuredContext();
+    fixture.panel.receivePayload(fixture.current, QStringLiteral("history_page"), contextPage(usage));
+    QCOMPARE(label->text(), QStringLiteral("50% left (16,000 used / 20,000)"));
+    QCOMPARE(bar->value(), 50);
+    QVERIFY(!bar->isHidden());
+    QVERIFY(label->toolTip().contains(QStringLiteral("999,999")));
+    QVERIFY(label->toolTip().contains(QStringLiteral("缓存")));
+    usage.latestSampling.total = {16000, MaiUsageValueSource::Derived};
+    fixture.panel.receivePayload(fixture.current, QStringLiteral("snapshot"), contextPage(usage));
+    QVERIFY(label->text().startsWith(QStringLiteral("推算")));
+    usage.latestSampling.total = {0, MaiUsageValueSource::Provider};
+    fixture.panel.receivePayload(fixture.current, QStringLiteral("snapshot"), contextPage(usage));
+    QCOMPARE(bar->value(), 0);
+    QVERIFY(!bar->isHidden());
+    QVERIFY(label->text().contains(QStringLiteral("100% left")));
+    usage.latestSampling.total.source = MaiUsageValueSource::Missing;
+    fixture.panel.receivePayload(fixture.current, QStringLiteral("snapshot"), contextPage(usage));
+    QVERIFY(bar->isHidden());
+    QVERIFY(!label->text().contains(QLatin1Char('%')));
+    usage = measuredContext();
+    usage.windowTokens = 0;
+    usage.windowSource = MaiContextWindowSource::Missing;
+    fixture.panel.receivePayload(fixture.current, QStringLiteral("snapshot"), contextPage(usage));
+    QVERIFY(label->text().contains(QStringLiteral("窗口未知")));
+    QVERIFY(bar->isHidden());
+    usage = measuredContext();
+    usage.samplingValid = false;
+    usage.windowNumber = 2;
+    fixture.panel.receivePayload(fixture.current, QStringLiteral("snapshot"), contextPage(usage));
+    QVERIFY(bar->isHidden());
+    QVERIFY(!label->text().contains(QLatin1Char('%')));
+    fixture.panel.receivePayload(fixture.current, QStringLiteral("history_page"),
+                                 {{QStringLiteral("ok"), true}});
+    QVERIFY(bar->isHidden());
+    QVERIFY(!label->text().contains(QLatin1Char('%')));
+    fixture.panel.receivePayload(fixture.current, QStringLiteral("snapshot"),
+                                 {{QStringLiteral("ok"), true}, {QStringLiteral("contextUsage"), QString(16385, QLatin1Char('x'))}});
+    QVERIFY(bar->isHidden());
+}
+
+void RemoteToolDetailTest::contextClearsAcrossSessionLoginAndAccount() {
+    Fixture fixture(false);
+    auto* label = fixture.panel.findChild<QLabel*>(QStringLiteral("remoteAgentContextSize"));
+    auto* bar = fixture.panel.findChild<QProgressBar*>(QStringLiteral("remoteAgentContextUsageBar"));
+    QVERIFY(label);
+    QVERIFY(bar);
+    const auto page = contextPage(measuredContext());
+    fixture.panel.receivePayload(fixture.current, QStringLiteral("history_page"), page);
+    QVERIFY(!bar->isHidden());
+    const auto second = owner(QStringLiteral("second-context"));
+    fixture.panel.openSession(second);
+    QVERIFY(bar->isHidden());
+    fixture.panel.receivePayload(fixture.current, QStringLiteral("snapshot"), page);
+    QVERIFY(bar->isHidden());
+    fixture.panel.receivePayload(second, QStringLiteral("snapshot"), page);
+    QVERIFY(!bar->isHidden());
+    const auto replacement = owner(QStringLiteral("second-context"), QStringLiteral("replacement-login"));
+    fixture.panel.updateSession(replacement);
+    QVERIFY(bar->isHidden());
+    fixture.panel.receivePayload(second, QStringLiteral("snapshot"), page);
+    QVERIFY(bar->isHidden());
+    fixture.panel.openSession(replacement);
+    fixture.panel.receivePayload(replacement, QStringLiteral("snapshot"), page);
+    QVERIFY(!bar->isHidden());
+    fixture.panel.setToolDetailScope(QStringLiteral("another-account"), 8);
+    QVERIFY(bar->isHidden());
+    fixture.panel.receivePayload(replacement, QStringLiteral("snapshot"), page);
+    QVERIFY(bar->isHidden());
+}
+
+void RemoteToolDetailTest::terminalPresenceRequestsOwnerContextOnce() {
+    QTemporaryDir directory;
+    RemoteAgentPanel panel(nullptr, directory.filePath(QStringLiteral("outbox.json")));
+    QList<Read> reads;
+    panel.setToolDetailScope(QStringLiteral("owned-account"), 7);
+    panel.setCommandHandler([&](const QJsonObject& remote, const QJsonObject& command,
+                               RemoteAgentPanel::Completion done) {
+        reads.append({remote, command});
+        done({});
+    });
+    auto current = owner();
+    panel.openSession(current);
+    QCOMPARE(reads.size(), 1);
+    const auto result = [&](const Read& read) {
+        auto value = contextPage(measuredContext());
+        value.insert(QStringLiteral("session"), read.owner.value(QStringLiteral("id")));
+        value.insert(QStringLiteral("model"), QStringLiteral("gpt-6.1-sol"));
+        value.insert(QStringLiteral("reasoningEffort"), QStringLiteral("medium"));
+        value.insert(QStringLiteral("wire"), QStringLiteral("responses"));
+        deliver(panel, read, value);
+    };
+    result(reads.last());
+    current.insert(QStringLiteral("busy"), true);
+    panel.updateSession(current);
+    current.insert(QStringLiteral("busy"), false);
+    panel.updateSession(current);
+    QCOMPARE(reads.size(), 2);
+    QCOMPARE(reads.last().command.value(QStringLiteral("action")).toString(), QStringLiteral("get_session"));
+    panel.updateSession(current);
+    QCOMPARE(reads.size(), 2);
+    const auto previous = reads.last();
+    auto replacement = owner(QStringLiteral("session-detail"), QStringLiteral("new-context-login"));
+    panel.updateSession(replacement);
+    result(previous);
+    auto* bar = panel.findChild<QProgressBar*>(QStringLiteral("remoteAgentContextUsageBar"));
+    QVERIFY(bar);
+    QVERIFY(bar->isHidden());
+}
+
+void RemoteToolDetailTest::ownerContextCommandRejectsOldModelAndCoalescesToolBatches() {
+    QTemporaryDir directory;
+    RemoteAgentPanel panel(nullptr, directory.filePath(QStringLiteral("outbox.json")));
+    QList<Read> reads;
+    panel.setToolDetailScope(QStringLiteral("owned-account"), 7);
+    panel.setCommandHandler([&](const QJsonObject& remote, const QJsonObject& command,
+                               RemoteAgentPanel::Completion done) {
+        reads.append({remote, command});
+        done({});
+    });
+    const auto current = owner();
+    panel.openSession(current);
+    const auto reply = [&](const Read& read, const QString& model, bool measured = true) {
+        auto usage = measuredContext();
+        usage.model = model.toStdString();
+        auto value = measured ? contextPage(usage) : QJsonObject{{QStringLiteral("ok"), true}};
+        value.insert(QStringLiteral("session"), current.value(QStringLiteral("id")));
+        value.insert(QStringLiteral("model"), model);
+        value.insert(QStringLiteral("reasoningEffort"), QStringLiteral("high"));
+        value.insert(QStringLiteral("wire"), QStringLiteral("responses"));
+        deliver(panel, read, value);
+    };
+    QCOMPARE(reads.size(), 1);
+    reply(reads.last(), QStringLiteral("gpt-6.1-sol"));
+    auto* label = panel.findChild<QLabel*>(QStringLiteral("remoteAgentContextSize"));
+    auto* bar = panel.findChild<QProgressBar*>(QStringLiteral("remoteAgentContextUsageBar"));
+    QVERIFY(label && bar);
+    QVERIFY(!bar->isHidden());
+    // Current service history omits metadata; an asynchronous page must not
+    // erase a newer authoritative response from the owner command transport.
+    panel.receivePayload(current, QStringLiteral("history_page"), {{QStringLiteral("ok"), true}});
+    QVERIFY(!bar->isHidden());
+    auto* option = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentModelOption-deepseek-flash"));
+    QVERIFY(option && option->isEnabled());
+    option->click();
+    QCOMPARE(reads.size(), 2);
+    QVERIFY(bar->isHidden());
+    panel.receivePayload(current, QStringLiteral("snapshot"), contextPage(measuredContext()));
+    QVERIFY(bar->isHidden());
+    reply(reads.last(), QStringLiteral("deepseek-flash"));
+    QVERIFY(!bar->isHidden());
+    panel.receivePayload(current, QStringLiteral("snapshot"), contextPage(measuredContext()));
+    QVERIFY(bar->isHidden()); // Late old-model metadata cannot regain a percentage.
+    snapshot(panel, current, part(), QStringLiteral("event"));
+    QCOMPARE(reads.size(), 3);
+    snapshot(panel, current, part(), QStringLiteral("event"));
+    QCOMPARE(reads.size(), 3);
+    auto another = part();
+    another.insert(QStringLiteral("id"), QStringLiteral("next-tool"));
+    snapshot(panel, current, another, QStringLiteral("event"));
+    QCOMPARE(reads.size(), 3); // Coalesced behind the first pending owner read.
+    reply(reads.last(), QStringLiteral("deepseek-flash"));
+    QCOMPARE(reads.size(), 4);
+    reply(reads.last(), QStringLiteral("deepseek-flash"), false);
+    QVERIFY(bar->isHidden()); // An old owner response without usage stays unknown.
+    QVERIFY(!label->text().contains(QLatin1Char('%')));
+    QJsonArray manyTools;
+    for (int index = 0; index < 150; ++index) {
+        auto tool = part();
+        tool.insert(QStringLiteral("id"), QStringLiteral("many-tool-%1").arg(index));
+        manyTools.append(tool);
+    }
+    const QJsonObject longLoop{{QStringLiteral("ok"), true},
+        {QStringLiteral("messages"), QJsonArray{QJsonObject{
+            {QStringLiteral("id"), QStringLiteral("many-tools-message")},
+            {QStringLiteral("role"), QStringLiteral("assistant")},
+            {QStringLiteral("parts"), manyTools}}}}};
+    panel.receivePayload(current, QStringLiteral("event"), longLoop);
+    QCOMPARE(reads.size(), 5);
+    reply(reads.last(), QStringLiteral("deepseek-flash"));
+    panel.receivePayload(current, QStringLiteral("event"), longLoop);
+    QCOMPARE(reads.size(), 5); // More than 128 tool parts must not churn on repeats.
+    panel.receivePayload(current, QStringLiteral("snapshot"),
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("contextUsage"), QStringLiteral("invalid")}});
+    QVERIFY(bar->isHidden());
+}
+
 void RemoteToolDetailTest::groupSummaryCategories_data() {
     QTest::addColumn<QStringList>("tools");
     QTest::addColumn<QStringList>("states");
@@ -154,9 +377,16 @@ void RemoteToolDetailTest::groupSummaryCategories_data() {
         << QStringList(8, QStringLiteral("completed")) << QStringLiteral("内置工具调用 8 次 · 已完成");
     QTest::newRow("ssh-exec-is-built-in")
         << QStringList{"ssh_exec"} << QStringList{"completed"} << QStringLiteral("内置工具调用 1 次 · 已完成");
+    QTest::newRow("exec-command-is-shell")
+        << QStringList{"exec_command"} << QStringList{"completed"} << QStringLiteral("shell 调用 1 次 · 已完成");
+    QTest::newRow("write-stdin-is-shell")
+        << QStringList{"write_stdin"} << QStringList{"completed"} << QStringLiteral("shell 调用 1 次 · 已完成");
+    QTest::newRow("active-unified-exec-pair")
+        << QStringList{"exec_command", "write_stdin"} << QStringList{"completed", "completed"}
+        << QStringLiteral("shell 调用 2 次 · 已完成");
     QTest::newRow("shell-input-session-is-shell")
         << QStringList{"shell_input"} << QStringList{"completed"} << QStringLiteral("shell 调用 1 次 · 已完成");
-    QTest::newRow("active-shell-session-pair")
+    QTest::newRow("historical-shell-session-pair")
         << QStringList{"shell", "shell_input"} << QStringList{"completed", "completed"}
         << QStringLiteral("shell 调用 2 次 · 已完成");
     // Retired process tool names still occur in persisted transcripts.
@@ -167,11 +397,11 @@ void RemoteToolDetailTest::groupSummaryCategories_data() {
         << QStringList{"file_read", "curl", "openssl", "ssh_exec", "desktop_browser", "computer", "shell", "desktop_process_read"}
         << QStringList(8, QStringLiteral("completed")) << QStringLiteral("内置工具调用 6 次 · shell 调用 2 次 · 已完成");
     QTest::newRow("mixed-failure")
-        << QStringList{"ssh_exec", "curl", "shell"} << QStringList{"completed", "completed", "error"}
+        << QStringList{"ssh_exec", "curl", "exec_command"} << QStringList{"completed", "completed", "error"}
         << QStringLiteral("内置工具调用 2 次 · shell 调用 1 次 · 有失败");
     QTest::newRow("shell-name-prefix-is-not-a-family-match")
-        << QStringList{"desktop_process_status", "shell_extra"} << QStringList{"completed", "completed"}
-        << QStringLiteral("内置工具调用 2 次 · 已完成");
+        << QStringList{"desktop_process_status", "shell_extra", "exec_command_extra", "write_stdin_extra"}
+        << QStringList(4, QStringLiteral("completed")) << QStringLiteral("内置工具调用 4 次 · 已完成");
     QTest::newRow("missing-name-keeps-legacy-summary")
         << QStringList{""} << QStringList{"completed"} << QStringLiteral("工具调用 1 次 · 已完成");
     QTest::newRow("partial-missing-name-keeps-legacy-summary")
@@ -231,6 +461,53 @@ void RemoteToolDetailTest::legacyGroupSummaryKeepsStatusPriority() {
              QStringLiteral("内置工具调用 1 次 · shell 调用 1 次 · 等待授权"));
     QCOMPARE(agentToolGroupTitle({"running", "pending"}, {"shell", "desktop_process_stop"}),
              QStringLiteral("shell 调用 2 次 · 运行中"));
+}
+
+void RemoteToolDetailTest::unifiedExecDetailsKeepNativeFields_data() {
+    QTest::addColumn<QString>("toolName");
+    QTest::addColumn<QString>("input");
+    QTest::addColumn<QString>("output");
+    QTest::newRow("exec-command-running")
+        << QStringLiteral("exec_command")
+        << QStringLiteral(R"({"cmd":"owned fixture only","tty":true,"yield_time_ms":1000})")
+        << QStringLiteral(R"({"chunk_id":"owned-start","wall_time_seconds":0.25,"output":"native-ready\n","session_id":42})");
+    QTest::newRow("write-stdin-completed")
+        << QStringLiteral("write_stdin")
+        << QStringLiteral(R"({"session_id":42,"chars":"owned input\n","yield_time_ms":1000})")
+        << QStringLiteral(R"({"chunk_id":"owned-done","wall_time_seconds":0.01,"output":"native-input:owned input\n","exit_code":0})");
+}
+
+void RemoteToolDetailTest::unifiedExecDetailsKeepNativeFields() {
+    QFETCH(QString, toolName);
+    QFETCH(QString, input);
+    QFETCH(QString, output);
+    Fixture f(false);
+    auto tool = part();
+    tool.insert(QStringLiteral("tool"), toolName);
+    snapshot(f.panel, f.current, tool);
+    QVERIFY(f.groupButton());
+    QCOMPARE(f.groupButton()->text(), QStringLiteral("⌘  shell 调用 1 次 · 已完成  ›"));
+    f.groupButton()->click();
+    QVERIFY(f.itemButton());
+    f.itemButton()->click();
+    QCOMPARE(f.reads.size(), 3);
+    for (const QString& field : {QStringLiteral("input"), QStringLiteral("output"), QStringLiteral("error")}) {
+        const auto read = f.read(field);
+        QCOMPARE(read.command.value(QStringLiteral("messageId")).toString(), QStringLiteral("msg-source"));
+        QCOMPARE(read.command.value(QStringLiteral("partId")).toString(), QStringLiteral("part-detail"));
+        auto result = page(read, field == QStringLiteral("input") ? input
+                                 : field == QStringLiteral("output") ? output : QString());
+        result.insert(QStringLiteral("tool"), toolName);
+        deliver(f.panel, read, result);
+    }
+    QVERIFY(f.text(QStringLiteral("input")) && f.text(QStringLiteral("output")));
+    QCOMPARE(f.text(QStringLiteral("input"))->text(), input);
+    QCOMPARE(f.text(QStringLiteral("output"))->text(), output);
+    auto* transcript = f.panel.findChild<MarkdownView*>();
+    QVERIFY(transcript);
+    transcript->selectAll();
+    QVERIFY(!transcript->selectedText().contains(QStringLiteral("chunk_id")));
+    QVERIFY(!transcript->selectedText().contains(QStringLiteral("native-input")));
 }
 
 void RemoteToolDetailTest::disclosureReadsOnlySelectedToolAndPagesOriginalSource() {

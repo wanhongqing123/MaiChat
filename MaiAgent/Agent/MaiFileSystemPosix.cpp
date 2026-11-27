@@ -11,8 +11,14 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#elif defined(__APPLE__)
+#include <stdio.h>
+#endif
 #if defined(__ANDROID__)
 #include <atomic>
+#include <dlfcn.h>
 #endif
 #include <algorithm>
 #include <limits>
@@ -29,9 +35,8 @@
 
 // POSIX 实现。
 //
-// **这份没有在真机上跑过**——本项目目前只在 Windows 上构建。写得尽量守规矩（EINTR 重试、O_CLOEXEC、
-// 不跟进符号链接），但第一次在 Linux/mac 上跑之前，不要假设它是对的。
-// MaiFileSystemTests 是可移植的，到那边先跑那一套。
+// 平台行为必须在对应系统验证，不能以 Windows 编译代替 POSIX 回归。
+// Android 的硬链接可能被系统策略拒绝；普通文件发布优先使用原生无覆盖重命名。
 //
 // 路径在 POSIX 上就是字节序列，**不保证是合法 UTF-8**。所以这里 fromUtf8 / toUtf8 都是原样搬运：
 // 擅自做编码转换反而会改写文件名。这正是内部不统一用 UTF-8 的理由（见 MaiFilePath.h）。
@@ -40,6 +45,23 @@ namespace {
 
 #if defined(__ANDROID__)
 std::atomic<MaiAndroidPublishNewFileCallback> sAndroidPublishNewFile{nullptr};
+
+// renameat2 是 Android API30 起的公开 libc 接口；minSdk26 不能直接强链接或
+// 试探原始 syscall（旧系统的 seccomp 可能直接终止进程，而非返回 ENOSYS）。
+// 与 NDK 的新版 API 使用规则一致，按实际导出能力选择，缺失时交平台兼容契约。
+int renameNoReplaceAndroid(const char* source, const char* destination) {
+    using Rename = int (*)(int, const char*, int, const char*, unsigned int);
+    static const auto rename = reinterpret_cast<Rename>(::dlsym(RTLD_DEFAULT, "renameat2"));
+    if (rename == nullptr) {
+        errno = ENOSYS;
+        return -1;
+    }
+    int status;
+    do {
+        status = rename(AT_FDCWD, source, AT_FDCWD, destination, 1u);
+    } while (status < 0 && errno == EINTR);
+    return status;
+}
 #endif
 
 MaiErrorCode toErrorCode(int savedErrno) {
@@ -71,6 +93,19 @@ void maiSetAndroidPublishNewFileCallback(MaiAndroidPublishNewFileCallback callba
 }
 
 int maiAndroidPublishNewFile(const char* source, const char* destination) {
+    if (source == nullptr || destination == nullptr || *source == '\0' || *destination == '\0')
+        return EINVAL;
+    struct stat before{};
+    if (::lstat(source, &before) != 0) return errno;
+    if (!S_ISREG(before.st_mode)) return EINVAL;
+    // Java 桥不是普通文件核心的必需环境。内核同时完成发布和“目标不存在”检查，
+    // 既避免 Android 拒绝硬链接，也不退化成先 exists 再覆盖 rename 的竞态。
+    const int status = renameNoReplaceAndroid(source, destination);
+    if (status == 0) return 0;
+    const int failure = errno;
+    if (failure != ENOSYS && failure != EINVAL && failure != EOPNOTSUPP) return failure;
+    // 只在内核/文件系统不支持该原子操作时保留既有 Android 宿主兼容契约；
+    // 目标已存在、权限拒绝和跨文件系统等真实错误绝不通过宿主回调重试。
     const auto callback = sAndroidPublishNewFile.load(std::memory_order_acquire);
     return callback != nullptr ? callback(source, destination) : ENOSYS;
 }
@@ -483,6 +518,80 @@ MaiResult<MaiFileInfo> MaiFileSystem::stat(const MaiFilePath& path) {
     return result;
 }
 
+MaiError MaiFileSystem::publishNewDirectory(const MaiFilePath& source,
+                                            const MaiFilePath& destination) {
+    maiAssertBlockingAllowed("MaiFileSystem::publishNewDirectory");
+    if (source.isEmpty() || destination.isEmpty())
+        return {MaiErrorCode::InvalidInput, "empty directory publication path"};
+    // 去掉末段分隔符，避免 lstat("alias/") 跟随目录链接。
+    auto sourceNative = source.value();
+    auto destinationNative = destination.value();
+    while (sourceNative.size() > 1 && sourceNative.back() == '/') sourceNative.pop_back();
+    while (destinationNative.size() > 1 && destinationNative.back() == '/')
+        destinationNative.pop_back();
+    const auto sourceResolved = resolve(MaiFilePath(sourceNative));
+    const auto destinationResolved = resolve(MaiFilePath(destinationNative));
+    if (sourceResolved.isEmpty() || destinationResolved.isEmpty() ||
+        sourceResolved == sourceResolved.dirName() ||
+        destinationResolved == destinationResolved.dirName() ||
+        sourceResolved == destinationResolved)
+        return {MaiErrorCode::InvalidInput,
+                "directory publication requires distinct non-root paths"};
+    struct stat info{};
+    if (::lstat(sourceNative.c_str(), &info) != 0)
+        return errnoAs("cannot inspect staged directory");
+    if (!S_ISDIR(info.st_mode))
+        return {MaiErrorCode::InvalidInput, "directory publication requires a non-link directory"};
+    // 只能使用内核的无覆盖重命名；普通 rename 会覆盖竞争者刚创建的空目录。
+#if defined(__ANDROID__)
+    const auto status = renameNoReplaceAndroid(sourceNative.c_str(), destinationNative.c_str());
+#elif defined(__linux__) && defined(SYS_renameat2)
+    constexpr unsigned int renameNoReplace = 1;
+    const auto status = ::syscall(SYS_renameat2, AT_FDCWD, sourceNative.c_str(), AT_FDCWD,
+                                  destinationNative.c_str(), renameNoReplace);
+#elif defined(__APPLE__) && defined(RENAME_EXCL)
+    const auto status = ::renamex_np(sourceNative.c_str(), destinationNative.c_str(), RENAME_EXCL);
+#else
+    return {MaiErrorCode::NotSupported,
+            "atomic directory publication is unavailable on this platform"};
+#endif
+#if defined(__ANDROID__) || (defined(__linux__) && defined(SYS_renameat2)) || \
+    (defined(__APPLE__) && defined(RENAME_EXCL))
+    if (status == 0) return {};
+    const int saved = errno;
+    if (saved == EXDEV || saved == ENOSYS || saved == EOPNOTSUPP || saved == EINVAL)
+        return {MaiErrorCode::NotSupported,
+                "filesystem does not support atomic directory publication"};
+    if (saved == EEXIST || saved == ENOTEMPTY)
+        return {MaiErrorCode::InvalidInput, "destination already exists; nothing was overwritten"};
+    errno = saved;
+    return errnoAs("cannot publish directory");
+#endif
+}
+
+MaiError MaiFileSystem::setUserExecutable(const MaiFilePath& path) {
+    maiAssertBlockingAllowed("MaiFileSystem::setUserExecutable");
+    if (path.isEmpty()) return {MaiErrorCode::InvalidInput, "empty executable path"};
+    // O_NONBLOCK 防止被替换成 FIFO 时卡住；fchmod 绑定同一已验证普通文件句柄。
+    int descriptor;
+    do {
+        descriptor = ::open(path.value().c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    } while (descriptor < 0 && errno == EINTR);
+    if (descriptor < 0) return errnoAs("cannot open executable file");
+    MaiOwnedDescriptor handle(descriptor);
+    struct stat info{};
+    if (::fstat(handle.get(), &info) != 0) return errnoAs("cannot inspect executable file");
+    if (!S_ISREG(info.st_mode))
+        return {MaiErrorCode::InvalidInput,
+                "executable permissions require a non-link ordinary file"};
+    int status;
+    do {
+        status = ::fchmod(handle.get(), static_cast<mode_t>((info.st_mode & 07777) | S_IXUSR));
+    } while (status != 0 && errno == EINTR);
+    if (status == 0) return {};
+    return errnoAs("cannot set owner executable permission");
+}
+
 MaiError MaiFileSystem::moveFile(const MaiFilePath& source, const MaiFilePath& destination,
                                  const std::string& expectedIdentity,
                                  const std::function<bool()>& isCanceled) {
@@ -496,6 +605,41 @@ MaiError MaiFileSystem::moveFile(const MaiFilePath& source, const MaiFilePath& d
         return {MaiErrorCode::InvalidInput, "move requires an unchanged ordinary file"};
     if (isCanceled && isCanceled())
         return {MaiErrorCode::Canceled, "file move canceled before commit"};
+#if defined(__ANDROID__)
+    // 真机可拒绝 link()；优先探测可用的公开 libc 接口，旧系统走明确宿主适配。
+    // NOREPLACE 原生路径原子拒绝已有目标，不使用会覆盖竞争者的普通 rename。
+    auto moved = renameNoReplaceAndroid(source.value().c_str(), destination.value().c_str());
+    if (moved < 0 && (errno == ENOSYS || errno == EINVAL || errno == EOPNOTSUPP)) {
+        struct stat parent{};
+        const auto directory = destination.dirName();
+        const auto parentPath = directory.isEmpty() ? MaiFilePath(".") : directory;
+        if (::stat(parentPath.value().c_str(), &parent) != 0)
+            return errnoAs("cannot inspect move destination parent");
+        if (parent.st_dev != before.st_dev)
+            return {MaiErrorCode::NotSupported,
+                    "cross-filesystem move is not supported; source was retained"};
+        // 与完整文件发布共享同一旧版 Android 适配，不退回会被系统拒绝的 link。
+        const int compatible =
+            maiAndroidPublishNewFile(source.value().c_str(), destination.value().c_str());
+        moved = compatible == 0 ? 0 : -1;
+        errno = compatible;
+    }
+    if (moved == 0) {
+        struct stat published{};
+        if (::lstat(destination.value().c_str(), &published) == 0 && S_ISREG(published.st_mode) &&
+            published.st_dev == before.st_dev && published.st_ino == before.st_ino)
+            return {};
+        return {MaiErrorCode::InvalidInput,
+                "move destination changed after atomic publication (partial move)"};
+    }
+    if (errno == EXDEV)
+        return {MaiErrorCode::NotSupported,
+                "cross-filesystem move is not supported; source was retained"};
+    if (errno == ENOSYS || errno == EINVAL || errno == EOPNOTSUPP)
+        return {MaiErrorCode::NotSupported,
+                "Android has no supported no-replace move backend; source was retained"};
+    return errnoAs("cannot move file without overwriting");
+#else
     // link/unlink 提供同文件系统、无覆盖的发布；提交前后均核实原生身份，不隐式跨卷复制。
     if (::link(source.value().c_str(), destination.value().c_str()) != 0) {
         if (errno == EXDEV)
@@ -519,6 +663,7 @@ MaiError MaiFileSystem::moveFile(const MaiFilePath& source, const MaiFilePath& d
     if (!destinationMatches)
         return {failure.code(), failure.message() + "; destination changed (partial move)"};
     return failure;
+#endif
 }
 
 MaiError MaiFileSystem::copyFile(const MaiFilePath& source, const MaiFilePath& destination,
@@ -593,6 +738,18 @@ MaiDirectoryDeleteResult MaiFileSystem::deleteDirectory(const MaiFilePath& path,
         result.error = deletePosixNode(parent.get(), resolved.baseName().value(), resolved, options,
                                        result, true, 0);
     return result;
+}
+
+MaiError MaiFileSystem::createNewDirectory(const MaiFilePath& path) {
+    maiAssertBlockingAllowed("MaiFileSystem::createNewDirectory");
+    const auto resolved = path.isEmpty() ? MaiFilePath{} : resolve(path);
+    if (path.isEmpty() || resolved.isEmpty() || resolved == resolved.dirName())
+        return {MaiErrorCode::InvalidInput, "exclusive directory creation refuses empty paths and roots"};
+    // 私有暂存目录不向组或其它用户开放；已有节点由 mkdir 原子拒绝。
+    if (::mkdir(path.value().c_str(), 0700) == 0) return {};
+    if (errno == EEXIST)
+        return {MaiErrorCode::InvalidInput, "directory creation target already exists"};
+    return errnoAs("cannot exclusively create directory");
 }
 
 MaiError MaiFileSystem::createDirectories(const MaiFilePath& path) {

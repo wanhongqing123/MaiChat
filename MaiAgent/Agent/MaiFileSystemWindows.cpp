@@ -20,6 +20,27 @@
 // 解释，中文机器上是 GBK，而我们的路径是 UTF-8——这正是 std::filesystem
 // 当初让进程挂掉的同一个原因。
 
+std::wstring MaiFileSystem::windowsApiPath(const MaiFilePath& path) {
+    auto native = path.value();
+    std::replace(native.begin(), native.end(), L'/', L'\\');
+    if (native.empty() || native.compare(0, 4, L"\\\\?\\") == 0 ||
+        native.compare(0, 4, L"\\\\.\\") == 0)
+        return native;
+    if (path.isAbsolute() && native.size() < 248) return native;
+    // 扩展前缀会关闭 Win32 的点段规范化，因此必须先取得完整路径。
+    // 只在 API 调用边界使用此拼写，避免改变授权根逐段比较的表示。
+    const DWORD required = ::GetFullPathNameW(native.c_str(), 0, nullptr, nullptr);
+    if (required == 0 || required > 32767) return native;
+    std::wstring full(required, L'\0');
+    const DWORD length = ::GetFullPathNameW(native.c_str(), required, full.data(), nullptr);
+    if (length == 0 || length >= required) return native;
+    full.resize(length);
+    if (full.size() < 248) return full;
+    if (full.compare(0, 2, L"\\\\") == 0) return L"\\\\?\\UNC\\" + full.substr(2);
+    if (full.size() >= 3 && full[1] == L':' && full[2] == L'\\') return L"\\\\?\\" + full;
+    return native;
+}
+
 namespace {
 
 // UTF-8 -> UTF-16。空串直接返回空，别让 MultiByteToWideChar 去处理
@@ -85,7 +106,8 @@ MaiError lastErrorAs(const char* what) {
 
 bool attributesOf(const MaiFilePath& path, WIN32_FILE_ATTRIBUTE_DATA& out) {
     if (path.isEmpty()) return false;
-    return ::GetFileAttributesExW(path.value().c_str(), GetFileExInfoStandard, &out) != FALSE;
+    return ::GetFileAttributesExW(MaiFileSystem::windowsApiPath(path).c_str(),
+                                  GetFileExInfoStandard, &out) != FALSE;
 }
 
 }  // namespace
@@ -180,7 +202,7 @@ bool readHandleInfo(HANDLE handle, MaiRegularFileInfo& out) {
 bool MaiFileSystem::regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo& out) {
     if (path.isEmpty()) return false;
     const HANDLE handle = ::CreateFileW(
-        path.value().c_str(), FILE_READ_ATTRIBUTES,
+        MaiFileSystem::windowsApiPath(path).c_str(), FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return false;
@@ -202,9 +224,10 @@ MaiResult<std::unique_ptr<MaiFileReadHandle>> MaiFileReadHandle::open(const MaiF
     if (path.isEmpty()) return {MaiErrorCode::InvalidInput, "empty file path"};
     maiAssertBlockingAllowed("MaiFileReadHandle::open");
     // 不共享删除使已验证的最后一级路径在整个分页期间不能被重命名或替换。
-    const HANDLE handle = ::CreateFileW(
-        path.value().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    const HANDLE handle =
+        ::CreateFileW(MaiFileSystem::windowsApiPath(path).c_str(), GENERIC_READ,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return lastErrorAs("cannot open file for reading");
     MaiRegularFileInfo info;
     if (!readHandleInfo(handle, info)) {
@@ -282,9 +305,9 @@ MaiError MaiFileSystem::readFile(const MaiFilePath& path, std::string& contents,
     maiAssertBlockingAllowed("MaiFileSystem::readFile");
     // FILE_SHARE_READ | FILE_SHARE_WRITE：别人正开着这个文件时我们也能读。不给 SHARE_WRITE 的话，
     // 读一个编辑器正打开的文件会失败。
-    const HANDLE handle =
-        ::CreateFileW(path.value().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const HANDLE handle = ::CreateFileW(MaiFileSystem::windowsApiPath(path).c_str(), GENERIC_READ,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return lastErrorAs("cannot open file for reading");
 
     LARGE_INTEGER size{};
@@ -338,8 +361,9 @@ MaiError MaiFileSystem::writeFile(const MaiFilePath& path, const std::string& co
     if (path.isEmpty()) return MaiError::make(MaiErrorCode::InvalidInput, "empty path");
 
     maiAssertBlockingAllowed("MaiFileSystem::writeFile");
-    const HANDLE handle = ::CreateFileW(path.value().c_str(), GENERIC_WRITE, FILE_SHARE_READ,
-                                        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const HANDLE handle =
+        ::CreateFileW(MaiFileSystem::windowsApiPath(path).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                      nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return lastErrorAs("cannot open file for writing");
 
     std::size_t done = 0;
@@ -362,8 +386,9 @@ MaiError MaiFileSystem::createEmptyFile(const MaiFilePath& path) {
     if (path.isEmpty()) return MaiError::make(MaiErrorCode::InvalidInput, "empty path");
 
     maiAssertBlockingAllowed("MaiFileSystem::createEmptyFile");
-    const HANDLE handle = ::CreateFileW(path.value().c_str(), GENERIC_WRITE, FILE_SHARE_READ,
-                                        nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const HANDLE handle =
+        ::CreateFileW(MaiFileSystem::windowsApiPath(path).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                      nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return lastErrorAs("cannot create file");
     ::CloseHandle(handle);
     return {};
@@ -373,7 +398,7 @@ MaiError MaiFileSystem::removeFile(const MaiFilePath& path) {
     if (path.isEmpty()) return MaiError::make(MaiErrorCode::InvalidInput, "empty path");
 
     maiAssertBlockingAllowed("MaiFileSystem::removeFile");
-    if (::DeleteFileW(path.value().c_str())) return {};
+    if (::DeleteFileW(MaiFileSystem::windowsApiPath(path).c_str())) return {};
     return lastErrorAs("cannot delete file");
 }
 
@@ -381,7 +406,8 @@ MaiError MaiFileSystem::publishNewFile(const MaiFilePath& source, const MaiFileP
     if (source.isEmpty() || destination.isEmpty())
         return MaiError::make(MaiErrorCode::InvalidInput, "empty publish path");
     maiAssertBlockingAllowed("MaiFileSystem::publishNewFile");
-    if (::MoveFileExW(source.value().c_str(), destination.value().c_str(), MOVEFILE_WRITE_THROUGH))
+    if (::MoveFileExW(MaiFileSystem::windowsApiPath(source).c_str(),
+                      MaiFileSystem::windowsApiPath(destination).c_str(), MOVEFILE_WRITE_THROUGH))
         return {};
     return lastErrorAs("cannot publish file");
 }
@@ -487,7 +513,7 @@ MaiError deleteWindowsNode(const MaiFilePath& path, const MaiDirectoryDeleteOpti
         return {MaiErrorCode::InvalidInput, "directory deletion path was denied"};
     // 不共享删除，防止枚举期间该节点被重命名或替换；最终也通过同一已验证句柄标记删除。
     MaiOwnedWindowsHandle handle(
-        ::CreateFileW(path.value().c_str(), DELETE | FILE_READ_ATTRIBUTES,
+        ::CreateFileW(MaiFileSystem::windowsApiPath(path).c_str(), DELETE | FILE_READ_ATTRIBUTES,
                       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
     if (handle.get() == INVALID_HANDLE_VALUE) return lastErrorAs("cannot open delete target");
@@ -500,7 +526,8 @@ MaiError deleteWindowsNode(const MaiFilePath& path, const MaiDirectoryDeleteOpti
     if (info.value().isDirectory && options.recursive) {
         WIN32_FIND_DATAW entry{};
         const auto pattern = path.append(MaiFilePath(L"*"));
-        const HANDLE finder = ::FindFirstFileW(pattern.value().c_str(), &entry);
+        const HANDLE finder =
+            ::FindFirstFileW(MaiFileSystem::windowsApiPath(pattern).c_str(), &entry);
         if (finder == INVALID_HANDLE_VALUE && ::GetLastError() != ERROR_FILE_NOT_FOUND)
             return lastErrorAs("cannot enumerate delete directory");
         if (finder != INVALID_HANDLE_VALUE) {
@@ -550,11 +577,63 @@ MaiResult<MaiFileInfo> MaiFileSystem::stat(const MaiFilePath& path) {
     if (isSymbolicLink(path))
         return {MaiErrorCode::InvalidInput, "stat refuses symbolic links and junctions"};
     MaiOwnedWindowsHandle handle(::CreateFileW(
-        path.value().c_str(), FILE_READ_ATTRIBUTES,
+        MaiFileSystem::windowsApiPath(path).c_str(), FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
     if (handle.get() == INVALID_HANDLE_VALUE) return lastErrorAs("cannot stat path");
     return objectInfo(handle.get());
+}
+
+MaiError MaiFileSystem::publishNewDirectory(const MaiFilePath& source,
+                                              const MaiFilePath& destination) {
+    maiAssertBlockingAllowed("MaiFileSystem::publishNewDirectory");
+    if (source.isEmpty() || destination.isEmpty() || isWindowsFilesystemRoot(source) ||
+        isWindowsFilesystemRoot(destination))
+        return {MaiErrorCode::InvalidInput, "directory publication refuses empty paths and roots"};
+    const auto sourceResolved = resolve(source);
+    const auto destinationResolved = resolve(destination);
+    if (sourceResolved.isEmpty() || destinationResolved.isEmpty() ||
+        isWindowsFilesystemRoot(sourceResolved) || isWindowsFilesystemRoot(destinationResolved) ||
+        sourceResolved == destinationResolved)
+        return {MaiErrorCode::InvalidInput,
+                "directory publication requires distinct non-root paths"};
+    // 句柄查询拒绝 reparse point，包含长路径下 isSymbolicLink 无法识别的情况。
+    MaiOwnedWindowsHandle handle(::CreateFileW(
+        windowsApiPath(source).c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (handle.get() == INVALID_HANDLE_VALUE) return lastErrorAs("cannot open staged directory");
+    const auto info = objectInfo(handle.get());
+    if (!info) return info.error();
+    if (!info.value().isDirectory)
+        return {MaiErrorCode::InvalidInput, "directory publication requires a non-link directory"};
+    // 不设置 REPLACE_EXISTING 或 COPY_ALLOWED；目标竞争与跨卷失败由内核原子裁决。
+    if (::MoveFileExW(windowsApiPath(source).c_str(), windowsApiPath(destination).c_str(),
+                      MOVEFILE_WRITE_THROUGH))
+        return {};
+    const auto saved = ::GetLastError();
+    if (saved == ERROR_NOT_SAME_DEVICE)
+        return {MaiErrorCode::NotSupported, "directory publication requires the same filesystem"};
+    if (saved == ERROR_ALREADY_EXISTS || saved == ERROR_FILE_EXISTS)
+        return {MaiErrorCode::InvalidInput, "destination already exists; nothing was overwritten"};
+    ::SetLastError(saved);
+    return lastErrorAs("cannot publish directory");
+}
+
+MaiError MaiFileSystem::setUserExecutable(const MaiFilePath& path) {
+    maiAssertBlockingAllowed("MaiFileSystem::setUserExecutable");
+    if (path.isEmpty()) return {MaiErrorCode::InvalidInput, "empty executable path"};
+    MaiOwnedWindowsHandle handle(::CreateFileW(
+        windowsApiPath(path).c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (handle.get() == INVALID_HANDLE_VALUE) return lastErrorAs("cannot open executable file");
+    MaiRegularFileInfo info;
+    if (!readHandleInfo(handle.get(), info))
+        return {MaiErrorCode::InvalidInput,
+                "executable permissions require a non-link ordinary file"};
+    // Windows 无 POSIX 所有者执行位；验证类型即可，不改变现有 ACL。
+    return {};
 }
 
 MaiError MaiFileSystem::moveFile(const MaiFilePath& source, const MaiFilePath& destination,
@@ -564,7 +643,7 @@ MaiError MaiFileSystem::moveFile(const MaiFilePath& source, const MaiFilePath& d
     auto error = validateTransfer(source, destination);
     if (error) return error;
     MaiOwnedWindowsHandle handle(
-        ::CreateFileW(source.value().c_str(), DELETE | FILE_READ_ATTRIBUTES,
+        ::CreateFileW(MaiFileSystem::windowsApiPath(source).c_str(), DELETE | FILE_READ_ATTRIBUTES,
                       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
     if (handle.get() == INVALID_HANDLE_VALUE) return lastErrorAs("cannot open move source");
@@ -610,8 +689,8 @@ MaiError MaiFileSystem::copyFile(const MaiFilePath& source, const MaiFilePath& d
         temporary = destination.dirName().append(
             MaiFilePath::fromUtf8(".mai-copy-" + std::to_string(::GetCurrentProcessId()) + "-" +
                                   std::to_string(++sequence)));
-        output = ::CreateFileW(temporary.value().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        output = ::CreateFileW(MaiFileSystem::windowsApiPath(temporary).c_str(), GENERIC_WRITE, 0,
+                               nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (output != INVALID_HANDLE_VALUE) break;
         if (::GetLastError() != ERROR_FILE_EXISTS && ::GetLastError() != ERROR_ALREADY_EXISTS)
             return lastErrorAs("cannot create private copy staging file");
@@ -647,7 +726,7 @@ MaiError MaiFileSystem::copyFile(const MaiFilePath& source, const MaiFilePath& d
     if (!error && isCanceled && isCanceled())
         error = {MaiErrorCode::Canceled, "file copy canceled before publication"};
     if (!error) error = publishNewFile(temporary, destination);
-    if (error && !::DeleteFileW(temporary.value().c_str()) &&
+    if (error && !::DeleteFileW(MaiFileSystem::windowsApiPath(temporary).c_str()) &&
         ::GetLastError() != ERROR_FILE_NOT_FOUND)
         return {error.code(),
                 error.message() + "; could not remove private staging file: " + temporary.toUtf8()};
@@ -669,6 +748,19 @@ MaiDirectoryDeleteResult MaiFileSystem::deleteDirectory(const MaiFilePath& path,
     return result;
 }
 
+MaiError MaiFileSystem::createNewDirectory(const MaiFilePath& path) {
+    maiAssertBlockingAllowed("MaiFileSystem::createNewDirectory");
+    if (path.isEmpty() || isWindowsFilesystemRoot(path))
+        return {MaiErrorCode::InvalidInput, "exclusive directory creation refuses empty paths and roots"};
+    // CreateDirectory 的成功本身证明本次创建的所有权，不能把已有目录当作成功。
+    if (::CreateDirectoryW(windowsApiPath(path).c_str(), nullptr)) return {};
+    const auto saved = ::GetLastError();
+    if (saved == ERROR_ALREADY_EXISTS || saved == ERROR_FILE_EXISTS)
+        return {MaiErrorCode::InvalidInput, "directory creation target already exists"};
+    ::SetLastError(saved);
+    return lastErrorAs("cannot exclusively create directory");
+}
+
 MaiError MaiFileSystem::createDirectories(const MaiFilePath& path) {
     if (path.isEmpty()) return MaiError::make(MaiErrorCode::InvalidInput, "empty path");
     if (isDirectory(path)) return {};
@@ -680,7 +772,7 @@ MaiError MaiFileSystem::createDirectories(const MaiFilePath& path) {
         if (error.hasError()) return error;
     }
 
-    if (::CreateDirectoryW(path.value().c_str(), nullptr)) return {};
+    if (::CreateDirectoryW(MaiFileSystem::windowsApiPath(path).c_str(), nullptr)) return {};
     // 并发时别人可能刚好抢先建好了，那不算错。
     const DWORD code = ::GetLastError();
     if (code == ERROR_ALREADY_EXISTS && isDirectory(path)) return {};
@@ -706,8 +798,8 @@ void MaiFileSystem::walk(const MaiFilePath& root,
         // FindExInfoBasic：不要 cAlternateFileName（8.3 短名），少一次查询。
         // 遍历大目录时这个差别是实打实的。
         const HANDLE handle =
-            ::FindFirstFileExW(pattern.value().c_str(), FindExInfoBasic, &data,
-                               FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+            ::FindFirstFileExW(MaiFileSystem::windowsApiPath(pattern).c_str(), FindExInfoBasic,
+                               &data, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
         if (handle == INVALID_HANDLE_VALUE) {
             const DWORD saved = ::GetLastError();
             // FindFirstFile 在正常空目录返回 FILE_NOT_FOUND；须另查目录仍存在，
@@ -759,9 +851,10 @@ MaiFilePath MaiFileSystem::resolve(const MaiFilePath& path) {
     // 这是判断越界时必须做的一步——root 里放一个指向 C:\ 的联接，光靠词法规范化是看不出来的。
     //
     // FILE_FLAG_BACKUP_SEMANTICS 是打开**目录**句柄所必需的，少了它 CreateFileW 对目录一律失败。
-    const HANDLE handle = ::CreateFileW(
-        path.value().c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    const HANDLE handle =
+        ::CreateFileW(MaiFileSystem::windowsApiPath(path).c_str(), 0,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle != INVALID_HANDLE_VALUE) {
         std::wstring buffer(1024, L'\0');
         DWORD length =
@@ -779,7 +872,11 @@ MaiFilePath MaiFileSystem::resolve(const MaiFilePath& path) {
             // 返回的是 "\\?\C:\..." 形式。那个前缀是给 API 用的，
             // 留着会让后面逐段比对时两边形状对不上，剥掉。
             constexpr wchar_t kPrefix[] = L"\\\\?\\";
-            if (buffer.rfind(kPrefix, 0) == 0) buffer.erase(0, 4);
+            constexpr wchar_t kUncPrefix[] = L"\\\\?\\UNC\\";
+            if (buffer.rfind(kUncPrefix, 0) == 0)
+                buffer = L"\\\\" + buffer.substr(8);
+            else if (buffer.rfind(kPrefix, 0) == 0)
+                buffer.erase(0, 4);
             return MaiFilePath(buffer);
         }
     }
@@ -813,7 +910,7 @@ void MaiFileSystem::removeRecursively(const MaiFilePath& path) {
     if (path.isEmpty() || !exists(path)) return;
 
     if (!isDirectory(path)) {
-        ::DeleteFileW(path.value().c_str());
+        ::DeleteFileW(MaiFileSystem::windowsApiPath(path).c_str());
         return;
     }
 
@@ -829,11 +926,11 @@ void MaiFileSystem::removeRecursively(const MaiFilePath& path) {
         return MaiWalkAction::Continue;
     });
 
-    for (const auto& file : files) ::DeleteFileW(file.value().c_str());
+    for (const auto& file : files) ::DeleteFileW(MaiFileSystem::windowsApiPath(file).c_str());
     // 子目录一定排在父目录后面删：walk 是先父后子给出来的，倒着来即可。
     for (auto it = directories.rbegin(); it != directories.rend(); ++it)
-        ::RemoveDirectoryW(it->value().c_str());
-    ::RemoveDirectoryW(path.value().c_str());
+        ::RemoveDirectoryW(MaiFileSystem::windowsApiPath(*it).c_str());
+    ::RemoveDirectoryW(MaiFileSystem::windowsApiPath(path).c_str());
 }
 
 // ── MaiThread ───────────────────────────────────────────────────

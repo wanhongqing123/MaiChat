@@ -127,6 +127,8 @@ QJsonObject ffplayTestVideoLayerGeometry(QWidget* widget) {
     value.insert("windowKey", bool(view.window.keyWindow));
     value.insert("windowMain", bool(view.window.mainWindow));
     value.insert("windowCollectionBehavior", double(view.window.collectionBehavior));
+    value.insert("fullscreenAuxiliary", bool(view.window.collectionBehavior & NSWindowCollectionBehaviorFullScreenAuxiliary));
+    value.insert("fullscreenPrimary", bool(view.window.collectionBehavior & NSWindowCollectionBehaviorFullScreenPrimary));
     value.insert("windowOcclusionVisible", bool(view.window.occlusionState & NSWindowOcclusionStateVisible));
     value.insert("windowClass", QString::fromUtf8(NSStringFromClass(view.window.class).UTF8String));
     value.insert("windowFrameX", NSMinX(view.window.frame));
@@ -213,6 +215,14 @@ void activateFfplayTestWindow(QWidget* widget) {
         NSWindowCollectionBehaviorMoveToActiveSpace | NSWindowCollectionBehaviorFullScreenPrimary;
     [window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+}
+
+// 原生全屏完成后仅激活自有窗口，不再改collectionBehavior或移动它所属的Space。
+void activateFfplayTestFullscreenWindow(QWidget* widget) {
+    NSWindow* window = reinterpret_cast<NSView*>(widget->winId()).window;
+    [window makeKeyAndOrderFront:nil];
+    [NSRunningApplication.currentApplication activateWithOptions:
+        NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps];
 }
 
 QString ffplayTestNativeState(QWidget* widget) {

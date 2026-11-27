@@ -160,12 +160,14 @@ public final class MaiChatAuthClient {
         public final String deepseek;
         public final String minimax;
         public final String openrouter;
+        public final String openai;
 
-        AccountModelKeys(String glm, String deepseek, String minimax, String openrouter) {
+        AccountModelKeys(String glm, String deepseek, String minimax, String openrouter, String openai) {
             this.glm = glm;
             this.deepseek = deepseek;
             this.minimax = minimax;
             this.openrouter = openrouter;
+            this.openai = openai;
         }
     }
 
@@ -743,20 +745,22 @@ public final class MaiChatAuthClient {
     }
 
     // Missing optional providers mean unavailable. Never coerce another JSON type into
-    // a credential or reject an account just because its only enabled route is OpenRouter.
+    // a credential or reject an account just because its only enabled route is OpenRouter or OpenAI.
     static AccountModelKeys parseAccountModelKeys(JSONObject keys) throws Exception {
         if (!(keys.opt("glm") instanceof String) || !(keys.opt("deepseek") instanceof String) ||
                 (keys.has("minimax") && !(keys.opt("minimax") instanceof String)) ||
-                (keys.has("openrouter") && !(keys.opt("openrouter") instanceof String)))
+                (keys.has("openrouter") && !(keys.opt("openrouter") instanceof String)) ||
+                (keys.has("openai") && !(keys.opt("openai") instanceof String)))
             throw new IOException("主聊天模型凭据无效");
         String glm = keys.getString("glm");
         String deepseek = keys.getString("deepseek");
         String minimax = keys.has("minimax") ? keys.getString("minimax") : "";
         String openrouter = keys.has("openrouter") ? keys.getString("openrouter") : "";
-        if ((glm.isEmpty() && deepseek.isEmpty() && minimax.isEmpty() && openrouter.isEmpty()) ||
-            !validModelKey(glm) || !validModelKey(deepseek) || !validModelKey(minimax) || !validModelKey(openrouter))
+        String openai = keys.has("openai") ? keys.getString("openai") : "";
+        if ((glm.isEmpty() && deepseek.isEmpty() && minimax.isEmpty() && openrouter.isEmpty() && openai.isEmpty()) ||
+            !validModelKey(glm) || !validModelKey(deepseek) || !validModelKey(minimax) || !validModelKey(openrouter) || !validModelKey(openai))
             throw new IOException("主聊天模型凭据无效");
-        return new AccountModelKeys(glm, deepseek, minimax, openrouter);
+        return new AccountModelKeys(glm, deepseek, minimax, openrouter, openai);
     }
 
     // 调用者在录音工作线程等待预取中的同一个 Future；每次取用都生成新的流标识和 URL。

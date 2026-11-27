@@ -20,7 +20,7 @@ final class RemoteDesktopSignalTests: XCTestCase {
     }
 
     func testRejectsUnsupportedProtocolVersionButStillRecognizesSignalPrefix() {
-        let text = RemoteDesktopSignal.prefix + #"{"v":2,"type":"stop","sessionId":"old"}"#
+        let text = RemoteDesktopSignal.prefix + #"{"v":99,"type":"stop","sessionId":"old"}"#
 
         XCTAssertTrue(RemoteDesktopSignal.isSignalText(text))
         XCTAssertNil(RemoteDesktopSignal.decodeText(text))
@@ -30,6 +30,28 @@ final class RemoteDesktopSignalTests: XCTestCase {
         let text = RemoteDesktopSignal.prefix + #"{"v":1,"type":"notice","sessionId":"s1"}"#
 
         XCTAssertNil(RemoteDesktopSignal.decodeText(text))
+    }
+
+    func testDeviceDiscoveryAndTargetAddressRoundTrip() throws {
+        var signal = RemoteDesktopSignal(kind: .device, sessionID: "owned-query")
+        signal.sourceDeviceID = "owned-mac"
+        signal.targetDeviceID = "owned-phone"
+        signal.deviceName = "Owned computer"
+        signal.platform = "macOS"
+        signal.canShareScreen = true
+        signal.available = true
+        let decoded = try XCTUnwrap(RemoteDesktopSignal.decodeText(try signal.encodedText()))
+        XCTAssertEqual(decoded, signal)
+        XCTAssertEqual(decoded.version, 2)
+        XCTAssertEqual(decoded.sourceDeviceID, "owned-mac")
+        XCTAssertEqual(decoded.targetDeviceID, "owned-phone")
+    }
+
+    func testMediaIdentityMatchesAccountService() {
+        XCTAssertEqual(RemoteDesktopSignal.mediaUserID(ownerUserID: "owned_account",
+            deviceID: "0123456789abcdef0123456789abcdef"), "rd_0f41444bc8e51e0eef0dba30")
+        XCTAssertNotEqual(RemoteDesktopSignal.mediaUserID(ownerUserID: "owned_account", deviceID: "first-device"),
+            RemoteDesktopSignal.mediaUserID(ownerUserID: "owned_account", deviceID: "second-device"))
     }
 
     func testNormalChatMessageIsNotRemoteSignal() {

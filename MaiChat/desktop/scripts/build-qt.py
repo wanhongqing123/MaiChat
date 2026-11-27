@@ -106,6 +106,34 @@ def msvc_include_hook(compiler, build_root):
     return prefix, hook
 
 
+def is_configured_macos_sdk(source_root, build_root, prefix, modules, arch, c_compiler, cxx_compiler):
+    """Recognize an existing compatible lane, without changing its cache or install stamp."""
+    if not c_compiler or not cxx_compiler:
+        return False
+    for name, _ in modules:
+        build = build_root / name
+        cache = build / "CMakeCache.txt"
+        if not cache.is_file() or not (build / "build.ninja").is_file():
+            return False
+        values = {}
+        for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in line and ":" in line.split("=", 1)[0] and not line.startswith(("#", "//")):
+                key, value = line.split("=", 1)
+                values[key.split(":", 1)[0]] = value
+        paths = {"CMAKE_HOME_DIRECTORY": source_root / name,
+                 "CMAKE_INSTALL_PREFIX": prefix,
+                 "CMAKE_C_COMPILER": Path(c_compiler),
+                 "CMAKE_CXX_COMPILER": Path(cxx_compiler)}
+        if any(not values.get(key) or Path(values[key]).resolve() != expected.resolve()
+               for key, expected in paths.items()):
+            return False
+        if (values.get("CMAKE_GENERATOR") != "Ninja" or
+                values.get("CMAKE_BUILD_TYPE") != "Release" or
+                values.get("CMAKE_OSX_ARCHITECTURES") != arch):
+            return False
+    return bool(modules)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cmake", default=shutil.which("cmake"))
@@ -190,8 +218,15 @@ def main():
             print(f"[MaiChat Qt] reusing {lock['version']} at {prefix}", flush=True)
             return
     build_root.mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(build_root).free < 12 * 1024 ** 3:
-        parser.error("less than 12 GiB free; clean old generated artifacts before building Qt")
+    # A compatible macOS lane already holds its SDK products and needs less temporary
+    # space for dependency-tracked updates. Source locks/patches above and normal
+    # configure/build/install below still run; cold or changed lanes keep 12 GiB.
+    incremental = (system == "macos" and all(p.is_file() for p in required) and
+                   is_configured_macos_sdk(source_root, build_root, prefix, sources, arch,
+                                           args.c_compiler, args.cxx_compiler))
+    required_gib = 6 if incremental else 12
+    if shutil.disk_usage(build_root).free < required_gib * 1024 ** 3:
+        parser.error(f"less than {required_gib} GiB free; clean old generated artifacts before building Qt")
     common = ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_INSTALL_PREFIX={prefix}",
               "-DQT_BUILD_EXAMPLES=OFF", "-DQT_BUILD_TESTS=OFF", "-DBUILD_WITH_PCH=OFF",
               "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF"]

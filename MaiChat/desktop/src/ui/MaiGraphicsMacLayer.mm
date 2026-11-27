@@ -99,6 +99,33 @@ extern "C" void maiGraphicsReleaseMacLayer(void *nativeLayer) {
   [static_cast<CAMetalLayer *>(nativeLayer) release];
 }
 
+void maiPrepareMacVideoWindowState(QWidget* widget, bool fullscreen) {
+  if (!widget || QGuiApplication::platformName() != QStringLiteral("cocoa")) return;
+  NSWindow* window = reinterpret_cast<NSView*>(widget->winId()).window;
+  if (!window) return;
+  NSWindowCollectionBehavior behavior = window.collectionBehavior;
+  if (fullscreen || (window.styleMask & NSWindowStyleMaskFullScreen)) {
+    // Qt进入原生全屏会置Primary；必须先清掉互斥的Auxiliary，退出转场中也不能改回。
+    behavior &= ~(NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorMoveToActiveSpace);
+    behavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+  } else {
+    QWidget* parent = widget->parentWidget() ? widget->parentWidget()->window() : nullptr;
+    NSWindow* parentWindow = parent ? reinterpret_cast<NSView*>(parent->winId()).window : nil;
+    const bool parentFullscreen = parent && (parent->isFullScreen() ||
+        (parentWindow.styleMask & NSWindowStyleMaskFullScreen));
+    if (parentFullscreen) {
+      // macOS可将全屏应用中新显示的Primary窗口也拉入全屏。普通播放器以Auxiliary
+      // 加入当前Space，保留正常层级、2/3尺寸及Qt父对象生命周期，不退出主窗口全屏。
+      behavior &= ~(NSWindowCollectionBehaviorFullScreenPrimary | NSWindowCollectionBehaviorCanJoinAllSpaces);
+      behavior |= NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorMoveToActiveSpace;
+    } else {
+      behavior &= ~(NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorMoveToActiveSpace);
+      behavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+    }
+  }
+  if (window.collectionBehavior != behavior) window.collectionBehavior = behavior;
+}
+
 extern "C" void maiGraphicsStyleMacVideoWindow(QWidget *widget) {
   // WId is platform-plugin opaque. Only cocoa supplies an NSView pointer;
   // offscreen uses small integer handles that must never receive ObjC messages.
@@ -108,6 +135,7 @@ extern "C" void maiGraphicsStyleMacVideoWindow(QWidget *widget) {
   NSWindow *window = view.window;
   if (!window)
     return;
+  maiPrepareMacVideoWindowState(widget, widget->isFullScreen());
   // Qt 的最终几何准备好后直接映射同一窗口；不再叠加 AppKit 默认的弹出缩放，
   // 否则窗口服务器仍可先显示中间大小，Qt/native frame 检查却始终是目标矩形。
   window.animationBehavior = NSWindowAnimationBehaviorNone;

@@ -97,6 +97,10 @@ public:
     void decideFriendRequest(const QString& requestId, bool accept, Completion completion);
     void removeFriend(const QString& account, Completion completion);
     void fetchImCredential(Completion completion);
+    using RemoteDesktopCredentialCompletion =
+        std::function<void(const DesktopImCredential &, const QString &)>;
+    void fetchRemoteDesktopCredential(const QString &deviceId,
+                                      RemoteDesktopCredentialCompletion completion);
     // 账号鉴权 GET：各供应商 Key 只交给调用方内存；可选 OpenRouter 缺省为空，不写本机存储。
     using AccountModelKeysCompletion =
         std::function<void(const QHash<QString, QString>&, const QString&)>;

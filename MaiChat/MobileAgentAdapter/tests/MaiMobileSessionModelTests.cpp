@@ -1,6 +1,7 @@
 // 文件作用：真实 C ABI + loopback 验证原会话回归和独立五档推理 selector。
 // 合成账号/模型响应与独立临时库，不读取用户数据库、真实凭据或付费供应商。
 #include "MaiMobileAgent.h"
+#include "MaiResponsesFixture.h"
 
 #include <atomic>
 #include <chrono>
@@ -45,6 +46,8 @@ struct Handle {
 };
 struct Keys {
     bool glmAvailable = true;
+    std::string openaiKey = "synthetic-openai-key";
+    int openaiReads = 0;
 };
 const char* keyHandler(void* context, const char* name, const char*) {
     auto& keys = *static_cast<Keys*>(context);
@@ -53,7 +56,10 @@ const char* keyHandler(void* context, const char* name, const char*) {
         result = {{"ok", true}, {"output", Json{{"key", keys.glmAvailable ? "synthetic-glm-key" : ""}}.dump()}};
     else if (std::strcmp(name, "deepseek_api_key") == 0)
         result = {{"ok", true}, {"output", Json{{"key", "synthetic-deepseek-key"}}.dump()}};
-    else if (std::strcmp(name, "openrouter_api_key") == 0)
+    else if (std::strcmp(name, "openai_api_key") == 0) {
+        ++keys.openaiReads;
+        result = {{"ok", true}, {"output", Json{{"key", keys.openaiKey}}.dump()}};
+    } else if (std::strcmp(name, "openrouter_api_key") == 0)
         result = {{"ok", true}, {"output", Json{{"key", "synthetic-openrouter-key"}}.dump()}};
     else
         result = {{"ok", false}, {"error", "Synthetic optional host capability is unavailable."}};
@@ -77,7 +83,7 @@ struct Provider {
     std::string url;
     explicit Provider(bool glm) {
         server.new_task_queue = [] { return new httplib::ThreadPool(2); };
-        server.Post(glm ? "/chat/completions" : "/responses", [this, glm](const auto& request, auto& response) {
+        server.Post("/responses", [this, glm](const auto& request, auto& response) {
             const auto body = Json::parse(request.body, nullptr, false);
             std::unique_lock<std::mutex> lock(mutex);
             requests.push_back(body);
@@ -99,13 +105,10 @@ struct Provider {
                 response.set_content("{}", "application/json");
                 return;
             }
-            response.set_content(
-                glm ? "data: {\"choices\":[{\"delta\":{\"content\":\"Owned GLM "
-                      "reply\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
-                    : "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Owned DeepSeek "
-                      "reply\"}\n\ndata: "
-                      "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
-                "text/event-stream");
+            check(body.contains("input") && !body.contains("messages"),
+                  "Cloud provider request must use Responses input");
+            response.set_content(MaiResponsesFixture::text(glm ? "Owned GLM reply" : "Owned DeepSeek reply"),
+                                 "text/event-stream");
         });
         const int port = server.bind_to_any_port("127.0.0.1");
         check(port > 0, "Could not bind owned provider");
@@ -430,17 +433,66 @@ void waitIdle(void* handle, const std::string& id) {
     throw std::runtime_error("Synthetic session did not become idle");
 }
 
+// Exercise the product route with private loopback providers; account key changes
+// must be observed on every request and never borrow another provider's credential.
+int runSol() {
+    EffortProvider openai("openai"), deepseek("deepseek"), openrouter("openrouter");
+    const auto root = effortWorkspace();
+    Keys keys;
+    Handle handle;
+    bindEffortKeys(handle, keys);
+    auto configuration = effortConfiguration(root, openrouter, deepseek, "deepseek-flash", "high");
+    configuration["openaiBaseUrl"] = openai.url;
+    check(call(handle.value, configuration).value("ok", false), "Cannot initialize Sol route control");
+    const auto created = call(handle.value, {{"op", "create"}, {"model", "gpt-6.1-sol"}});
+    check(created.value("ok", false), "Exact Sol model must be selectable on mobile");
+    const auto id = created.at("id").get<std::string>();
+    ModelEffortChecks checks;
+    for (const char* effort : {"low", "medium", "high", "xhigh", "max"}) {
+        check(call(handle.value,
+                   {{"op", "set_model"}, {"session", id}, {"model", "gpt-6.1-sol"}, {"reasoningEffort", effort}})
+                  .value("ok", false),
+              "Sol effort must be selectable");
+        expectEffortChoices(checks, handle.value, id, "gpt-6.1-sol", effort, "high", kFableEfforts, "Sol choice");
+        const auto before = openai.requestCount();
+        check(call(handle.value, {{"op", "send"}, {"session", id}, {"text", "Owned Sol prompt"}}).value("ok", false),
+              "Cannot send Sol prompt");
+        waitIdle(handle.value, id);
+        check(openai.requestCount() == before + 1, "Sol request did not use the OpenAI route");
+        std::lock_guard<std::mutex> lock(openai.mutex);
+        check(
+            openai.requests.back()["model"] == "gpt-6.1-sol" && openai.requests.back()["reasoning"]["effort"] == effort,
+            "Sol selected model or effort was not serialized");
+    }
+    check(keys.openaiReads >= 5, "Sol must read its current account key for every request");
+    const auto before = openai.requestCount();
+    keys.openaiKey.clear();
+    const auto denied = call(handle.value, {{"op", "send"}, {"session", id}, {"text", "Missing OpenAI key"}});
+    // Request submission may acknowledge before its asynchronous provider check.
+    if (denied.value("ok", false)) waitIdle(handle.value, id);
+    check(keys.openaiReads >= 6 && openai.requestCount() == before, "Missing OpenAI key must prevent provider HTTP");
+    check(deepseek.requestCount() == 0 && openrouter.requestCount() == 0, "Sol must never use another provider");
+    keys.openaiKey = "synthetic-openai-key";
+    check(call(handle.value, configuration).value("ok", false), "Cannot reopen Sol session");
+    expectEffortChoices(checks, handle.value, id, "gpt-6.1-sol", "max", "high", kFableEfforts, "Reopened Sol");
+    check(!call(handle.value, {{"op", "create"}, {"model", "gpt-6.1-sol-preview"}}).value("ok", false),
+          "Sol alias must not gain a product route");
+    std::printf("Mobile Sol: failures=%d checks=%d OpenAIHTTP=%zu keyReads=%d\n", checks.failures, checks.checks,
+                openai.requestCount(), keys.openaiReads);
+    return checks.failures ? 1 : 0;
+}
+
 Json config(const MaiFilePath& root, const Provider& glm, const Provider& deepseek, const std::string& model) {
     return {{"op", "configure"},
             {"database", root.append(MaiFilePath::fromUtf8("sessions.sqlite")).toUtf8()},
             {"workspace", root.toUtf8()},
             {"appRoot", root.toUtf8()},
-            {"baseUrl", model == "glm-5.3" ? glm.url : deepseek.url},
+            {"baseUrl", model == "glm-5.4" ? glm.url : deepseek.url},
             {"glmBaseUrl", glm.url},
             {"deepseekBaseUrl", deepseek.url},
-            {"apiKey", model == "glm-5.3" ? "synthetic-glm-key" : "synthetic-deepseek-key"},
+            {"apiKey", model == "glm-5.4" ? "synthetic-glm-key" : "synthetic-deepseek-key"},
             {"model", model},
-            {"wire", model == "glm-5.3" ? "chat_completions" : "responses"},
+            {"wire", "responses"},
             {"reasoningEffort", "high"},
             {"policy", "never"},
             {"localModelName", "local:owned-placeholder"}};
@@ -472,18 +524,18 @@ void run(bool legacyOnly) {
     check(handle.value != nullptr, "Cannot create native Agent");
     check(maiMobileAgentSetHostToolHandler(handle.value, &keys, keyHandler, freeResponse, releaseKeys) == 1,
           "Cannot bind owned provider keys");
-    check(call(handle.value, config(root, glm, deepseek, "glm-5.3"))["ok"], "Cannot initialize GLM fixture");
+    check(call(handle.value, config(root, glm, deepseek, "glm-5.4"))["ok"], "Cannot initialize GLM fixture");
     const auto a = call(handle.value, {{"op", "create"}}).at("id").get<std::string>();
-    check(storedModel(root, a) == "glm-5.3", "Initial GLM session was not persisted");
+    check(storedModel(root, a) == "glm-5.4", "Initial GLM session was not persisted");
     check(call(handle.value, config(root, glm, deepseek, "deepseek-flash"))["ok"], "Cannot reinitialize host default");
     const auto b = call(handle.value, {{"op", "create"}}).at("id").get<std::string>();
     check(call(handle.value, {{"op", "send"}, {"session", a}, {"text", "Preserve this existing model"}})["ok"],
           "Cannot send owned GLM prompt");
     waitIdle(handle.value, a);
-    check(storedModel(root, a) == "glm-5.3", "send overwrote an existing session model with the global default");
+    check(storedModel(root, a) == "glm-5.4", "send overwrote an existing session model with the global default");
     {
         std::lock_guard<std::mutex> lock(glm.mutex);
-        check(!glm.requests.empty() && glm.requests.back()["model"] == "glm-5.3", "GLM prompt went to the wrong route");
+        check(!glm.requests.empty() && glm.requests.back()["model"] == "glm-5.4", "GLM prompt went to the wrong route");
     }
     if (legacyOnly) {
         std::printf("Legacy overwrite regression passed\n");
@@ -503,26 +555,25 @@ void run(bool legacyOnly) {
         return call(handle.value,
                     {{"op", "set_model"}, {"session", id}, {"model", model}, {"reasoningEffort", effort}});
     };
-    check(select(a, "glm-5.3", "low")["ok"], "Cannot select session A effort");
+    check(select(a, "glm-5.4", "low")["ok"], "Cannot select session A effort");
     check(select(b, "deepseek-v4-pro", "max")["ok"], "Cannot select DeepSeek Pro");
     check(call(handle.value, {{"op", "send"}, {"session", a}, {"text", "Use GLM low effort"}})["ok"],
           "Cannot send GLM low effort");
     waitIdle(handle.value, a);
     {
         std::lock_guard<std::mutex> lock(glm.mutex);
-        check(glm.requests.back()["model"] == "glm-5.3" && glm.requests.back()["reasoning_effort"] == "low",
+        check(glm.requests.back()["model"] == "glm-5.4" && glm.requests.back()["reasoning"]["effort"] == "low",
               "GLM low effort was not serialized");
     }
 
-    check(call(handle.value, {{"op", "get_session"}, {"session", a}})["wire"] == "chat_completions",
-          "GLM wire is incorrect");
+    check(call(handle.value, {{"op", "get_session"}, {"session", a}})["wire"] == "responses", "GLM wire is incorrect");
     check(call(handle.value, {{"op", "get_session"}, {"session", b}})["wire"] == "responses",
           "DeepSeek wire is incorrect");
     for (const auto& bad : {select(a, "glm-5.3-flash", "medium"), select(a, "glm-unknown", "max"),
                             select(a, "glm-5.3-flash", Json(nullptr))})
         check(!bad["ok"].get<bool>(), "Invalid model or effort was accepted");
     auto choice = call(handle.value, {{"op", "get_session"}, {"session", a}});
-    check(choice["model"] == "glm-5.3" && choice["reasoningEffort"] == "low",
+    check(choice["model"] == "glm-5.4" && choice["reasoningEffort"] == "low",
           "Invalid update partially changed session A");
     keys.glmAvailable = false;
     check(!select(b, "glm-5.3-flash", "high")["ok"].get<bool>(), "Missing provider credentials changed the model");
@@ -540,7 +591,7 @@ void run(bool legacyOnly) {
         check(deepseek.wake.wait_for(lock, std::chrono::seconds(10), [&] { return deepseek.entered; }),
               "Session B never reached provider");
     }
-    const auto busy = select(b, "glm-5.3", "low");
+    const auto busy = select(b, "glm-5.4", "low");
     check(!busy["ok"].get<bool>() && busy["errorCode"] == "busy", "Busy session changed configuration");
     check(select(a, "glm-5.3-flash", "high")["ok"], "Other idle session was blocked by session B");
     check(call(handle.value, {{"op", "send"}, {"session", a}, {"text", "Use GLM Flash"}})["ok"],
@@ -548,7 +599,7 @@ void run(bool legacyOnly) {
     waitIdle(handle.value, a);
     {
         std::lock_guard<std::mutex> lock(glm.mutex);
-        check(glm.requests.back()["model"] == "glm-5.3-flash" && glm.requests.back()["reasoning_effort"] == "high",
+        check(glm.requests.back()["model"] == "glm-5.3-flash" && glm.requests.back()["reasoning"]["effort"] == "high",
               "Parallel GLM config crossed sessions");
     }
     check(call(handle.value, {{"op", "enqueue"},
@@ -582,11 +633,11 @@ void run(bool legacyOnly) {
     choice = call(handle.value, {{"op", "get_session"}, {"session", b}});
     check(choice["model"] == "deepseek-v4-pro" && choice["reasoningEffort"] == "max",
           "Session B choice did not survive reopen");
-    check(call(handle.value, {{"op", "set_model"}, {"session", a}, {"model", "glm-5.3"}})["ok"],
+    check(call(handle.value, {{"op", "set_model"}, {"session", a}, {"model", "glm-5.4"}})["ok"],
           "Optional effort was rejected");
     check(call(handle.value, {{"op", "get_session"}, {"session", a}})["reasoningEffort"] == "high",
           "Omitted effort overwrote selection");
-    check(select(a, "glm-5.3", "")["ok"], "Cannot restore inherited effort");
+    check(select(a, "glm-5.4", "")["ok"], "Cannot restore inherited effort");
     choice = call(handle.value, {{"op", "get_session"}, {"session", a}});
     check(choice["reasoningEffort"] == "" && choice["defaultReasoningEffort"] == "high",
           "Inherited effort lost its explicit meaning");
@@ -605,6 +656,7 @@ int main(int argc, char** argv) {
     setenv("no_proxy", "*", 1);
 #endif
     try {
+        if (argc == 2 && std::string(argv[1]) == "--sol") return runSol();
         if (argc == 2 && std::string(argv[1]) == "--model-efforts") return runModelEfforts();
         if (argc == 2 && std::string(argv[1]) == "--opus-55") return runModelEfforts("anthropic/claude-opus-5.5");
         run(argc == 2 && std::string(argv[1]) == "--legacy-overwrite");

@@ -13,6 +13,7 @@
 #include "MaiMemoryStore.h"
 #include "MaiSessionStore.h"
 #include "MaiSqliteStore.h"
+#include "support/MaiLegacySessionFixture.h"
 
 static int failures = 0;
 #define CHECK(condition)                                                    \
@@ -359,23 +360,33 @@ void testSqliteReopen() {
 
 void testSqliteMigrationAndAtomicCleanup() {
     TempDatabase temporary;
-    auto opened = makeMaiSqliteStore(temporary.path());
+    // 旧版本夹具直接用冻结普通表构造，不在正式日志投影中 DROP 生成列或回写低版本号。
+    CHECK(!MaiFileSystem::createDirectories(temporary.root));
+    MaiToolOutputRecord output;
+    output.id = "out_migrate";
+    output.sessionId = "ses_migrate";
+    output.messageId = "msg_out_migrate";
+    output.partId = "prt_out_migrate";
+    output.callId = "call_out_migrate";
+    output.text = "original preview";
+    output.created = 1;
+    sqlite3* database = nullptr;
+    CHECK(sqlite3_open(temporary.path().c_str(), &database) == SQLITE_OK);
+    CHECK(sqlite3_exec(database, kMaiLegacySessionSchemaV15, nullptr, nullptr, nullptr) ==
+          SQLITE_OK);
+    CHECK(sqlite3_exec(
+              database,
+              "INSERT INTO sessions(id) VALUES('ses_migrate');INSERT INTO "
+              "messages(id,session_id,role) VALUES('msg_out_migrate','ses_migrate',1);INSERT INTO "
+              "parts(id,message_id,kind,tool,call_id,state) "
+              "VALUES('prt_out_migrate','msg_out_migrate',2,'shell','call_out_migrate',0);ALTER "
+              "TABLE parts DROP COLUMN execution;DROP TABLE tool_outputs;PRAGMA user_version=10;",
+              nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(database);
+    MaiResult<std::unique_ptr<MaiSessionStore>> opened = makeMaiSqliteStore(temporary.path());
     CHECK(opened.isOk());
     if (!opened) return;
     auto store = std::move(opened.value());
-    auto output = seedOutput(*store, "ses_migrate", "out_migrate", "original preview");
-    store.reset();
-    sqlite3* database = nullptr;
-    CHECK(sqlite3_open(temporary.path().c_str(), &database) == SQLITE_OK);
-    CHECK(sqlite3_exec(database,
-                       "ALTER TABLE parts DROP COLUMN execution;"
-                       "DROP TABLE tool_outputs;PRAGMA user_version=10;",
-                       nullptr, nullptr, nullptr) == SQLITE_OK);
-    sqlite3_close(database);
-    opened = makeMaiSqliteStore(temporary.path());
-    CHECK(opened.isOk());
-    if (!opened) return;
-    store = std::move(opened.value());
     MaiMessage message;
     CHECK(store->getMessage(output.sessionId, output.messageId, message));
     CHECK(!std::get<MaiToolPart>(message.parts.front().body).execution);

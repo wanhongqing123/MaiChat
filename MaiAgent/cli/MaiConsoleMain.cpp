@@ -1,5 +1,5 @@
 // 文件作用：启动命令行 Agent，解析启动参数并连接核心库。
-// 直接依赖：MaiAgent.h、MaiOpenAiClient.h、MaiMemoryStore.h；本文件在这些接口之间完成调用与结果转换。
+// 直接依赖：MaiAgent.h、MaiResponsesClient.h、MaiMemoryStore.h；本文件在这些接口之间完成调用与结果转换。
 // maiagent-console：直接链库的交互式控制台。
 //
 // ── 它是这个仓库里唯一的宿主进程 ────────────────────────────────
@@ -41,7 +41,7 @@
 #endif
 
 #include "MaiAgent.h"
-#include "MaiOpenAiClient.h"
+#include "MaiResponsesClient.h"
 #include "MaiMemoryStore.h"
 #include "MaiSqliteStore.h"
 #include "MaiFilePath.h"
@@ -475,11 +475,11 @@ void usage() {
         "                       Default: the current directory. File tools cannot\n"
         "                       reach outside it.\n"
         "  --model-url <url>    Model base url, for example\n"
-        "                         https://open.bigmodel.cn/api/paas/v4   (GLM)\n"
+        "                         https://open.bigmodel.cn/api/v1        (GLM Responses)\n"
         "                         http://127.0.0.1:11434/v1              (Ollama)\n"
         "  --model-key <key>    API key; MAIAGENT_API_KEY works too\n"
-        "  --model <name>       Default model name, default glm-5.3\n"
-        "  --wire <name>        chat_completions (default) or responses\n"
+        "  --model <name>       Default model name, default glm-5.4\n"
+        "  --wire <name>        responses (the only remote protocol)\n"
         "  --db <path>          SQLite file for sessions and messages.\n"
         "                       Omitted means in-memory: everything is gone on exit.\n"
         "  --reasoning          Also print the model's thinking. Off by default: it\n"
@@ -617,8 +617,8 @@ int main(int argc, char** argv) {
     std::string directory;
     std::string modelUrl;
     std::string modelKey = envOrEmpty("MAIAGENT_API_KEY");
-    std::string modelName = "glm-5.3";
-    MaiWireApi wire = MaiWireApi::ChatCompletions;
+    std::string modelName = "glm-5.4";
+    MaiWireApi wire = MaiWireApi::Responses;
     std::string databasePath;
     MaiMillis permissionTimeoutMs = 0;
     bool showReasoning = false;
@@ -641,8 +641,6 @@ int main(int argc, char** argv) {
             const std::string selected = argv[++i];
             if (selected == "responses")
                 wire = MaiWireApi::Responses;
-            else if (selected == "chat_completions")
-                wire = MaiWireApi::ChatCompletions;
             else {
                 std::fprintf(stderr, "unknown wire protocol: %s\n", selected.c_str());
                 return 2;
@@ -692,6 +690,8 @@ int main(int argc, char** argv) {
     }
 
     MaiAgent::Options agentOptions;
+    agentOptions.skillsEnabled = true;
+    agentOptions.toolDiscoveryEnabled = true;
     agentOptions.defaultModel = modelName;
     agentOptions.permissionTimeoutMs = permissionTimeoutMs;
 

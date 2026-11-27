@@ -34,7 +34,7 @@ void test_contract_and_registration() {
     MaiToolRegistry registry;
     registerMaiBuiltinTools(registry);
     CHECK(registry.find("list_windows") == nullptr);
-    for (const std::string model : {"deepseek-flash", "glm-5.3-flash", "glm-5.3", "local:qa"}) {
+    for (const std::string model : {"deepseek-flash", "glm-5.3-flash", "glm-5.4", "local:qa"}) {
         CHECK(registry.findForModel("list_windows", model) == nullptr);
         const auto specs = registry.specs(model);
         CHECK(std::none_of(specs.begin(), specs.end(),

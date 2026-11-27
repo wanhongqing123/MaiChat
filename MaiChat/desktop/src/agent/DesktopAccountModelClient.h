@@ -15,6 +15,8 @@ public:
         QString glmBaseUrl;
         QString deepseekBaseUrl;
         QString openrouterBaseUrl;
+        // OpenAI shares the Responses route; each request reads its current account key.
+        QString openaiBaseUrl = QStringLiteral("https://api.openai.com/v1");
         // 只读取宿主缓存，不发网络请求；纯配置查询也可在 UI 线程调用。
         std::function<QString(const QString&)> keyProvider;
         MaiModelImagePreparer prepareImage;
@@ -28,6 +30,7 @@ public:
     MaiWireApi wireApi() const override;
     std::optional<MaiWireApi> wireApiForModel(const std::string& model) const override;
     MaiModelContextLimits contextLimits(const std::string& model) const override;
+    std::string usageProviderForModel(const std::string& model) const override;
     MaiResult<std::size_t> requestBodyBytes(const MaiModelRequest& request) override;
     bool isConfiguredForModel(const std::string& model) const;
 

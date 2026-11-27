@@ -10,6 +10,7 @@
 #include "MaiProcess.h"
 #include "MaiCurlTools.h"
 #include "MaiFileTools.h"
+#include "MaiApplyPatchTool.h"
 #include "MaiAgentSendFileTool.h"
 #include "MaiLlamaTools.h"
 #include "MaiOpenSslTool.h"
@@ -20,7 +21,7 @@
 #include "MaiSessionTools.h"
 #include "MaiScreenshot.h"
 #include "MaiScreenshotTool.h"
-#include "MaiShellTool.h"
+#include "MaiExecCommandTool.h"
 #include "MaiToolOutputTool.h"
 #include "MaiSubAgentTools.h"
 #include "MaiTimeTool.h"
@@ -226,6 +227,15 @@ std::vector<MaiToolSpec> MaiToolRegistry::specs(const std::string& model) const 
     return out;
 }
 
+std::vector<MaiToolMetadata> MaiToolRegistry::metadata(const std::string& model) const {
+    std::vector<MaiToolMetadata> out;
+    for (const auto& tool : mTools) {
+        if (mInternalNames.count(tool->name()) > 0 || !tool->isAvailableForModel(model)) continue;
+        out.push_back({tool->name(), tool->description()});
+    }
+    return out;
+}
+
 std::vector<MaiSpecialistInfo> MaiToolRegistry::specialists() const {
     std::vector<MaiSpecialistInfo> out;
     for (const auto& tool : mTools) {
@@ -254,8 +264,12 @@ MaiError MaiToolRegistry::finishTurn(const std::string& sessionId,
     return firstError;
 }
 
-void registerMaiBuiltinTools(MaiToolRegistry& registry) {
-    registerMaiFileTools(registry);
+void registerMaiBuiltinTools(MaiToolRegistry& registry, bool includeFileTools) {
+    // 文件能力保留在共享核心；只有桌面宿主选择不暴露重复的 file_* 模型入口。
+    if (includeFileTools)
+        registerMaiFileTools(registry);
+    else
+        registry.add(makeMaiApplyPatchTool());
     registry.add(makeMaiAgentSendFileTool());
     registry.add(makeMaiTodoWriteTool());
     registerMaiCurlTools(registry);
@@ -287,7 +301,7 @@ void registerMaiBuiltinTools(MaiToolRegistry& registry) {
     // **不支持就根本不注册，而不是注册一个总是失败的。** 摆出来的话模型会反复试，
     // 而它收到的「失败」听起来像临时故障，于是它换个写法再试一遍，一轮对话就耗在这上面了。
     // iOS 的沙箱不允许 exec，这是 App Store 的硬规矩（见 MaiProcess.h）。
-    if (maiIsProcessExecutionSupported()) registerMaiShellTools(registry);
+    if (maiIsProcessExecutionSupported()) registerMaiExecTools(registry);
     registry.add(makeMaiCurrentTimeTool());
 }
 

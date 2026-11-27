@@ -6,6 +6,7 @@ const { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEq
   require('node:crypto');
 const { generatePngQrCode } = require('@juit/qrcode');
 const { createUserSig } = require('./usersig');
+const { remoteDesktopCredential } = require('./remote-desktop-credential');
 const { hashPassword, validPassword, verifyPassword } = require('./password');
 const { createFriendService } = require('./friends');
 const { createVideoCircleService } = require('./video-circle-service');
@@ -999,7 +1000,7 @@ function createAuthService(options) {
         '/v1/safety/reports'].includes(path)) ||
       (method === 'POST' && ['/v1/auth/desktop/approve',
         '/v1/auth/desktop/deny', '/v1/auth/password/set', '/v1/auth/profile',
-        '/v1/auth/logout', '/v1/friend/resolve',
+        '/v1/auth/logout', '/v1/friend/resolve', '/v1/remote-desktop/credential',
         '/v1/auth/account/deletion/challenge',
         '/v1/auth/account/deletion', '/v1/safety/reports'].includes(path)) ||
       (method === 'GET' && ['/v1/auth/me', '/v1/im/credential',
@@ -1084,6 +1085,13 @@ function createAuthService(options) {
         .get(phone);
       if (!peer) return json(404, { error: 'MaiChat account not found' });
       return json(200, { user_id: peer.im_user_id });
+    }
+    if (method === 'POST' && path === '/v1/remote-desktop/credential') {
+      if (!session) return authenticationFailure(headers);
+      const credential = remoteDesktopCredential(session.im_user_id, body, sdkAppId,
+        imSecret, Math.floor(now() / 1000));
+      if (!credential) return json(400, { error: 'Invalid remote desktop device' });
+      return { ...json(200, credential), headers: { 'Cache-Control': 'no-store' } };
     }
     if (method === 'GET' && path === '/v1/im/credential') {
       if (!session) return json(401, { error: 'Authentication required' });

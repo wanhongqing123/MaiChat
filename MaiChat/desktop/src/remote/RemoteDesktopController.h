@@ -7,6 +7,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QVector>
 #include <functional>
 #include <memory>
 
@@ -42,8 +43,10 @@ public:
     struct Config {
         int sdkAppId = 0;
         QString localUserId;
-        // 使用与 IM 同一账号的服务端签发 UserSig。
-        std::function<QString(const QString& userId)> userSigProvider;
+        // 每次安装的稳定端点身份；与 IM 账号分别比较，不改变 IM/TRTC 登录账号。
+        QString localDeviceId;
+        QString localDeviceName;
+        QString platform;
     };
 
     RemoteDesktopController(Config config,
@@ -59,7 +62,17 @@ public:
 
     // 控制端：请求查看 peer 的屏幕。password 为空表示不带 proof
     // （对方是有人值守模式时无需密码）。
-    void requestView(const QString& peerId, const QString& password = QString());
+    void requestView(const QString &peerId, const QString &password, const QString &targetDeviceId);
+    // 发现也走 IM；只收本轮 nonce、账号和目标端点均匹配的能力回复，最多64台。
+    // 取消或重试使旧回复失效；发现不创建 TRTC 会话、不触发共享授权。
+    void discoverDevices(const QString &peerId);
+    void cancelDiscovery();
+    QVector<RemoteDesktopSignals::Signal> discoveredDevices() const;
+    QString viewerDeviceId() const;
+    QString localDeviceId() const;
+    QString localUserId() const;
+    // 专属媒体凭据只存内存，必须与当前账号+设备身份及有效期匹配。
+    void setMediaCredential(const QString &userId, const QString &signature, qint64 expiresAt);
 
     // 被控端：有人值守弹窗的结果。
     void resolveConsent(bool accepted);
@@ -102,8 +115,10 @@ public:
     bool isRemoteControlAllowed() const { return settings_.allowRemoteControl; }
 
 signals:
-    // 控制端收到被控端的状态播报（当前只有安全桌面进出）。
-    void peerNoticeReceived(const QString& noticeCode);
+  void devicesChanged();
+  void discoveryFinished();
+  // 控制端收到被控端的状态播报（当前只有安全桌面进出）。
+  void peerNoticeReceived(const QString &noticeCode);
 
 signals:
     // 被控端需要弹确认窗（有人值守）。
@@ -150,11 +165,20 @@ private:
     RemoteDesktop::ViewerState viewerState_ = RemoteDesktop::ViewerState::Idle;
 
     // 被控端当前会话
+    QString mediaUserId_;
+    QString mediaSignature_;
+    qint64 mediaExpiresAt_ = 0;
     QString hostPeerId_;
+    QString hostPeerDeviceId_;
     QString hostSessionId_;
     QString hostRoomId_;
     // 控制端当前会话
     QString viewerPeerId_;
+    QString viewerPeerDeviceId_;
+    QString discoveryPeerId_;
+    QString discoveryId_;
+    QVector<RemoteDesktopSignals::Signal> devices_;
+    QTimer *discoveryTimer_ = nullptr;
     QString viewerSessionId_;
     QString viewerRoomId_;
 

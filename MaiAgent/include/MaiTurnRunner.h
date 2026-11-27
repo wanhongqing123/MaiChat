@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -22,6 +24,7 @@
 #include "MaiContextBuilder.h"
 #include "MaiEventEmitter.h"
 #include "MaiSessionTitler.h"
+#include "MaiRolloutRuntimeFacts.h"
 
 // 跑一轮对话：组装上下文 → 流式请求 → 把增量变成事件 → 有工具调用就执行并再来一圈 → 落库。
 //
@@ -74,6 +77,18 @@ public:
         std::function<void()> closeSteering;
         // 显式只读工具的并发上限，1 禁用并行；执行器进一步限制到最多 8。
         int maxParallelTools = 4;
+        // 工作目录与型号固定后，仅在工作线程准备本会话的稳定技能目录提示词。
+        // 回调可阻塞读目录/存储；结果仅追加本轮 baseInstructions，不改写旧消息历史。
+        // 返回空串表示没有目录；错误终止本轮，不伪造技能已加载。
+        std::function<MaiResult<std::string>(const MaiTurnContext&)> prepareSkills;
+        // 在工作线程为真实 user 输入固定显式技能正文；结果仅作为同条 USER 的非特权前缀。
+        // 返回源消息 ID 到不可变正文的映射；错误中止采样，不能降级成未加载成功。
+        std::function<MaiResult<std::map<std::string, std::string>>(const std::vector<MaiMessage>&,
+                                                                    const MaiTurnContext&)>
+            prepareSkillInputs;
+        // 可选的会话工具声明选择器；为空保持旧宿主全部声明行为。
+        // 工作线程调用，返回冻结的追加式 Schema；错误终止请求，不回退全目录。
+        std::function<MaiResult<std::vector<MaiToolSpec>>(const MaiTurnContext&)> prepareTools;
     };
 
     MaiTurnRunner(Dependencies dependencies, std::string sessionId, MaiMessage assistant);
@@ -120,6 +135,9 @@ private:
                                   const MaiToolContext& context, bool& allowed,
                                   const std::atomic<bool>& cancel);
     bool toolNeedsApproval(const MaiToolInvocation& call) const;
+    // 已开启发现时，执行只能使用本次真实模型请求中声明的名称。
+    // 同批 tool_search 的选择不能为尚未声明的兄弟调用提前放行。
+    MaiTool* findDeclaredTool(const std::string& name) const;
 
     // 组装这一次要发给模型的请求。
     // 可能同步增量总结旧轮次。includeTools 对应实际请求能力，与最终回答提示无关；
@@ -141,10 +159,10 @@ private:
     // 这个洞是拿真实 GLM-5.3 跑出来的：假模型不发 reasoning_content，测不到。
     void beginStreamedPart(const std::string& partId, MaiMessagePartBody body);
 
-    // 流式增量每积累约 1 KiB 就写一次，结束/中断时强制写尾巴。**就地填**，
-    // 不是新建——part 在第一个 chunk 到达时就已经占位入库了。
+    // 流式增量每积累约 1 KiB 更新后端进程内投影，结束/中断时补齐尾巴。
+    // 权威源只保存已完成 item；未完成片段保持 modelDraft，不承诺重启恢复。
     void commitStreamedParts();
-    // 仅在本次完整响应 commit 后调用；每个正文 part 一次，早于任何实际工具执行。
+    // 专业任务交付凭据仍在完整响应校验后发布；每个正文 part 一次，早于工具执行。
     void announceCommittedTextParts(const std::atomic<bool>& cancel);
     void checkpointStreamedParts(bool force);
     void fillStreamedPart(const std::string& partId, const std::string& buffer);
@@ -152,9 +170,14 @@ private:
     // 工具清理与普通消息收尾结束后保存整轮终态；分段结束不提前完成原始轮次。
     void finishOutcome(const std::atomic<bool>& cancel, bool cleanupFailed);
     void publishContextStatus(const MaiContextStatus& status);
+    // 最近一次真实输入量仅覆盖经版本/来源/指纹校验的请求前缀；只估计其后新增内容。
+    // 型号/来源/声明/历史改变、路径图片或精确 tokenizer 时回退原计数，不沿用倍率。
+    MaiModelTokenEstimate estimateContextInput(const MaiModelRequest& request) const;
 
     Dependencies mDependencies;
     MaiTurnContext mContext;
+    // 轮次模型事实只记录完成 item/用量/已采用窗口，草稿仍只交后端内存投影。
+    std::unique_ptr<MaiRolloutRuntimeFacts> mRuntimeFacts;
     // 只保存当前显式补充组，下一组替换；不累积历史图片，也不另建待执行输入队列。
     std::vector<std::string> mCurrentUserMessageIds;
     // 专业通知可能重用较旧的消息 ID；不能按这个 ID 把既存的新用户历史移到回复之后。
@@ -172,14 +195,18 @@ private:
     std::size_t mResponseFirstPart = 0;
     // item 切换会更换当前正文缓冲，整次响应是否有可见正文须独立记录。
     bool mResponseHasVisibleText = false;
-    // 真实 usage 高于启发式计数时，保守校正本轮后续请求；它不是供应商实际用量。
-    double mContextEstimateMultiplier = 1.0;
+    // 指纹锚点和 actual input 原子保存，不复制整份请求或持久化正文；只在严格前缀
+    // 仍相同、估计器版本一致时跨轮次/重开复用，不从累计或 total 推导输入。
+    std::optional<MaiModelInputAnchor> mInputEstimateAnchor;
+    std::uint64_t mInputCheckpointRevision = 0;
     // 只属于当前轮次；一次软区整理失败后不在每项工具后重复整理，硬上限仍会重检。
     bool mCompactionDeferred = false;
     bool mForceCompaction = false;
 
     MaiError mError;
     std::optional<MaiContextStatus> mContextStatus;
+    // 本轮累计的供应商 usage 输出 token；随每次模型请求的 usage 回调递增。
+    std::size_t mOutputTokens = 0;
     bool mHasVisibleText = false;
 
     // 这一轮里已经被拒绝过的 (工具名, 参数)。模型被拒之后经常原样再调一次，
@@ -187,4 +214,5 @@ private:
     //
     // 只记这一轮：用户拒绝的是"现在这件事"，下一轮同样的请求该重新问。
     std::set<std::string> mRejected;
+    std::set<std::string> mDeclaredTools;
 };

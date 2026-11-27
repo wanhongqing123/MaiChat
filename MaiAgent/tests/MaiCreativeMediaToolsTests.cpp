@@ -64,7 +64,7 @@ void testPaidVideosArePausedBeforeCredentialsOrUpload() {
     context.specialistTasks = store.get();
     for (const auto& video : videos) {
         CHECK(!video->isAvailableForModel(""));
-        CHECK(!video->isAvailableForModel("glm-5.3"));
+        CHECK(!video->isAvailableForModel("glm-5.4"));
         CHECK(!video->isAvailableForModel("glm-5.3-flash"));
         MaiSpecialistTask previous;
         previous.id = MaiIdGenerator::generate("spt_");
@@ -112,7 +112,7 @@ void testPaidVideosArePausedBeforeCredentialsOrUpload() {
     MaiToolRegistry registry;
     registry.add(makeMaiMiniMaxVideoTool(key, {}, upload));
     registry.add(makeMaiBailianKlingVideoTool(credentials, {}, upload));
-    for (const std::string model : {"", "glm-5.3", "glm-5.3-flash"}) {
+    for (const std::string model : {"", "glm-5.4", "glm-5.3-flash"}) {
         CHECK(registry.specs(model).empty());
         for (const char* name : {"minimax_video", "kling_bailian_video"}) {
             CHECK(registry.find(name));

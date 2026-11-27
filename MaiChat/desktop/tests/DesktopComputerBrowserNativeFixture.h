@@ -516,23 +516,18 @@ bool runOwnedBrowserSlider(const std::shared_ptr<DesktopComputerController>& con
     guard.setInterval(20);
     QObject::connect(&guard, &QTimer::timeout, [&] { if (canceled()) canceledInput = true; });
     guard.start();
-    MaiToolContext context;
-    context.sessionId = session;
-    context.turnId = "owned-browser-slider-turn";
-    context.root = workspace.toStdString();
-    context.model = "glm-5.3-flash";  // Static tool capability context, not a model request.
-    context.cancel = &canceledInput;
-    MaiToolRegistry registry;
-    registerDesktopComputerTools(registry, controller);
-    MaiTool* computer = registry.find("desktop_computer");
-    if (!computer) return fail("production desktop_computer tool was not registered");
     const auto release = qScopeGuard([&] { controller->releaseInput(session); });
-    const auto call = [&](const char* stage, const Json& arguments) -> std::optional<MaiToolResult> {
+    const std::string turn = "owned-browser-slider-turn";
+    const auto stopped = [&] { return canceledInput.load() || canceled(); };
+    const auto call = [&](const char* stage, DesktopComputerAction action)
+        -> std::optional<DesktopComputerActionResult> {
         if (canceled() || canceledInput) { fail(std::string(stage) + ": owned scope changed"); return {}; }
-        std::optional<MaiToolResult> result;
+        action.isCanceled = stopped;
+        action.turnId = turn;
+        std::optional<MaiResult<DesktopComputerActionResult>> result;
         std::atomic<bool> finished{false};
         std::thread worker([&] {
-            try { result.emplace(computer->execute(arguments.dump(), context)); }
+            try { result.emplace(controller->perform(session, action)); }
             catch (...) { canceledInput = true; }
             finished = true;
         });
@@ -544,14 +539,15 @@ bool runOwnedBrowserSlider(const std::shared_ptr<DesktopComputerController>& con
             QThread::msleep(2);
         }
         worker.join();
-        if (!result || result->hasError() || canceledInput || canceled()) {
-            fail(std::string(stage) + ": " + (result && result->hasError()
+        if (!result || !*result || canceledInput || canceled()) {
+            fail(std::string(stage) + ": " + (result && !*result
                 ? result->error().message() : "native tool canceled or did not return"));
             return {};
         }
-        trace.push_back({{"stage", stage}, {"entry", "registered desktop_computer"},
-                         {"arguments", arguments}, {"output", result->output()}});
-        return result;
+        trace.push_back({{"stage", stage}, {"entry", "ordinary DesktopComputerController"},
+                         {"action", action.action}, {"dispatched", result->value().dispatched},
+                         {"observation_error", result->value().observationError}});
+        return std::move(result->value());
     };
     const auto nativeHeld = [&] {
         const auto state = controller->inputState(session);
@@ -572,11 +568,12 @@ bool runOwnedBrowserSlider(const std::shared_ptr<DesktopComputerController>& con
     const auto observe = [&](const char* stage, bool held, bool requireChangedFrame = true) {
         const std::string previousSnapshot = snapshot.is_object()
             ? snapshot.value("snapshot_id", std::string()) : std::string();
-        auto result = call(stage, {{"action", "observe"}, {"target", "display"},
-            {"display_id", std::to_string(display.id)}, {"wait_ms", 120}});
-        if (!result || result->images().size() != 1) return fail(std::string(stage) + ": no actual browser PNG");
-        snapshot = Json::parse(result->output(), nullptr, false);
-        pixels = QImage(QString::fromStdString(result->images().front().path));
+        if (stopped()) return fail(std::string(stage) + ": owned scope changed");
+        const auto result = controller->observeDisplay(session, workspace.toStdString(), display.id,
+                                                       stopped, 0, 0, 120, turn);
+        if (!result || result.value().imagePath.empty()) return fail(std::string(stage) + ": no actual browser PNG");
+        snapshot = Json::parse(result.value().json, nullptr, false);
+        pixels = QImage(QString::fromStdString(result.value().imagePath));
         if (!snapshot.is_object() || !snapshot.contains("snapshot_id") || pixels.width() < 2 || pixels.height() < 2)
             return fail(std::string(stage) + ": invalid observation binding");
         const auto frame = snapshot.value("frame_sequence", std::uint64_t(0));
@@ -587,7 +584,7 @@ bool runOwnedBrowserSlider(const std::shared_ptr<DesktopComputerController>& con
             snapshot.value("snapshot_id", std::string()) == previousSnapshot)
             return fail(std::string(stage) + ": observation frame or binding was not valid");
         lastFrame = frame;
-        if (!preserve(stage, {result->output(), result->images().front().path})) return false;
+        if (!preserve(stage, result.value())) return false;
         handle = center(pixels, qRgb(0x28, 0xaf, 0x77));
         target = center(pixels, qRgb(0xdf, 0x85, 0x47));
         if (handle.x() < 0 || target.x() < 0) return fail(std::string(stage) + ": visible markers not found in PNG");
@@ -605,13 +602,20 @@ bool runOwnedBrowserSlider(const std::shared_ptr<DesktopComputerController>& con
             {"owned_native_left", nativeHeld()}, {"page_oracle", oracle}});
         return true;
     };
+    const auto inputAction = [&](const char* kind) {
+        DesktopComputerAction action;
+        action.action = kind;
+        action.desktopScope = true;
+        action.workspace = workspace.toStdString();
+        action.displayId = display.id;
+        action.snapshotId = snapshot.value("snapshot_id", std::string());
+        return action;
+    };
     const auto pointAction = [&](const char* stage, const char* kind, const QPointF& destination) {
-        Json arguments{{"action", kind}, {"target", "display"},
-            {"display_id", std::to_string(display.id)}, {"snapshot_id", snapshot.at("snapshot_id")},
-            {"x_ratio", destination.x() / (pixels.width() - 1)},
-            {"y_ratio", destination.y() / (pixels.height() - 1)}};
-        if (std::string(kind) == "mouse_down") arguments["button"] = "left";
-        return bool(call(stage, arguments));
+        auto action = inputAction(kind);
+        action.xRatio = destination.x() / (pixels.width() - 1);
+        action.yRatio = destination.y() / (pixels.height() - 1);
+        return bool(call(stage, action));
     };
     try {
         if (!OwnedDocumentDesktop::physicalInputReleased() || !observe("slider-initial", false))
@@ -619,18 +623,21 @@ bool runOwnedBrowserSlider(const std::shared_ptr<DesktopComputerController>& con
 
         // A one-shot drag intentionally stops short. Dispatch success is not a
         // substitute for the page's alignment result on the ensuing real up.
-        auto negative = call("slider-negative-drag", {{"action", "drag"}, {"target", "display"},
-            {"display_id", std::to_string(display.id)}, {"snapshot_id", snapshot.at("snapshot_id")},
-            {"x_ratio", handle.x() / (pixels.width() - 1)}, {"y_ratio", handle.y() / (pixels.height() - 1)},
-            {"to_x_ratio", (target.x() - 32) / (pixels.width() - 1)},
-            {"to_y_ratio", target.y() / (pixels.height() - 1)}, {"duration_ms", 200}});
+        auto shortDrag = inputAction("drag");
+        shortDrag.xRatio = handle.x() / (pixels.width() - 1);
+        shortDrag.yRatio = handle.y() / (pixels.height() - 1);
+        shortDrag.toXRatio = (target.x() - 32) / (pixels.width() - 1);
+        shortDrag.toYRatio = target.y() / (pixels.height() - 1);
+        shortDrag.durationMs = 200;
+        auto negative = call("slider-negative-drag", shortDrag);
         if (!negative || !waitUntil([&] { return server.sliderSnapshot().value("ups", 0) == 1; }) ||
             server.sliderSnapshot().value("verdict", std::string()) != "unaligned" || nativeHeld())
             return fail("short atomic drag did not produce the expected unaligned negative result");
         if (!observe("slider-negative-released", false)) return false;
         const int oldLoad = server.sliderLoads.load();
-        auto reloaded = call("slider-owned-reload", {{"action", "key"}, {"target", "display"},
-            {"display_id", std::to_string(display.id)}, {"snapshot_id", snapshot.at("snapshot_id")}, {"key", "Ctrl+R"}});
+        auto reload = inputAction("key");
+        reload.key = "Ctrl+R";
+        auto reloaded = call("slider-owned-reload", reload);
         if (!reloaded || !waitUntil([&] {
                 const auto oracle = server.sliderSnapshot();
                 return server.sliderLoads.load() > oldLoad && oracle.value("kind", std::string()) == "ready";
@@ -660,8 +667,7 @@ bool runOwnedBrowserSlider(const std::shared_ptr<DesktopComputerController>& con
         trace.push_back({{"stage", "slider-before-explicit-up"}, {"held_captures", heldCaptures},
             {"pixel_alignment_confirmed", true}, {"owned_left", nativeHeld()},
             {"page_oracle", server.sliderSnapshot()}});
-        auto up = call("slider-explicit-up", {{"action", "mouse_up"}, {"button", "left"},
-            {"target", "display"}, {"display_id", std::to_string(display.id)}});
+        auto up = call("slider-explicit-up", inputAction("mouse_up"));
         if (!up || !waitUntil([&] {
                 const auto oracle = server.sliderSnapshot();
                 return oracle.value("ups", 0) == 1 && !oracle.value("held", true) &&
@@ -1165,8 +1171,8 @@ int runBrowserWorkflow(bool sliderWorkflow = false) {
                        {"exit_code", passed ? 0 : 1}};
     if (sliderWorkflow) {
         receipt["page_oracle"] = server.sliderSnapshot();
-        receipt["tool_entry"] = "registered desktop_computer";
-        receipt["input_source"] = "native tool actions, no DOM/CDP input";
+        receipt["tool_entry"] = "ordinary DesktopComputerController";
+        receipt["input_source"] = "native ordinary actions, no DOM/CDP input";
         receipt["external_captcha_acceptance"] = false;
     }
     if (!evidence.isEmpty()) {

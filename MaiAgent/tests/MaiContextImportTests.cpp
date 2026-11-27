@@ -573,7 +573,7 @@ public:
         return {};
     }
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
     bool waitForRequest() {
         std::unique_lock<std::mutex> lock(mMutex);

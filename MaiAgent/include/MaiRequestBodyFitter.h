@@ -26,7 +26,7 @@ struct MaiRequestBodyFitResult {
     bool reduced = false;
     // fittedBytes <= byteLimit。
     bool fits = false;
-    // 已到达最小可用请求（基础指令、工具声明与各消息的最小正文），无法继续缩小。
+    // 已到达保留完整正文的最小请求（基础指令、工具声明与工具必要骨架），无法继续缩小。
     bool exhausted = false;
     std::size_t omittedImages = 0;
     std::size_t truncatedTexts = 0;
@@ -38,9 +38,10 @@ struct MaiRequestBodyFitResult {
 //   1. 当前用户输入之前的历史图片 → 文本占位（保留 workspace_path）；
 //   2. 当前轮较早的工具截图 → 占位（最新一组截图保留到更后面）；
 //   3. 较早 assistant 消息的不透明续接状态 → 省略（回退到普通文本/调用投影）；
-//   4. 历史文本、工具结果、较早思考、工具参数 → 统一上限截断，保留首尾并注明回查方式；
+//   4. 工具结果、较早思考、工具参数 → 统一上限截断，保留首尾并注明回查方式；
 //   5. 最新一组工具截图、当前用户附件 → 占位；
-//   6. 当前用户正文 → 同样截断。
+// 用户及助手正文（包括历史正文）始终逐字保留；工具可缩部分耗尽后仍超限，
+// 返回 exhausted，不通过截断正文伪造 fits。宿主须明确报告容量限制。
 // 不会删除消息或拆散工具调用/结果配对，因此请求结构对所有 wire 保持合法。
 // 测量次数为 O(log n)，不在内层循环里反复编码。取消时返回 Canceled。
 MaiResult<MaiRequestBodyFitResult> maiFitRequestBody(MaiModelClient& model,

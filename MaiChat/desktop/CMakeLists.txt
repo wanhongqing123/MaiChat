@@ -10,7 +10,7 @@ if(CMAKE_HOST_APPLE)
   endif()
 endif()
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 3.2.2 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 4.0.1 LANGUAGES C CXX)
 if(MSVC AND MSVC_VERSION LESS 1930)
   message(FATAL_ERROR "The source Qt 6 desktop build requires MSVC 2022 or later")
 endif()
@@ -30,6 +30,7 @@ endif()
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
+option(MAICHAT_LOCAL_PREVIEW "Use an isolated local-preview data/settings identity" OFF)
 option(MAICHAT_USE_FAKE_CLIENT "Use the fake IM client for desktop UI development" OFF)
 # 远程桌面依赖腾讯 TRTC C++ SDK（vendor/tencent-trtc）。
 option(MAICHAT_ENABLE_REMOTE_DESKTOP "Build remote desktop support (requires TRTC SDK)" ON)
@@ -599,6 +600,8 @@ add_library(remote_im_desktop_ui
   src/ui/DesktopMusicPlayerDialog.h
   src/ui/DesktopMusicPlayerDialog.cpp
   src/ui/RemoteDesktopConsentDialog.h
+  src/ui/RemoteDesktopDeviceDialog.cpp
+  src/ui/RemoteDesktopDeviceDialog.h
   src/ui/RemoteDesktopConsentDialog.cpp
   src/ui/RemoteDesktopProxyDialog.h
   src/ui/RemoteDesktopProxyDialog.cpp
@@ -704,6 +707,9 @@ qt6_add_executable(maichat
 # 版本号带进运行时：日志第一行就得答出"用户跑的到底是哪个包"，
 # 这个问题每次排障都要问一遍。
 target_compile_definitions(maichat PRIVATE MAICHAT_VERSION="${PROJECT_VERSION}")
+if(MAICHAT_LOCAL_PREVIEW)
+  target_compile_definitions(maichat PRIVATE MAICHAT_LOCAL_PREVIEW=1)
+endif()
 if(WIN32)
   add_custom_command(TARGET maichat POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -903,6 +909,10 @@ add_library(maichat_agent
   src/ui/ComposerTextEdit.cpp
   src/agent/AgentController.h
   src/agent/AgentController.cpp
+  src/agent/AgentContextUsagePresentation.h
+  src/agent/AgentContextUsagePresentation.cpp
+  src/agent/DesktopAgentStoragePreparation.h
+  src/agent/DesktopAgentStoragePreparation.cpp
   src/agent/DesktopScreenCaptureControl.h
   src/agent/DesktopScreenCaptureControl.cpp
   src/agent/DesktopScreenCaptureBar.h
@@ -919,14 +929,14 @@ add_library(maichat_agent
   ../MaiChatTools/MaiCalendarTools.cpp
   src/MaiChatTools/DesktopCalendarEvents.h
   src/MaiChatTools/DesktopCalendarEvents.cpp
-  src/MaiChatTools/DesktopBrowserTools.h
-  src/MaiChatTools/DesktopBrowserTools.cpp
   src/MaiChatTools/DesktopComputerPlatform.h
   src/MaiChatTools/DesktopComputerBackend.h
   src/MaiChatTools/DesktopComputerKeys.h
   src/MaiChatTools/DesktopComputerKeys.cpp
   src/MaiChatTools/DesktopComputerTools.h
   src/MaiChatTools/DesktopComputerTools.cpp
+  src/MaiChatTools/DesktopComputerSkyTool.cpp
+  src/MaiChatTools/DesktopComputerInputTool.cpp
   src/MaiChatTools/DesktopComputerInputOwnership.h
   src/MaiChatTools/DesktopComputerInputOwnership.cpp
   src/MaiChatTools/DesktopComputerInputTypes.h
@@ -985,6 +995,7 @@ if(APPLE)
   target_sources(maichat_agent PRIVATE
     src/agent/MaiDesktopGpu.h src/agent/MaiDesktopGpuMac.mm
     src/MaiChatTools/DesktopComputerMac.mm)
+  target_sources(maichat_agent PRIVATE src/MaiChatTools/DesktopComputerAppsMac.mm)
   target_link_libraries(maichat_agent PRIVATE "-framework Metal"
     "-framework ApplicationServices" "-framework AppKit" "-framework Carbon")
 elseif(WIN32)
@@ -993,8 +1004,9 @@ elseif(WIN32)
     src/MaiChatTools/DesktopComputerWindows.cpp
     src/MaiChatTools/DesktopComputerWindowsInputInternal.h
     src/MaiChatTools/DesktopComputerWindowsKeyMap.cpp)
+  target_sources(maichat_agent PRIVATE src/MaiChatTools/DesktopComputerAppsWindows.cpp)
   target_compile_definitions(maichat_agent PRIVATE NOMINMAX)
-  target_link_libraries(maichat_agent PRIVATE dxgi dwmapi uiautomationcore ole32)
+  target_link_libraries(maichat_agent PRIVATE dxgi dwmapi uiautomationcore ole32 shell32 advapi32 propsys)
 endif()
 target_include_directories(maichat_agent PUBLIC src ../SessionSync)
 target_include_directories(maichat_agent PRIVATE ../Media ../MaiChatTools
@@ -1186,6 +1198,19 @@ add_executable(markdown_label_test tests/MarkdownLabelTest.cpp)
 target_link_libraries(markdown_label_test PRIVATE maichat_markdown Qt6::Widgets Qt6::Test)
 
 add_executable(agent_controller_test tests/AgentControllerTest.cpp)
+add_executable(playwright_skill_integration_test tests/PlaywrightSkillIntegrationTest.cpp)
+target_include_directories(playwright_skill_integration_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/httplib
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/nlohmann)
+target_link_libraries(playwright_skill_integration_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
+  remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
+add_executable(agent_context_usage_presentation_test tests/AgentContextUsagePresentationTest.cpp)
+target_link_libraries(agent_context_usage_presentation_test PRIVATE maichat_agent Qt6::Core)
+add_test(NAME agent_context_usage_presentation_test COMMAND agent_context_usage_presentation_test)
+add_executable(agent_storage_preparation_test tests/AgentStoragePreparationTest.cpp)
+target_link_libraries(agent_storage_preparation_test PRIVATE remote_im_desktop_ui
+  remote_im_desktop_app maichat_agent Qt6::Widgets Qt6::Concurrent)
+add_test(NAME agent_storage_preparation_test COMMAND agent_storage_preparation_test)
 target_include_directories(agent_controller_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/httplib
   ../MaiChatTools)
@@ -1370,12 +1395,6 @@ target_include_directories(mai_session_schedule_test PRIVATE
 target_link_libraries(mai_session_schedule_test PRIVATE maiagent mai_sqlite)
 add_test(NAME mai_session_schedule COMMAND mai_session_schedule_test)
 
-add_executable(desktop_browser_tools_test tests/DesktopBrowserToolsTest.cpp)
-target_link_libraries(desktop_browser_tools_test PRIVATE maichat_agent Qt6::Core)
-target_include_directories(desktop_browser_tools_test PRIVATE
-  src ../../MaiAgent/third_party/nlohmann)
-add_test(NAME desktop_browser_tools COMMAND desktop_browser_tools_test)
-
 add_executable(desktop_computer_tools_test tests/DesktopComputerToolsTest.cpp)
 target_link_libraries(desktop_computer_tools_test PRIVATE maichat_agent Qt6::Widgets)
 target_include_directories(desktop_computer_tools_test PRIVATE
@@ -1388,6 +1407,25 @@ add_executable(desktop_computer_contracts_test tests/DesktopComputerContractsTes
 target_link_libraries(desktop_computer_contracts_test PRIVATE maichat_agent Qt6::Core)
 target_include_directories(desktop_computer_contracts_test PRIVATE ../../MaiAgent/third_party/nlohmann)
 add_test(NAME desktop_computer_contracts COMMAND desktop_computer_contracts_test)
+add_executable(desktop_computer_sky_test tests/DesktopComputerSkyTest.cpp)
+target_link_libraries(desktop_computer_sky_test PRIVATE maichat_agent Qt6::Core)
+target_include_directories(desktop_computer_sky_test PRIVATE ../../MaiAgent/third_party/nlohmann)
+add_test(NAME desktop_computer_sky COMMAND desktop_computer_sky_test)
+add_executable(desktop_computer_input_tool_test tests/DesktopComputerInputToolTest.cpp)
+target_link_libraries(desktop_computer_input_tool_test PRIVATE maichat_agent Qt6::Core)
+target_include_directories(desktop_computer_input_tool_test PRIVATE ../../MaiAgent/third_party/nlohmann)
+add_test(NAME desktop_computer_input_tool COMMAND desktop_computer_input_tool_test)
+if(WIN32)
+  add_executable(desktop_computer_element_windows_test tests/DesktopComputerElementWindowsTest.cpp)
+  target_link_libraries(desktop_computer_element_windows_test PRIVATE maichat_agent user32 comctl32)
+  add_test(NAME desktop_computer_element_windows COMMAND desktop_computer_element_windows_test)
+  add_executable(desktop_computer_apps_windows_test tests/DesktopComputerAppsWindowsTest.cpp
+    src/MaiChatTools/DesktopComputerAppsWindows.cpp ../../MaiAgent/Agent/MaiError.cpp)
+  target_include_directories(desktop_computer_apps_windows_test PRIVATE src ../../MaiAgent/include)
+  target_compile_definitions(desktop_computer_apps_windows_test PRIVATE NOMINMAX)
+  target_link_libraries(desktop_computer_apps_windows_test PRIVATE shell32 ole32 advapi32 user32 propsys)
+  add_test(NAME desktop_computer_apps_windows COMMAND desktop_computer_apps_windows_test)
+endif()
 add_executable(desktop_computer_input_ownership_test tests/DesktopComputerInputOwnershipTest.cpp)
 target_link_libraries(desktop_computer_input_ownership_test PRIVATE maichat_agent Qt6::Core)
 add_test(NAME desktop_computer_input_ownership COMMAND desktop_computer_input_ownership_test)
@@ -1597,6 +1635,7 @@ if(APPLE AND TARGET maiagent_obs_metal)
     "-framework CoreMedia" "-framework CoreVideo" "-framework VideoToolbox")
   target_sources(remote_im_desktop_ui PRIVATE
     src/ui/MaiFfplayVideoDialog.h src/ui/MaiFfplayVideoDialog.cpp
+    src/ui/MaiVideoSeekSlider.h src/ui/MaiVideoSeekSlider.cpp
     src/MaiChatTools/DesktopMediaTools.h src/MaiChatTools/DesktopMediaTools.cpp)
   target_include_directories(remote_im_desktop_ui PRIVATE ../Media/FfplayCompat)
   target_link_libraries(remote_im_desktop_ui PRIVATE maichat_ffplay_hosted)
@@ -1702,6 +1741,7 @@ if(WIN32 AND MAICHAT_ENABLE_FFMPEG)
 
   target_sources(remote_im_desktop_ui PRIVATE
     src/ui/MaiFfplayVideoDialog.h src/ui/MaiFfplayVideoDialog.cpp
+    src/ui/MaiVideoSeekSlider.h src/ui/MaiVideoSeekSlider.cpp
     src/MaiChatTools/DesktopMediaTools.h src/MaiChatTools/DesktopMediaTools.cpp)
   target_include_directories(remote_im_desktop_ui PRIVATE ../Media/FfplayCompat)
   target_link_libraries(remote_im_desktop_ui PRIVATE maichat_ffplay_hosted)
@@ -2035,8 +2075,10 @@ target_link_libraries(remote_desktop_session_test PRIVATE remote_im_core Qt6::Te
 add_executable(remote_desktop_settings_test tests/RemoteDesktopSettingsTest.cpp)
 target_link_libraries(remote_desktop_settings_test PRIVATE remote_im_core Qt6::Test)
 
-add_executable(remote_desktop_controller_test tests/RemoteDesktopControllerTest.cpp)
-target_link_libraries(remote_desktop_controller_test PRIVATE remote_im_core Qt6::Test)
+# 此集包含真实设备选择 QWidget 的定点回归，普通路由仍用同一记录型 IM/TRTC 夹具。
+add_executable(remote_desktop_controller_test tests/RemoteDesktopControllerTest.cpp
+  src/ui/RemoteDesktopDeviceDialog.cpp)
+target_link_libraries(remote_desktop_controller_test PRIVATE remote_im_core Qt6::Widgets Qt6::Test)
 
 add_executable(trtc_engine_test tests/TrtcEngineTest.cpp)
 target_link_libraries(trtc_engine_test PRIVATE remote_im_core Qt6::Test)
@@ -2153,13 +2195,24 @@ add_test(NAME MaiContextImportPurgeTests COMMAND MaiContextImportPurgeTests)
 add_library(mai_context_regression_support STATIC ../../MaiAgent/tests/support/MaiFakeModelClient.cpp)
 target_include_directories(mai_context_regression_support PUBLIC ../../MaiAgent/tests/support)
 target_link_libraries(mai_context_regression_support PUBLIC maiagent)
-foreach(context_regression MaiCoreTests MaiStoreTests MaiInputQueueTests MaiToolOutputStoreTests
+foreach(context_regression MaiCoreTests MaiRuntimeTests MaiOpenAiSolTests MaiGlm54Tests MaiStoreTests MaiInputQueueTests MaiToolOutputStoreTests
         MaiContextCompactorTests MaiSpecialistNotificationTests MaiSubAgentTests MaiTurnRunnerTests
-        MaiContextBuilderImageTests)
+        MaiContextBuilderImageTests MaiToolLoopTests MaiToolOutputReadTests
+        MaiJournalStoreTests MaiJournalRuntimeTests MaiRolloutRuntimeFactsTests MaiModelContextUsageTests
+        MaiModelToolCatalogTests MaiToolDiscoveryRuntimeTests
+        MaiUnifiedExecToolTests MaiShellToolTests MaiShellPtyTests MaiExecSessionTests
+        MaiRequestBodyRecoveryTests MaiResponsesProtocolTests
+        MaiCustomPatchWireTests MaiToolTests MaiEditToolTests MaiApplyPatchToolTests
+        MaiFileSearchTests MaiTextFileReaderTests MaiFilePathTests
+        MaiSessionMigrationTests MaiSqliteProjectionMutationTests MaiSkillTests MaiSkillRuntimeTests
+        MaiSkillInstallerTests MaiSkillDirectoryPublishTests
+        MaiCommandScriptTests MaiFileCommandTests MaiInProcessShellToolTests
+        MaiRolloutLogTests MaiRolloutPathTests MaiRolloutProjectionTests MaiSessionRecordCodecTests
+        MaiCodexStoreSchemaTests MaiLegacySessionReaderTests MaiAppendFileTests)
   add_executable(${context_regression} ../../MaiAgent/tests/${context_regression}.cpp)
   target_include_directories(${context_regression} PRIVATE ../../MaiAgent/third_party/sqlite
     ../../MaiAgent/third_party/nlohmann ../../MaiAgent/third_party/httplib)
-  target_link_libraries(${context_regression} PRIVATE maiagent mai_context_regression_support)
+  target_link_libraries(${context_regression} PRIVATE maiagent mai_context_regression_support mai_sqlite)
   if(WIN32)
     target_compile_definitions(${context_regression} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(${context_regression} PRIVATE ws2_32 crypt32)
@@ -2168,6 +2221,10 @@ foreach(context_regression MaiCoreTests MaiStoreTests MaiInputQueueTests MaiTool
 endforeach()
 
 # Core 存储变更沿既有控制台真实 stdin/stdout 验证，仍复用正式库和当前缓存。
+target_include_directories(MaiLegacySessionReaderTests PRIVATE
+  ${OPENSSL_INCLUDE_DIR} ../../MaiAgent/third_party/openssl/include)
+target_include_directories(MaiModelToolCatalogTests PRIVATE
+  ${OPENSSL_INCLUDE_DIR} ../../MaiAgent/third_party/openssl/include)
 if(NOT TARGET MaiModelClientTests)
   add_executable(MaiModelClientTests ../../MaiAgent/tests/MaiModelClientTests.cpp)
   target_include_directories(MaiModelClientTests PRIVATE
@@ -2280,4 +2337,20 @@ add_test(NAME desktop_pdf_password_prompt_test COMMAND desktop_pdf_password_prom
 # compiler metadata, so Ninja tracks headers in every locale.
 if(MSVC)
   include("${MAICHAT_QT_PREFIX}/../msvc-showincludes.cmake")
+endif()
+
+# 视频时间轴的普通 QWidget 路径；不需要启动解码器或访问用户素材。
+add_executable(maichat_video_seek_slider_test tests/MaiVideoSeekSliderTest.cpp
+  src/ui/MaiVideoSeekSlider.cpp)
+target_include_directories(maichat_video_seek_slider_test PRIVATE src)
+target_link_libraries(maichat_video_seek_slider_test PRIVATE Qt6::Widgets Qt6::Test)
+add_test(NAME maichat_video_seek_slider_test COMMAND maichat_video_seek_slider_test)
+
+add_test(NAME qt_build_space_preflight_test
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/QtBuildSpacePreflightTest.py")
+
+if(APPLE AND MAICHAT_LOCAL_PREVIEW)
+  set_target_properties(maichat PROPERTIES
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.kongshang.maichat.preview"
+    MACOSX_BUNDLE_BUNDLE_NAME "MaiChat Preview")
 endif()

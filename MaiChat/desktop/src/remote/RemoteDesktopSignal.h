@@ -10,18 +10,20 @@
 
 // 远程桌面信令：借道现有 IM 文本消息通道传输，不新增 IM 消息类型。
 //
-// 载荷形如：<不可见前缀>[remote-desktop]{"v":1,"type":"invite",...}
+// 载荷形如：<不可见前缀>[remote-desktop]{"v":2,"type":"invite",...}
 // 不可见前缀让信令不污染聊天记录展示；应用层识别后直接转交控制器，
 // 既不入库也不产生未读红点。
 namespace RemoteDesktopSignals {
 
 enum class Type {
-    Unknown,   // 不是信令（普通聊天文本），或版本/格式不被支持
-    Invite,    // 控制端 → 被控端：请求查看屏幕
-    Accept,    // 被控端 → 控制端：同意，附房间号
-    Reject,    // 被控端 → 控制端：拒绝，附原因
-    Stop,      // 任一端 → 对端：结束会话
-    Notice     // 被控端 → 控制端：会话中的状态播报，附 noticeCode
+    Unknown,  // 不是信令（普通聊天文本），或版本/格式不被支持
+    Invite,   // 控制端 → 被控端：请求查看屏幕
+    Accept,   // 被控端 → 控制端：同意，附房间号
+    Reject,   // 被控端 → 控制端：拒绝，附原因
+    Stop,     // 任一端 → 对端：结束会话
+    Discover, // IM 设备发现；不创建远控会话或触发授权弹窗
+    Device,   // 设备能力响应，仅回给发起发现的设备
+    Notice    // 被控端 → 控制端：会话中的状态播报，附 noticeCode
 };
 
 // Notice 的取值。传码不传文案：文案属于展示层，控制端可以自己决定怎么呈现，
@@ -46,15 +48,24 @@ struct Signal {
     // 仅 Accept 使用。v1 的可选扩展：老端会忽略这个 JSON 对象，新端在字段
     // 缺失或校验失败时也保持旧的“按编码帧直接归一化”行为。
     std::optional<RemoteDesktop::CaptureGeometry> captureGeometry;
-    int protocolVersion = 0;
+    // v2 将账号内的具体端点绑定到整个连接生命周期。v1 仅能解析，不能驱动连接。
+    QString sourceDeviceId;
+    QString targetDeviceId;
+    QString deviceName;
+    QString platform;
+    bool canShareScreen = false;
+    bool available = false;
+    int protocolVersion = 2;
 };
 
-// 当前协议版本。解析时版本不匹配一律降级为 Unknown（宁可当普通消息，
-// 也不要用错误的语义去驱动状态机）。
-constexpr int kProtocolVersion = 1;
+// v2 必须按设备定向。解析保留 v1 的只读兼容，但控制器不得据无端点的 v1 建连。
+constexpr int kProtocolVersion = 2;
 
 // 便于测试与排错：允许调用方拿到裸前缀。
 QString signalPrefix();
+// 与账号服务及 iOS 使用同一个 domain-separated SHA256 截断格式；只用于 TRTC，
+// 不能取代 IM 账号或授权。签名必须由服务端按这个身份另行签发。
+QString mediaUserId(const QString &ownerUserId, const QString &deviceId);
 
 // 这段文本是否是远程桌面信令（只看前缀，不做完整解析）。
 bool isSignalText(const QString& text);

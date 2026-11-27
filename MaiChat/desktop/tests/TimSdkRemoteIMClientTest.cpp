@@ -271,6 +271,9 @@ class TimSdkRemoteIMClientTest : public QObject {
 private slots:
     void avatarUpdateWaitsForSdkAndRejectsOldLoginCallbacks();
     void loadsAndUpdatesOwnAvatarWithoutAddingSelfAsContact();
+    void sparseSelfUpdateDoesNotDiscardInitialAvatar();
+    void staleInitialProfileCannotReplaceNewAvatar_data();
+    void staleInitialProfileCannotReplaceNewAvatar();
     void activityUsesOnlineCustomTransportWithoutHistory();
     void connectsThroughSdkAndSendsTextAndImage();
     void sendsApprovalDecisionAsV2CloudInteraction();
@@ -401,6 +404,55 @@ void TimSdkRemoteIMClientTest::loadsAndUpdatesOwnAvatarWithoutAddingSelfAsContac
     QCOMPARE(profiles.size(), 2);
     client.disconnectFromService({});
     QVERIFY(!fake->selfInfoCallback);
+}
+
+void TimSdkRemoteIMClientTest::sparseSelfUpdateDoesNotDiscardInitialAvatar() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    fake->deferUserProfiles = true;
+    TimSdkRemoteIMClient client(std::move(api));
+    QSignalSpy profiles(&client, &RemoteIMClient::selfProfileReceived);
+    client.connectToService(123456, QStringLiteral("owner"), QStringLiteral("sig"), {});
+    QCOMPARE(fake->deferredUserProfiles.size(), 1);
+    // 登录后的权限/昵称推送可以抢在完整资料回执前到达，不能让未变更的头像永远缺失。
+    fake->selfInfoCallback(QString::fromUtf8(
+        R"({"user_profile_identifier":"owner","user_profile_nick_name":"New Name"})"));
+    fake->deferredUserProfiles.takeFirst()(0, {}, QString::fromUtf8(
+        R"([{"user_profile_identifier":"owner","user_profile_nick_name":"Old Name","user_profile_face_url":"https://example.invalid/owned.jpg"}])"));
+    QVERIFY(!profiles.isEmpty());
+    QCOMPARE(profiles.last().at(1).toString(), QStringLiteral("New Name"));
+    QCOMPARE(profiles.last().at(2).toString(), QStringLiteral("https://example.invalid/owned.jpg"));
+}
+
+void TimSdkRemoteIMClientTest::staleInitialProfileCannotReplaceNewAvatar_data() {
+    QTest::addColumn<QString>("newAvatar");
+    QTest::newRow("changed") << QStringLiteral("https://example.invalid/new.jpg");
+    QTest::newRow("explicitly-cleared") << QString();
+}
+
+void TimSdkRemoteIMClientTest::staleInitialProfileCannotReplaceNewAvatar() {
+    QFETCH(QString, newAvatar);
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    fake->deferUserProfiles = true;
+    TimSdkRemoteIMClient client(std::move(api));
+    QSignalSpy profiles(&client, &RemoteIMClient::selfProfileReceived);
+    client.connectToService(123456, QStringLiteral("owner"), QStringLiteral("sig"), {});
+    const QJsonObject push{{QStringLiteral("user_profile_identifier"), QStringLiteral("owner")},
+                           {QStringLiteral("user_profile_face_url"), newAvatar}};
+    fake->selfInfoCallback(QString::fromUtf8(QJsonDocument(push).toJson(QJsonDocument::Compact)));
+    fake->deferredUserProfiles.takeFirst()(0, {}, QString::fromUtf8(
+        R"([{"user_profile_identifier":"owner","user_profile_nick_name":"Owner","user_profile_face_url":"https://example.invalid/old.jpg"}])"));
+    QCOMPARE(profiles.last().at(1).toString(), QStringLiteral("Owner"));
+    QCOMPARE(profiles.last().at(2).toString(), newAvatar);
+    // 登出后即使旧查询回调仍到达，也不能更新其它账号。
+    client.disconnectFromService({});
+    client.connectToService(123456, QStringLiteral("owner"), QStringLiteral("sig"), {});
+    auto stale = fake->deferredUserProfiles.takeFirst();
+    client.disconnectFromService({});
+    const int before = profiles.size();
+    stale(0, {}, QString::fromUtf8(QJsonDocument(push).toJson(QJsonDocument::Compact)));
+    QCOMPARE(profiles.size(), before);
 }
 
 // 临时活动状态走在线自定义消息，不落入历史，也不能污染普通消息列表。

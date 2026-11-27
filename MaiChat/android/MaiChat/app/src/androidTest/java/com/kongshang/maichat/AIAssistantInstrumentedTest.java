@@ -128,7 +128,7 @@ public class AIAssistantInstrumentedTest {
         JSONObject owner() throws Exception {
             return new JSONObject().put("id", SESSION).put("device_slot", "owned-detail-owner")
                 .put("login_session_id", "owned-detail-login").put("online", true).put("model", "deepseek-flash")
-                .put("reasoningEffort", "high").put("wire", "chat_completions");
+                .put("reasoningEffort", "high").put("wire", "responses");
         }
         JSONObject envelope() throws Exception {
             return new JSONObject().put("session_id", SESSION).put("from_slot", "owned-detail-owner")
@@ -154,7 +154,7 @@ public class AIAssistantInstrumentedTest {
             JSONObject result;
             if (request.optString("action").equals("get_session")) {
                 result = new JSONObject().put("ok", true).put("session", SESSION).put("model", "deepseek-flash")
-                    .put("reasoningEffort", "high").put("wire", "chat_completions");
+                    .put("reasoningEffort", "high").put("wire", "responses");
             } else {
                 assertEquals("No tool, prompt or mutable command is accepted", "get_tool_detail", request.optString("action"));
                 requests.add(new JSONObject(request.toString()));
@@ -1014,7 +1014,7 @@ public class AIAssistantInstrumentedTest {
             scenario.onActivity(activity ->
                 assertTrue(findDescription(activity.panel, "更多").performClick()));
             assertTrue(clickNodeOrParent(awaitExactSystemText("主模型", 3_000)));
-            for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
+            for (String model : new String[]{"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
                 assertNotNull("Missing exact main-model choice: " + model,
                     awaitExactSystemText(model, 3_000));
             assertNotNull(awaitExactSystemText("本地模型", 3_000));
@@ -1028,7 +1028,7 @@ public class AIAssistantInstrumentedTest {
             } finally { screenshot.recycle(); }
             assertTrue(clickNodeOrParent(awaitExactSystemText("思考强度", 3_000)));
             assertNotNull(awaitExactSystemText("简单", 3_000));
-            assertNull(awaitExactSystemText("glm-5.3", 300));
+            assertNull(awaitExactSystemText("glm-5.4", 300));
         }
     }
 
@@ -1044,7 +1044,7 @@ public class AIAssistantInstrumentedTest {
                         .put("device_slot", "mac").put("login_session_id", "fixture-login")
                         .put("device_name", "Fixture Mac").put("online", true).put("busy", false)
                         .put("model", "glm-5.3-flash").put("reasoningEffort", "low")
-                        .put("wire", "chat_completions");
+                        .put("wire", "responses");
                     JSONObject data = new JSONObject().put("messages", new org.json.JSONArray())
                         .put("sessions", new org.json.JSONArray().put(owner));
                     activity.panel.onState(new AIAssistantController.State(data, owner,
@@ -1055,14 +1055,14 @@ public class AIAssistantInstrumentedTest {
                 } catch (Exception failure) { throw new AssertionError(failure); }
             });
             assertTrue(clickNodeOrParent(awaitExactSystemText("主模型", 3_000)));
-            for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
+            for (String model : new String[]{"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
                 assertNotNull(awaitExactSystemText(model, 3_000));
             assertNull(awaitExactSystemText("本地模型", 300));
             assertNull(awaitExactSystemText("操作权限", 300));
             assertNull(awaitExactSystemText("清空当前对话", 300));
             assertTrue(clickNodeOrParent(awaitExactSystemText("思考强度", 3_000)));
             assertNotNull(awaitExactSystemText("简单", 3_000));
-            assertNull(awaitExactSystemText("glm-5.3", 300));
+            assertNull(awaitExactSystemText("glm-5.4", 300));
             scenario.onActivity(activity -> assertEquals("fixture remote draft",
                 activity.panel.composer.getText().toString()));
         }
@@ -1080,7 +1080,7 @@ public class AIAssistantInstrumentedTest {
             assertNotNull(awaitExactSystemText("简单", 3_000));
             assertNotNull(awaitExactSystemText("标准", 3_000));
             assertNotNull(awaitExactSystemText("深度", 3_000));
-            assertNull(awaitExactSystemText("glm-5.3", 500));
+            assertNull(awaitExactSystemText("glm-5.4", 500));
             Bitmap screenshot = InstrumentationRegistry.getInstrumentation()
                 .getUiAutomation().takeScreenshot();
             assertNotNull(screenshot);
@@ -1206,7 +1206,7 @@ public class AIAssistantInstrumentedTest {
             CountDownLatch saved = new CountDownLatch(1);
             AtomicBoolean savedOK = new AtomicBoolean();
             scenario.onActivity(a
-                -> a.panel.controller.save("glm-5.3", "on-request", ok -> {
+                -> a.panel.controller.save("glm-5.4", "on-request", ok -> {
                         savedOK.set(ok);
                         saved.countDown();
                     }));

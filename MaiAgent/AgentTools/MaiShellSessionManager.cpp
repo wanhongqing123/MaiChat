@@ -1,4 +1,4 @@
-// 文件作用：以原生管道、进程树和有界捕获实现可续读 shell 进程，不改变阻塞 maiRunProcess。
+// 文件作用：以原生管道或 PTY、进程树和有界捕获实现可续读命令，不改变阻塞 maiRunProcess。
 #include "MaiShellSessionManager.h"
 
 #include <algorithm>
@@ -6,8 +6,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <random>
+#include <set>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -30,8 +33,10 @@
 #else
 #include <cerrno>
 #include <fcntl.h>
+#include <cstdlib>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -58,6 +63,9 @@ struct ShellSession {
     bool startupChecked = false;
     bool started = false;
     bool done = false;
+    // 前台完成可先返回；done 仍只在 worker 释放整组资源后成立，供额度和回收判断。
+    bool foregroundCompleted = false;
+    bool backgroundRunning = false;
     bool timedOut = false;
     bool terminated = false;
     bool stdinClosed = false;
@@ -115,7 +123,8 @@ void startup(ShellSession& session, const MaiError& error = {}) {
 void finish(ShellSession& session, std::optional<int> exitCode, const MaiError& error = {}) {
     std::lock_guard<std::mutex> lock(session.mutex);
     if (error) session.error = error;
-    session.exitCode = exitCode;
+    if (!session.foregroundCompleted) session.exitCode = exitCode;
+    session.backgroundRunning = false;
     session.done = true;
     session.stdinClosed = true;
     session.input.clear();
@@ -132,6 +141,7 @@ std::string takeInput(ShellSession& session, std::size_t limit) {
 
 bool mustStop(ShellSession& session, const Clock::time_point& deadline) {
     if (session.stop.load() || session.cancel.load()) return true;
+    if (session.options.timeoutMs == 0) return false;
     if (Clock::now() < deadline) return false;
     std::lock_guard<std::mutex> lock(session.mutex);
     session.timedOut = true;
@@ -164,12 +174,110 @@ void closeHandle(HANDLE& handle) {
     handle = nullptr;
 }
 
+// Job 的 ActiveProcesses/PID 列表会先于进程对象变为 signaled 而清空；终止前必须保留句柄。
+// 参考 Microsoft TerminateJobObject/TerminateProcess 契约及 Chromium base/process/kill_win.cc。
+// 仅打开本 Job 查询出的进程，并再核对成员身份，不能把已复用 PID 的其他进程纳入清理。
+bool captureJobProcesses(HANDLE job, std::vector<HANDLE>& processes) {
+    std::set<ULONG_PTR> captured;
+    std::size_t capacity = 16;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        std::vector<ULONG_PTR> storage(capacity + 2);
+        auto* list = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(storage.data());
+        const auto bytes = storage.size() * sizeof(ULONG_PTR);
+        if (bytes > std::numeric_limits<DWORD>::max()) return false;
+        const bool complete =
+            ::QueryInformationJobObject(job, JobObjectBasicProcessIdList, list,
+                                        static_cast<DWORD>(bytes), nullptr) != FALSE;
+        if (!complete && ::GetLastError() != ERROR_MORE_DATA) return false;
+        for (DWORD index = 0; index < list->NumberOfProcessIdsInList; ++index) {
+            const auto id = list->ProcessIdList[index];
+            if (!captured.insert(id).second) continue;
+            HANDLE process = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                           static_cast<DWORD>(id));
+            if (!process) {
+                // 已彻底退出的对象可能不再可打开；其他失败则不能宣称已核实完整进程边界。
+                if (::GetLastError() == ERROR_INVALID_PARAMETER) continue;
+                return false;
+            }
+            BOOL belongs = FALSE;
+            if (!::IsProcessInJob(process, job, &belongs)) {
+                closeHandle(process);
+                return false;
+            }
+            if (belongs)
+                processes.push_back(process);
+            else
+                closeHandle(process);
+        }
+        if (complete) return true;
+        capacity =
+            std::max(capacity * 2, static_cast<std::size_t>(list->NumberOfAssignedProcesses));
+    }
+    return false;
+}
+
+using CreatePseudoConsoleFunction = HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HANDLE*);
+using ClosePseudoConsoleFunction = void(WINAPI*)(HANDLE);
+
+// ClosePseudoConsole 可能等待终端输出被消费；不能在唯一读取线程上同步调用它。
+// 关闭线程只拥有伪终端句柄，原 worker 同时继续有界采集，Job 仍负责整棵用户进程树。
+void closePseudoConsole(HANDLE& console, ClosePseudoConsoleFunction closeConsole, HANDLE& output,
+                        ShellSession& session) {
+    if (!console || !closeConsole) return;
+    const HANDLE closing = std::exchange(console, nullptr);
+    std::atomic<bool> closed{false};
+    std::thread closer;
+    try {
+        closer = std::thread([&] {
+            closeConsole(closing);
+            closed.store(true);
+        });
+    } catch (...) {
+        // 无法创建关闭线程时先断开输出读端，使终端写入立即失败，不能留下同步死锁。
+        closeHandle(output);
+        closeConsole(closing);
+        std::lock_guard<std::mutex> lock(session.mutex);
+        if (!session.error)
+            session.error = {MaiErrorCode::Internal, "cannot drain terminal during closure"};
+        return;
+    }
+    while (!closed.load()) {
+        DWORD available = 0, got = 0;
+        char buffer[16384];
+        if (output && ::PeekNamedPipe(output, nullptr, 0, nullptr, &available, nullptr) &&
+            available &&
+            ::ReadFile(output, buffer, std::min<DWORD>(available, sizeof(buffer)), &got, nullptr) &&
+            got) {
+            try {
+                appendOutput(session, buffer, got);
+            } catch (...) {
+                // 异常收尾仍须释放输出背压和关闭线程；外层保持已有 worker 错误事实。
+                closeHandle(output);
+                std::lock_guard<std::mutex> lock(session.mutex);
+                if (!session.error)
+                    session.error = {MaiErrorCode::Internal, "cannot capture terminal output"};
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+        }
+    }
+    closer.join();
+}
+
 void runNative(ShellSession& session) {
     HANDLE outputRead = nullptr, outputWrite = nullptr, inputWrite = INVALID_HANDLE_VALUE,
-           inputRead = INVALID_HANDLE_VALUE, job = nullptr;
+           inputRead = INVALID_HANDLE_VALUE, job = nullptr, console = nullptr;
+    const auto kernel = ::GetModuleHandleW(L"kernel32.dll");
+    const auto createConsole = reinterpret_cast<CreatePseudoConsoleFunction>(
+        ::GetProcAddress(kernel, "CreatePseudoConsole"));
+    const auto closeConsole = reinterpret_cast<ClosePseudoConsoleFunction>(
+        ::GetProcAddress(kernel, "ClosePseudoConsole"));
     PROCESS_INFORMATION process{};
     SECURITY_ATTRIBUTES inherit{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     const auto cleanup = [&] {
+        // 清理异常或启动失败路径也先关 Job；ConPTY 的关闭不能替代进程树所有权。
+        if (job) ::TerminateJobObject(job, 1);
+        closePseudoConsole(console, closeConsole, outputRead, session);
         closeHandle(inputRead);
         closeHandle(inputWrite);
         closeHandle(outputRead);
@@ -179,6 +287,12 @@ void runNative(ShellSession& session) {
         closeHandle(job);
     };
     NativeCleanup nativeCleanup(cleanup);
+    if (session.options.tty && (!createConsole || !closeConsole)) {
+        const MaiError error{MaiErrorCode::NotSupported, "Windows ConPTY is unavailable"};
+        startup(session, error);
+        finish(session, {}, error);
+        return;
+    }
     const auto fail = [&](const char* message) {
         const MaiError error{MaiErrorCode::Internal, message};
         startup(session, error);
@@ -186,7 +300,9 @@ void runNative(ShellSession& session) {
         cleanup();
     };
     // stdin 使用 overlapped 命名管道；不读 stdin 的子进程不能卡住取消或超时线程。
-    const auto pipeName = MaiFilePath::fromUtf8("\\\\.\\pipe\\MaiShell-" + session.id).value();
+    // 公共十进制 ID 只在当前 manager 内唯一；命名管道另用不透明唯一值，避免实例间碰撞。
+    const auto pipeName =
+        MaiFilePath::fromUtf8("\\\\.\\pipe\\MaiShell-" + MaiIdGenerator::generate("pipe_")).value();
     inputWrite = ::CreateNamedPipeW(
         pipeName.c_str(),
         PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
@@ -211,12 +327,26 @@ void runNative(ShellSession& session) {
         fail("cannot create shell output pipe");
         return;
     }
+    if (session.options.tty &&
+        FAILED(createConsole(COORD{120, 30}, inputRead, outputWrite, 0, &console))) {
+        const MaiError error{MaiErrorCode::NotSupported, "cannot create Windows ConPTY"};
+        startup(session, error);
+        finish(session, {}, error);
+        return;
+    }
     STARTUPINFOEXW startupInfo{};
     startupInfo.StartupInfo.cb = sizeof(startupInfo);
+    // ConPTY 也显式选择无效标准句柄，由控制台绑定补齐；省略此标志会沿用宿主重定向句柄。
+    // 参考 Codex 所用 portable-pty 的 Windows spawn：STARTF_USESTDHANDLES + INVALID_HANDLE_VALUE。
     startupInfo.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startupInfo.StartupInfo.hStdInput = inputRead;
-    startupInfo.StartupInfo.hStdOutput = outputWrite;
-    startupInfo.StartupInfo.hStdError = outputWrite;
+    startupInfo.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+    startupInfo.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+    startupInfo.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+    if (!session.options.tty) {
+        startupInfo.StartupInfo.hStdInput = inputRead;
+        startupInfo.StartupInfo.hStdOutput = outputWrite;
+        startupInfo.StartupInfo.hStdError = outputWrite;
+    }
     SIZE_T attributeBytes = 0;
     ::InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeBytes);
     std::vector<unsigned char> attributes(attributeBytes);
@@ -227,8 +357,11 @@ void runNative(ShellSession& session) {
         return;
     }
     if (!::UpdateProcThreadAttribute(startupInfo.lpAttributeList, 0,
-                                     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
-                                     sizeof(inherited), nullptr, nullptr)) {
+                                     session.options.tty ? PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+                                                         : PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                     session.options.tty ? console : static_cast<void*>(inherited),
+                                     session.options.tty ? sizeof(console) : sizeof(inherited),
+                                     nullptr, nullptr)) {
         ::DeleteProcThreadAttributeList(startupInfo.lpAttributeList);
         fail("cannot restrict shell handle inheritance");
         return;
@@ -252,13 +385,15 @@ void runNative(ShellSession& session) {
     mutableLine.push_back(0);
     const auto directory = MaiFilePath::fromUtf8(session.options.workdir).value();
     const BOOL created =
-        ::CreateProcessW(application.c_str(), mutableLine.data(), nullptr, nullptr, TRUE,
-                         CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP |
-                             EXTENDED_STARTUPINFO_PRESENT,
+        ::CreateProcessW(application.c_str(), mutableLine.data(), nullptr, nullptr,
+                         session.options.tty ? FALSE : TRUE,
+                         (session.options.tty ? 0 : CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP) |
+                             CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
                          nullptr, directory.c_str(), &startupInfo.StartupInfo, &process);
     ::DeleteProcThreadAttributeList(startupInfo.lpAttributeList);
     closeHandle(inputRead);
     closeHandle(outputWrite);
+    if (!session.options.tty) closeHandle(inputWrite);
     if (!created) {
         fail("could not start shell in the requested working directory");
         return;
@@ -322,7 +457,6 @@ void runNative(ShellSession& session) {
     while (!error) {
         const bool received = drain();
         if (mustStop(session, deadline)) {
-            ::TerminateJobObject(job, 1);
             stopped = true;
             break;
         }
@@ -339,7 +473,7 @@ void runNative(ShellSession& session) {
                 session.stdinClosed = true;
             }
         }
-        if (!pending && writing.hEvent) {
+        if (session.options.tty && !pending && writing.hEvent) {
             if (pendingBytes.empty()) pendingBytes = takeInput(session, 4096);
             if (!pendingBytes.empty()) {
                 ::ResetEvent(writing.hEvent);
@@ -362,7 +496,53 @@ void runNative(ShellSession& session) {
         else
             std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
     }
-    // 普通父进程退出也关闭 Job，后代不能脱离 session 继续持有管道或执行副作用。
+    // 与 pinned Codex 的前台退出状态分离相同：命令结果不应由后台守护进程的寿命决定。
+    // 管道与 ConPTY 正常退出均保留 Job 所有权；终端也留给同一 worker 排空，直到后代结束。
+    // 不开放 breakaway，停止和期限仍进入原有整树终止及 ConPTY 关闭路径。
+    if (!error && !stopped) {
+        DWORD foregroundCode = 0;
+        if (!::GetExitCodeProcess(process.hProcess, &foregroundCode) ||
+            foregroundCode == STILL_ACTIVE) {
+            error = {MaiErrorCode::Internal, "could not confirm shell termination"};
+        } else {
+            drain();
+            bool published = false;
+            for (;;) {
+                if (mustStop(session, deadline)) {
+                    stopped = true;
+                    break;
+                }
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+                if (!::QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                                                 &accounting, sizeof(accounting), nullptr)) {
+                    error = {MaiErrorCode::Internal, "cannot monitor shell background processes"};
+                    break;
+                }
+                if (accounting.ActiveProcesses == 0) break;
+                if (!published) {
+                    std::lock_guard<std::mutex> lock(session.mutex);
+                    session.foregroundCompleted = true;
+                    session.backgroundRunning = true;
+                    // 前台解释器已退出，不能把输入继续排入无人消费的 PTY 队列。
+                    session.stdinClosed = true;
+                    session.input.clear();
+                    session.exitCode = static_cast<int>(foregroundCode);
+                    session.changed.notify_all();
+                    published = true;
+                }
+                // 后台若仍持有输出管道，也沿用有界捕获；不会创建额外线程或借用调用者回调。
+                drain();
+                std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+            }
+        }
+    }
+    // 先固定仍属于本 Job 的进程对象，再触发异步终止；事后枚举会漏掉尚未 signaled 的对象。
+    std::vector<HANDLE> treeProcesses;
+    NativeCleanup treeHandles([&] {
+        for (auto& handle : treeProcesses) closeHandle(handle);
+    });
+    const bool treeCaptured = captureJobProcesses(job, treeProcesses);
+    // 此处仅处理已无后台成员的正常退出，或取消、期限和失败路径的整树终止。
     ::TerminateJobObject(job, 1);
     ::WaitForSingleObject(process.hProcess, 2000);
     if (pending) {
@@ -372,7 +552,8 @@ void runNative(ShellSession& session) {
         pending = false;
     }
     closeHandle(writing.hEvent);
-    // 父进程退出不等于 Job 后代退出；在宣告 completed 前确认整棵树已清空。
+    closePseudoConsole(console, closeConsole, outputRead, session);
+    // 前台可能早已完成；done 和终止调用仍必须等到整棵树已清空。
     bool treeStopped = false;
     const auto treeDeadline = Clock::now() + std::chrono::seconds(2);
     do {
@@ -385,7 +566,16 @@ void runNative(ShellSession& session) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
     } while (Clock::now() < treeDeadline);
-    if (!treeStopped && !error)
+    // ConPTY 输出已经抽干，进程异步 I/O 可完成取消；对每个原进程对象等待，而非仅看 Job 计数。
+    for (const auto handle : treeProcesses) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(treeDeadline - Clock::now())
+                .count();
+        if (::WaitForSingleObject(handle, remaining > 0 ? static_cast<DWORD>(remaining) : 0) !=
+            WAIT_OBJECT_0)
+            treeStopped = false;
+    }
+    if ((!treeCaptured || !treeStopped) && !error)
         error = {MaiErrorCode::Internal, "could not confirm shell process-tree termination"};
     // 子孙已终止，抽干有限的剩余管道字节。
     for (;;) {
@@ -440,12 +630,49 @@ void runNative(ShellSession& session) {
         closePair(input);
         closePair(launch);
     };
-    if (::pipe(output) || ::pipe(input) || ::pipe(launch)) {
+    if (session.options.tty) {
+        // master/slave 分别打开；父端副本共享非阻塞 master，绝不把非阻塞状态施加到 slave。
+        // 不依赖 libutil/openpty；fork 前完成路径和授权处理，子进程只做原生会话/句柄绑定。
+        output[0] = ::posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+        char name[1024]{};
+        bool named = false;
+        if (output[0] >= 0 && ::grantpt(output[0]) == 0 && ::unlockpt(output[0]) == 0) {
+#if defined(__APPLE__)
+            named = ::ioctl(output[0], TIOCPTYGNAME, name) == 0;
+#else
+            named = ::ptsname_r(output[0], name, sizeof(name)) == 0;
+#endif
+        }
+        if (named) {
+            output[1] = ::open(name, O_RDWR | O_NOCTTY | O_CLOEXEC);
+            input[1] = ::dup(output[0]);
+            // 与 ConPTY 一致的固定初始尺寸；普通输入沿用已有 API，本次不引入 resize 协议。
+            struct winsize size{};
+            size.ws_col = 120;
+            size.ws_row = 30;
+            named = ::ioctl(output[0], TIOCSWINSZ, &size) == 0;
+        }
+        if (!named || output[1] < 0 || input[1] < 0) {
+            const MaiError error{MaiErrorCode::NotSupported, "native PTY is unavailable"};
+            startup(session, error);
+            finish(session, {}, error);
+            return;
+        }
+    }
+    if ((!session.options.tty && (::pipe(output) || ::pipe(input))) || ::pipe(launch)) {
         fail("cannot create shell pipes");
         return;
     }
+#if defined(__APPLE__) && defined(F_SETNOSIGPIPE)
+    // 独立宿主可能仍把 SIGPIPE 设为默认动作；Darwin 通过 fd 级抑制让闭管道只返回 EPIPE，
+    // 不依赖 Qt 的进程级策略，也不修改宿主全局 signal handler。
+    if (::fcntl(input[1], F_SETNOSIGPIPE, 1) < 0) {
+        fail("cannot protect shell stdin from SIGPIPE");
+        return;
+    }
+#endif
     for (int fd : {output[0], output[1], input[0], input[1], launch[0], launch[1]})
-        ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+        if (fd >= 0) ::fcntl(fd, F_SETFD, FD_CLOEXEC);
     // argv 和字符串全部在 fork 之前准备，子进程只调用 async-signal-safe 的系统入口。
     std::vector<char*> argv;
     argv.reserve(session.arguments.size() + 1);
@@ -457,9 +684,13 @@ void runNative(ShellSession& session) {
         return;
     }
     if (pid == 0) {
-        if (::setpgid(0, 0) != 0 || ::chdir(session.options.workdir.c_str()) != 0 ||
-            ::dup2(input[0], STDIN_FILENO) < 0 || ::dup2(output[1], STDOUT_FILENO) < 0 ||
-            ::dup2(output[1], STDERR_FILENO) < 0) {
+        // setsid 必须在尚非进程组首领时调用；PTY 分支禁止再执行父/子 setpgid。
+        const bool groupFailed = session.options.tty
+                                     ? (::setsid() < 0 || ::ioctl(output[1], TIOCSCTTY, 0) < 0)
+                                     : ::setpgid(0, 0) != 0;
+        if (groupFailed || ::chdir(session.options.workdir.c_str()) != 0 ||
+            ::dup2(session.options.tty ? output[1] : input[0], STDIN_FILENO) < 0 ||
+            ::dup2(output[1], STDOUT_FILENO) < 0 || ::dup2(output[1], STDERR_FILENO) < 0) {
             const int cause = errno;
             const auto ignored = ::write(launch[1], &cause, sizeof(cause));
             (void)ignored;
@@ -473,11 +704,15 @@ void runNative(ShellSession& session) {
         ::_exit(127);
     }
     child = pid;
-    ::setpgid(pid, pid);
+    if (!session.options.tty) ::setpgid(pid, pid);
     ::close(output[1]);
     output[1] = -1;
     ::close(input[0]);
     input[0] = -1;
+    if (!session.options.tty) {
+        ::close(input[1]);
+        input[1] = -1;
+    }
     ::close(launch[1]);
     launch[1] = -1;
     int cause = 0;
@@ -495,11 +730,12 @@ void runNative(ShellSession& session) {
         return;
     }
     ::fcntl(output[0], F_SETFL, ::fcntl(output[0], F_GETFL, 0) | O_NONBLOCK);
-    ::fcntl(input[1], F_SETFL, ::fcntl(input[1], F_GETFL, 0) | O_NONBLOCK);
+    if (input[1] >= 0) ::fcntl(input[1], F_SETFL, ::fcntl(input[1], F_GETFL, 0) | O_NONBLOCK);
     // 仅本 worker 屏蔽 SIGPIPE；写入已退出进程不能终止宿主，也不修改全局 signal handler。
     sigset_t blocked, previous;
-    ::sigemptyset(&blocked);
-    ::sigaddset(&blocked, SIGPIPE);
+    // macOS SDK 将这两项定义为函数式宏，不能加 ::；POSIX 函数形式也兼容此写法。
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGPIPE);
     ::pthread_sigmask(SIG_BLOCK, &blocked, &previous);
     startup(session);
     const auto deadline = Clock::now() + std::chrono::milliseconds(session.options.timeoutMs);
@@ -539,7 +775,7 @@ void runNative(ShellSession& session) {
         }
         if (stopping && Clock::now() - killedAt >= std::chrono::milliseconds(250))
             ::kill(-pid, SIGKILL);
-        if (!stopping) {
+        if (!stopping && session.options.tty) {
             if (pending.empty()) pending = takeInput(session, 4096);
             if (!pending.empty()) {
                 const auto written = ::write(input[1], pending.data(), pending.size());
@@ -583,6 +819,12 @@ void joinSession(const std::shared_ptr<ShellSession>& session) {
 struct MaiShellSessionManager::Impl {
     std::mutex mutex;
     std::map<std::string, std::shared_ptr<ShellSession>> sessions;
+    // 参考 pinned Codex 的生产随机 ID，降低 manager 重建后旧显示句柄误命中新进程的概率。
+    // 覆盖完整正 i32 空间；这不是鉴权秘密。所有已分配值保留到析构，回收记录不回收 ID。
+    std::mt19937 random{std::random_device{}()};
+    std::uniform_int_distribution<std::int32_t> idDistribution{
+        1, std::numeric_limits<std::int32_t>::max()};
+    std::set<std::int32_t> allocatedIds;
 };
 
 MaiShellSessionManager::MaiShellSessionManager() : mImpl(std::make_unique<Impl>()) {}
@@ -599,8 +841,8 @@ MaiResult<std::string> MaiShellSessionManager::start(const std::string& owner,
     if (owner.empty() || owner.size() > 256 || owner.find('\0') != std::string::npos ||
         options.command.empty() || options.command.size() > 64 * 1024 ||
         options.command.find('\0') != std::string::npos || options.workdir.empty() ||
-        options.workdir.find('\0') != std::string::npos || options.timeoutMs < 1000 ||
-        options.timeoutMs > 600000 ||
+        options.workdir.find('\0') != std::string::npos ||
+        (options.timeoutMs != 0 && options.timeoutMs < 1000) || options.timeoutMs > 600000 ||
         !MaiFileSystem::isDirectory(MaiFilePath::fromUtf8(options.workdir)))
         return {MaiErrorCode::InvalidInput, "invalid shell command, working directory or timeout"};
     if (isCanceled && isCanceled())
@@ -608,9 +850,9 @@ MaiResult<std::string> MaiShellSessionManager::start(const std::string& owner,
     const auto environment = maiResolveShellEnvironment(options.shell);
     if (!environment) return environment.error();
     auto session = std::make_shared<ShellSession>();
-    session->id = MaiIdGenerator::generate("shell_");
     session->owner = owner;
     session->options = options;
+    session->stdinClosed = !options.tty;
     session->environment = environment.value();
     const auto prepared = maiShellStartupCommand(environment.value(), options.command,
                                                  options.login, options.workdir);
@@ -638,6 +880,14 @@ MaiResult<std::string> MaiShellSessionManager::start(const std::string& owner,
                     ++item;
             }
         }
+        if (mImpl->allocatedIds.size() >=
+            static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
+            return {MaiErrorCode::Busy, "shell session identifier space is exhausted"};
+        std::int32_t id = 0;
+        do {
+            id = mImpl->idDistribution(mImpl->random);
+        } while (!mImpl->allocatedIds.insert(id).second);
+        session->id = std::to_string(id);
         mImpl->sessions.emplace(session->id, session);
         session->worker = std::thread([session] {
             MaiThread::setCurrentName("MaiShellSession");
@@ -664,7 +914,7 @@ MaiResult<MaiShellSessionSnapshot> MaiShellSessionManager::interact(
     const std::string& owner, const std::string& sessionId, const std::string& chars, int yieldMs,
     bool terminate, const std::function<bool()>& isCanceled, bool waitForCompletion) {
     maiAssertBlockingAllowed("MaiShellSessionManager::interact");
-    const int maximumYieldMs = !waitForCompletion && chars.empty() && !terminate ? 300000 : 30000;
+    const int maximumYieldMs = chars.empty() && !terminate ? 300000 : 30000;
     if (yieldMs < 0 || yieldMs > maximumYieldMs || chars.size() > kStdinBytes ||
         (terminate && !chars.empty()))
         return {MaiErrorCode::InvalidInput, "invalid stdin, terminate combination or yield time"};
@@ -692,12 +942,21 @@ MaiResult<MaiShellSessionSnapshot> MaiShellSessionManager::interact(
         std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
     }
     std::unique_lock<std::mutex> state(session->mutex);
+    const bool pipeInterrupt = !session->options.tty && chars == std::string(1, '\x03');
     if (!chars.empty() && !canceledBeforeInput) {
-        if (session->done || session->stdinClosed)
+        if (pipeInterrupt) {
+            // 与原生终端控制分开：关闭的管道没有可写句柄，只请求已有所有权边界内的终止。
+            if (!session->done) {
+                session->terminated = true;
+                session->stop.store(true);
+            }
+        } else if (session->done || session->stdinClosed) {
             return {MaiErrorCode::InvalidInput, "shell stdin is closed"};
-        if (chars.size() > kStdinBytes - session->input.size())
+        } else if (chars.size() > kStdinBytes - session->input.size()) {
             return {MaiErrorCode::Busy, "shell stdin queue is full"};
-        session->input += chars;
+        } else {
+            session->input += chars;
+        }
     }
     if (terminate && !session->done) {
         session->terminated = true;
@@ -712,8 +971,11 @@ MaiResult<MaiShellSessionSnapshot> MaiShellSessionManager::interact(
                 deadline = Clock::now() + std::chrono::seconds(3);
             }
         }
-        if (session->done || Clock::now() >= deadline ||
-            (!waitForCompletion && !terminate && !cancellationSeen &&
+        const bool stopping = terminate || pipeInterrupt || cancellationSeen ||
+                              session->stop.load() || session->cancel.load();
+        if (session->done || (!stopping && session->foregroundCompleted) ||
+            Clock::now() >= deadline ||
+            (!waitForCompletion && !terminate && !pipeInterrupt && !cancellationSeen &&
              session->total > session->cursor))
             break;
         session->changed.wait_for(state, std::chrono::milliseconds(kPollMs));
@@ -721,7 +983,8 @@ MaiResult<MaiShellSessionSnapshot> MaiShellSessionManager::interact(
     MaiShellSessionSnapshot result;
     result.sessionId = session->id;
     result.started = session->started;
-    result.completed = session->done;
+    result.completed = session->foregroundCompleted || session->done;
+    result.backgroundRunning = session->backgroundRunning;
     result.timedOut = session->timedOut;
     result.canceled = session->cancel.load();
     result.terminated = session->terminated;
@@ -764,6 +1027,7 @@ MaiResult<MaiShellSessionSnapshot> MaiShellSessionManager::interact(
     result.shellName = session->environment.name;
     result.shellPath = session->environment.path;
     result.login = session->options.login;
+    result.tty = session->started && session->options.tty;
     if (session->done && !result.hasMoreOutput) {
         session->capture.clear();
         session->capture.shrink_to_fit();

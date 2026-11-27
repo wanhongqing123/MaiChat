@@ -3,9 +3,12 @@
 
 #include "MaiCloudDriveClient.h"
 #include "MaiCloudModelCatalog.h"
+#include "MaiSessionRecordCodec.h"
+#include "agent/AgentContextUsagePresentation.h"
 
 #include <QDateTime>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QEvent>
 #include <QDesktopServices>
 #include <QDir>
@@ -33,6 +36,7 @@
 #include <QPixmap>
 #include <QPointer>
 #include <QPushButton>
+#include <QProgressBar>
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringList>
@@ -113,13 +117,14 @@ QString sessionKey(const QJsonObject& value) {
 }
 
 const QStringList& sessionModelChoices() {
-    static const QStringList models{QStringLiteral("glm-5.3"),
+    static const QStringList models{QStringLiteral("glm-5.4"),
                                     QStringLiteral("glm-5.3-flash"),
                                     QStringLiteral("deepseek-flash"),
                                     QStringLiteral("deepseek-v4-pro"),
                                     QStringLiteral("anthropic/claude-fable-5.2"),
                                     QStringLiteral("anthropic/claude-opus-5.5"),
-                                    QStringLiteral("particle-ai/particle-1:free")};
+                                    QStringLiteral("particle-ai/particle-1:free"),
+                                    QStringLiteral("gpt-6.1-sol")};
     return models;
 }
 
@@ -352,7 +357,7 @@ public:
         fields->setContentsMargins(UiZoom::s(9), UiZoom::s(7), UiZoom::s(9), UiZoom::s(7));
         fields->setSpacing(UiZoom::s(5));
         body_->setObjectName(QStringLiteral("remoteAgentToolFields"));
-        body_->setStyleSheet(QStringLiteral("QWidget#remoteAgentToolFields{background:#f7f8fa;border:1px solid #e4e7ec;border-radius:7px;}"));
+        body_->setStyleSheet(QStringLiteral("QWidget#remoteAgentToolFields{background:#f4f6fb;border:1px solid #c9d2e0;border-radius:7px;}"));
         note_ = new QLabel(body_);
         note_->setWordWrap(true);
         UiZoom::setFont(note_, UiZoom::TextRole::Detail, note_->font());
@@ -625,6 +630,15 @@ struct RemoteAgentPanel::Runtime {
     QHash<QString, QString> modelRequestByOwner;
     QString modelStatus;
     QString modelStatusOwner;
+    QLabel* contextSize = nullptr;
+    QProgressBar* contextUsageBar = nullptr;
+    // A scope/login replacement cannot adopt old room-state or command replies.
+    bool contextScopeCurrent = false;
+    bool contextOwnerBusy = false;
+    bool contextRefreshPending = false;
+    bool contextModelChanging = false;
+    QHash<QString, QByteArray> contextCompletedTools;
+    QStringList contextCompletedToolOrder;
     QPushButton* more = nullptr;
     QFrame* actionPanel = nullptr;
     QPushButton* modelSection = nullptr;
@@ -774,6 +788,19 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
     UiZoom::setFont(title, UiZoom::TextRole::Heading3, titleFont);
     title->setAlignment(Qt::AlignCenter);
     headerLayout->addWidget(title, 1);
+    runtime_->contextUsageBar = new QProgressBar(header);
+    runtime_->contextUsageBar->setObjectName(QStringLiteral("remoteAgentContextUsageBar"));
+    runtime_->contextUsageBar->setRange(0, 100);
+    runtime_->contextUsageBar->setTextVisible(false);
+    runtime_->contextUsageBar->setFixedSize(UiZoom::s(70), UiZoom::s(5));
+    runtime_->contextUsageBar->hide();
+    headerLayout->addWidget(runtime_->contextUsageBar);
+    runtime_->contextSize = new QLabel(header);
+    runtime_->contextSize->setObjectName(QStringLiteral("remoteAgentContextSize"));
+    UiZoom::setFont(runtime_->contextSize, UiZoom::TextRole::Metadata, runtime_->contextSize->font());
+    runtime_->contextSize->setStyleSheet(QStringLiteral("color:#667085;"));
+    runtime_->contextSize->hide();
+    headerLayout->addWidget(runtime_->contextSize);
     runtime_->more = new QPushButton(QStringLiteral("⋯"), header);
     runtime_->more->setObjectName(QStringLiteral("remoteAgentMoreActions"));
     runtime_->more->setAccessibleName(QStringLiteral("更多"));
@@ -839,6 +866,7 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
     modelOptionsLayout->setSpacing(0);
     for (const auto& model : sessionModelChoices()) {
         const QString title =
+            model == QStringLiteral("gpt-6.1-sol") ? QStringLiteral("GPT-6.1 Sol") :
             model == QStringLiteral("particle-ai/particle-1:free") ? QStringLiteral("Particle-1（免费）") : model;
         auto* option = new QPushButton(title, runtime_->modelOptions);
         if (model == QStringLiteral("particle-ai/particle-1:free"))
@@ -1093,6 +1121,11 @@ void RemoteAgentPanel::setCommandHandler(CommandHandler handler) {
     // A replacement transport may represent another authenticated connection.
     // Outstanding reads must not be adopted by its eventual receipts.
     invalidateToolDetailRequests(true);
+    runtime_->modelRequests.clear();
+    runtime_->modelRequestByOwner.clear();
+    runtime_->contextModelChanging = false;
+    runtime_->contextRefreshPending = false;
+    updateContextUsage();
     runtime_->command = std::move(handler);
     requestSessionModel();
 }
@@ -1101,6 +1134,14 @@ void RemoteAgentPanel::setToolDetailScope(const QString& accountId, quint64 gene
     runtime_->detailAccount = accountId;
     runtime_->detailAccountGeneration = generation;
     invalidateToolDetailRequests(true);
+    runtime_->contextScopeCurrent = false;
+    runtime_->contextRefreshPending = false;
+    runtime_->contextModelChanging = false;
+    runtime_->modelRequests.clear();
+    runtime_->modelRequestByOwner.clear();
+    runtime_->modelConfigurations.clear();
+    runtime_->modelConfigurationOrder.clear();
+    updateContextUsage();
 }
 
 void RemoteAgentPanel::invalidateToolDetailRequests(bool clearCache) {
@@ -1409,6 +1450,7 @@ void RemoteAgentPanel::updateSessionModelControls() {
     const auto capability = maiCloudModelInfo(model.toUtf8().toStdString());
     const bool effortAvailable = available && capability && capability->supportsReasoningEffort;
     runtime_->modelValue->setText(model.isEmpty() ? pending ? QStringLiteral("正在读取") : QStringLiteral("未确认")
+                                  : model == QStringLiteral("gpt-6.1-sol") ? QStringLiteral("GPT-6.1 Sol")
                                   : model == QStringLiteral("particle-ai/particle-1:free")
                                       ? QStringLiteral("Particle-1（免费）")
                                       : model);
@@ -1431,6 +1473,56 @@ void RemoteAgentPanel::updateSessionModelControls() {
         option->setChecked(value == effort);
         option->setEnabled(effortAvailable);
     }
+}
+
+void RemoteAgentPanel::updateContextUsage(const QJsonObject& payload) {
+    MaiModelContextUsage usage;
+    const auto value = payload.value(QStringLiteral("contextUsage"));
+    if (runtime_->contextScopeCurrent && !runtime_->contextModelChanging && value.isString()) {
+        const auto source = value.toString().toUtf8();
+        if (!source.isEmpty() && source.size() <= 16 * 1024) {
+            const auto decoded = MaiSessionRecordCodec::decodeContextUsage(source.toStdString());
+            if (decoded) usage = decoded.value();
+        }
+    }
+    const auto model = runtime_->modelConfigurations.value(sessionKey(runtime_->session)).value
+                           .value(QStringLiteral("model")).toString();
+    // A late snapshot from the previous model cannot restore its occupancy
+    // after the owner acknowledged a new configuration. Accumulators survive.
+    if (!model.isEmpty() && QString::fromStdString(usage.model) != model) usage.samplingValid = false;
+    const auto presentation = presentAgentContextUsage(usage);
+    runtime_->contextSize->setText(presentation.text);
+    runtime_->contextSize->setToolTip(presentation.detail);
+    runtime_->contextSize->setVisible(!runtime_->session.isEmpty());
+    runtime_->contextUsageBar->setToolTip(presentation.detail);
+    if (presentation.usedPercent) {
+        const auto percent = *presentation.usedPercent;
+        const auto tone = percent >= 90 ? QStringLiteral("#dc2626")
+                          : percent >= 70 ? QStringLiteral("#d97706") : QStringLiteral("#2563eb");
+        runtime_->contextUsageBar->setStyleSheet(
+            QStringLiteral("QProgressBar{background:#e5e9f0;border:0;border-radius:2px;}"
+                           "QProgressBar::chunk{background:%1;border-radius:2px;}").arg(tone));
+        runtime_->contextUsageBar->setValue(percent);
+        runtime_->contextUsageBar->show();
+    } else {
+        runtime_->contextUsageBar->hide();
+    }
+}
+
+void RemoteAgentPanel::observeOwnerBusy(bool busy) {
+    const bool finished = runtime_->contextOwnerBusy && !busy;
+    runtime_->contextOwnerBusy = busy;
+    if (!finished) return;
+    // One authoritative read per observed completion covers old transports
+    // which do not yet forward usage room-state. Never poll while idle.
+    requestContextRefresh();
+}
+
+void RemoteAgentPanel::requestContextRefresh() {
+    if (!runtime_->contextScopeCurrent) return;
+    const auto key = sessionKey(runtime_->session);
+    if (runtime_->modelRequestByOwner.contains(key)) runtime_->contextRefreshPending = true;
+    else requestSessionModel();
 }
 
 void RemoteAgentPanel::invalidateReplacedModelOwner(const QJsonObject& owner) {
@@ -1474,6 +1566,10 @@ void RemoteAgentPanel::sendSessionModelCommand(const QJsonObject& requested) {
     command.insert(QStringLiteral("requestId"), requestId);
     runtime_->modelRequests.insert(requestId, {owner, command});
     runtime_->modelRequestByOwner.insert(key, requestId);
+    if (changing) {
+        runtime_->contextModelChanging = true;
+        updateContextUsage();
+    }
     updateSessionModelControls();
     QPointer<RemoteAgentPanel> guard(this);
     const auto fail = [guard, key, requestId, changing](const QString& error) {
@@ -1487,9 +1583,17 @@ void RemoteAgentPanel::sendSessionModelCommand(const QJsonObject& requested) {
         if (changing) {
             guard->runtime_->modelConfigurations.remove(key);
             guard->runtime_->modelConfigurationOrder.removeAll(key);
+            if (sessionKey(guard->runtime_->session) == key) {
+                guard->runtime_->contextModelChanging = false;
+                guard->updateContextUsage();
+            }
         }
         guard->updateSessionModelControls();
         guard->showSessionModelFailure(key, error);
+        if (sessionKey(guard->runtime_->session) == key && guard->runtime_->contextRefreshPending) {
+            guard->runtime_->contextRefreshPending = false;
+            guard->requestSessionModel();
+        }
     };
     QTimer::singleShot(30'000, this, [fail] { fail(QStringLiteral("所属设备未确认会话模型，请重新读取后重试")); });
     runtime_->command(owner, command, [fail](const QString& error) { if (!error.isEmpty()) fail(error); });
@@ -1541,17 +1645,25 @@ bool RemoteAgentPanel::receiveSessionModelResult(const QJsonObject& owner, const
         while (runtime_->modelConfigurationOrder.size() > 128)
             runtime_->modelConfigurations.remove(runtime_->modelConfigurationOrder.takeFirst());
         if (sessionKey(runtime_->session) == key) {
+            runtime_->contextModelChanging = false;
+            updateContextUsage(result);
             if (runtime_->modelStatusOwner == key && !runtime_->modelStatus.isEmpty())
                 showStatus({});
             runtime_->modelStatus.clear();
             runtime_->modelStatusOwner.clear();
         }
     } else if (sessionKey(runtime_->session) == key) {
+        runtime_->contextModelChanging = false;
+        updateContextUsage();
         showSessionModelFailure(key, result.value(QStringLiteral("error")).toString());
     }
     runtime_->modelRequests.remove(id);
     runtime_->modelRequestByOwner.remove(key);
     updateSessionModelControls();
+    if (sessionKey(runtime_->session) == key && runtime_->contextRefreshPending) {
+        runtime_->contextRefreshPending = false;
+        requestSessionModel();
+    }
     return true;
 }
 
@@ -1567,6 +1679,11 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
     const QString previous = sessionKey(runtime_->session);
     const QString next = sessionKey(remote);
     if (previous != next) {
+        runtime_->contextModelChanging = false;
+        runtime_->contextRefreshPending = false;
+        runtime_->contextOwnerBusy = remote.value(QStringLiteral("busy")).toBool();
+        runtime_->contextCompletedTools.clear();
+        runtime_->contextCompletedToolOrder.clear();
         invalidateToolDetailRequests(true);
         runtime_->actionPanel->hide();
         runtime_->modelOptions->hide();
@@ -1611,6 +1728,10 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
         runtime_->observedBusy = false;
     }
     runtime_->session = remote;
+    runtime_->contextScopeCurrent = true;
+    const auto pendingModel = runtime_->modelRequests.value(runtime_->modelRequestByOwner.value(next));
+    runtime_->contextModelChanging = pendingModel.command.value(QStringLiteral("action")) == QStringLiteral("set_model");
+    if (previous != next) updateContextUsage();
     invalidateReplacedModelOwner(remote);
     runtime_->owners.insert(next, remote);
     dispatchQueued();
@@ -1630,6 +1751,9 @@ void RemoteAgentPanel::updateSession(const QJsonObject& remote) {
     runtime_->owners.insert(sessionKey(remote), remote);
     if (sessionKey(remote) != sessionKey(runtime_->session)) {
         if (sameModelRoom(remote, runtime_->session)) {
+            runtime_->contextScopeCurrent = false;
+            runtime_->contextRefreshPending = false;
+            updateContextUsage();
             invalidateToolDetailRequests(false);
             runtime_->session.insert(QStringLiteral("online"), false);
             refreshToolDetailViews();
@@ -1644,6 +1768,7 @@ void RemoteAgentPanel::updateSession(const QJsonObject& remote) {
     runtime_->owners.insert(sessionKey(remote), remote);
     refreshToolDetailViews();
     updateControls();
+    observeOwnerBusy(remote.value(QStringLiteral("busy")).toBool());
     if (remote.value(QStringLiteral("busy")).toBool() && runtime_->awaitingResponse) runtime_->observedBusy = true;
     if (!remote.value(QStringLiteral("busy")).toBool() && runtime_->observedBusy) {
         runtime_->awaitingResponse = false;
@@ -2269,7 +2394,16 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
                        true);
         return;
     }
+    // Existing room-history services omit new owner metadata. Such a page
+    // cannot erase an authoritative get_session reply that arrived first.
+    // Selection, scope changes and an owner reply without usage clear it.
+    if (payload.contains(QStringLiteral("contextUsage")))
+        updateContextUsage(payload);
+    const auto busy = payload.value(QStringLiteral("busy"));
+    const bool ownerFinished = busy.isBool() && runtime_->contextOwnerBusy && !busy.toBool();
+    if (busy.isBool()) runtime_->contextOwnerBusy = busy.toBool();
     const QJsonArray received = payload.value(QStringLiteral("messages")).toArray();
+    bool completedToolBatch = false;
     if (payload.contains(QStringLiteral("questions")))
         runtime_->questions = payload.value(QStringLiteral("questions")).toArray();
     if (payload.contains(QStringLiteral("questionMessages"))) {
@@ -2286,10 +2420,17 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
         const QString sourceId = message.value(QStringLiteral("source_message_id")).toString(id);
         QJsonArray parts = message.value(QStringLiteral("parts")).toArray();
         QSet<QString> presentTools;
+        QByteArray completedTools;
         for (int index = 0; index < parts.size(); ++index) {
             const QJsonObject part = parts[index].toObject();
             const QString partId = part.value(QStringLiteral("id")).toString();
             if (part.value(QStringLiteral("kind")) != QStringLiteral("tool") || partId.isEmpty()) continue;
+            const auto state = part.value(QStringLiteral("state")).toString();
+            if (state == QStringLiteral("completed") || state == QStringLiteral("error") ||
+                state == QStringLiteral("canceled")) {
+                completedTools += QJsonDocument(QJsonArray{partId, part.value(QStringLiteral("callId")), state})
+                                      .toJson(QJsonDocument::Compact);
+            }
             const QString key = sourceId + QChar(0x1f) + partId;
             presentTools.insert(key);
             if (kind == QStringLiteral("history_page")) {
@@ -2305,6 +2446,19 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
             for (auto it = protectedTools.cbegin(); it != protectedTools.cend(); ++it)
                 if (it->messageId == sourceId && !presentTools.contains(it.key())) parts.append(it->part);
         message.insert(QStringLiteral("parts"), parts);
+        if (!completedTools.isEmpty()) {
+            const auto fingerprint = QCryptographicHash::hash(completedTools, QCryptographicHash::Sha256);
+            if (runtime_->contextCompletedTools.value(sourceId) != fingerprint) {
+                runtime_->contextCompletedTools.insert(sourceId, fingerprint);
+                runtime_->contextCompletedToolOrder.removeAll(sourceId);
+                runtime_->contextCompletedToolOrder.append(sourceId);
+                completedToolBatch |= kind != QStringLiteral("history_page");
+                // One fingerprint per message avoids churning individual tool
+                // IDs when a long shell loop has hundreds of completed parts.
+                while (runtime_->contextCompletedToolOrder.size() > 64)
+                    runtime_->contextCompletedTools.remove(runtime_->contextCompletedToolOrder.takeFirst());
+            }
+        }
         if (!id.isEmpty()) {
             const bool outsideWindow = kind != QStringLiteral("history_page") && !runtime_->messages.contains(id) &&
                                        !runtime_->oldest.isEmpty() && id < runtime_->oldest;
@@ -2342,6 +2496,9 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
     }
     renderMessages();
     renderRequests(payload);
+    // A whole observed tool batch requests one owner read. Repeated snapshots
+    // and text deltas do not request usage, and concurrent batches coalesce.
+    if (completedToolBatch || ownerFinished) requestContextRefresh();
     // A history/event receipt cannot acknowledge a model mutation. Preserve a
     // currently displayed model failure only for this exact owner; a newer
     // prompt status goes through showStatus and supersedes that marker.

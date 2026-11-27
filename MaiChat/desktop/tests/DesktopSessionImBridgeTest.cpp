@@ -293,7 +293,7 @@ class OwnedModel final : public MaiModelClient {
 public:
     explicit OwnedModel(std::shared_ptr<ModelState> state) : state_(std::move(state)) {}
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                     const std::atomic<bool>& canceled) override {
@@ -1962,7 +1962,7 @@ void DesktopSessionImBridgeTest::ordinaryConfigurationChangeKeepsBoundOutput() {
         update.reasoningEffort = before.reasoningEffort == "high" ? "low" : "high";
         QVERIFY(f.controller.agent().submit(update));
     } else {
-        const auto model = before.model == "glm-5.3" ? QStringLiteral("glm-5.3-flash") : QStringLiteral("glm-5.3");
+        const auto model = before.model == "glm-5.4" ? QStringLiteral("glm-5.3-flash") : QStringLiteral("glm-5.4");
         QVERIFY(f.controller.setModel(f.session, model));
     }
     QCoreApplication::processEvents();

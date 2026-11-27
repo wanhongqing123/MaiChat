@@ -182,6 +182,8 @@ ViewerTransition viewerOnSignal(ViewerState current, const Signal& signal) {
             // 对端随时可以叫停；未开始的会话收到 stop 也直接回 Idle。
             if (current != ViewerState::Idle) transition.nextState = ViewerState::Idle;
             break;
+        case Type::Discover:
+        case Type::Device:
         case Type::Notice:
         case Type::Invite:
         case Type::Unknown:

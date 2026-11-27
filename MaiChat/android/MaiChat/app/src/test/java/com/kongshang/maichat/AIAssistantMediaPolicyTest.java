@@ -15,6 +15,7 @@ public class AIAssistantMediaPolicyTest {
     }
 
     @Test public void recognizesVisualModelsAndSupportedImageTypes() {
+        assertTrue(AIAssistantMediaPolicy.supportsImages("glm-5.4"));
         assertFalse(AIAssistantMediaPolicy.supportsImages("glm-5.3"));
         assertTrue(AIAssistantMediaPolicy.supportsImages("glm-5.3-flash"));
         assertTrue(AIAssistantMediaPolicy.isSupportedImageMime("image/png"));

@@ -21,7 +21,7 @@
 class MaiContextBuilder {
 public:
     struct Options {
-        // 默认不回灌历史思考草稿，避免 Chat 与 Responses 的上下文出现差异。
+        // 默认不回灌历史思考草稿，避免把显示文本误当成协议续接状态。
         // 显式启用时才把草稿交给模型。原响应的 opaque continuation 独立保留，
         // 不由此显示文本选项或 maxReasoningBytes 裁剪。
         bool includeReasoning = false;
@@ -47,6 +47,11 @@ public:
     using ToolOutputProjector =
         std::function<std::string(const MaiMessage&, const MaiMessagePart&, const MaiToolPart&)>;
 
+    // 已按输入 ID 固定的用户级上下文，例如显式选择的技能正文。仅添加到对应用户
+    // 请求副本，不改历史正文或提升为系统指令。读取失败必须由调用方在 build 前处理；
+    // 此回调只查已准备好的内存快照，不能在重建期间重新读取变化中的技能文件。
+    using UserContextProjector = std::function<std::string(const MaiMessage&)>;
+
     // firstMessage 为已成功摘要覆盖的源前缀长度，默认 0；firstPart 只跳过其 assistant
     // 稳定片段前缀。preservedUserMessageId 允许把部分 assistant 的当前 user 原文保留在前。
     // 越界/试图裁 user parts 返回空列表。引用仍在完整 history 中解析；未覆盖的图片全部保留。
@@ -61,7 +66,8 @@ public:
                                        const std::string& preservedUserMessageId = {},
                                        bool preserveReasoning = false,
                                        const std::vector<std::string>& currentUserMessageIds = {},
-                                       const ToolOutputProjector& toolOutputProjector = {}) const;
+                                       const ToolOutputProjector& toolOutputProjector = {},
+                                       const UserContextProjector& userContextProjector = {}) const;
 
 private:
     Options mOptions;

@@ -26,12 +26,13 @@
 #include "MaiFfmpegTools.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
-#include "MaiFileTools.h"
+#include "MaiApplyPatchTool.h"
+#include "MaiInProcessShellTool.h"
 #include "MaiGlmMediaTools.h"
 #include "MaiMiniMaxMediaTools.h"
 #include "MaiModelStudioTools.h"
 #include "MaiNetworkIpTool.h"
-#include "MaiOpenAiClient.h"
+#include "MaiResponsesClient.h"
 #include "MaiOpenSslCliTool.h"
 #include "MaiOpenSslTool.h"
 #include "MaiPdfTool.h"
@@ -42,6 +43,7 @@
 #include "MaiQuestionTool.h"
 #include "MaiQuestionTranscript.h"
 #include "MaiSessionTools.h"
+#include "MaiSessionRecordCodec.h"
 #include "MaiSqliteStore.h"
 #include "MaiSshTool.h"
 #include "MaiSystemResourcesTool.h"
@@ -535,7 +537,7 @@ struct MaiMobileAgent {
     std::unordered_map<std::string, std::string> errors;
     std::string workspace;
     std::string model;
-    MaiWireApi primaryWire = MaiWireApi::ChatCompletions;
+    MaiWireApi primaryWire = MaiWireApi::Responses;
     // 本地主模型探针与 Agent 使用同一种已配置客户端；不另开回复建议模型链。
     std::function<std::unique_ptr<MaiModelClient>()> modelClientFactory;
     std::vector<MaiToolSpec> modelProbeTools;
@@ -661,13 +663,13 @@ struct MaiMobileAgent {
                 MaiError::make(MaiErrorCode::InvalidInput, "A remote model endpoint is required."));
         config.apiKey = request.value("apiKey", "");
         config.caBundlePath = request.value("caBundle", "");
-        // Responses/Chat 是主模型线协议，和 Seedance 等专业工具的供应商 API 无关。
+        // 主模型仅支持 Responses；专业媒体工具使用其各自的供应商 API。
         const std::string wire = request.value("wire", std::string{});
         if (isLocal)
             config.wire = MaiWireApi::Local;
-        else if (wire == "responses" || (wire.empty() && request.value("model", std::string{}) == "deepseek-flash"))
+        else if (wire.empty() || wire == "responses")
             config.wire = MaiWireApi::Responses;
-        else if (!wire.empty() && wire != "chat_completions")
+        else
             throw std::runtime_error("Unsupported model wire protocol.");
         MaiFfmpegEngine ffmpegEngine{mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check,
                                      mai_ffprobe_execute,      mai_ffprobe_set_cancel_check,
@@ -676,7 +678,7 @@ struct MaiMobileAgent {
         std::function<std::unique_ptr<MaiModelClient>()> nextModelClientFactory;
         std::optional<MaiModelRoute> nextLocalRoute;
         bool nextLocalSupportsImages = false;
-        const auto requestedModel = request.at("model").get<std::string>();
+        const auto requestedModel = maiCanonicalCloudModel(request.at("model").get<std::string>());
         const auto defaultCapability = maiCloudModelInfo(requestedModel);
         if (!isLocal && defaultCapability) {
             config.wire = defaultCapability->wire;
@@ -728,12 +730,14 @@ struct MaiMobileAgent {
                                                                                  : std::string{};
         };
         MaiRoutedModelConfig nextRoutes;
-        for (const std::string providerName : {"glm", "deepseek", "openrouter"}) {
+        for (const std::string providerName : {"glm", "deepseek", "openrouter", "openai"}) {
             MaiModelRoute route;
             if (providerName == "glm")
-                route.modelNames = {"glm-5.3", "glm-5.3-flash"};
+                route.modelNames = {"glm-5.4", "glm-5.3-flash"};
             else if (providerName == "deepseek")
                 route.modelNames = {"deepseek-flash", "deepseek-v4-pro"};
+            else if (providerName == "openai")
+                route.modelNames = {"gpt-6.1-sol"};
             else
                 route.modelNames = {"anthropic/claude-fable-5.2", "anthropic/claude-opus-5.5",
                                     "particle-ai/particle-1:free"};
@@ -743,6 +747,7 @@ struct MaiMobileAgent {
             const std::string field = providerName + "BaseUrl";
             const char* official = providerName == "glm"        ? "https://open.bigmodel.cn/api/v1"
                                    : providerName == "deepseek" ? "https://api.deepseek.com"
+                                   : providerName == "openai"   ? "https://api.openai.com/v1"
                                                                 : "https://openrouter.ai/api/v1";
             route.config.baseUrl = request.value(field, defaultCapability && defaultCapability->provider == providerName
                                                             ? config.baseUrl
@@ -764,8 +769,10 @@ struct MaiMobileAgent {
         }
         nextModelClientFactory = [nextRoutes] { return makeMaiRoutedModelClient(nextRoutes); };
         auto tools = std::make_unique<MaiToolRegistry>();
-        // 两个移动端只提供真实可用的本地文件和网络工具，不暴露桌面 shell。
-        registerMaiFileTools(*tools);
+        // 两个移动端与桌面共用文件算法；模型只走进程内命令和补丁入口，不注册旧文件工具。
+        tools->add(makeMaiApplyPatchTool());
+        // 与系统进程版同名，但这是共享核心内的有界解释器，不创建 Shell/子进程或 PTY。
+        tools->add(makeMaiInProcessShellTool());
         // 移动宿主的媒体与导出工具仍使用统一的默认工作目录，不能只切换 Agent 会话路径。
         registerMaiSessionTools(*tools, /*includeWorkspaceSwitch=*/false);
         // 移动端手工注册表也必须提供只读回查，才能消费Runner返回的原始输出句柄。
@@ -993,11 +1000,14 @@ struct MaiMobileAgent {
 #endif
         registerMobilePhotoTools(*tools, hostTools);
         MaiAgent::Options options;
-        options.defaultModel = request.at("model").get<std::string>();
+        options.skillsEnabled = true;
+        options.defaultModel = requestedModel;
         options.reasoningEffort = request.value("reasoningEffort", std::string("high"));
         if (!maiIsValidReasoningEffortForModel(options.defaultModel, options.reasoningEffort))
             throw NativeOperationFailure({MaiErrorCode::InvalidInput, "Unsupported reasoning effort."});
         options.fileAccessRoot = request.value("appRoot", request.at("workspace").get<std::string>());
+        // 移动沙盒是当前应用的用户根目录；项目内技能仍从会话工作目录的 .agents/skills 发现。
+        options.skillOptions.homeDirectory = MaiFilePath::fromUtf8(options.fileAccessRoot);
         options.decodeText = [dispatcher = hostTools](const std::string& bytes,
                                                       const std::string& encoding) -> MaiResult<std::string> {
             const MaiToolResult result = callMaiMobileHostTool(
@@ -1007,6 +1017,20 @@ struct MaiMobileAgent {
         };
         // 与桌面端共用可见正文进度约定，后续本地模型能力边界仍按当前配置追加。
         options.baseInstructions = kMarkdownBaseInstructions + maiAgentProgressInstructions();
+        options.baseInstructions +=
+            "\nOn mobile, use exec_command for bounded in-process file commands and apply_patch "
+            "for exact file edits. "
+            "It does not start an OS shell, process or PTY and returns no session_id. "
+            "Use its documented command/grammar subset; do not assume Bash, Python, Node, "
+            "external executables, command substitution or loops exist. Use find/stat for "
+            "file discovery, grep for regular-expression search (-F for literal text), "
+            "read-text for paged/encoded text, and rmdir only for empty directories. "
+            "curl, ffmpeg and ffprobe remain separately adapted tools; they are not registered "
+            "commands inside this interpreter. Variables and cd reset at the next invocation. "
+            "The file command namespace contains only App-owned files, including imported "
+            "copies of external photos/documents. Use existing native picker/import/export "
+            "tools to create those copies; OS permission alone does not mount external content "
+            "as command paths. File commands can delete only App-owned files.";
         options.baseInstructions +=
             "\nPrimary model selection belongs to this session. "
             "A text-only primary model cannot analyze image pixels merely "
@@ -1035,10 +1059,11 @@ struct MaiMobileAgent {
         else if (policy != "on-request")
             throw std::runtime_error("Unknown approval policy.");
         // QA 与正式 Agent 必须使用相同的模型能力过滤，不能用更宽的工具清单验收本地模型。
-        const auto nextProbeTools = tools->specs(options.defaultModel);
+        auto* replacementTools = tools.get();
         const auto nextProbeInstructions = options.baseInstructions;
         auto replacement =
             std::make_unique<MaiAgent>(std::move(store.value()), nextModelClientFactory(), std::move(tools), options);
+        const auto nextProbeTools = replacementTools->specs(options.defaultModel);
         stopSchedulePolling();
         if (anyBusy()) {
             startSchedulePolling();
@@ -1405,7 +1430,37 @@ struct MaiMobileAgent {
                 {MaiErrorCode::NotSupported, "The target session model accepts text only; its input was preserved."});
     }
 
-    // 作用：读取指定会话的有限消息快照和任务状态。
+    // 同一 Core 快照同时服务本机和远端读取；仅序列化实测事实，不从消息长度估算计量。
+    // 百分比复用 Core 的显示口径，小窗口不把零余量哨兵误画成已满；失败保留明确状态。
+    Json contextUsage(const std::string& sessionId) const {
+        if (sessionId.empty()) return nullptr;
+        const auto measured = agent->getModelContextUsage(sessionId);
+        if (!measured)
+            return {{"session_id", sessionId}, {"available", false},
+                    {"error_code", maiErrorCodeToString(measured.error().code())}};
+        const auto encoded = MaiSessionRecordCodec::encodeContextUsage(measured.value());
+        if (!encoded)
+            return {{"session_id", sessionId}, {"available", false}, {"error_code", "invalid_usage"}};
+        auto value = Json::parse(encoded.value());
+        value["session_id"] = sessionId;
+        const auto& usage = measured.value();
+        const auto remaining = usage.windowTokens > kMaiContextUsageDisplayBaselineTokens
+                                   ? maiContextRemainingPercent(usage) : std::nullopt;
+        value["remaining_percent"] = remaining ? Json(*remaining) : Json();
+        // 补充消费统计复用 Core 算术；缺失缓存仍保留其 source，不冒充供应商明细。
+        const auto addCount = [&value](const char* name, const MaiTokenUsageCount& count) {
+            value["latest_sampling"][name] =
+                count.source == MaiUsageValueSource::Missing ? Json() : Json(count.tokens);
+            value["latest_sampling"][std::string(name) + "_source"] =
+                count.source == MaiUsageValueSource::Missing ? "missing"
+                : count.source == MaiUsageValueSource::Provider ? "provider" : "derived";
+        };
+        addCount("non_cached_input_tokens", maiNonCachedInput(usage.latestSampling));
+        addCount("blended_total_tokens", maiBlendedTotal(usage.latestSampling));
+        return value;
+    }
+
+    // 作用：读取指定会话的有限消息快照和任务状态，计量身份始终绑定 selected。
     Json snapshot(const std::string& selected, bool force, int limit, bool includeMessageUpdates = false) {
         std::unordered_map<std::string, std::string> errorCopy;
         std::unordered_set<std::string> changedParts;
@@ -1528,6 +1583,7 @@ struct MaiMobileAgent {
                 {"defaultReasoningEffort", choice["defaultReasoningEffort"]},
                 {"supportedReasoningEfforts", choice["supportedReasoningEfforts"]},
                 {"selectedWire", choice["wire"]},
+                {"contextUsage", hasChosen ? contextUsage(selected) : Json()},
                 {"localGpuSelected", localStatus.gpuSelected},
                 {"localGpuModelBytes", localStatus.gpuModelBytes},
                 {"localGpuBackend", localStatus.gpuBackend},
@@ -1614,6 +1670,7 @@ struct MaiMobileAgent {
         const auto choice = sessionConfiguration(session);
         return {{"ok", true},
                 {"session", sessionId},
+                {"contextUsage", contextUsage(sessionId)},
                 {"model", choice["model"]},
                 {"reasoningEffort", choice["reasoningEffort"]},
                 {"defaultReasoningEffort", choice["defaultReasoningEffort"]},

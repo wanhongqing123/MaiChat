@@ -4,7 +4,7 @@
 // LLM 客户端的测试。
 //
 // 默认不打真实的大模型；可显式启用无账号 Key 的 TLS 探针，服务端拒绝后不会计费。
-// 这里起一个假的 Chat Completions 服务端，
+// 这里起一个假的 Responses 服务端，
 // 喂**对抗性分片**的 SSE ——把工具调用的 arguments 一个字符一个字符地切、切在 JSON 的引号中间、
 // 把多个事件塞进同一个 TCP 包、再掺几个心跳注释行和畸形行。
 //
@@ -30,7 +30,7 @@
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
 #include "MaiMemoryStore.h"
-#include "MaiOpenAiClient.h"
+#include "MaiResponsesClient.h"
 #include "MaiViewImageTool.h"
 
 using nlohmann::json;
@@ -68,6 +68,7 @@ struct FakeServer {
     int stallRequests = 0;
     std::vector<std::string> delayedChunks;
     int delayedChunkMs = 0;
+    std::atomic<std::size_t> delayedChunksSent{0};
     std::atomic<bool> releaseStall{false};
     std::atomic<int> requestCount{0};
 
@@ -133,6 +134,7 @@ struct FakeServer {
                             return false;
                         }
                         const std::string& chunk = delayedChunks[(*index)++];
+                        ++delayedChunksSent;
                         const bool written = sink.write(chunk.data(), chunk.size());
                         std::this_thread::sleep_for(std::chrono::milliseconds(delayedChunkMs));
                         return written;
@@ -172,7 +174,6 @@ struct FakeServer {
                     return ok;
                 });
         };
-        server.Post("/chat/completions", handle);
         server.Post("/responses", handle);
         port = server.bind_to_any_port("127.0.0.1");
         th = std::thread([this] { server.listen_after_bind(); });
@@ -205,12 +206,11 @@ struct Collected {
     bool done = false;
 };
 
-Collected runAgainst(FakeServer& fake, const MaiModelRequest& request,
-                     MaiWireApi wire = MaiWireApi::ChatCompletions) {
+Collected runAgainst(FakeServer& fake, const MaiModelRequest& request) {
     MaiModelConfig config;
     config.baseUrl = fake.base();
     config.apiKey = "test-key";
-    config.wire = wire;
+    config.wire = MaiWireApi::Responses;
     auto client = makeMaiModelClient(config);
 
     Collected collected;
@@ -253,7 +253,7 @@ Collected run(const std::string& script, std::size_t chunk) {
     auto client = makeMaiModelClient(config);
 
     MaiModelRequest request;
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     MaiModelMessage t;
     t.role = MaiModelRole::User;
     t.content = "run the tests";
@@ -288,36 +288,41 @@ json wireValue(const json& document, const char* path) {
     return document.contains(pointer) ? document.at(pointer) : json{};
 }
 
-// 构造一条 tool_calls 增量。传 nullptr 表示这一帧不带该字段。
-std::string tool_delta(int index, const char* id, const char* name, const char* args) {
-    json tc;
-    tc["index"] = index;
-    if (id) tc["id"] = id;
-    json fn = json::object();
-    if (name) fn["name"] = name;
-    if (args) fn["arguments"] = args;
-    tc["function"] = std::move(fn);
-
-    json delta;
-    delta["tool_calls"] = json::array({tc});
-    json choice;
-    choice["delta"] = std::move(delta);
-    json root;
-    root["choices"] = json::array({choice});
-    return sse(root);
+// 直接构造 Responses 原生事件；调用身份、参数增量和完成快照各有独立的协议字段。
+json function_item(const char* callId, const char* name, const char* arguments) {
+    return json{{"type", "function_call"},
+                {"id", std::string("fc_") + callId},
+                {"call_id", callId},
+                {"name", name},
+                {"arguments", arguments}};
 }
 
-std::string text_delta(const char* content) {
-    json delta;
-    delta["content"] = content;
-    json choice;
-    choice["delta"] = std::move(delta);
-    json root;
-    root["choices"] = json::array({choice});
-    return sse(root);
+std::string function_added(int index, const char* callId, const char* name) {
+    return sse(json{{"type", "response.output_item.added"},
+                    {"output_index", index},
+                    {"item", function_item(callId, name, "")}});
 }
 
-const char* kDone = "data: [DONE]\n\n";
+std::string function_arguments_delta(int index, const char* arguments) {
+    return sse(json{{"type", "response.function_call_arguments.delta"},
+                    {"output_index", index},
+                    {"delta", arguments}});
+}
+
+std::string function_done(int index, const char* callId, const char* name, const char* arguments) {
+    return sse(json{{"type", "response.output_item.done"},
+                    {"output_index", index},
+                    {"item", function_item(callId, name, arguments)}});
+}
+
+std::string response_text_delta(const char* content) {
+    return sse(json{{"type", "response.output_text.delta"},
+                    {"output_index", 0},
+                    {"content_index", 0},
+                    {"delta", content}});
+}
+
+const char* kCompleted = "data: {\"type\":\"response.completed\"}\n\n";
 
 // 这三段合起来是 "你好，世界 🙂"。
 //
@@ -337,45 +342,24 @@ std::string greeting() {
 }
 
 std::string text_script() {
-    return std::string(": ping\n\n") + text_delta(kGreetingPart1) + text_delta(kGreetingPart2) +
-           text_delta(kGreetingPart3) + kDone;
+    return std::string(": ping\n\n") + response_text_delta(kGreetingPart1) +
+           response_text_delta(kGreetingPart2) + response_text_delta(kGreetingPart3) + kCompleted;
 }
 
-// 工具调用：arguments 切成四段，切点故意落在 JSON 的引号和冒号中间。
-// 四段拼起来应该正好是 {"command":"npm test"}
+// 工具调用：arguments 切成三段，切点故意落在 JSON 的引号和冒号中间。
+// 完整 item.done 快照也必须与这些增量保持同一个调用身份，不能重复交付。
 std::string tool_script() {
-    json fin_delta = json::object();
-    json fin_choice;
-    fin_choice["delta"] = std::move(fin_delta);
-    fin_choice["finish_reason"] = "tool_calls";
-    json fin;
-    fin["choices"] = json::array({fin_choice});
-
-    return tool_delta(0, "call_abc", "bash", "") + tool_delta(0, nullptr, nullptr, "{\"comm") +
-           tool_delta(0, nullptr, nullptr, "and\":\"npm ") +
-           tool_delta(0, nullptr, nullptr, "test\"}") + sse(fin) + kDone;
+    return function_added(0, "call_abc", "bash") + function_arguments_delta(0, "{\"comm") +
+           function_arguments_delta(0, "and\":\"npm ") + function_arguments_delta(0, "test\"}") +
+           function_done(0, "call_abc", "bash", R"({"command":"npm test"})") + kCompleted;
 }
 
 // 两个并行调用，index 交错到达：先来 1 的参数，再来 0 的。
 std::string two_tools_script() {
-    json c0;
-    c0["index"] = 0;
-    c0["id"] = "c0";
-    c0["function"] = json{{"name", "read"}, {"arguments", ""}};
-    json c1;
-    c1["index"] = 1;
-    c1["id"] = "c1";
-    c1["function"] = json{{"name", "grep"}, {"arguments", ""}};
-
-    json delta;
-    delta["tool_calls"] = json::array({c0, c1});
-    json choice;
-    choice["delta"] = std::move(delta);
-    json root;
-    root["choices"] = json::array({choice});
-
-    return sse(root) + tool_delta(1, nullptr, nullptr, "{\"q\":1}") +
-           tool_delta(0, nullptr, nullptr, "{\"p\":2}") + kDone;
+    return function_added(0, "c0", "read") + function_added(1, "c1", "grep") +
+           function_arguments_delta(1, "{\"q\":1}") + function_arguments_delta(0, "{\"p\":2}") +
+           function_done(1, "c1", "grep", R"({"q":1})") +
+           function_done(0, "c0", "read", R"({"p":2})") + kCompleted;
 }
 
 // ── 用例 ────────────────────────────────────────────────────────
@@ -413,6 +397,45 @@ void test_tool_call_fragments() {
     }
 }
 
+// 完整 item 快照可以补回参数，因此仅检查最终 arguments 看不出 delta 解析是否失效。
+// 把增量间隔拉到超过总进度期限，证明参数片段本身推进期限，并且终态前不交付工具。
+void test_function_argument_deltas_extend_progress_without_early_delivery() {
+    FakeServer fake;
+    fake.delayedChunks = {function_added(0, "call_progress", "bash"),
+                          function_arguments_delta(0, "{\"comm"),
+                          function_arguments_delta(0, "and\":\"npm "),
+                          function_arguments_delta(0, "test\"}"),
+                          function_done(0, "call_progress", "bash", R"({"command":"npm test"})"),
+                          kCompleted};
+    fake.delayedChunkMs = 700;
+    fake.start();
+    MaiModelConfig config;
+    config.baseUrl = fake.base();
+    config.inactivityTimeoutSeconds = 2;
+    config.progressTimeoutSeconds = 2;
+    config.totalTimeoutSeconds = 8;
+    config.maxRetries = 0;
+    MaiModelRequest request;
+    request.model = "test-model";
+    std::vector<MaiToolInvocation> calls;
+    MaiStreamSink sink;
+    sink.onToolCall = [&](const MaiToolInvocation& invocation) {
+        CHECK(fake.delayedChunksSent.load() == fake.delayedChunks.size());
+        calls.push_back(invocation);
+    };
+    const std::atomic<bool> cancel{false};
+    const auto started = std::chrono::steady_clock::now();
+    CHECK(!makeMaiModelClient(config)->stream(request, sink, cancel));
+    CHECK(std::chrono::steady_clock::now() - started > std::chrono::seconds(2));
+    CHECK(fake.requestCount.load() == 1);
+    CHECK(calls.size() == 1);
+    if (calls.size() == 1) {
+        CHECK(calls[0].id == "call_progress");
+        CHECK(calls[0].name == "bash");
+        CHECK(calls[0].arguments == R"({"command":"npm test"})");
+    }
+}
+
 void test_two_tool_calls_interleaved() {
     const auto c = run(two_tools_script(), 3);
     CHECK(c.error.empty());
@@ -430,8 +453,9 @@ void test_two_tool_calls_interleaved() {
 
 void test_malformed_lines_are_ignored() {
     const std::string script = std::string(": heartbeat\n\n") + "data: not json at all\n\n" +
-                               "data: {\"choices\":[]}\n\n" + text_delta("ok") +
-                               "garbage line with no prefix\n\n" + kDone;
+                               "data: {\"type\":\"unknown.event\"}\n\n" +
+                               response_text_delta("ok") + "garbage line with no prefix\n\n" +
+                               kCompleted;
     const auto c = run(script, 5);
     CHECK(c.error.empty());  // 畸形行不该升级成错误
     CHECK(c.text == "ok");   // 正常那条仍要收到
@@ -439,24 +463,24 @@ void test_malformed_lines_are_ignored() {
 }
 
 void test_server_error_inside_stream() {
-    // 有的服务端不用 HTTP 状态码，把错误塞在正常的流里
-    json root;
-    root["error"] = "quota exhausted";
-    const auto c = run(sse(root), 4);
+    // HTTP 200 也能携带 Responses 的明确失败事件，必须保留供应商错误。
+    const auto c =
+        run(sse(json{{"type", "response.failed"},
+                     {"response",
+                      {{"error", {{"code", "quota_exhausted"}, {"message", "quota exhausted"}}}}}}),
+            4);
     CHECK(c.error == "quota exhausted");
     CHECK(c.code == MaiErrorCode::Protocol);
     CHECK(!c.done);
 }
 
 void test_reasoning_delta() {
-    json delta;
-    delta["reasoning_content"] = "let me think";
-    json choice;
-    choice["delta"] = std::move(delta);
-    json root;
-    root["choices"] = json::array({choice});
-
-    const auto c = run(sse(root) + text_delta("the answer") + kDone, 2);
+    const auto c = run(sse(json{{"type", "response.reasoning_text.delta"},
+                                {"output_index", 1},
+                                {"content_index", 0},
+                                {"delta", "let me think"}}) +
+                           response_text_delta("the answer") + kCompleted,
+                       2);
     CHECK(c.reasoning == "let me think");
     CHECK(c.text == "the answer");
 }
@@ -468,7 +492,7 @@ void test_http_error_preserves_provider_message() {
     fake.start();
 
     MaiModelRequest request;
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     const Collected result = runAgainst(fake, request);
     CHECK(result.code == MaiErrorCode::RateLimited);
     CHECK(result.error.find("HTTP 429") != std::string::npos);
@@ -494,7 +518,7 @@ void test_openrouter_402_classifies_in_flight_budget_without_retry() {
     fake.start();
     MaiModelRequest request;
     request.model = "anthropic/claude-fable-5.2";
-    const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+    const Collected answer = runAgainst(fake, request);
     CHECK(answer.code == MaiErrorCode::RateLimited);
     CHECK(answer.error.find("HTTP 402") != std::string::npos);
     CHECK(answer.error.find(providerMessage) != std::string::npos);
@@ -528,7 +552,7 @@ void test_openrouter_402_limits_do_not_infer_missing_or_foreign_metadata() {
         {"anthropic/claude-fable-5.2",
          {{"reason", "in_flight_budget_exhausted"}, {"limit_source", "openrouter_credits"}},
          false},
-        {"glm-5.3",
+        {"glm-5.4",
          {{"reason", "in_flight_budget_exhausted"},
           {"limit_source", "openrouter_in_flight_budget"}},
          false},
@@ -547,7 +571,7 @@ void test_openrouter_402_limits_do_not_infer_missing_or_foreign_metadata() {
         fake.start();
         MaiModelRequest request;
         request.model = item.model;
-        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected answer = runAgainst(fake, request);
         CHECK(answer.code == MaiErrorCode::Protocol);
         CHECK(answer.error.find(providerMessage) != std::string::npos);
         if (item.singleRequest) {
@@ -601,7 +625,7 @@ void test_openrouter_402_retry_after_only_accepts_bounded_numeric_seconds() {
         fake.start();
         MaiModelRequest request;
         request.model = "anthropic/claude-fable-5.2";
-        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected answer = runAgainst(fake, request);
         CHECK(answer.code == MaiErrorCode::RateLimited);
         if (item.expected)
             CHECK(answer.error.find(item.expected) != std::string::npos);
@@ -765,20 +789,19 @@ void test_openrouter_402_truncated_reset_response_is_not_retried() {
     }
 }
 
-void test_finish_reason_length_is_not_reported_as_success() {
-    json choice;
-    choice["delta"] = json::object();
-    choice["finish_reason"] = "length";
-    const Collected result = run(sse(json{{"choices", json::array({choice})}}) + kDone, 3);
+void test_output_token_limit_is_not_reported_as_success() {
+    const Collected result =
+        run(sse(json{{"type", "response.incomplete"},
+                     {"response", {{"incomplete_details", {{"reason", "max_output_tokens"}}}}}}),
+            3);
     CHECK(result.code == MaiErrorCode::Protocol);
-    CHECK(result.error.find("length limit") != std::string::npos);
+    CHECK(result.error.find("max_output_tokens") != std::string::npos);
 }
 
 void test_final_unterminated_sse_line_is_processed() {
-    json root;
-    root["error"] = "last line error";
-    const std::string unterminated = "data: " + root.dump();
-    const Collected result = run(unterminated, 2);
+    const json event{{"type", "response.failed"},
+                     {"response", {{"error", {{"message", "last line error"}}}}}};
+    const Collected result = run("data: " + event.dump(), 2);
     CHECK(result.code == MaiErrorCode::Protocol);
     CHECK(result.error == "last line error");
 }
@@ -786,80 +809,78 @@ void test_final_unterminated_sse_line_is_processed() {
 void test_transient_http_failure_retries_before_streaming() {
     FakeServer fake;
     fake.transientFailures = 1;
-    fake.script = text_delta("recovered") + kDone;
+    fake.script = response_text_delta("recovered") + kCompleted;
     fake.chunk = 4;
     fake.start();
 
     MaiModelRequest request;
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     const Collected result = runAgainst(fake, request);
     CHECK(result.done);
     CHECK(result.text == "recovered");
     CHECK(fake.requestCount.load() == 2);
 }
 
-void test_chat_completions_requires_done_before_reporting_success() {
+void test_responses_item_done_requires_terminal_before_reporting_success() {
     FakeServer fake;
+    const json item{{"type", "message"},
+                    {"id", "msg_partial"},
+                    {"role", "assistant"},
+                    {"content", json::array({json{{"type", "output_text"}, {"text", "partial"}}})}};
     fake.script =
-        text_delta("partial") +
-        sse(json{{"choices",
-                  json::array({json{{"delta", json::object()}, {"finish_reason", "stop"}}})}});
+        response_text_delta("partial") +
+        sse(json{{"type", "response.output_item.done"}, {"output_index", 0}, {"item", item}});
     fake.start();
-
     MaiModelRequest request;
     request.model = "test-model";
     const Collected result = runAgainst(fake, request);
     CHECK(result.code == MaiErrorCode::Protocol);
-    CHECK(result.error.find("without a terminal [DONE]") != std::string::npos);
+    CHECK(result.error.find("without a terminal event") != std::string::npos);
     CHECK(result.text == "partial");
-    CHECK(result.calls.empty());
+    CHECK(result.calls.empty() && result.continuations.empty());
     CHECK(fake.requestCount.load() == 1);
 }
 
-void test_chat_completions_does_not_release_tools_without_done() {
+void test_responses_does_not_release_completed_tools_without_terminal() {
     FakeServer fake;
-    fake.script = tool_delta(0, "call_abc", "read", "{\"path\":\"a.txt\"}") +
-                  sse(json{{"choices", json::array({json{{"delta", json::object()},
-                                                         {"finish_reason", "tool_calls"}}})}});
+    fake.script = function_added(0, "call_abc", "read") +
+                  function_done(0, "call_abc", "read", R"({"path":"a.txt"})");
     fake.start();
-
     MaiModelRequest request;
     request.model = "test-model";
     const Collected result = runAgainst(fake, request);
     CHECK(result.code == MaiErrorCode::Protocol);
-    CHECK(result.error.find("without a terminal [DONE]") != std::string::npos);
-    CHECK(result.calls.empty());
+    CHECK(result.error.find("without a terminal event") != std::string::npos);
+    CHECK(result.calls.empty() && result.continuations.empty());
     CHECK(fake.requestCount.load() == 1);
 }
 
 void test_heartbeats_do_not_extend_model_progress_deadline() {
-    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
-        FakeServer fake;
-        fake.sendOnlyHeartbeats = true;
-        fake.start();
+    FakeServer fake;
+    fake.sendOnlyHeartbeats = true;
+    fake.start();
 
-        MaiModelConfig config;
-        config.baseUrl = fake.base();
-        config.inactivityTimeoutSeconds = 1;
-        config.progressTimeoutSeconds = 2;
-        config.totalTimeoutSeconds = 6;
-        config.wire = wire;
-        config.maxRetries = 0;
-        auto client = makeMaiModelClient(config);
-        MaiModelRequest request;
-        request.model = "test-model";
-        MaiStreamSink sink;
-        const std::atomic<bool> cancel{false};
-        const auto started = std::chrono::steady_clock::now();
-        const MaiError result = client->stream(request, sink, cancel);
-        const auto elapsed = std::chrono::steady_clock::now() - started;
-        CHECK(result.code() == MaiErrorCode::Network);
-        CHECK(result.message().find("made no progress") != std::string::npos);
-        CHECK(result.message().find("Reduce image size") == std::string::npos);
-        CHECK(elapsed >= std::chrono::milliseconds(1500));
-        CHECK(elapsed < std::chrono::seconds(5));
-        CHECK(fake.requestCount.load() == 1);
-    }
+    MaiModelConfig config;
+    config.baseUrl = fake.base();
+    config.inactivityTimeoutSeconds = 1;
+    config.progressTimeoutSeconds = 2;
+    config.totalTimeoutSeconds = 6;
+    config.wire = MaiWireApi::Responses;
+    config.maxRetries = 0;
+    auto client = makeMaiModelClient(config);
+    MaiModelRequest request;
+    request.model = "test-model";
+    MaiStreamSink sink;
+    const std::atomic<bool> cancel{false};
+    const auto started = std::chrono::steady_clock::now();
+    const MaiError result = client->stream(request, sink, cancel);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(result.code() == MaiErrorCode::Network);
+    CHECK(result.message().find("made no progress") != std::string::npos);
+    CHECK(result.message().find("Reduce image size") == std::string::npos);
+    CHECK(elapsed >= std::chrono::milliseconds(1500));
+    CHECK(elapsed < std::chrono::seconds(5));
+    CHECK(fake.requestCount.load() == 1);
 }
 
 std::string response_event(const nlohmann::json& event) {
@@ -868,23 +889,19 @@ std::string response_event(const nlohmann::json& event) {
 
 void test_protocol_liveness_and_progress_are_distinct() {
     // 连接确有保活，等待超过短传输期限仍能收到正文；不是把有效请求按无正文直接杀掉。
-    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
+    {
         FakeServer fake;
-        fake.delayedChunks = {
-            ": keepalive\n\n",
-            ": keepalive\n\n",
-            ": keepalive\n\n",
-            ": keepalive\n\n",
-            wire == MaiWireApi::Responses
-                ? response_event({{"type", "response.output_text.delta"}, {"delta", "ready"}})
-                : text_delta("ready"),
-            wire == MaiWireApi::Responses ? response_event({{"type", "response.completed"}})
-                                          : kDone};
+        fake.delayedChunks = {": keepalive\n\n",
+                              ": keepalive\n\n",
+                              ": keepalive\n\n",
+                              ": keepalive\n\n",
+                              response_text_delta("ready"),
+                              kCompleted};
         fake.delayedChunkMs = 450;
         fake.start();
         MaiModelConfig config;
         config.baseUrl = fake.base();
-        config.wire = wire;
+        config.wire = MaiWireApi::Responses;
         config.inactivityTimeoutSeconds = 1;
         config.progressTimeoutSeconds = 4;
         config.totalTimeoutSeconds = 7;
@@ -964,34 +981,32 @@ void test_responses_lifecycle_advances_without_synthetic_output() {
 }
 
 void test_silent_transport_still_times_out() {
-    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
-        FakeServer fake;
-        fake.stallWithoutBytes = true;
-        fake.start();
-        MaiModelConfig config;
-        config.baseUrl = fake.base();
-        config.wire = wire;
-        config.inactivityTimeoutSeconds = 1;
-        config.progressTimeoutSeconds = 5;
-        config.totalTimeoutSeconds = 7;
-        // 单次超时之外最多再连一次，不能把无输出超时漏在恢复分支之外。
-        config.maxRetries = 1;
-        config.retryInitialDelayMs = 0;
-        auto client = makeMaiModelClient(config);
-        MaiModelRequest request;
-        request.model = "test-model";
-        MaiStreamSink sink;
-        const std::atomic<bool> cancel{false};
-        const auto result = client->stream(request, sink, cancel);
-        CHECK(result.code() == MaiErrorCode::Network);
-        CHECK(result.message().find("transport inactive") != std::string::npos);
-        CHECK(fake.requestCount.load() == 2);
-    }
+    FakeServer fake;
+    fake.stallWithoutBytes = true;
+    fake.start();
+    MaiModelConfig config;
+    config.baseUrl = fake.base();
+    config.wire = MaiWireApi::Responses;
+    config.inactivityTimeoutSeconds = 1;
+    config.progressTimeoutSeconds = 5;
+    config.totalTimeoutSeconds = 7;
+    // 单次超时之外最多再连一次，不能把无输出超时漏在恢复分支之外。
+    config.maxRetries = 1;
+    config.retryInitialDelayMs = 0;
+    auto client = makeMaiModelClient(config);
+    MaiModelRequest request;
+    request.model = "test-model";
+    MaiStreamSink sink;
+    const std::atomic<bool> cancel{false};
+    const auto result = client->stream(request, sink, cancel);
+    CHECK(result.code() == MaiErrorCode::Network);
+    CHECK(result.message().find("transport inactive") != std::string::npos);
+    CHECK(fake.requestCount.load() == 2);
 }
 
 void test_real_model_progress_extends_idle_deadline() {
     FakeServer fake;
-    fake.delayedChunks = {text_delta("first"), text_delta("second"), kDone};
+    fake.delayedChunks = {response_text_delta("first"), response_text_delta("second"), kCompleted};
     fake.delayedChunkMs = 1100;
     fake.start();
 
@@ -1012,10 +1027,10 @@ void test_real_model_progress_extends_idle_deadline() {
     CHECK(output == "firstsecond");
 }
 
-void test_done_ends_stream_without_waiting_for_socket_close() {
+void test_completed_ends_stream_without_waiting_for_socket_close() {
     FakeServer fake;
     fake.keepOpenAfterDone = true;
-    fake.script = text_delta("complete") + kDone;
+    fake.script = response_text_delta("complete") + kCompleted;
     fake.start();
 
     MaiModelConfig config;
@@ -1066,16 +1081,13 @@ void test_cancel_interrupts_silent_model_stream() {
 
 // ── 线格式 ──────────────────────────────────────────────────────
 //
-// 这一组断言的是**真正发到 socket 上的 JSON**，对照 OpenAI Chat Completions 的规范，
+// 这一组断言的是**真正发到 socket 上的 JSON**，对照 OpenAI Responses 的规范，
 // 不是对照我们自己的结构体。
 //
-// 这个区分是有代价才学到的：tool_call_id 曾经被写成了 toolCallId，
-// 而当时的用例写的是 `m.value("toolCallId", "") == callId`——拿自己的字段名去核自己的输出，
-// 永远是绿的。真跑起来服务端会说缺 tool_call_id，或者模型认不出这是哪次调用的结果，
-// 下一轮把同样的工具再调一遍。
+// 函数调用和结果必须通过协议规定的 call_id 关联；不能用内部结构体字段名自证输出。
 void test_wire_shape_of_request() {
     FakeServer fake;
-    fake.script = std::string(": ping\n\n") + kDone;
+    fake.script = std::string(": ping\n\n") + kCompleted;
     fake.chunk = 100000;
     fake.start();
 
@@ -1122,50 +1134,43 @@ void test_wire_shape_of_request() {
 
     CHECK(sent.value("model", "") == "glm-4.6");
     CHECK(sent.value("stream", false) == true);  // 不开流就收不到增量
-    CHECK(sent["messages"].size() == 4);
+    CHECK(sent["instructions"] == request.baseInstructions);
+    CHECK(!sent.contains("messages"));
+    CHECK(sent["input"].size() == 3);
+    CHECK(sent["input"][0]["role"] == "user");
+    CHECK(sent["input"][0]["content"] == "read a.txt");
 
-    CHECK(sent["messages"][0]["role"] == "system");
-    CHECK(sent["messages"][0]["content"] == request.baseInstructions);
-    CHECK(sent["messages"][1]["role"] == "user");
-    CHECK(sent["messages"][1]["content"] == "read a.txt");
+    // 函数调用和结果是独立 input item，通过 call_id 关联，参数保持 JSON 字符串。
+    const json& call = sent["input"][1];
+    CHECK(call["type"] == "function_call");
+    CHECK(call["call_id"] == "call_1");
+    CHECK(call["name"] == "read");
+    CHECK(call["arguments"].is_string());
+    CHECK(call["arguments"] == R"({"path":"a.txt"})");
+    const json& result = sent["input"][2];
+    CHECK(result["type"] == "function_call_output");
+    CHECK(result["call_id"] == "call_1");
+    CHECK(result["output"] == "file body");
 
-    // assistant 发起调用那条：tool_calls 的嵌套必须对。
-    const json& call = sent["messages"][2];
-    CHECK(call["role"] == "assistant");
-    CHECK(call["tool_calls"].size() == 1);
-    if (call["tool_calls"].size() == 1) {
-        CHECK(call["tool_calls"][0]["id"] == "call_1");
-        CHECK(call["tool_calls"][0]["type"] == "function");
-        CHECK(call["tool_calls"][0]["function"]["name"] == "read");
-        // arguments 是 JSON **字符串**，不是对象。写成对象服务端会拒。
-        CHECK(call["tool_calls"][0]["function"]["arguments"].is_string());
-    }
-
-    // 工具结果那条：字段名是 tool_call_id，snake_case。
-    const json& result = sent["messages"][3];
-    CHECK(result["role"] == "tool");
-    CHECK(result.contains("tool_call_id"));
-    CHECK(result.value("tool_call_id", "") == "call_1");
-    CHECK(!result.contains("toolCallId"));  // 别再犯一次
-    CHECK(result["content"] == "file body");
-
-    // 工具清单的嵌套：type / function / {name, description, parameters}
+    // Responses 工具声明直接包含 name / description / parameters。
     CHECK(sent["tools"].size() == 1);
     if (sent["tools"].size() == 1) {
         CHECK(sent["tools"][0]["type"] == "function");
-        CHECK(sent["tools"][0]["function"]["name"] == "read");
-        CHECK(sent["tools"][0]["function"]["parameters"].is_object());
+        CHECK(sent["tools"][0]["name"] == "read");
+        CHECK(sent["tools"][0]["description"] == "read a file");
+        CHECK(sent["tools"][0]["parameters"].is_object());
+        CHECK(!sent["tools"][0].contains("function"));
     }
 }
 
 void test_no_tools_field_when_empty() {
     FakeServer fake;
-    fake.script = std::string(": ping\n\n") + kDone;
+    fake.script = std::string(": ping\n\n") + kCompleted;
     fake.chunk = 100000;
     fake.start();
 
     MaiModelRequest request;
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     MaiModelMessage user;
     user.role = MaiModelRole::User;
     user.content = "chat";
@@ -1185,7 +1190,7 @@ void test_no_tools_field_when_empty() {
 
 void test_user_image_is_sent_as_multimodal_content() {
     FakeServer fake;
-    fake.script = text_delta("ok") + std::string(kDone);
+    fake.script = response_text_delta("ok") + std::string(kCompleted);
     fake.chunk = 100000;
     fake.start();
 
@@ -1197,7 +1202,7 @@ void test_user_image_is_sent_as_multimodal_content() {
     CHECK(!MaiFileSystem::writeFile(image, std::string("\x89PNG", 4)));
 
     MaiModelRequest request;
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     request.workingDirectory = root.toUtf8();
     MaiModelMessage user;
     user.role = MaiModelRole::User;
@@ -1215,14 +1220,14 @@ void test_user_image_is_sent_as_multimodal_content() {
     const json sent = json::parse(body, nullptr, false);
     CHECK(!sent.is_discarded());
     if (!sent.is_discarded()) {
-        const json& content = sent["messages"][0]["content"];
+        const json& content = sent["input"][0]["content"];
         CHECK(content.is_array());
         CHECK(content.size() == 2);
         if (content.size() == 2) {
-            CHECK(content[0]["type"] == "text");
+            CHECK(content[0]["type"] == "input_text");
             CHECK(content[0]["text"] == "inspect");
-            CHECK(content[1]["type"] == "image_url");
-            CHECK(content[1]["image_url"]["url"] == "data:image/png;base64,iVBORw==");
+            CHECK(content[1]["type"] == "input_image");
+            CHECK(content[1]["image_url"] == "data:image/png;base64,iVBORw==");
         }
     }
     MaiFileSystem::removeRecursively(root);
@@ -1251,7 +1256,7 @@ std::string decodeBase64Image(const std::string& encoded) {
 
 // 真实 view_image、Agent 工具循环和线格式客户端共同走两次本地 HTTP 请求。
 // 第一轮没有附图，第二轮必须包含工具实际读取的 PNG 像素，而非只有成功回执或文件路径。
-void test_view_image_tool_pixels_reach_next_http_request(MaiWireApi wire) {
+void test_view_image_tool_pixels_reach_next_http_request() {
     // 有效的 1x1 RGBA PNG，含完整 IHDR/IDAT/IEND 和 CRC；不复用被测编码器构造期望值。
     const char pngBytes[] =
         "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52"
@@ -1274,38 +1279,31 @@ void test_view_image_tool_pixels_reach_next_http_request(MaiWireApi wire) {
     }
     const std::string imagePath = MaiFileSystem::resolve(image).toUtf8();
 
-    const bool responses = wire == MaiWireApi::Responses;
     const std::string arguments = json{{"path", "photo.png"}}.dump();
     FakeServer fake;
     fake.chunk = 100000;
-    if (responses) {
-        const json call{{"type", "function_call"},
-                        {"id", "fc_view_image"},
-                        {"call_id", "call_view_image"},
-                        {"name", "view_image"},
-                        {"arguments", arguments}};
-        const json answer{
-            {"type", "message"},
-            {"id", "msg_image_answer"},
-            {"role", "assistant"},
-            {"content",
-             json::array({json{{"type", "output_text"}, {"text", "Pixels received."}}})}};
-        fake.scripts = {
-            sse(json{{"type", "response.completed"},
-                     {"response", {{"status", "completed"}, {"output", json::array({call})}}}}),
-            sse(json{{"type", "response.completed"},
-                     {"response", {{"status", "completed"}, {"output", json::array({answer})}}}})};
-    } else {
-        fake.scripts = {tool_delta(0, "call_view_image", "view_image", arguments.c_str()) + kDone,
-                        text_delta("Pixels received.") + kDone};
-    }
+    const json call{{"type", "function_call"},
+                    {"id", "fc_view_image"},
+                    {"call_id", "call_view_image"},
+                    {"name", "view_image"},
+                    {"arguments", arguments}};
+    const json answer{
+        {"type", "message"},
+        {"id", "msg_image_answer"},
+        {"role", "assistant"},
+        {"content", json::array({json{{"type", "output_text"}, {"text", "Pixels received."}}})}};
+    fake.scripts = {
+        sse(json{{"type", "response.completed"},
+                 {"response", {{"status", "completed"}, {"output", json::array({call})}}}}),
+        sse(json{{"type", "response.completed"},
+                 {"response", {{"status", "completed"}, {"output", json::array({answer})}}}})};
     fake.start();
 
     std::vector<MaiMessage> history;
     {
         MaiModelConfig config;
         config.baseUrl = fake.base();
-        config.wire = wire;
+        config.wire = MaiWireApi::Responses;
         config.maxRetries = 0;
         config.connectTimeoutSeconds = 5;
         config.totalTimeoutSeconds = 10;
@@ -1357,37 +1355,24 @@ void test_view_image_tool_pixels_reach_next_http_request(MaiWireApi wire) {
     CHECK(first["model"] == "deepseek-flash");
     CHECK(second["model"] == "deepseek-flash");
     CHECK(first["tools"].size() == 1);
-    if (first["tools"].size() == 1)
-        CHECK((responses ? first["tools"][0]["name"] : first["tools"][0]["function"]["name"]) ==
-              "view_image");
-    const json& messages = second[responses ? "input" : "messages"];
+    if (first["tools"].size() == 1) CHECK(first["tools"][0]["name"] == "view_image");
+    const json& messages = second["input"];
     CHECK(messages.is_array() && messages.size() == 4);
     if (!messages.is_array() || messages.size() != 4) return;
     CHECK(messages[0]["role"] == "user");
-    if (responses) {
-        CHECK(messages[1]["type"] == "function_call");
-        CHECK(messages[1]["call_id"] == "call_view_image");
-        CHECK(messages[1]["name"] == "view_image");
-        CHECK(messages[1]["arguments"] == arguments);
-        CHECK(messages[2]["type"] == "function_call_output");
-        CHECK(messages[2]["call_id"] == "call_view_image");
-        CHECK(messages[2]["output"].get<std::string>().find("photo.png") != std::string::npos);
-        CHECK(messages[3]["type"] == "message");
-    } else {
-        CHECK(messages[1]["role"] == "assistant");
-        CHECK(messages[1]["tool_calls"].size() == 1);
-        CHECK(messages[1]["tool_calls"][0]["id"] == "call_view_image");
-        CHECK(messages[1]["tool_calls"][0]["function"]["name"] == "view_image");
-        CHECK(messages[1]["tool_calls"][0]["function"]["arguments"] == arguments);
-        CHECK(messages[2]["role"] == "tool");
-        CHECK(messages[2]["tool_call_id"] == "call_view_image");
-        CHECK(messages[2]["content"].get<std::string>().find("photo.png") != std::string::npos);
-    }
+    CHECK(messages[1]["type"] == "function_call");
+    CHECK(messages[1]["call_id"] == "call_view_image");
+    CHECK(messages[1]["name"] == "view_image");
+    CHECK(messages[1]["arguments"] == arguments);
+    CHECK(messages[2]["type"] == "function_call_output");
+    CHECK(messages[2]["call_id"] == "call_view_image");
+    CHECK(messages[2]["output"].get<std::string>().find("photo.png") != std::string::npos);
+    CHECK(messages[3]["type"] == "message");
     CHECK(messages[3]["role"] == "user");
     const json& observation = messages[3]["content"];
     CHECK(observation.is_array() && observation.size() == 2);
     if (!observation.is_array() || observation.size() != 2) return;
-    CHECK(observation[0]["type"] == (responses ? "input_text" : "text"));
+    CHECK(observation[0]["type"] == "input_text");
     // 工具图片在整组回执后追加，wire 只能声明真实组来源；原像素字节断言继续独立验证。
     const json source = json::parse(observation[0]["text"].get<std::string>(), nullptr, false);
     CHECK(source.is_object());
@@ -1410,9 +1395,8 @@ void test_view_image_tool_pixels_reach_next_http_request(MaiWireApi wire) {
             CHECK(source["through_tool_part_id"] == toolPartId);
         }
     }
-    CHECK(observation[1]["type"] == (responses ? "input_image" : "image_url"));
-    const json& encoded =
-        responses ? observation[1]["image_url"] : observation[1]["image_url"]["url"];
+    CHECK(observation[1]["type"] == "input_image");
+    const json& encoded = observation[1]["image_url"];
     CHECK(encoded.is_string());
     if (!encoded.is_string()) return;
     const std::string dataUrl = encoded.get<std::string>();
@@ -1426,7 +1410,7 @@ void test_view_image_tool_pixels_reach_next_http_request(MaiWireApi wire) {
 // 假服务器只接收本地请求，不产生外部模型费用。
 void test_large_historical_image_uses_cached_bounded_preview() {
     FakeServer fake;
-    fake.script = text_delta("ok") + std::string(kDone);
+    fake.script = response_text_delta("ok") + std::string(kCompleted);
     fake.chunk = 100000;
     fake.start();
 
@@ -1487,10 +1471,10 @@ void test_large_historical_image_uses_cached_bounded_preview() {
     const json sent = json::parse(body, nullptr, false);
     CHECK(!sent.is_discarded());
     if (!sent.is_discarded()) {
-        const json& content = sent["messages"][0]["content"];
+        const json& content = sent["input"][0]["content"];
         CHECK(content.size() == 5);
         for (std::size_t index = 1; index < content.size(); ++index) {
-            const std::string url = content[index]["image_url"]["url"];
+            const std::string url = content[index]["image_url"];
             CHECK(url.rfind("data:image/jpeg;base64,", 0) == 0);
         }
     }
@@ -1499,7 +1483,7 @@ void test_large_historical_image_uses_cached_bounded_preview() {
 
 void test_absolute_desktop_image_can_be_outside_the_workspace() {
     FakeServer fake;
-    fake.script = text_delta("ok") + std::string(kDone);
+    fake.script = response_text_delta("ok") + std::string(kCompleted);
     fake.chunk = 100000;
     fake.start();
 
@@ -1516,7 +1500,7 @@ void test_absolute_desktop_image_can_be_outside_the_workspace() {
     CHECK(!MaiFileSystem::writeFile(image, std::string("\x89PNG", 4)));
 
     MaiModelRequest request;
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     request.workingDirectory = workspace.toUtf8();
     MaiModelMessage user;
     user.role = MaiModelRole::User;
@@ -1534,11 +1518,10 @@ void test_absolute_desktop_image_can_be_outside_the_workspace() {
     const json sent = json::parse(body, nullptr, false);
     CHECK(!sent.is_discarded());
     if (!sent.is_discarded()) {
-        const json& content = sent["messages"][0]["content"];
+        const json& content = sent["input"][0]["content"];
         CHECK(content.is_array());
         CHECK(content.size() == 2);
-        if (content.size() == 2)
-            CHECK(content[1]["image_url"]["url"] == "data:image/png;base64,iVBORw==");
+        if (content.size() == 2) CHECK(content[1]["image_url"] == "data:image/png;base64,iVBORw==");
     }
     MaiFileSystem::removeRecursively(workspace);
     MaiFileSystem::removeRecursively(external);
@@ -1546,7 +1529,7 @@ void test_absolute_desktop_image_can_be_outside_the_workspace() {
 
 void test_missing_historical_image_does_not_break_later_turns() {
     FakeServer fake;
-    fake.script = text_delta("ok") + std::string(kDone);
+    fake.script = response_text_delta("ok") + std::string(kCompleted);
     fake.chunk = 100000;
     fake.start();
 
@@ -1556,7 +1539,7 @@ void test_missing_historical_image_does_not_break_later_turns() {
     CHECK(!MaiFileSystem::createDirectories(root));
 
     MaiModelRequest request;
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     request.workingDirectory = root.toUtf8();
     MaiModelMessage oldUser;
     oldUser.role = MaiModelRole::User;
@@ -1582,22 +1565,22 @@ void test_missing_historical_image_does_not_break_later_turns() {
     const json sent = json::parse(body, nullptr, false);
     CHECK(!sent.is_discarded());
     if (!sent.is_discarded()) {
-        const json& content = sent["messages"][0]["content"];
+        const json& content = sent["input"][0]["content"];
         CHECK(content.is_array());
         CHECK(content.size() == 1);
         if (content.size() == 1) {
-            CHECK(content[0]["type"] == "text");
+            CHECK(content[0]["type"] == "input_text");
             CHECK(content[0]["text"].get<std::string>().find("no longer available") !=
                   std::string::npos);
         }
-        CHECK(sent["messages"].back()["content"] == "continue");
+        CHECK(sent["input"].back()["content"] == "continue");
     }
     MaiFileSystem::removeRecursively(root);
 }
 
 void test_missing_current_image_is_reported() {
     FakeServer fake;
-    fake.script = text_delta("unexpected") + std::string(kDone);
+    fake.script = response_text_delta("unexpected") + std::string(kCompleted);
     fake.chunk = 100000;
     fake.start();
 
@@ -1607,7 +1590,7 @@ void test_missing_current_image_is_reported() {
     CHECK(!MaiFileSystem::createDirectories(root));
 
     MaiModelRequest request;
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     request.workingDirectory = root.toUtf8();
     MaiModelMessage user;
     user.role = MaiModelRole::User;
@@ -1625,12 +1608,12 @@ void test_missing_current_image_is_reported() {
 
 void test_invalid_utf8_history_is_replaced_before_serialization() {
     FakeServer fake;
-    fake.script = text_delta("ok") + std::string(kDone);
+    fake.script = response_text_delta("ok") + std::string(kCompleted);
     fake.chunk = 100000;
     fake.start();
 
     MaiModelRequest request;
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     MaiModelMessage toolResult;
     toolResult.role = MaiModelRole::ToolResult;
     toolResult.toolCallId = "call_legacy";
@@ -1656,10 +1639,9 @@ void test_invalid_utf8_history_is_replaced_before_serialization() {
     }
     const json sent = json::parse(body, nullptr, false);
     CHECK(!sent.is_discarded());
-    CHECK(sent["messages"].size() == 1);
-    CHECK(sent["messages"][0]["role"] == "tool");
-    CHECK(sent["messages"][0]["content"].get<std::string>().find("\xEF\xBF\xBD") !=
-          std::string::npos);
+    CHECK(sent["input"].size() == 1);
+    CHECK(sent["input"][0]["type"] == "function_call_output");
+    CHECK(sent["input"][0]["output"].get<std::string>().find("\xEF\xBF\xBD") != std::string::npos);
 }
 
 // 验证 Responses 流中推理文本与函数调用按事件顺序分别回传。
@@ -1711,7 +1693,7 @@ void test_responses_streams_reasoning_text_and_function_calls() {
     user.role = MaiModelRole::User;
     user.content = "Check status";
     request.messages.push_back(std::move(user));
-    const Collected result = runAgainst(fake, request, MaiWireApi::Responses);
+    const Collected result = runAgainst(fake, request);
     CHECK(result.done);
     CHECK(result.text == "Ready");
     CHECK(result.reasoning == "Think");
@@ -1758,7 +1740,7 @@ void test_responses_item_done_recovers_missing_text_without_duplicates() {
     fake.start();
     MaiModelRequest request;
     request.model = "fake";
-    const Collected result = runAgainst(fake, request, MaiWireApi::Responses);
+    const Collected result = runAgainst(fake, request);
     CHECK(result.done);
     CHECK(result.text == "ABCDone");
     CHECK(result.reasoning.empty());
@@ -1916,7 +1898,7 @@ void test_responses_serializes_history_images_and_flat_tools() {
     result.content = "found";
     request.messages.push_back(std::move(result));
     request.tools.push_back({"lookup", "Look up a value", R"({"type":"object"})"});
-    const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+    const Collected answer = runAgainst(fake, request);
     CHECK(answer.done);
     std::string wire;
     {
@@ -2041,7 +2023,7 @@ void test_responses_continuation_replays_original_output_before_tool_results() {
         MaiModelRequest request;
         request.model = "anthropic/claude-fable-5.2";
         request.reasoningEffort = "max";
-        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected answer = runAgainst(fake, request);
         CHECK(answer.done);
         CHECK(answer.text == "Checking");
         CHECK(answer.reasoning == reasoning);
@@ -2072,7 +2054,7 @@ void test_responses_continuation_replays_original_output_before_tool_results() {
             result.content = "Result for " + call.id;
             request.messages.push_back(result);
         }
-        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        CHECK(runAgainst(fake, request).done);
         std::lock_guard<std::mutex> lock(fake.mutex);
         const json body = json::parse(fake.lastBody);
         CHECK(wireValue(body, "/store") == false);
@@ -2114,7 +2096,7 @@ void test_responses_continuation_uses_completed_items_without_terminal_output() 
     fake.start();
     MaiModelRequest request;
     request.model = "anthropic/claude-fable-5.2";
-    const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+    const Collected answer = runAgainst(fake, request);
     CHECK(answer.done);
     CHECK(answer.reasoning == "Summary");
     CHECK(answer.text.empty());
@@ -2138,7 +2120,7 @@ void test_responses_explicit_empty_terminal_does_not_recover_old_tool() {
     fake.start();
     MaiModelRequest request;
     request.model = "anthropic/claude-fable-5.2";
-    const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+    const Collected answer = runAgainst(fake, request);
     CHECK(!answer.done);
     CHECK(answer.code == MaiErrorCode::Protocol);
     CHECK(answer.continuations.empty());
@@ -2166,7 +2148,7 @@ void test_responses_item_snapshot_fallback_rejects_unfinished_visible_item() {
     fake.start();
     MaiModelRequest request;
     request.model = "anthropic/claude-fable-5.2";
-    const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+    const Collected answer = runAgainst(fake, request);
     CHECK(answer.text == "Visible answer");
     CHECK(!answer.done);
     CHECK(answer.code == MaiErrorCode::Protocol);
@@ -2213,7 +2195,7 @@ void test_responses_never_publishes_continuation_or_tools_from_unsuccessful_outp
         fake.start();
         MaiModelRequest request;
         request.model = "anthropic/claude-fable-5.2";
-        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected answer = runAgainst(fake, request);
         CHECK(!answer.done);
         CHECK(answer.calls.empty());
         CHECK(answer.continuations.empty());
@@ -2270,18 +2252,18 @@ void test_responses_continuation_checks_source_and_rejects_corruption() {
     for (const char* payload :
          {"not-json", "{}", "[null]", R"([{"type":"reasoning","content":"invalid"}])"}) {
         request.messages[0].continuation->payload = payload;
-        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected answer = runAgainst(fake, request);
         CHECK(!answer.done);
         CHECK(answer.code == MaiErrorCode::Protocol);
         CHECK(fake.requestCount.load() == 0);
     }
     request.messages[0].continuation->provider = "deepseek";
-    CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+    CHECK(runAgainst(fake, request).done);
     request.messages[0].continuation->provider = "openrouter";
     request.messages[0].continuation->model = "anthropic/other-model";
-    CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+    CHECK(runAgainst(fake, request).done);
     request.messages[0].continuation.reset();
-    CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+    CHECK(runAgainst(fake, request).done);
     std::lock_guard<std::mutex> lock(fake.mutex);
     for (const auto& wire : fake.requestBodies) {
         const json body = json::parse(wire);
@@ -2310,7 +2292,7 @@ void test_responses_foreign_continuation_uses_only_ordinary_history() {
         const char* targetModel;
     };
     const RouteCase cases[] = {
-        {"openrouter", "anthropic/claude-fable-5.2", "glm-5.3"},
+        {"openrouter", "anthropic/claude-fable-5.2", "glm-5.4"},
         {"openrouter", "anthropic/claude-fable-5.2", "deepseek-flash"},
         {"deepseek", "deepseek-flash", "deepseek-v4-pro"},
     };
@@ -2334,7 +2316,7 @@ void test_responses_foreign_continuation_uses_only_ordinary_history() {
         result.toolCallId = "call_foreign";
         result.content = "Retained tool result";
         request.messages.push_back(result);
-        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        CHECK(runAgainst(fake, request).done);
         std::lock_guard<std::mutex> lock(fake.mutex);
         const json body = json::parse(fake.lastBody);
         CHECK(wireValue(body, "/input").size() == 3);
@@ -2351,7 +2333,7 @@ void test_responses_foreign_continuation_uses_only_ordinary_history() {
     }
 }
 
-// GLM Responses 官方终态没有 Chat 的 [DONE]；空文本和加密快照仍需发布独立状态。
+// GLM Responses 官方终态无需额外哨兵；空文本和加密快照仍需发布独立状态。
 void test_glm_responses_completes_without_done_and_keeps_metadata_only_state() {
     const json thought{{"type", "reasoning"},
                        {"id", "glm_reasoning"},
@@ -2363,10 +2345,10 @@ void test_glm_responses_completes_without_done_and_keeps_metadata_only_state() {
         sse(json{{"type", "response.completed"},
                  {"response", {{"status", "completed"}, {"output", json::array({thought})}}}});
     fake.start();
-    for (const char* model : {"glm-5.3", "glm-5.3-flash"}) {
+    for (const char* model : {"glm-5.4", "glm-5.3-flash"}) {
         MaiModelRequest request;
         request.model = model;
-        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected answer = runAgainst(fake, request);
         CHECK(answer.done);
         CHECK(answer.text.empty() && answer.reasoning.empty());
         CHECK(answer.continuations.size() == 1);
@@ -2414,7 +2396,7 @@ void test_opus_55_catalog_and_responses_request() {
     for (const char* effort : {"low", "medium", "high", "xhigh", "max"}) {
         request.reasoningEffort = effort;
         CHECK(maiIsValidReasoningEffortForModel(model, effort));
-        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        CHECK(runAgainst(fake, request).done);
         std::lock_guard<std::mutex> lock(fake.mutex);
         const auto body = json::parse(fake.lastBody);
         CHECK(wireValue(body, "/model") == model);
@@ -2428,7 +2410,7 @@ void test_opus_55_catalog_and_responses_request() {
     const auto before = fake.requestCount.load();
     for (const char* effort : {"none", "invalid"}) {
         request.reasoningEffort = effort;
-        CHECK(runAgainst(fake, request, MaiWireApi::Responses).code == MaiErrorCode::InvalidInput);
+        CHECK(runAgainst(fake, request).code == MaiErrorCode::InvalidInput);
     }
     CHECK(fake.requestCount == before);
 }
@@ -2442,7 +2424,7 @@ void test_responses_cache_session_hints_preserve_the_original_request() {
     const ProviderCase cases[] = {
         {"anthropic/claude-fable-5.2", 1},
         {"anthropic/claude-opus-5.5", 1},
-        {"glm-5.3", 2},
+        {"glm-5.4", 2},
         {"glm-5.3-flash", 2},
         {"deepseek-flash", 0},
         {"deepseek-v4-pro", 0},
@@ -2477,7 +2459,7 @@ void test_responses_cache_session_hints_preserve_the_original_request() {
         // 刻意逆字典序，缓存元数据不能顺带重排原工具声明。
         request.tools = {{"z_lookup", "Read retained data", parameters},
                          {"a_lookup", "Read another retained source", parameters}};
-        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        CHECK(runAgainst(fake, request).done);
         const json original = body();
         CHECK(original.is_object());
         if (!original.is_object()) continue;
@@ -2499,7 +2481,7 @@ void test_responses_cache_session_hints_preserve_the_original_request() {
                                                 std::string(256, 'x'), "!~\"\\/#"};
         for (std::size_t index = 0; index < sessions.size(); ++index) {
             request.sessionId = sessions[index];
-            CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+            CHECK(runAgainst(fake, request).done);
             const json actual = body();
             CHECK(actual.is_object());
             if (!actual.is_object()) continue;
@@ -2526,12 +2508,12 @@ void test_responses_cache_session_hints_preserve_the_original_request() {
             if (index == 2 && item.hints != 0) CHECK(actual != sameSession);
         }
         request.sessionId.clear();
-        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        CHECK(runAgainst(fake, request).done);
         CHECK(body() == original);
         // 默认输出/推理设置不受会话提示影响，非零显式值和原始默认值都需保持。
         request.maxOutputTokens = 0;
         request.reasoningEffort.clear();
-        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        CHECK(runAgainst(fake, request).done);
         const json defaults = body();
         CHECK(defaults.is_object());
         if (!defaults.is_object()) continue;
@@ -2539,7 +2521,7 @@ void test_responses_cache_session_hints_preserve_the_original_request() {
               !defaults.contains("prompt_cache_key"));
         CHECK(!defaults.contains("max_output_tokens") && !defaults.contains("reasoning"));
         request.sessionId = "session_alpha";
-        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        CHECK(runAgainst(fake, request).done);
         CHECK(withoutHints(body()) == defaults);
     }
 }
@@ -2561,7 +2543,7 @@ void test_responses_cache_session_rejects_bad_ids_before_http() {
         marker + "\xE7\x95\x8C",
     };
     for (const char* model :
-         {"anthropic/claude-fable-5.2", "glm-5.3", "glm-5.3-flash", "deepseek-flash",
+         {"anthropic/claude-fable-5.2", "glm-5.4", "glm-5.3-flash", "deepseek-flash",
           "deepseek-v4-pro", "unknown-fixture", "local:synthetic"}) {
         FakeServer fake;
         fake.script = sse(json{{"type", "response.completed"},
@@ -2571,7 +2553,7 @@ void test_responses_cache_session_rejects_bad_ids_before_http() {
             MaiModelRequest request;
             request.model = model;
             request.sessionId = id;
-            const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+            const Collected answer = runAgainst(fake, request);
             CHECK(!answer.done);
             CHECK(answer.code == MaiErrorCode::InvalidInput);
             CHECK(fake.requestCount.load() == 0);
@@ -2634,7 +2616,7 @@ void test_particle_free_primary_wire_keeps_zero_price_guards_without_a_session()
     json first;
     for (const std::string& id : {std::string{}, std::string{"owned_free_session"}}) {
         request.sessionId = id;
-        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected answer = runAgainst(fake, request);
         CHECK(answer.done);
         json body;
         {
@@ -2675,7 +2657,7 @@ void test_particle_free_primary_wire_keeps_zero_price_guards_without_a_session()
 // 增加免费型号不能改变旧供应商字段；Fable 的 Claude 缓存规则仍按原空/非空身份工作。
 void test_particle_free_primary_does_not_change_existing_provider_fields() {
     for (const char* model :
-         {"anthropic/claude-fable-5.2", "glm-5.3", "deepseek-flash", "unknown-fixture"}) {
+         {"anthropic/claude-fable-5.2", "glm-5.4", "deepseek-flash", "unknown-fixture"}) {
         FakeServer fake;
         fake.script = sse(json{{"type", "response.completed"},
                                {"response", {{"status", "completed"}, {"output", json::array()}}}});
@@ -2684,7 +2666,7 @@ void test_particle_free_primary_does_not_change_existing_provider_fields() {
         request.model = model;
         for (const std::string& id : {std::string{}, std::string{"owned_legacy_session"}}) {
             request.sessionId = id;
-            CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+            CHECK(runAgainst(fake, request).done);
             std::lock_guard<std::mutex> lock(fake.mutex);
             const json body = json::parse(fake.lastBody, nullptr, false);
             CHECK(body.is_object());
@@ -2695,7 +2677,7 @@ void test_particle_free_primary_does_not_change_existing_provider_fields() {
                 CHECK(wireValue(body, "/session_id") == id);
                 CHECK(wireValue(body, "/cache_control") == json({{"type", "ephemeral"}}));
                 CHECK(!body.contains("prompt_cache_key"));
-            } else if (std::string(model) == "glm-5.3" && !id.empty()) {
+            } else if (std::string(model) == "glm-5.4" && !id.empty()) {
                 CHECK(wireValue(body, "/prompt_cache_key") == id);
                 CHECK(!body.contains("session_id"));
                 CHECK(!body.contains("cache_control"));
@@ -2779,13 +2761,13 @@ void test_fable_responses_preserves_all_five_reasoning_efforts() {
     request.model = "anthropic/claude-fable-5.2";
     for (const char* effort : {"low", "medium", "high", "xhigh", "max"}) {
         request.reasoningEffort = effort;
-        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+        CHECK(runAgainst(fake, request).done);
         std::lock_guard<std::mutex> lock(fake.mutex);
         const json body = json::parse(fake.lastBody);
         CHECK(wireValue(body, "/reasoning/effort") == effort);
     }
     request.reasoningEffort.clear();
-    CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
+    CHECK(runAgainst(fake, request).done);
     std::lock_guard<std::mutex> lock(fake.mutex);
     CHECK(!json::parse(fake.lastBody).contains("reasoning"));
 }
@@ -2796,13 +2778,13 @@ void test_responses_rejects_unsupported_model_efforts_before_http() {
     fake.script = sse(json{{"type", "response.completed"},
                            {"response", {{"status", "completed"}, {"output", json::array()}}}});
     fake.start();
-    for (const char* model : {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
+    for (const char* model : {"glm-5.4", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro",
                               "local:synthetic", "unknown-fixture"}) {
         for (const char* effort : {"medium", "xhigh"}) {
             MaiModelRequest request;
             request.model = model;
             request.reasoningEffort = effort;
-            const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+            const Collected answer = runAgainst(fake, request);
             CHECK(!answer.done);
             CHECK(answer.code == MaiErrorCode::InvalidInput);
             CHECK(answer.text.empty() && answer.reasoning.empty());
@@ -2814,7 +2796,7 @@ void test_responses_rejects_unsupported_model_efforts_before_http() {
         MaiModelRequest request;
         request.model = "anthropic/claude-fable-5.2";
         request.reasoningEffort = effort;
-        const Collected answer = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected answer = runAgainst(fake, request);
         CHECK(!answer.done);
         CHECK(answer.code == MaiErrorCode::InvalidInput);
         CHECK(answer.calls.empty() && answer.continuations.empty());
@@ -2822,54 +2804,41 @@ void test_responses_rejects_unsupported_model_efforts_before_http() {
     }
 }
 
-// 官方型号矩阵：产品云端统一 Responses；generic Chat 仅保留 GLM 的旧兼容扩展。
-void test_cloud_effort_levels_reach_the_selected_wire() {
-    for (const MaiWireApi wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
-        FakeServer fake;
-        fake.script =
-            wire == MaiWireApi::Responses
-                ? sse(json{{"type", "response.completed"},
-                           {"response", {{"status", "completed"}, {"output", json::array()}}}})
-                : "data: [DONE]\n\n";
-        fake.start();
-        for (const char* model : {"deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash",
-                                  "anthropic/claude-fable-5.2"}) {
-            for (const char* effort : {"low", "high", "max"}) {
-                MaiModelRequest request;
-                request.model = model;
-                request.reasoningEffort = effort;
-                MaiModelMessage user;
-                user.role = MaiModelRole::User;
-                user.content = "Check effort";
-                request.messages.push_back(std::move(user));
-                CHECK(runAgainst(fake, request, wire).done);
-                json body;
-                {
-                    std::lock_guard<std::mutex> lock(fake.mutex);
-                    body = json::parse(fake.lastBody);
-                }
-                CHECK(body["model"] == model);
-                if (wire == MaiWireApi::Responses) {
-                    CHECK(body["reasoning"]["effort"] == effort);
-                } else if (std::string(model).find("glm-") == 0) {
-                    CHECK(body["thinking"]["type"] == "enabled");
-                    CHECK(body["reasoning_effort"] == effort);
-                } else {
-                    CHECK(!body.contains("thinking"));
-                    CHECK(!body.contains("reasoning_effort"));
-                }
+// 官方型号矩阵统一使用 Responses reasoning.effort，未知型号不擅自添加供应商扩展。
+void test_cloud_effort_levels_reach_responses() {
+    FakeServer fake;
+    fake.script = sse(json{{"type", "response.completed"},
+                           {"response", {{"status", "completed"}, {"output", json::array()}}}});
+    fake.start();
+    for (const char* model : {"deepseek-flash", "deepseek-v4-pro", "glm-5.4", "glm-5.3-flash",
+                              "anthropic/claude-fable-5.2"}) {
+        for (const char* effort : {"low", "high", "max"}) {
+            MaiModelRequest request;
+            request.model = model;
+            request.reasoningEffort = effort;
+            MaiModelMessage user;
+            user.role = MaiModelRole::User;
+            user.content = "Check effort";
+            request.messages.push_back(std::move(user));
+            CHECK(runAgainst(fake, request).done);
+            json body;
+            {
+                std::lock_guard<std::mutex> lock(fake.mutex);
+                body = json::parse(fake.lastBody);
             }
+            CHECK(body["model"] == model);
+            CHECK(body["reasoning"]["effort"] == effort);
         }
-        MaiModelRequest unknown;
-        unknown.model = "unrelated-fixture-model";
-        unknown.reasoningEffort = "max";
-        CHECK(runAgainst(fake, unknown, wire).done);
-        std::lock_guard<std::mutex> lock(fake.mutex);
-        const auto body = json::parse(fake.lastBody);
-        CHECK(!body.contains("reasoning"));
-        CHECK(!body.contains("reasoning_effort"));
-        CHECK(!body.contains("thinking"));
     }
+    MaiModelRequest unknown;
+    unknown.model = "unrelated-fixture-model";
+    unknown.reasoningEffort = "max";
+    CHECK(runAgainst(fake, unknown).done);
+    std::lock_guard<std::mutex> lock(fake.mutex);
+    const auto body = json::parse(fake.lastBody);
+    CHECK(!body.contains("reasoning"));
+    CHECK(!body.contains("reasoning_effort"));
+    CHECK(!body.contains("thinking"));
 }
 
 // 三个供应商均使用 Responses；账号凭据不可交叉，也不因鉴权错误回退到其它供应商。
@@ -2884,7 +2853,7 @@ void test_routed_models_keep_wire_key_and_failure_isolation() {
     int glmKeyReads = 0, deepseekKeyReads = 0, openrouterKeyReads = 0;
     std::string glmKey = "synthetic-glm-key", deepseekKey = "synthetic-deepseek-key";
     MaiModelRoute glmRoute;
-    glmRoute.modelNames = {"glm-5.3", "glm-5.3-flash"};
+    glmRoute.modelNames = {"glm-5.4", "glm-5.3-flash"};
     glmRoute.config.baseUrl = glm.base();
     glmRoute.config.wire = MaiWireApi::Responses;
     glmRoute.apiKeyProvider = [&] {
@@ -2911,7 +2880,7 @@ void test_routed_models_keep_wire_key_and_failure_isolation() {
     };
     auto client = makeMaiRoutedModelClient({{glmRoute, deepseekRoute, openrouterRoute}});
     CHECK(client->wireApi() == MaiWireApi::Responses);
-    CHECK(client->wireApiForModel("glm-5.3") == MaiWireApi::Responses);
+    CHECK(client->wireApiForModel("glm-5.4") == MaiWireApi::Responses);
     CHECK(client->wireApiForModel("deepseek-v4-pro") == MaiWireApi::Responses);
     CHECK(client->wireApiForModel("anthropic/claude-fable-5.2") == MaiWireApi::Responses);
     CHECK(!client->wireApiForModel("glm-unknown"));
@@ -2930,7 +2899,7 @@ void test_routed_models_keep_wire_key_and_failure_isolation() {
     output.toolCallId = "raw_reasoning_call";
     output.content = "Result";
     request.messages.push_back(output);
-    for (const char* model : {"glm-5.3", "deepseek-v4-pro", "glm-5.3-flash", "deepseek-flash",
+    for (const char* model : {"glm-5.4", "deepseek-v4-pro", "glm-5.3-flash", "deepseek-flash",
                               "anthropic/claude-fable-5.2"}) {
         request.model = model;
         CHECK(!client->stream(request, {}, cancel));
@@ -2972,7 +2941,7 @@ void test_routed_models_keep_wire_key_and_failure_isolation() {
     CHECK(glmKeyReads == 2 && deepseekKeyReads == 2);
     CHECK(openrouterKeyReads == 1 && openrouter.requestCount == 1);
     glmKey = "rotated-glm-key";
-    request.model = "glm-5.3";
+    request.model = "glm-5.4";
     CHECK(!client->stream(request, {}, cancel));
     {
         std::lock_guard<std::mutex> lock(glm.mutex);
@@ -2987,7 +2956,7 @@ void test_routed_models_keep_wire_key_and_failure_isolation() {
     CHECK(client->stream(request, {}, cancel).code() == MaiErrorCode::NotConfigured);
     CHECK(glm.requestCount == glmRequests && deepseek.requestCount == 2);
     auto invalid = makeMaiRoutedModelClient({{glmRoute, glmRoute}});
-    CHECK(!invalid->wireApiForModel("glm-5.3"));
+    CHECK(!invalid->wireApiForModel("glm-5.4"));
     CHECK(invalid->stream(request, {}, cancel).code() == MaiErrorCode::InvalidInput);
     cancel = true;
     CHECK(client->stream(request, {}, cancel).code() == MaiErrorCode::Canceled);
@@ -3004,7 +2973,7 @@ void test_responses_needs_terminal_event_and_reports_incomplete() {
         FakeServer fake;
         fake.script = sse(json{{"type", "response.output_text.delta"}, {"delta", "partial"}});
         fake.start();
-        const Collected result = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected result = runAgainst(fake, request);
         CHECK(!result.done);
         CHECK(result.text == "partial");
         CHECK(result.error.find("without a terminal event") != std::string::npos);
@@ -3016,7 +2985,7 @@ void test_responses_needs_terminal_event_and_reports_incomplete() {
                                 {{"output", json::array()},
                                  {"incomplete_details", {{"reason", "max_output_tokens"}}}}}});
         fake.start();
-        const Collected result = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected result = runAgainst(fake, request);
         CHECK(!result.done);
         CHECK(result.error.find("max_output_tokens") != std::string::npos);
     }
@@ -3028,7 +2997,7 @@ void test_responses_needs_terminal_event_and_reports_incomplete() {
                   {{"output", json::array()},
                    {"error", {{"code", "provider_error"}, {"message", "generation failed"}}}}}});
         fake.start();
-        const Collected result = runAgainst(fake, request, MaiWireApi::Responses);
+        const Collected result = runAgainst(fake, request);
         CHECK(!result.done);
         CHECK(result.error.find("generation failed") != std::string::npos);
     }
@@ -3073,13 +3042,7 @@ struct FakeModelProxy {
                 return;
             }
             response.status = terminalStatus;
-            response.set_content(request.target.find("/responses") != std::string::npos ||
-                                         request.target.find("/final") != std::string::npos
-                                     ? "data: "
-                                       "{\"type\":\"response.completed\",\"response\":{\"status\":"
-                                       "\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n"
-                                     : "data: [DONE]\n\n",
-                                 "text/event-stream");
+            response.set_content(kCompleted, "text/event-stream");
         };
         server.Post(".*", handle);
         server.Get(".*", handle);
@@ -3142,7 +3105,7 @@ private:
     bool mHadValue = false;
 };
 
-void test_responses_proxy_redirects(MaiWireApi wire) {
+void test_responses_proxy_redirects() {
     // NO_PROXY 覆盖了环境变量匹配目标的情况，系统代理选择仍应生效。
     ScopedProxyEnvironment noProxy("no_proxy", "*");
     ScopedProxyEnvironment upperNoProxy("NO_PROXY", "*");
@@ -3157,7 +3120,7 @@ void test_responses_proxy_redirects(MaiWireApi wire) {
         MaiModelConfig config;
         config.baseUrl = "http://first.test";
         config.apiKey = "test-key";
-        config.wire = wire;
+        config.wire = MaiWireApi::Responses;
         config.maxRetries = 0;
         config.proxyResolver = [&](const std::string& url, MaiModelProxy& proxy) {
             resolved.push_back(url);
@@ -3180,10 +3143,7 @@ void test_responses_proxy_redirects(MaiWireApi wire) {
         CHECK(secondRequests.size() == 1);
         if (firstRequests.size() == 1 && secondRequests.size() == 1) {
             CHECK(firstRequests[0].method == "POST");
-            CHECK(firstRequests[0].target ==
-                  "http://first.test" + std::string(wire == MaiWireApi::Responses
-                                                        ? "/responses"
-                                                        : "/chat/completions"));
+            CHECK(firstRequests[0].target == "http://first.test/responses");
             CHECK(firstRequests[0].host == "first.test");
             CHECK(firstRequests[0].authorization == "Bearer test-key");
             CHECK(firstRequests[0].proxyAuthorization == "Basic YWxwaGE6b25l");
@@ -3198,7 +3158,7 @@ void test_responses_proxy_redirects(MaiWireApi wire) {
     }
 }
 
-void test_responses_proxy_same_origin_redirect(MaiWireApi wire) {
+void test_responses_proxy_same_origin_redirect() {
     ScopedProxyEnvironment noProxy("no_proxy", "*");
     ScopedProxyEnvironment upperNoProxy("NO_PROXY", "*");
     FakeModelProxy proxy;
@@ -3208,7 +3168,7 @@ void test_responses_proxy_same_origin_redirect(MaiWireApi wire) {
     MaiModelConfig config;
     config.baseUrl = "http://first.test";
     config.apiKey = "test-key";
-    config.wire = wire;
+    config.wire = MaiWireApi::Responses;
     config.maxRetries = 0;
     config.proxyResolver = [&](const std::string&, MaiModelProxy& route) {
         route.url = proxy.address();
@@ -3230,7 +3190,7 @@ void test_responses_proxy_same_origin_redirect(MaiWireApi wire) {
     }
 }
 
-void test_responses_proxy_redirect_total_timeout(MaiWireApi wire) {
+void test_responses_proxy_redirect_total_timeout() {
     ScopedProxyEnvironment noProxy("no_proxy", "*");
     ScopedProxyEnvironment upperNoProxy("NO_PROXY", "*");
     FakeModelProxy first;
@@ -3243,7 +3203,7 @@ void test_responses_proxy_redirect_total_timeout(MaiWireApi wire) {
     second.start();
     MaiModelConfig config;
     config.baseUrl = "http://first.test";
-    config.wire = wire;
+    config.wire = MaiWireApi::Responses;
     config.maxRetries = 0;
     config.totalTimeoutSeconds = 2;
     config.proxyResolver = [&](const std::string& url, MaiModelProxy& route) {
@@ -3263,7 +3223,7 @@ void test_responses_proxy_redirect_total_timeout(MaiWireApi wire) {
     CHECK(second.received().size() == 1);
 }
 
-void test_responses_without_location_retains_body(MaiWireApi wire) {
+void test_responses_without_location_retains_body() {
     ScopedProxyEnvironment noProxy("no_proxy", "*");
     ScopedProxyEnvironment upperNoProxy("NO_PROXY", "*");
     FakeModelProxy destination;
@@ -3271,7 +3231,7 @@ void test_responses_without_location_retains_body(MaiWireApi wire) {
     destination.start();
     MaiModelConfig config;
     config.baseUrl = destination.address();
-    config.wire = wire;
+    config.wire = MaiWireApi::Responses;
     config.maxRetries = 0;
     MaiModelRequest request;
     request.model = "test-model";
@@ -3283,13 +3243,13 @@ void test_responses_without_location_retains_body(MaiWireApi wire) {
     CHECK(destination.received().size() == 2);
 }
 
-void test_responses_proxy_resolver_timeout_retries_before_output(MaiWireApi wire) {
+void test_responses_proxy_resolver_timeout_retries_before_output() {
     FakeModelProxy destination;
     destination.start();
     int resolutions = 0;
     MaiModelConfig config;
     config.baseUrl = destination.address();
-    config.wire = wire;
+    config.wire = MaiWireApi::Responses;
     config.totalTimeoutSeconds = 1;
     config.maxRetries = 1;
     config.retryInitialDelayMs = 0;
@@ -3309,7 +3269,7 @@ void test_responses_proxy_resolver_timeout_retries_before_output(MaiWireApi wire
 }
 
 #if defined(MAI_MODEL_CLIENT_TLS_TESTS)
-void test_responses_proxy_rejects_tls_downgrade(MaiWireApi wire) {
+void test_responses_proxy_rejects_tls_downgrade() {
     const std::string certificateRoot =
         std::string(MAI_AGENT_SOURCE_DIR) + "/third_party/curl/tests/certs/";
     const std::string certificate = certificateRoot + "Server-localhost-sv.crt";
@@ -3323,18 +3283,17 @@ void test_responses_proxy_rejects_tls_downgrade(MaiWireApi wire) {
     std::mutex mutex;
     std::vector<ProxyRequest> secureRequests;
     std::atomic<int> redirectStatus{302};
-    secure.Post(wire == MaiWireApi::Responses ? "/responses" : "/chat/completions",
-                [&](const httplib::Request& request, httplib::Response& response) {
-                    {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        secureRequests.push_back(
-                            {request.method, request.target, request.get_header_value("Host"),
-                             request.get_header_value("Authorization"),
-                             request.get_header_value("Proxy-Authorization"), request.body});
-                    }
-                    response.status = redirectStatus.load();
-                    response.set_header("Location", plain.address() + "/final");
-                });
+    secure.Post("/responses", [&](const httplib::Request& request, httplib::Response& response) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            secureRequests.push_back(
+                {request.method, request.target, request.get_header_value("Host"),
+                 request.get_header_value("Authorization"),
+                 request.get_header_value("Proxy-Authorization"), request.body});
+        }
+        response.status = redirectStatus.load();
+        response.set_header("Location", plain.address() + "/final");
+    });
     const int securePort = secure.bind_to_any_port("127.0.0.1");
     CHECK(securePort > 0);
     if (securePort <= 0) return;
@@ -3345,7 +3304,7 @@ void test_responses_proxy_rejects_tls_downgrade(MaiWireApi wire) {
     config.baseUrl = "https://localhost:" + std::to_string(securePort);
     config.caBundlePath = authority;
     config.apiKey = "test-key";
-    config.wire = wire;
+    config.wire = MaiWireApi::Responses;
     config.maxRetries = 0;
     std::vector<std::string> resolved;
     config.proxyResolver = [&](const std::string& url, MaiModelProxy&) {
@@ -3376,7 +3335,7 @@ void test_responses_proxy_rejects_tls_downgrade(MaiWireApi wire) {
 }
 #endif
 
-void test_responses_proxy_direct_and_cancel(MaiWireApi wire) {
+void test_responses_proxy_direct_and_cancel() {
     FakeModelProxy destination;
     destination.start();
     // 本地监听器能证明空路由绕过环境代理，而不是仅验证回调被调用。
@@ -3385,7 +3344,7 @@ void test_responses_proxy_direct_and_cancel(MaiWireApi wire) {
     ScopedProxyEnvironment httpProxy("http_proxy", "http://127.0.0.1:1");
     MaiModelConfig config;
     config.baseUrl = destination.address();
-    config.wire = wire;
+    config.wire = MaiWireApi::Responses;
     config.maxRetries = 0;
     config.proxyResolver = [](const std::string&, MaiModelProxy& route) {
         route.url.clear();
@@ -3434,33 +3393,58 @@ void test_local_mode_never_falls_back_to_a_remote_request() {
     CHECK(destination.received().empty());
 }
 
+// 两个公开远端入口共享 Responses 默认值；目录描述值不能被当成可发送的协议。
+void test_remote_factories_default_to_responses_and_reject_mixed() {
+    FakeServer fake;
+    fake.script = response_text_delta("default response") + kCompleted;
+    fake.start();
+    MaiModelConfig config;
+    config.baseUrl = fake.base();
+    CHECK(config.wire == MaiWireApi::Responses);
+    MaiModelRequest request;
+    request.model = "test-model";
+    std::atomic<bool> cancel{false};
+    for (const bool direct : {false, true}) {
+        auto client = direct ? makeMaiResponsesClient(config) : makeMaiModelClient(config);
+        CHECK(client->wireApi() == MaiWireApi::Responses);
+        std::string output;
+        MaiStreamSink sink;
+        sink.onText = [&](std::string_view text) { output.append(text); };
+        CHECK(!client->stream(request, sink, cancel));
+        CHECK(output == "default response");
+    }
+    CHECK(fake.requestCount.load() == 2);
+    config.wire = MaiWireApi::Mixed;
+    for (const bool direct : {false, true}) {
+        auto client = direct ? makeMaiResponsesClient(config) : makeMaiModelClient(config);
+        CHECK(client->wireApi() == MaiWireApi::Mixed);
+        bool delivered = false;
+        MaiStreamSink sink;
+        sink.onText = [&](std::string_view) { delivered = true; };
+        sink.onToolCall = [&](const MaiToolInvocation&) { delivered = true; };
+        cancel.store(false);
+        CHECK(client->stream(request, sink, cancel).code() == MaiErrorCode::InvalidInput);
+        cancel.store(true);
+        CHECK(client->stream(request, sink, cancel).code() == MaiErrorCode::Canceled);
+        CHECK(!delivered);
+    }
+    CHECK(fake.requestCount.load() == 2);
+}
+
 // 用实际 socket 字节核对 output 上限和 usage 字段，不能把本地估计当作服务端 usage。
 void test_context_limits_output_budget_and_actual_usage() {
     std::printf("   context limits, output wire budgets, and actual provider usage\n");
-    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
+    {
         FakeServer fake;
         fake.chunk = 1;
-        if (wire == MaiWireApi::ChatCompletions) {
-            fake.script =
-                "data: "
-                "{\"choices\":[{\"delta\":{\"content\":\"reply\"},\"finish_reason\":\"stop\"}]}\n\n"
-                "data: "
-                "{\"choices\":[],\"usage\":{\"prompt_tokens\":1234,\"completion_tokens\":57}}\n\n"
-                "data: [DONE]\n\n";
-        } else {
-            fake.script =
-                "data: "
-                "{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"reply\"}"
-                "\n\n"
-                "data: "
-                "{\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_"
-                "tokens\":1234,\"output_tokens\":57}}}\n\n";
-        }
+        fake.script =
+            response_text_delta("reply") +
+            sse(json{{"type", "response.completed"},
+                     {"response", {{"usage", {{"input_tokens", 1234}, {"output_tokens", 57}}}}}});
         fake.start();
         MaiModelConfig config;
         config.baseUrl = fake.base();
-        config.wire = wire;
-        config.includeStreamUsage = true;
+        config.wire = MaiWireApi::Responses;
         config.contextLimits = [](const std::string& model) {
             return model == "small-window" ? MaiModelContextLimits{8192, 2048}
                                            : MaiModelContextLimits{32768, 4096};
@@ -3490,12 +3474,8 @@ void test_context_limits_output_budget_and_actual_usage() {
             body = fake.lastBody;
         }
         const auto sent = json::parse(body);
-        if (wire == MaiWireApi::ChatCompletions) {
-            CHECK(sent["max_tokens"] == 256);
-            CHECK(sent["stream_options"]["include_usage"] == true);
-        } else {
-            CHECK(sent["max_output_tokens"] == 256);
-        }
+        CHECK(sent["max_output_tokens"] == 256);
+        CHECK(!sent.contains("stream_options"));
         request.maxOutputTokens = 0;
         CHECK(!client->stream(request, sink, cancel));
         {
@@ -3507,10 +3487,7 @@ void test_context_limits_output_budget_and_actual_usage() {
         CHECK(!defaultBody.contains("max_output_tokens"));
     }
     FakeServer absent;
-    absent.script =
-        "data: "
-        "{\"choices\":[{\"delta\":{\"content\":\"reply\"},\"finish_reason\":\"stop\"}]}\n\ndata: "
-        "[DONE]\n\n";
+    absent.script = response_text_delta("reply") + kCompleted;
     absent.start();
     MaiModelRequest request;
     request.model = "unknown";
@@ -3519,13 +3496,13 @@ void test_context_limits_output_budget_and_actual_usage() {
     CHECK(result.usage.empty());
     MaiModelConfig unknown;
     unknown.baseUrl = absent.base();
-    CHECK(makeMaiModelClient(unknown)->contextLimits("glm-5.3").contextWindowTokens == 0);
+    CHECK(makeMaiModelClient(unknown)->contextLimits("glm-5.4").contextWindowTokens == 0);
 }
 
 }  // namespace
 
 // 走真实 HTTP 和 Agent：半截正文后正常 EOF 也必须恢复，失败草稿不能进入重试请求。
-void test_agent_recovers_partial_stream_without_replaying_draft(MaiWireApi wire, bool stalled,
+void test_agent_recovers_partial_stream_without_replaying_draft(bool stalled,
                                                                 bool serverError = false) {
     FakeServer fake;
     const json finalItem{
@@ -3538,17 +3515,11 @@ void test_agent_recovers_partial_stream_without_replaying_draft(MaiWireApi wire,
                              {"delta", "FAILED_ATTEMPT_PRIVATE_DRAFT"}}),
                     sse(json{{"type", "response.completed"},
                              {"response", {{"output", json::array({finalItem})}}}})};
-    if (wire == MaiWireApi::ChatCompletions)
-        fake.scripts = {text_delta("FAILED_ATTEMPT_PRIVATE_DRAFT"),
-                        text_delta("RECOVERED_FINAL") + kDone};
     if (serverError) {
         // HTTP 200 中的明确 server_error 与 EOF 共用同一恢复所有者。
-        fake.scripts[0] +=
-            wire == MaiWireApi::ChatCompletions
-                ? sse(json{{"error", {{"code", "server_error"}, {"message", "try again"}}}})
-                : sse(json{{"type", "response.failed"},
-                           {"response",
-                            {{"error", {{"code", "server_error"}, {"message", "try again"}}}}}});
+        fake.scripts[0] += sse(
+            json{{"type", "response.failed"},
+                 {"response", {{"error", {{"code", "server_error"}, {"message", "try again"}}}}}});
     }
     if (stalled) {
         fake.stallRequests = 1;
@@ -3558,7 +3529,7 @@ void test_agent_recovers_partial_stream_without_replaying_draft(MaiWireApi wire,
     MaiModelConfig config;
     config.baseUrl = fake.base();
     config.apiKey = "test-key";
-    config.wire = wire;
+    config.wire = MaiWireApi::Responses;
     config.inactivityTimeoutSeconds = 1;
     config.progressTimeoutSeconds = 2;
     config.maxRetries = 2;
@@ -3596,7 +3567,7 @@ void test_agent_recovers_partial_stream_without_replaying_draft(MaiWireApi wire,
 }
 
 // 两层均有重试能力时，真实 HTTP 次数仍严格受同一预算约束；永久拒绝不重试。
-void test_agent_transport_retry_budget_and_permanent_rejections(MaiWireApi wire) {
+void test_agent_transport_retry_budget_and_permanent_rejections() {
     for (const int status : {503, 429, 401, 402, 403}) {
         for (const bool hardQuota : {false, true}) {
             if (hardQuota && status != 429) continue;
@@ -3607,16 +3578,11 @@ void test_agent_transport_retry_budget_and_permanent_rejections(MaiWireApi wire)
             if (hardQuota)
                 fake.transientBody =
                     R"({"error":{"code":"insufficient_quota","message":"no credit"}})";
-            fake.script = wire == MaiWireApi::ChatCompletions
-                              ? text_delta("Recovered after rate limit") + kDone
-                              : sse(json{{"type", "response.output_text.delta"},
-                                         {"output_index", 0},
-                                         {"delta", "Recovered after rate limit"}}) +
-                                    sse(json{{"type", "response.completed"}});
+            fake.script = response_text_delta("Recovered after rate limit") + kCompleted;
             fake.start();
             MaiModelConfig config;
             config.baseUrl = fake.base();
-            config.wire = wire;
+            config.wire = MaiWireApi::Responses;
             config.maxRetries = 2;
             config.retryInitialDelayMs = 0;
             MaiAgent agent(makeMaiMemoryStore(), makeMaiModelClient(config));
@@ -3642,79 +3608,73 @@ void test_agent_transport_retry_budget_and_permanent_rejections(MaiWireApi wire)
 
 // 通过服务端观察真实 TCP 来源端口，不能用客户端“命中缓存”计数代替连接复用证明。
 void test_routed_clients_reuse_connections_and_retire_changed_credentials() {
-    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
-        FakeServer fake;
-        fake.fixedBody = true;
-        fake.script = wire == MaiWireApi::ChatCompletions
-                          ? text_delta("pooled") + kDone
-                          : sse(json{{"type", "response.output_text.delta"},
-                                     {"output_index", 0},
-                                     {"delta", "pooled"}}) +
-                                sse(json{{"type", "response.completed"}});
-        fake.start();
-        std::string key = "owned-key-one";
-        MaiModelRoute route;
-        route.modelNames = {"fixture"};
-        route.config.baseUrl = fake.base();
-        route.config.wire = wire;
-        route.config.maxRetries = 0;
-        route.apiKeyProvider = [&] { return key; };
-        MaiRoutedModelConfig routes;
-        routes.routes.push_back(route);
-        auto client = makeMaiRoutedModelClient(std::move(routes));
-        MaiModelRequest request;
-        request.model = "fixture";
-        const std::atomic<bool> cancel{false};
-        const auto send = [&] {
-            std::string text;
-            MaiStreamSink sink;
-            sink.onText = [&](std::string_view chunk) { text.append(chunk); };
-            const auto result = client->stream(request, sink, cancel);
-            if (!result) CHECK(text == "pooled");
-            return result;
-        };
-        CHECK(!send());
-        CHECK(!send());
-        key = "owned-key-two";
-        CHECK(!send());
-        key.clear();
-        CHECK(send().code() == MaiErrorCode::NotConfigured);
-        key = "owned-key-two";
-        CHECK(!send());
-        std::lock_guard<std::mutex> lock(fake.mutex);
-        CHECK(fake.clientPorts.size() == 4);
-        if (fake.clientPorts.size() == 4) {
-            CHECK(fake.clientPorts[0] == fake.clientPorts[1]);
-            CHECK(fake.clientPorts[1] != fake.clientPorts[2]);
-            CHECK(fake.clientPorts[2] != fake.clientPorts[3]);
-        }
-        CHECK(fake.lastAuthorization == "Bearer owned-key-two");
+    FakeServer fake;
+    fake.fixedBody = true;
+    fake.script = response_text_delta("pooled") + kCompleted;
+    fake.start();
+    std::string key = "owned-key-one";
+    MaiModelRoute route;
+    route.modelNames = {"fixture"};
+    route.config.baseUrl = fake.base();
+    // TCP 来源端口只能观察直接连接。继承的环境代理可能复用客户端连接，
+    // 却为每次转发新建上游连接，使服务端端口无法证明客户端是否复用。
+    route.config.proxyResolver = [](const std::string&, MaiModelProxy& proxy) {
+        proxy = {};
+        return true;
+    };
+    route.config.wire = MaiWireApi::Responses;
+    route.config.maxRetries = 0;
+    route.apiKeyProvider = [&] { return key; };
+    MaiRoutedModelConfig routes;
+    routes.routes.push_back(route);
+    auto client = makeMaiRoutedModelClient(std::move(routes));
+    MaiModelRequest request;
+    request.model = "fixture";
+    const std::atomic<bool> cancel{false};
+    const auto send = [&] {
+        std::string text;
+        MaiStreamSink sink;
+        sink.onText = [&](std::string_view chunk) { text.append(chunk); };
+        const auto result = client->stream(request, sink, cancel);
+        if (!result) CHECK(text == "pooled");
+        return result;
+    };
+    CHECK(!send());
+    CHECK(!send());
+    key = "owned-key-two";
+    CHECK(!send());
+    key.clear();
+    CHECK(send().code() == MaiErrorCode::NotConfigured);
+    key = "owned-key-two";
+    CHECK(!send());
+    std::lock_guard<std::mutex> lock(fake.mutex);
+    CHECK(fake.clientPorts.size() == 4);
+    if (fake.clientPorts.size() == 4) {
+        CHECK(fake.clientPorts[0] == fake.clientPorts[1]);
+        CHECK(fake.clientPorts[1] != fake.clientPorts[2]);
+        CHECK(fake.clientPorts[2] != fake.clientPorts[3]);
     }
+    CHECK(fake.lastAuthorization == "Bearer owned-key-two");
 }
 void test_context_length_failure_is_typed_without_network_retry() {
-    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
-        FakeServer fake;
-        fake.status = 400;
-        fake.script =
-            R"({"error":{"code":"context_length_exceeded","message":"owned context limit"}})";
-        fake.start();
-        MaiModelRequest request;
-        request.model = "fixture";
-        const auto result = runAgainst(fake, request, wire);
-        CHECK(result.code == MaiErrorCode::ContextWindowExceeded);
-        CHECK(fake.requestCount.load() == 1);
-    }
+    FakeServer fake;
+    fake.status = 400;
+    fake.script = R"({"error":{"code":"context_length_exceeded","message":"owned context limit"}})";
+    fake.start();
+    MaiModelRequest request;
+    request.model = "fixture";
+    const auto result = runAgainst(fake, request);
+    CHECK(result.code == MaiErrorCode::ContextWindowExceeded);
+    CHECK(fake.requestCount.load() == 1);
 }
 
 void test_stream_recovery() {
     test_routed_clients_reuse_connections_and_retire_changed_credentials();
     test_context_length_failure_is_typed_without_network_retry();
-    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
-        test_agent_recovers_partial_stream_without_replaying_draft(wire, false);
-        test_agent_recovers_partial_stream_without_replaying_draft(wire, true);
-        test_agent_recovers_partial_stream_without_replaying_draft(wire, false, true);
-        test_agent_transport_retry_budget_and_permanent_rejections(wire);
-    }
+    test_agent_recovers_partial_stream_without_replaying_draft(false);
+    test_agent_recovers_partial_stream_without_replaying_draft(true);
+    test_agent_recovers_partial_stream_without_replaying_draft(false, true);
+    test_agent_transport_retry_budget_and_permanent_rejections();
 }
 
 int main(int argc, char** argv) {
@@ -3752,7 +3712,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--reasoning-efforts") {
         test_fable_responses_preserves_all_five_reasoning_efforts();
         test_responses_rejects_unsupported_model_efforts_before_http();
-        test_cloud_effort_levels_reach_the_selected_wire();
+        test_cloud_effort_levels_reach_responses();
         return failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--continuation-completeness") {
@@ -3776,24 +3736,24 @@ int main(int argc, char** argv) {
         test_glm_responses_completes_without_done_and_keeps_metadata_only_state();
         test_fable_responses_preserves_all_five_reasoning_efforts();
         test_responses_rejects_unsupported_model_efforts_before_http();
-        test_cloud_effort_levels_reach_the_selected_wire();
+        test_cloud_effort_levels_reach_responses();
         test_routed_models_keep_wire_key_and_failure_isolation();
         return failures == 0 ? 0 : 1;
     }
-    if (argc == 2 && std::string(argv[1]) == "--chat-proxy") {
-        test_responses_proxy_redirects(MaiWireApi::ChatCompletions);
-        test_responses_proxy_same_origin_redirect(MaiWireApi::ChatCompletions);
-        test_responses_proxy_redirect_total_timeout(MaiWireApi::ChatCompletions);
-        test_responses_without_location_retains_body(MaiWireApi::ChatCompletions);
-        test_responses_proxy_resolver_timeout_retries_before_output(MaiWireApi::ChatCompletions);
+    if (argc == 2 && std::string(argv[1]) == "--responses-proxy") {
+        test_responses_proxy_redirects();
+        test_responses_proxy_same_origin_redirect();
+        test_responses_proxy_redirect_total_timeout();
+        test_responses_without_location_retains_body();
+        test_responses_proxy_resolver_timeout_retries_before_output();
 #if defined(MAI_MODEL_CLIENT_TLS_TESTS)
-        test_responses_proxy_rejects_tls_downgrade(MaiWireApi::ChatCompletions);
+        test_responses_proxy_rejects_tls_downgrade();
 #endif
-        test_responses_proxy_direct_and_cancel(MaiWireApi::ChatCompletions);
+        test_responses_proxy_direct_and_cancel();
         return failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--session-models") {
-        test_cloud_effort_levels_reach_the_selected_wire();
+        test_cloud_effort_levels_reach_responses();
         test_routed_models_keep_wire_key_and_failure_isolation();
         return failures == 0 ? 0 : 1;
     }
@@ -3829,6 +3789,7 @@ int main(int argc, char** argv) {
     test_text_stream_one_byte_at_a_time();
     test_text_stream_all_at_once();
     test_tool_call_fragments();
+    test_function_argument_deltas_extend_progress_without_early_delivery();
     test_two_tool_calls_interleaved();
     test_malformed_lines_are_ignored();
     test_server_error_inside_stream();
@@ -3838,23 +3799,22 @@ int main(int argc, char** argv) {
     test_openrouter_402_limits_do_not_infer_missing_or_foreign_metadata();
     test_openrouter_402_retry_after_only_accepts_bounded_numeric_seconds();
     test_openrouter_402_truncated_reset_response_is_not_retried();
-    test_finish_reason_length_is_not_reported_as_success();
+    test_output_token_limit_is_not_reported_as_success();
     test_final_unterminated_sse_line_is_processed();
     test_transient_http_failure_retries_before_streaming();
-    test_chat_completions_requires_done_before_reporting_success();
-    test_chat_completions_does_not_release_tools_without_done();
+    test_responses_item_done_requires_terminal_before_reporting_success();
+    test_responses_does_not_release_completed_tools_without_terminal();
     test_heartbeats_do_not_extend_model_progress_deadline();
     test_protocol_liveness_and_progress_are_distinct();
     test_responses_lifecycle_advances_without_synthetic_output();
     test_silent_transport_still_times_out();
     test_real_model_progress_extends_idle_deadline();
-    test_done_ends_stream_without_waiting_for_socket_close();
+    test_completed_ends_stream_without_waiting_for_socket_close();
     test_cancel_interrupts_silent_model_stream();
     test_wire_shape_of_request();
     test_no_tools_field_when_empty();
     test_user_image_is_sent_as_multimodal_content();
-    test_view_image_tool_pixels_reach_next_http_request(MaiWireApi::ChatCompletions);
-    test_view_image_tool_pixels_reach_next_http_request(MaiWireApi::Responses);
+    test_view_image_tool_pixels_reach_next_http_request();
     test_opus_55_catalog_and_responses_request();
     test_large_historical_image_uses_cached_bounded_preview();
     test_absolute_desktop_image_can_be_outside_the_workspace();
@@ -3879,21 +3839,22 @@ int main(int argc, char** argv) {
     test_responses_cache_session_hints_preserve_the_original_request();
     test_responses_cache_session_rejects_bad_ids_before_http();
     test_responses_rejects_unsupported_model_efforts_before_http();
-    test_cloud_effort_levels_reach_the_selected_wire();
+    test_cloud_effort_levels_reach_responses();
     test_routed_models_keep_wire_key_and_failure_isolation();
     test_responses_needs_terminal_event_and_reports_incomplete();
-    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
-        test_responses_proxy_redirects(wire);
-        test_responses_proxy_same_origin_redirect(wire);
-        test_responses_proxy_redirect_total_timeout(wire);
-        test_responses_without_location_retains_body(wire);
-        test_responses_proxy_resolver_timeout_retries_before_output(wire);
+    {
+        test_responses_proxy_redirects();
+        test_responses_proxy_same_origin_redirect();
+        test_responses_proxy_redirect_total_timeout();
+        test_responses_without_location_retains_body();
+        test_responses_proxy_resolver_timeout_retries_before_output();
 #if defined(MAI_MODEL_CLIENT_TLS_TESTS)
-        test_responses_proxy_rejects_tls_downgrade(wire);
+        test_responses_proxy_rejects_tls_downgrade();
 #endif
-        test_responses_proxy_direct_and_cancel(wire);
+        test_responses_proxy_direct_and_cancel();
     }
     test_local_mode_never_falls_back_to_a_remote_request();
+    test_remote_factories_default_to_responses_and_reject_mixed();
     if (failures == 0) std::printf("llm tests passed\n");
     return failures == 0 ? 0 : 1;
 }

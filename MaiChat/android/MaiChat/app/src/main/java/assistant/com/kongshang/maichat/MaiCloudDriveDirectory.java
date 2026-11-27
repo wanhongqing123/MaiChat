@@ -44,7 +44,7 @@ final class MaiCloudDriveDirectory {
     ArrayList<JSONObject> children() {
         ArrayList<JSONObject> children = new ArrayList<>();
         for (JSONObject folder : folders)
-            if (current.equals(folder.optString("parent_id", ""))) children.add(folder);
+            if (current.equals(nullableId(folder, "parent_id"))) children.add(folder);
         return children;
     }
 
@@ -70,7 +70,15 @@ final class MaiCloudDriveDirectory {
     }
 
     boolean accepts(JSONObject media) {
-        return current.equals(media.optString("folder_id", ""));
+        return current.equals(nullableId(media, "folder_id"));
+    }
+
+    private static String nullableId(JSONObject item, String key) {
+        Object value = item.opt(key);
+        // 服务端以 JSON null 表示根目录；Android optString 会把它变成字符串 "null"。
+        // 仅将缺省值和 JSON null 归一为空 ID，保留字符串原值并拒绝其他类型，避免串目录。
+        if (value == null || value == JSONObject.NULL) return "";
+        return value instanceof String ? (String) value : null;
     }
 
     JSONObject payload(String cursor) {
@@ -93,14 +101,14 @@ final class MaiCloudDriveDirectory {
         path.clear();
         HashSet<String> visited = new HashSet<>();
         String id = current;
-        while (!id.isEmpty()) {
+        while (id != null && !id.isEmpty()) {
             // Corrupt parent chains fall back to a root return instead of
             // creating an endless back-navigation loop.
             if (!visited.add(id)) { path.clear(); return; }
             JSONObject folder = find(id);
             if (folder == null) return;
             path.add(0, folder);
-            id = folder.optString("parent_id", "");
+            id = nullableId(folder, "parent_id");
         }
     }
 }

@@ -28,6 +28,39 @@ macOS 14.4+ / MSVC 2022 are required; see [Qt source provenance](qt/UPSTREAM.md)
 MaiChat/desktop/build/maichat
 ```
 
+## Local agent history and skills
+
+The persistent agent backend keeps authoritative append-only JSONL under the account's
+`Agent/Accounts/<owner SHA256>/sessions/YYYY/MM/DD/` directory inside Qt AppLocalDataLocation.
+`agent.db` contains indexes and byte references. Keep the entire `sessions/` directory,
+including `.journal/`, when backing up history. Legacy databases are migrated read-only;
+the original database is retained. Startup prepares storage in a worker with cancellable
+progress and fails visibly instead of falling back to an empty account store.
+
+Skills are discovered under the user and project `.agents/skills/<name>/SKILL.md`
+directories. Metadata is advertised first; selected contents are loaded on demand and
+remain stable for the corresponding user input across follow-ups and restarts.
+`skill_install` discovers public GitHub skill folders and README links, then installs a selected folder
+at a pinned commit. The default destination is the host user's `.agents/skills`; workspace scope is
+explicit. Existing skills are never overwritten, and downloaded scripts/dependencies are not executed.
+The next input in the same conversation discovers new skills. Unchanged metadata is not repeated in
+every message; historical instructions and selected bodies remain immutable.
+Windows command launchers can exit while their Playwright/browser service continues in its owned Job.
+Cancellation, explicit deadlines and owner cleanup still reap those background processes.
+
+The desktop account runtime starts new sessions with a small tool catalog. Other
+capabilities remain available through bounded `tool_search` discovery and selection;
+new schemas take effect on the next model request. Existing session prefixes remain
+stable. The usage header shows the last sampling's provider total, not a local input
+estimate or accumulated session cost. Missing, derived, and obsolete measurements
+remain distinguishable. Remote desktop sessions fetch the same typed measurement
+through the existing owner command replies; no service deployment is required.
+
+Desktop no longer registers standalone `file_*` model tools: use `exec_command` for reading/search
+and `apply_patch` for text changes. Shared native file algorithms remain available to the mobile
+in-process command host; mobile also exposes no standalone `file_*` tools to the model.
+Tool catalog v5 preserves older records while retiring desktop file declarations from new snapshots.
+
 ## Native IM SDK
 
 The desktop app is an independent Qt client. It does not depend on the Electron app or any local bridge process.
@@ -76,29 +109,37 @@ permissions to MaiChat in System Settings when prompted.
 
 ## Desktop Agent tools
 
-The Desktop Agent exposes three additional capabilities through ordinary C++ entry points
-and model tool calls:
+Commands use the shared Core `exec_command` / `write_stdin` implementation. It provides
+bounded output, numeric session IDs and optional native PTY interaction between Agent turns.
+Only the owning Session can continue its process; the selected approval policy still applies.
+See the Core README for output retention and recovery.
 
-- `desktop_process_start/read/write/stop` keeps a command running between Agent turns. Its
-  output uses a byte cursor, is returned in bounded chunks, and retains at most 1 MiB per
-  process. Only the owning Session can read, write or stop it. Starting, writing and stopping
-  use the selected Agent approval mode. Commands run with the App user's OS permissions. Use the existing
-  `shell` tool for short, single commands.
-- `desktop_browser` opens a separate visible Chrome or Edge profile. It reads bounded page
-  text and elements, captures a PNG, and acts only on an observed element with the same URL,
-  snapshot and label. It does not use the user's normal browser profile or execute
-  model-supplied JavaScript. Opening, screenshots, clicking and typing follow the Agent approval mode.
-  After an action, observe again to confirm the outcome. A new `open` starts a clean profile;
-  two Agent browser Sessions may be open at once. Chrome requires a separate profile for
-  remote debugging ([source](https://developer.chrome.com/blog/remote-debugging-port)).
-- `desktop_computer` selects one visible window by exact title, returns a screenshot and
-  bounded Accessibility or UI Automation elements, then accepts a click, text, supported key
-  or scroll for that same window and observation token. Approval follows the selected Agent mode.
-  The result of an action only means input was sent; observe again to verify the
-  screen. Password fields, locked screens and invisible windows are excluded. On macOS,
-  grant Screen & System Audio Recording and Accessibility to the running MaiChat App.
+The client-executed `computer` function exposes the 13 Sky window2 methods through
+`{method,parameters}`: list_windows, get_window, list_apps, launch_app, get_window_state, click,
+press_key, type_text, scroll, set_value, drag, perform_secondary_action and activate_window.
+Select a returned `{app,id,title?}` window. `get_window_state` defaults to
+`include_screenshot=true, include_text=false`; text-only state reads do not request or return an
+image. Native focus, selection, document text and supported element actions remain conditional
+provider facts. Coordinates are window-relative logical pixels; image pixel dimensions are
+reported separately for DPI conversion. Element indices and screenshot IDs belong to the current
+observation. No separate screenshot tool is needed for a window observation.
+The ordinary C++ API and model adapter share one implementation. Ordinary screenshot URLs are
+data URLs; model output uses image attachments plus `image_attachment_index` instead of duplicating
+Base64 in tool text. This function does not enable Responses built-in `computer_call`.
+`computer_input` retains the existing advanced display/raw/held/touch/pen operations through the
+same controller. Window operations use the `native_input_binding` from the current Sky observation;
+display observation is an explicit advanced operation. It does not offer duplicate basic Sky actions.
+Approval follows the selected Agent mode. An input or launch receipt is not proof that the app task
+finished: observe the actual result before reporting success.
+The independent `screenshot` tool and computer observations currently share a resident native
+capture backend. Retaining that backend does not stream every captured frame into model requests;
+stopping it affects the process, not just one conversation. Password fields, locked screens and
+invisible windows are excluded. On macOS, grant Screen & System Audio Recording and Accessibility
+to the running MaiChat App. macOS window-image/native-frame alignment remains unverified; the
+returned mapping flag stays false and screenshot-derived coordinate input is refused, while native
+element operations remain available where the provider supports them.
 
-The browser uses Chrome or Edge. CDP uses the shared WebSocket++ transport;
+Web search and fetch remain provider capabilities; ordinary application links still open normally.
 HTTP requests use curl and native system proxy lookup. Qt supplies UI only.
 Full Access skips prompts for these general tools; billable provider submissions still
 require confirmation.

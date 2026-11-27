@@ -110,6 +110,11 @@ void appendUtf8(std::string& output, std::uint32_t codePoint) {
 
 MaiResult<std::string> decodeUtf16(const std::string& bytes, bool littleEndian) {
     std::size_t offset = 0;
+    // 显式编码仍须尊重 BOM；与普通 reader 一样拒绝冲突，不能返回乱码后的“无命中”。
+    if (bytes.size() >= 2 &&
+        ((littleEndian && bytes.compare(0, 2, "\xFE\xFF", 2) == 0) ||
+         (!littleEndian && bytes.compare(0, 2, "\xFF\xFE", 2) == 0)))
+        return {MaiErrorCode::InvalidInput, "UTF-16 BOM conflicts with the requested encoding"};
     if (bytes.size() >= 2 && ((littleEndian && static_cast<unsigned char>(bytes[0]) == 0xFF &&
                                static_cast<unsigned char>(bytes[1]) == 0xFE) ||
                               (!littleEndian && static_cast<unsigned char>(bytes[0]) == 0xFE &&
@@ -815,7 +820,7 @@ public:
             requested = MaiFilePath::fromUtf8(context.root).append(requested);
         if (MaiFileSystem::isSymbolicLink(requested))
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "file_delete refuses symbolic links; use shell with "
+                                          "file_delete refuses symbolic links; use exec_command with "
                                           "the selected Agent policy to remove the link itself");
         if (!MaiFileSystem::exists(path))
             return MaiToolResult::failure(MaiErrorCode::NotFound,

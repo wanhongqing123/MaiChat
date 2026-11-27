@@ -13,7 +13,7 @@
 #include "MaiIMHistoryFormat.h"
 #include "MaiMiniMaxMediaTools.h"
 #include "MaiModelStudioTools.h"
-#include "MaiOpenAiClient.h"
+#include "MaiResponsesClient.h"
 #include "MaiSqliteStore.h"
 #include "MaiSessionTools.h"
 #include "MaiSystemResourcesTool.h"
@@ -39,7 +39,6 @@
 #include "MaiChatTools/DesktopPdfRenderer.h"
 #include "MaiChatTools/DesktopPdfPasswordPrompt.h"
 #include "MaiChatTools/DesktopCalendarEvents.h"
-#include "MaiChatTools/DesktopBrowserTools.h"
 #include "MaiChatTools/DesktopComputerTools.h"
 #if defined(MAICHAT_DESKTOP_PORTRAIT)
 #include "MaiChatTools/DesktopPortraitTools.h"
@@ -125,20 +124,40 @@ image directly. Do not call view_image for a filename merely visible inside a sc
 On desktop, file tools accept absolute paths wherever the operating system allows access; relative
 paths start in this session's working directory. If an original image is needed, use its accessible
 path or ask the user to attach it.
-For local file work, prefer file_create, file_create_directory, file_delete, file_read, file_write,
-file_edit, and file_patch. file_create makes an empty file without overwriting; file_write sets content. Use
-shell only when the built-in tools cannot perform the task.
-Desktop computer tools provide general input primitives. Choose actions and observation timing from
-current task/application state; do not impose a fixed observe/click/type recipe. Display observations
-bind a whole-screen image, native bounds and a snapshot; window observations provide window metadata
-and Accessibility/UIA elements without a window image. Coordinates must match the selected target.
-Use an existing returned observation when it is sufficient, and refresh unknown, consumed, expired or
-changed targets/tokens as required by the tool. Keyboard input uses the current appropriate focus;
-click only when the task calls for it. Independent mouse/key downs persist across observations until
-owned ups/release, task cleanup or inactivity expiry; atomic taps and complete drag remain distinct.
-Check actual results before claiming task completion.
-For standalone screen images, screenshot reuses the same resident native capture session and has no
-window capture mode. Use screenshot action=stop when screen capture is no longer needed.
+For local file work, inspect and search with exec_command using the selected shell's native syntax.
+Prefer rg and rg --files when available; use platform-native alternatives when they are not installed.
+Use apply_patch for text edits, following its declared input format and Codex patch markers.
+Do not assume an apply_patch executable, Python, or Unix utilities exist on PATH.
+On Windows PowerShell, use -LiteralPath for literal file names and -Encoding UTF8 when reading UTF-8 text.
+PowerShell does not use backslash to escape quotes. For complex scripts, create the script with apply_patch and run it instead of nesting shell, JSON, and language quoting.
+Standalone file_* tools are not registered by this desktop host; use exec_command and apply_patch.
+When the user asks to install a skill from a repository URL, discover/select skill_install and inspect
+the repository candidates and README links first. A framework root may link to its actual skill in
+another official repository; do not install the whole framework or guess a repository-maintenance skill.
+Install the selected directory at the pinned ref. Default scope is the user's .agents/skills; use
+workspace scope only when requested. Do not overwrite existing skills or execute downloaded scripts.
+Installed skills enter the catalog on the next user input in this conversation. If the same user task
+explicitly asks to install and immediately use one, read the returned SKILL.md path with normal file
+tools and resolve resources relative to that file; do not rewrite this input's pinned skill snapshot.
+Skill files and runtime
+dependencies are separate: verify required CLIs/browsers before claiming the skill can perform its task.
+The computer function uses the Sky window2 methods through {method,parameters}; no separate screenshot
+call is needed. Select an actual returned {app,id,title} window from list_windows/list_apps, or recover
+get_window by its id. get_window_state defaults to include_screenshot=true and include_text=false.
+Choose screenshot, Accessibility/UIA text, or both for the next decision; a text-only state has no pixels.
+Inspect the state before choosing an element_index or coordinates, then perform one state-derived action
+and refresh when needed. Indices and screenshotId belong to the latest window state and expire on input,
+window/DPI changes or interruption. Coordinates are window-relative logical pixels, never whole-screen
+positions or 0..1 ratios. Respect image_coordinates_usable_for_input; unverified image mappings require
+native element observations. Use press_key for controls/chords and type_text for literal text after
+verifying editor focus. set_value targets an observed editable element; it is not blind select-all.
+An input receipt is not task completion. Observe actual results before reporting success, and never
+blindly retry a partially dispatched or uncertain input.
+Standalone screenshot is for an independent whole-screen image, not a prerequisite for computer input.
+Both tools currently share the resident native capture backend. screenshot action=stop releases that
+process-wide backend and can affect other conversations; do not stop it merely to finish one computer
+action or imply that screen pixels were never captured. Native backend lifetime is separate from how
+often observations or images are returned to the model.
 To show a capture in this
 conversation, call agent_send_media with file_path set to the returned workspace-relative image_path
 and type=image;
@@ -272,7 +291,8 @@ private:
 namespace {
 
 QString initialModel(const QString& model) {
-    return model.isEmpty() ? fromUtf8(MaiAgent::Options{}.defaultModel) : model;
+    // Restore the retired flagship preference without changing Flash or custom models.
+    return fromUtf8(maiCanonicalCloudModel(model.isEmpty() ? MaiAgent::Options{}.defaultModel : toUtf8(model)));
 }
 
 QString initialReasoningEffort(const QString& model, const QString& effort) {
@@ -280,12 +300,9 @@ QString initialReasoningEffort(const QString& model, const QString& effort) {
     return maiIsValidReasoningEffortForModel(toUtf8(model), normalized) ? fromUtf8(normalized) : QStringLiteral("high");
 }
 
-// 存储打不开时退化成内存存储，而不是让整个界面起不来。
-//
-// 理由：数据库打不开的常见原因是磁盘满、路径没权限、或者文件被另一个进程占着。
-// 这些情况下用户仍然应该能用
-// agent（只是这次的对话不会留下来），而不是面对一个打不开的窗口。 错误从
-// openError() 取，界面自己决定怎么提示。
+// Ordinary/test constructors retain their explicit memory-store behavior.
+// Product startup uses the prepared-store overload and reports opening failure
+// before constructing the window; it cannot silently lose persistence here.
 std::unique_ptr<MaiSessionStore> openStore(const QString& databasePath, QString& openError) {
     if (databasePath.isEmpty()) return makeMaiMemoryStore();
 
@@ -310,12 +327,14 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
            MaiApprovalPolicy approvalPolicy, const AgentController::ToolRegistrar& hostTools,
            const AgentController::ModelConfig& credentials, const QString& databasePath,
            const std::shared_ptr<MaiSessionScheduleStore>& scheduleStore,
-           const std::shared_ptr<DesktopComputerController>& computer, MaiToolRegistry*& publicTools) {
+           const std::shared_ptr<DesktopComputerController>& computer, MaiToolRegistry*& publicTools,
+           bool discoverModelTools) {
     // MaiAgent 内置工具总是装着；平台不支持的能力由核心在注册时排除。
     // 会话没有工作目录时工具层会明确拒绝，
     // 要不要把工具声明给模型看是 MaiContextBuilder 的事，不是这里的。
     auto tools = std::make_unique<MaiToolRegistry>();
-    registerMaiBuiltinTools(*tools);
+    // 移动端没有 Shell，仍注册完整原生文件工具；桌面只保留终端与补丁这一条模型路径。
+    registerMaiBuiltinTools(*tools, /*includeFileTools=*/false);
     // 产品搜索/抓取固定使用明确的 GLM 原生合同，与主聊天供应商解耦。
     // 保留原生 /api/paas/v4 默认地址，不借用聊天 Responses 地址或 DeepSeek 凭据。
     MaiGlmWebOptions webOptions;
@@ -349,7 +368,6 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     if (!databasePath.isEmpty())
         registerDesktopPortraitTools(*tools, QFileInfo(databasePath).absolutePath());
 #endif
-    registerDesktopBrowserTools(*tools, std::make_shared<DesktopBrowserManager>());
     registerDesktopComputerTools(*tools, computer);
 #if defined(MAICHAT_EMBEDDED_FFMPEG)
     const MaiFfmpegEngine ffmpegEngine{mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check,
@@ -470,6 +488,10 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     if (hostTools) hostTools(*tools);
 
     MaiAgent::Options options;
+    // 技能目录由工作线程按会话工作目录及标准用户目录发现，构造 UI 时不扫描磁盘。
+    options.skillsEnabled = true;
+    // 普通注入客户端保留完整工具合同；账号桌面运行时使用按需工具目录。
+    options.toolDiscoveryEnabled = discoverModelTools;
     if (!defaultModel.isEmpty()) options.defaultModel = toUtf8(defaultModel);
     // 会话空值继承这个构造期常量，不再逐请求读取可变的 UI 全局设置。
     options.reasoningEffort =
@@ -505,7 +527,7 @@ AgentController::AgentController(std::unique_ptr<MaiModelClient> model, const QS
     runtime_->agent = buildAgent(std::move(model), openStore(databasePath, runtime_->openError),
                                  runtime_->initialDefaultModel,
                                  MaiApprovalPolicy::OnRequest, hostTools, AgentController::ModelConfig{}, databasePath,
-                                 runtime_->scheduleStore, runtime_->computer, runtime_->tools);
+                                 runtime_->scheduleStore, runtime_->computer, runtime_->tools, false);
 
     // **显式 QueuedConnection，不用 Auto。**
     //
@@ -529,6 +551,11 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
 
 AgentController::AgentController(const ModelConfig& model, const QString& databasePath, ToolRegistrar hostTools,
                                  QObject* parent)
+    : AgentController(model, databasePath, nullptr, std::move(hostTools), parent) {}
+
+AgentController::AgentController(const ModelConfig& model, const QString& databasePath,
+                                 std::unique_ptr<MaiSessionStore> preparedStore, ToolRegistrar hostTools,
+                                 QObject* parent)
     : QObject(parent),
       runtime_(
           std::make_unique<Runtime>(initialModel(model.modelName),
@@ -543,6 +570,7 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
         config.glmBaseUrl = model.glmBaseUrl;
         config.deepseekBaseUrl = model.deepseekBaseUrl;
         config.openrouterBaseUrl = model.openrouterBaseUrl;
+        config.openaiBaseUrl = model.openaiBaseUrl;
         config.keyProvider = model.accountModelKeyProvider;
 #if defined(MAICHAT_EMBEDDED_FFMPEG)
         MaiFfmpegEngine ffmpegEngine{mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check,
@@ -569,10 +597,11 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
 
     runtime_->modelClient = client.get();
     runtime_->ordinaryConfigured = client && model.wire != MaiWireApi::Local && model.wire != MaiWireApi::Mixed;
-    runtime_->agent = buildAgent(std::move(client), openStore(databasePath, runtime_->openError),
+    runtime_->agent = buildAgent(std::move(client), preparedStore ? std::move(preparedStore)
+                                                               : openStore(databasePath, runtime_->openError),
                                  runtime_->initialDefaultModel,
                                  model.approvalPolicy, hostTools, model, databasePath, runtime_->scheduleStore,
-                                 runtime_->computer, runtime_->tools);
+                                 runtime_->computer, runtime_->tools, true);
 
     connect(this, &AgentController::eventQueued, this, &AgentController::onEventQueued, Qt::QueuedConnection);
     runtime_->token = runtime_->agent->eventBus().subscribe([this](const MaiEvent& event) { rawEvent(event); });
@@ -889,6 +918,9 @@ bool AgentController::setSessionModelConfiguration(const QString& sessionId, con
         runtime_->setError(fromUtf8(updated.error().message()));
         return false;
     }
+    runtime_->contextStatuses.remove(sessionId);
+    runtime_->contextStatusTurns.remove(sessionId);
+    emit contextStatusChanged(sessionId);
     runtime_->setError({});
     return true;
 }
@@ -1176,6 +1208,11 @@ void AgentController::onEventQueued(const MaiEvent& event) {
             return;
 
         case MaiEventType::SessionUpdated:
+            if (event.field == "clear") {
+                runtime_->contextStatuses.remove(sessionId);
+                runtime_->contextStatusTurns.remove(sessionId);
+                emit contextStatusChanged(sessionId);
+            }
             if (!event.detail.empty()) {
                 emit sessionTitleChanged(sessionId, fromUtf8(event.detail));
             }
@@ -1203,9 +1240,35 @@ void AgentController::onEventQueued(const MaiEvent& event) {
 
 std::optional<MaiContextStatus> AgentController::contextStatus(const QString& sessionId) const {
     const auto cached = runtime_->contextStatuses.constFind(sessionId);
-    if (cached != runtime_->contextStatuses.constEnd()) return cached.value();
+    if (cached != runtime_->contextStatuses.constEnd()) {
+        auto value = cached.value();
+        MaiSession current;
+        if (value) {
+            if (!runtime_->agent->getSession(toUtf8(sessionId), current)) {
+                // 缓存不是权威来源；读取失败不能继续把旧测量标成当前有效占用。
+                value->usage.samplingValid = false;
+                value->error = {MaiErrorCode::Internal, "Context usage source is unavailable."};
+            } else {
+                const auto model = current.model.empty() ? toUtf8(runtime_->initialDefaultModel) : current.model;
+                if (!value->usage.model.empty() && value->usage.model != model)
+                    value->usage.samplingValid = false;
+            }
+        }
+        return value;
+    }
     const auto outcome = runtime_->agent->getTurnOutcome(toUtf8(sessionId));
     auto value = outcome ? outcome.value().context : std::optional<MaiContextStatus>{};
+    const auto measured = runtime_->agent->getModelContextUsage(toUtf8(sessionId));
+    if (measured) {
+        if (!value && (measured.value().samplingValid ||
+                       measured.value().thread.total.source != MaiUsageValueSource::Missing)) {
+            value = MaiContextStatus{};
+            value->phase = MaiContextPhase::Ready;
+        }
+        if (value) value->usage = measured.value();
+    } else if (value) {
+        value->usage.samplingValid = false;
+    }
     if (outcome) runtime_->contextStatusTurns[sessionId] = fromUtf8(outcome.value().turnId);
     runtime_->contextStatuses.insert(sessionId, value);
     return value;

@@ -5,6 +5,7 @@
 #endif
 
 #include "MaiCloudDriveClient.h"
+#include "MaiCurlNetworkRoute.h"
 #include "MaiFirstPartyRouteInternal.h"
 
 #include <curl/curl.h>
@@ -994,6 +995,18 @@ void performHttp(const MaiCloudDriveOptions* options, const std::string& url,
     if (!headers && setup == CURLE_OK) setup = CURLE_OUT_OF_MEMORY;
     if (headers) set(CURLOPT_HTTPHEADER, headers);
     long httpStatus = 0;
+    const auto routingStarted = std::chrono::steady_clock::now();
+    MaiCurlNetworkRoute networkRoute;
+    if (setup == CURLE_OK && route == MAI_FIRST_PARTY_ROUTE_SYSTEM)
+        setup = static_cast<CURLcode>(networkRoute.prepare(curl, url, !proxy.empty(),
+            options->connect_timeout_ms > 0 ? options->connect_timeout_ms : 10000,
+            [&] { return canceled(cancel); }));
+    if (setup == CURLE_OK) {
+        const auto remaining = timeoutMs - std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - routingStarted).count();
+        if (remaining <= 0) setup = CURLE_OPERATION_TIMEDOUT;
+        else set(CURLOPT_TIMEOUT_MS, static_cast<long>(remaining));
+    }
     CURLcode code = setup;
     if (setup == CURLE_OK && !canceled(cancel)) {
         code = curl_easy_perform(curl);

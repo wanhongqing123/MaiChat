@@ -366,6 +366,9 @@ final class AIMobileHostToolProvider {
             }
             #endif
             return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("deepseek")])
+        case "openai_api_key":
+            // Internal account callback only; never exposed in the model tool catalog.
+            return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("openai")])
         case "openrouter_api_key":
             #if DEBUG && targetEnvironment(simulator)
             if AIPrimaryModelUITestSupport.isSessionConfigurationRequested {

@@ -55,7 +55,7 @@ private:
 class OwnedModel final : public MaiModelClient {
 public:
     std::atomic<int> calls{0};
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override { return MaiWireApi::Responses; }
     MaiError stream(const MaiModelRequest&, const MaiStreamSink&, const std::atomic<bool>&) override {
         ++calls;
         return {};
@@ -195,7 +195,7 @@ void DesktopSessionImBindingToolsTest::actualHostRegistrarPinsConfiguredStartupI
     app.addContact(QStringLiteral("owned-startup-friend"), QStringLiteral("Owned Startup Friend"));
     // Match main.cpp: construct the real host with trusted SDK configuration
     // before its ordinary IM connection establishes currentAccount().
-    MainWindow window(app, 123, [](const QString&) { return QStringLiteral("owned-unused-signature"); });
+    MainWindow window(app, 123);
     MaiToolRegistry originalRegistry;
     window.registerSessionImBindingTool(originalRegistry);
     auto* original = originalRegistry.find("maichat_session_im_binding");

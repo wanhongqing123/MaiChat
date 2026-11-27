@@ -5,6 +5,7 @@
 #include "MaiCloudModelCatalog.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
@@ -12,16 +13,22 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <map>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 
 #include <json.hpp>
+#include <openssl/evp.h>
 
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
 #include "MaiThread.h"
+#include "MaiSkillInstallTool.h"
+#include "MaiSkillTool.h"
+#include "MaiToolSearchTool.h"
 
 #include "MaiContextBuilder.h"
 #include "MaiEventEmitter.h"
@@ -123,6 +130,55 @@ std::string inputFingerprint(const MaiMessage& message) {
     return steeringFingerprint(input);
 }
 
+MaiResult<std::string> skillContextDigest(const std::string& content) {
+    std::array<unsigned char, 32> digest{};
+    unsigned int length = 0;
+    if (EVP_Digest(content.data(), content.size(), digest.data(), &length, EVP_sha256(), nullptr) !=
+            1 ||
+        length != digest.size())
+        return {MaiErrorCode::Internal, "Cannot identify the skill context snapshot."};
+    constexpr const char* digits = "0123456789abcdef";
+    std::string fingerprint;
+    for (const auto byte : digest) {
+        fingerprint += digits[byte >> 4];
+        fingerprint += digits[byte & 15];
+    }
+    return fingerprint;
+}
+
+MaiResult<std::string> skillInputContextKey(const std::string& messageId) {
+    if (messageId.empty()) return {MaiErrorCode::InvalidInput, "A source input id is required."};
+    const auto digest = skillContextDigest(messageId);
+    if (!digest) return digest.error();
+    return "skills.input.v1." + digest.value();
+}
+
+MaiResult<std::string> skillInputCatalogDigestKey(const std::string& messageId) {
+    if (messageId.empty()) return {MaiErrorCode::InvalidInput, "A source input id is required."};
+    const auto digest = skillContextDigest(messageId);
+    if (!digest) return digest.error();
+    return "skills.input.catalog.v1." + digest.value();
+}
+
+bool isSkillCatalogDigest(const std::string& digest) {
+    return digest.size() == 64 &&
+           std::all_of(digest.begin(), digest.end(), [](const unsigned char character) {
+               return (character >= '0' && character <= '9') ||
+                      (character >= 'a' && character <= 'f');
+           });
+}
+
+MaiResult<std::string> skillScopeKey(const std::string& directory) {
+    if (directory.empty()) return std::string{};
+    const auto path = MaiFilePath::fromUtf8(directory);
+    if (!path.isAbsolute())
+        return {MaiErrorCode::InvalidInput, "The skill workspace must be an absolute directory."};
+    const auto resolved = MaiFileSystem::resolve(path);
+    if (resolved.isEmpty())
+        return {MaiErrorCode::InvalidInput, "Cannot resolve the skill workspace scope."};
+    return resolved.toGenericUtf8();
+}
+
 constexpr const char* kInterruptedToolError =
     "The app stopped before a final tool result was recorded. The operation may have already "
     "produced effects. Inspect its current state or query the existing task before considering "
@@ -222,7 +278,20 @@ struct MaiAgent::Runtime {
     std::unique_ptr<MaiSessionStore> store;
     std::unique_ptr<MaiModelClient> model;
     std::unique_ptr<MaiToolRegistry> tools;
+    std::shared_ptr<MaiModelToolCatalog> toolCatalog;
     Options options;
+    struct SkillSession {
+        std::string instructions;
+        std::unordered_map<std::string, MaiSkillCatalog> catalogs;
+    };
+    std::shared_ptr<MaiSkillManager> skills;
+    // 与 Runtime 主锁分开，发现/持久化期间不持锁，避免阻塞 UI 的普通 submit/query。
+    mutable std::mutex skillMutex;
+    std::unordered_map<std::string, SkillSession> skillSessions;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> skillInputs;
+    // 每条输入仅记录目录文本的 64 字节摘要；空串缓存旧版缺失，不反复查库或复制目录。
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+        skillInputCatalogDigests;
 
     MaiEventBus bus;
     MaiEventEmitter emitter{bus};
@@ -406,6 +475,251 @@ struct MaiAgent::Runtime {
         workersFinished.notify_all();
     }
 
+    MaiResult<std::string> formatSkillCatalog(const MaiSkillCatalog& catalog,
+                                              const MaiTurnContext& context) const {
+        MaiSkillCatalogRenderOptions budget;
+        budget.maxContextTokens = options.skillOptions.maxCatalogTokens;
+        if (model)
+            budget.contextWindowTokens = model->contextLimits(context.model).contextWindowTokens;
+        return MaiSkillManager::formatCatalog(catalog, budget);
+    }
+
+    MaiResult<MaiSkillCatalog> discoverSkillCatalog(const MaiTurnContext& context) {
+        auto discoveryOptions = options.skillOptions;
+        discoveryOptions.workspaceDirectory = MaiFilePath::fromUtf8(context.workingDirectory);
+        if (discoveryOptions.homeDirectory.isEmpty()) {
+            const auto home = MaiSkillManager::defaultHomeDirectory();
+            if (!home) return home.error();
+            discoveryOptions.homeDirectory = home.value();
+        }
+        return skills->snapshot(discoveryOptions);
+    }
+
+    MaiResult<std::string> prepareSkills(const MaiTurnContext& context) {
+        const auto scope = skillScopeKey(context.workingDirectory);
+        if (!scope) return scope.error();
+        {
+            std::lock_guard<std::mutex> lock(skillMutex);
+            const auto existing = skillSessions.find(context.sessionId);
+            if (existing != skillSessions.end() && existing->second.catalogs.count(scope.value()))
+                return existing->second.instructions;
+        }
+        if (!skills) return std::string{};
+        constexpr const char* name = "skills.catalog.prompt.v1";
+        const auto stored = store->getSessionContext(context.sessionId, name);
+        if (const auto sourceError = store->lastReadError()) return sourceError;
+        if (!stored && stored.error().code() != MaiErrorCode::NotFound &&
+            stored.error().code() != MaiErrorCode::NotSupported)
+            return stored.error();
+        const auto discovered = discoverSkillCatalog(context);
+        if (!discovered) return discovered.error();
+        std::string instructions;
+        if (stored) {
+            // 重启时重新发现允许访问的路径，但已经发送的目录字节必须保持完全一致。
+            instructions = stored.value();
+        } else if (stored.error().code() == MaiErrorCode::NotFound ||
+                   stored.error().code() == MaiErrorCode::NotSupported) {
+            const auto formatted = formatSkillCatalog(discovered.value(), context);
+            if (!formatted) return formatted.error();
+            instructions = formatted.value();
+            const auto saved = store->saveSessionContext(context.sessionId, name, instructions);
+            if (saved)
+                instructions = saved.value();
+            else if (saved.error().code() != MaiErrorCode::NotSupported)
+                return saved.error();
+            // 自定义旧后端明确不支持持久化时，仅缓存到当前 Runtime，不假装跨重启保存。
+        } else {
+            return stored.error();
+        }
+        SkillSession candidate;
+        candidate.instructions = std::move(instructions);
+        candidate.catalogs.emplace(scope.value(), discovered.value());
+        std::lock_guard<std::mutex> lock(skillMutex);
+        auto session = skillSessions.emplace(context.sessionId, std::move(candidate)).first;
+        session->second.catalogs.emplace(scope.value(), discovered.value());
+        return session->second.instructions;
+    }
+
+    MaiResult<MaiSkillCatalog> skillCatalog(const MaiToolContext& context) const {
+        const auto scope = skillScopeKey(context.root);
+        if (!scope) return scope.error();
+        std::lock_guard<std::mutex> lock(skillMutex);
+        const auto found = skillSessions.find(context.sessionId);
+        if (found == skillSessions.end())
+            return {MaiErrorCode::NotFound, "No prepared skill catalog belongs to this session."};
+        const auto catalog = found->second.catalogs.find(scope.value());
+        if (catalog == found->second.catalogs.end())
+            return {MaiErrorCode::NotFound,
+                    "No prepared skill catalog belongs to this workspace scope."};
+        return catalog->second;
+    }
+
+    MaiResult<std::string> loadSkillInput(const std::string& sessionId,
+                                          const std::string& messageId) const {
+        {
+            std::lock_guard<std::mutex> lock(skillMutex);
+            const auto session = skillInputs.find(sessionId);
+            if (session != skillInputs.end()) {
+                const auto input = session->second.find(messageId);
+                if (input != session->second.end()) return input->second;
+            }
+        }
+        const auto key = skillInputContextKey(messageId);
+        if (!key) return key.error();
+        const auto stored = store->getSessionContext(sessionId, key.value());
+        if (const auto sourceError = store->lastReadError()) return sourceError;
+        return stored;
+    }
+
+    MaiResult<std::string> loadSkillInputCatalogDigest(const std::string& sessionId,
+                                                       const std::string& messageId) {
+        {
+            std::lock_guard<std::mutex> lock(skillMutex);
+            const auto session = skillInputCatalogDigests.find(sessionId);
+            if (session != skillInputCatalogDigests.end()) {
+                const auto digest = session->second.find(messageId);
+                if (digest != session->second.end()) return digest->second;
+            }
+        }
+        const auto key = skillInputCatalogDigestKey(messageId);
+        if (!key) return key.error();
+        const auto stored = store->getSessionContext(sessionId, key.value());
+        if (const auto error = store->lastReadError()) return error;
+        if (!stored && stored.error().code() != MaiErrorCode::NotFound &&
+            stored.error().code() != MaiErrorCode::NotSupported)
+            return stored.error();
+        if (stored && !isSkillCatalogDigest(stored.value()))
+            return {MaiErrorCode::InvalidInput, "The saved skill catalog digest is invalid."};
+        // 缺摘要的历史输入保持未知；只允许下一条新输入重新声明一次，不追写旧上下文。
+        const auto digest = stored ? stored.value() : std::string{};
+        std::lock_guard<std::mutex> lock(skillMutex);
+        return skillInputCatalogDigests[sessionId].emplace(messageId, digest).first->second;
+    }
+
+    MaiResult<std::map<std::string, std::string>> prepareSkillInputs(
+        const std::vector<MaiMessage>& history, const MaiTurnContext& context) {
+        const auto header = prepareSkills(context);
+        if (!header) return header.error();
+        const auto turn = std::find_if(history.begin(), history.end(), [&](const auto& message) {
+            return message.id == context.turnId;
+        });
+        if (turn == history.end())
+            return {MaiErrorCode::NotFound,
+                    "The originating turn is missing from the skill input history."};
+        std::size_t firstCurrentInput = 0;
+        for (auto message = history.begin(); message != turn; ++message)
+            if (message->role == MaiRole::Assistant)
+                firstCurrentInput = static_cast<std::size_t>(message - history.begin()) + 1;
+        MaiSkillCatalog catalog;
+        std::string catalogText;
+        std::string catalogDigest;
+        const auto initialDigest = skillContextDigest(header.value());
+        if (!initialDigest) return initialDigest.error();
+        std::string previousCatalogDigest = initialDigest.value();
+        bool refreshed = false;
+        std::map<std::string, std::string> projected;
+        for (std::size_t index = 0; index < history.size(); ++index) {
+            const auto& message = history[index];
+            if (message.role != MaiRole::User || message.pendingInput ||
+                message.contextImportOrigin)
+                continue;
+            const auto inputDigest = loadSkillInputCatalogDigest(context.sessionId, message.id);
+            if (!inputDigest) return inputDigest.error();
+            const auto saved = loadSkillInput(context.sessionId, message.id);
+            std::string selected;
+            if (saved) {
+                selected = saved.value();
+                previousCatalogDigest = inputDigest.value();
+            } else {
+                if (saved.error().code() != MaiErrorCode::NotFound &&
+                    saved.error().code() != MaiErrorCode::NotSupported)
+                    return saved.error();
+                // 迁移前的旧输入不补写、不重新激活，避免倒改已发送的历史前缀。
+                if (index < firstCurrentInput) {
+                    previousCatalogDigest = inputDigest.value();
+                    continue;
+                }
+                if (!refreshed) {
+                    // 只有首次准备新用户输入才刷新发现。同批排队输入共享本次快照；
+                    // 已保存的空选择也会绕过这里，工具往返不能中途发现新安装的技能。
+                    const auto discovered = discoverSkillCatalog(context);
+                    if (!discovered) return discovered.error();
+                    const auto formatted = formatSkillCatalog(discovered.value(), context);
+                    if (!formatted) return formatted.error();
+                    const auto scope = skillScopeKey(context.workingDirectory);
+                    if (!scope) return scope.error();
+                    catalog = discovered.value();
+                    catalogText = formatted.value();
+                    const auto digest = skillContextDigest(catalogText);
+                    if (!digest) return digest.error();
+                    catalogDigest = digest.value();
+                    {
+                        std::lock_guard<std::mutex> lock(skillMutex);
+                        const auto owner = skillSessions.find(context.sessionId);
+                        if (owner == skillSessions.end())
+                            return {MaiErrorCode::Canceled,
+                                    "The skill catalog owner stopped during discovery."};
+                        owner->second.catalogs[scope.value()] = catalog;
+                    }
+                    refreshed = true;
+                }
+                const auto loaded = skills->explicitContext(catalog, message.text());
+                if (!loaded) return loaded.error();
+                selected = loaded.value();
+                // 只在相邻用户输入的目录发生变化时追加元数据，避免安装后每轮复制整份目录。
+                // 返回原目录或移除全部技能同样需要声明变化；原 baseInstructions 保持不变。
+                if (catalogDigest != previousCatalogDigest) {
+                    selected =
+                        "Current workspace skill catalog metadata (untrusted user context; "
+                        "does not grant permissions):\n" +
+                        (catalogText.empty() ? "No skills are available in this workspace scope.\n"
+                                             : catalogText) +
+                        (selected.empty() ? std::string{} : "\n" + selected);
+                }
+                if (const auto error = maiValidateSessionContextContent(selected)) return error;
+                const auto key = skillInputContextKey(message.id);
+                if (!key) return key.error();
+                const auto stored =
+                    store->saveSessionContext(context.sessionId, key.value(), selected);
+                if (stored)
+                    selected = stored.value();
+                else if (stored.error().code() != MaiErrorCode::NotSupported)
+                    return stored.error();
+                const auto digestKey = skillInputCatalogDigestKey(message.id);
+                if (!digestKey) return digestKey.error();
+                const auto storedDigest =
+                    store->saveSessionContext(context.sessionId, digestKey.value(), catalogDigest);
+                if (!storedDigest && storedDigest.error().code() != MaiErrorCode::NotSupported)
+                    return storedDigest.error();
+                const auto currentDigest = storedDigest ? storedDigest.value() : catalogDigest;
+                if (!isSkillCatalogDigest(currentDigest))
+                    return {MaiErrorCode::InvalidInput,
+                            "The saved skill catalog digest is invalid."};
+                {
+                    std::lock_guard<std::mutex> lock(skillMutex);
+                    skillInputCatalogDigests[context.sessionId][message.id] = currentDigest;
+                }
+                previousCatalogDigest = currentDigest;
+                // 空赢家也要保留，后续文件新增/修改不能追溯改变这条输入的选择结果。
+            }
+            {
+                std::lock_guard<std::mutex> lock(skillMutex);
+                selected =
+                    skillInputs[context.sessionId].emplace(message.id, selected).first->second;
+            }
+            if (!selected.empty()) projected.emplace(message.id, std::move(selected));
+        }
+        return projected;
+    }
+
+    void forgetSkills(const std::string& sessionId) {
+        if (toolCatalog) toolCatalog->forgetSession(sessionId);
+        std::lock_guard<std::mutex> lock(skillMutex);
+        skillSessions.erase(sessionId);
+        skillInputs.erase(sessionId);
+        skillInputCatalogDigests.erase(sessionId);
+    }
+
     MaiTurnRunner::Dependencies dependencies(const std::string& sessionId,
                                              const std::shared_ptr<ActiveTurn>& turn) {
         MaiTurnRunner::Dependencies dependencies;
@@ -423,6 +737,19 @@ struct MaiAgent::Runtime {
         dependencies.reasoningEffort = options.reasoningEffort;
         dependencies.reasoningEffortProvider = options.reasoningEffortProvider;
         dependencies.baseInstructions = options.baseInstructions;
+        if (toolCatalog)
+            dependencies.prepareTools = [this](const MaiTurnContext& context) {
+                return toolCatalog->exposedSpecs(context);
+            };
+        if (options.skillsEnabled)
+            dependencies.prepareSkills = [this](const MaiTurnContext& context) {
+                return prepareSkills(context);
+            };
+        if (options.skillsEnabled)
+            dependencies.prepareSkillInputs = [this](const std::vector<MaiMessage>& history,
+                                                     const MaiTurnContext& context) {
+                return prepareSkillInputs(history, context);
+            };
         dependencies.maxIterations = options.maxToolIterations;
         dependencies.maxParallelTools = options.maxParallelTools;
         dependencies.approvalPolicy = options.approvalPolicy;
@@ -658,12 +985,71 @@ MaiAgent::MaiAgent(std::unique_ptr<MaiSessionStore> store, std::unique_ptr<MaiMo
     mRuntime->model = std::move(model);
     mRuntime->tools = std::move(tools);
     mRuntime->options = std::move(options);
+    mRuntime->options.defaultModel = maiCanonicalCloudModel(mRuntime->options.defaultModel);
+    if (mRuntime->options.skillsEnabled) {
+        mRuntime->skills = std::make_shared<MaiSkillManager>();
+        if (!mRuntime->tools) mRuntime->tools = std::make_unique<MaiToolRegistry>();
+        const std::weak_ptr<Runtime> runtime = mRuntime;
+        // 构造只接线，不扫描磁盘；目录解析发生在实际轮次的工作线程。
+        mRuntime->tools->add(makeMaiSkillTool(
+            mRuntime->skills, MaiSkillCatalogResolver{[runtime](const MaiToolContext& context)
+                                                          -> MaiResult<MaiSkillCatalog> {
+                const auto owner = runtime.lock();
+                if (!owner)
+                    return {MaiErrorCode::NotConfigured, "The skill catalog owner has stopped."};
+                return owner->skillCatalog(context);
+            }}));
+        // 安装根只来自宿主与本轮已准备的工作区。安装结果留待下个用户输入发现，
+        // 不改写当前目录快照，也不执行技能正文或授予其中声明的权限。
+        mRuntime->tools->add(makeMaiSkillInstallTool(
+            [runtime](const MaiToolContext& context) -> MaiResult<MaiSkillInstallerOptions> {
+                const auto owner = runtime.lock();
+                if (!owner)
+                    return {MaiErrorCode::NotConfigured, "The skill catalog owner has stopped."};
+                const auto catalog = owner->skillCatalog(context);
+                if (!catalog) return catalog.error();
+                MaiSkillInstallerOptions installOptions;
+                installOptions.workspaceDirectory = MaiFilePath::fromUtf8(context.root);
+                installOptions.homeDirectory = owner->options.skillOptions.homeDirectory;
+                installOptions.maxBodyBytes = owner->options.skillOptions.maxBodyBytes;
+                installOptions.maxFrontmatterBytes =
+                    owner->options.skillOptions.maxFrontmatterBytes;
+                if (installOptions.homeDirectory.isEmpty()) {
+                    const auto home = MaiSkillManager::defaultHomeDirectory();
+                    if (!home) return home.error();
+                    installOptions.homeDirectory = home.value();
+                }
+                return installOptions;
+            }));
+    }
 
+    if (mRuntime->options.toolDiscoveryEnabled) {
+        if (!mRuntime->tools) mRuntime->tools = std::make_unique<MaiToolRegistry>();
+        mRuntime->toolCatalog =
+            std::make_shared<MaiModelToolCatalog>(*mRuntime->store, *mRuntime->tools);
+        mRuntime->tools->add(makeMaiToolSearchTool(mRuntime->toolCatalog));
+    }
     MaiPermissionGate::Options gateOptions;
     gateOptions.timeoutMs = mRuntime->options.permissionTimeoutMs;
     mRuntime->permissions = std::make_unique<MaiPermissionGate>(gateOptions);
     // 问答不设超时：超时等于替用户做了决定，而用户可能只是走开了。
     mRuntime->questions = std::make_unique<MaiQuestionGate>();
+    // 停用旗舰只迁移会话选择，不重写历史消息、原始供应商项或旧计量。
+    // 启动时直接追加受信任的元数据更新，不要求归档会话的供应商路由或密钥当前可用。
+    // 此时没有工作线程或活动缓存；新的身份自然使旧采样和续接状态失效。
+    // 正常用户切换仍走带路由校验的 MaiUpdateSession；持久化失败则阻止假恢复。
+    const auto restoredSessions = mRuntime->store->listSessions();
+    if (const auto error = mRuntime->store->lastReadError())
+        throw std::runtime_error(error.message());
+    for (auto session : restoredSessions) {
+        const auto model = maiCanonicalCloudModel(session.model);
+        if (model == session.model) continue;
+        session.model = model;
+        session.updated = MaiTime::getCurrentTime();
+        mRuntime->store->putSession(session);
+        if (const auto error = mRuntime->store->lastWriteError())
+            throw std::runtime_error(error.message());
+    }
     mRuntime->specialistWorker = std::thread([this] {
         MaiThread::setCurrentName("mai-specialists");
         while (!mRuntime->stopSpecialists.load(std::memory_order_relaxed)) {
@@ -1130,6 +1516,63 @@ std::vector<MaiMessage> MaiAgent::listMessages(const std::string& sessionId) con
     return mRuntime->store->listMessages(sessionId);
 }
 
+MaiResult<MaiToolCatalogPage> MaiAgent::searchTools(const std::string& sessionId,
+                                                    const MaiToolCatalogQuery& query) {
+    if (!mRuntime->toolCatalog)
+        return {MaiErrorCode::NotSupported, "Tool discovery is disabled by the host."};
+    MaiSession session;
+    if (!mRuntime->store->getSession(sessionId, session)) {
+        if (const auto error = mRuntime->store->lastReadError()) return error;
+        return {MaiErrorCode::NotFound, "Tool discovery session does not exist."};
+    }
+    MaiTurnContext context;
+    context.sessionId = sessionId;
+    context.workingDirectory = session.directory;
+    {
+        std::lock_guard<std::mutex> lock(mRuntime->mutex);
+        context.model = session.model.empty() ? mRuntime->options.defaultModel : session.model;
+        const auto active = mRuntime->active.find(sessionId);
+        if (active != mRuntime->active.end()) context.turnId = active->second->id;
+    }
+    return mRuntime->toolCatalog->search(context, query);
+}
+
+MaiResult<std::string> MaiAgent::getSkillInputContext(const std::string& sessionId,
+                                                      const std::string& messageId) const {
+    MaiMessage source;
+    if (!mRuntime->store->getMessage(sessionId, messageId, source)) {
+        const auto error = mRuntime->store->lastReadError();
+        return error ? MaiResult<std::string>{error}
+                     : MaiResult<std::string>{MaiErrorCode::NotFound,
+                                              "The source user input is unavailable."};
+    }
+    if (const auto error = mRuntime->store->lastReadError()) return error;
+    if (source.role != MaiRole::User || source.contextImportOrigin)
+        return {MaiErrorCode::NotFound, "The source is not an owned user input."};
+    return mRuntime->loadSkillInput(sessionId, messageId);
+}
+
+MaiResult<MaiModelContextUsage> MaiAgent::getModelContextUsage(const std::string& sessionId) const {
+    MaiSession session;
+    if (!mRuntime->store->getSession(sessionId, session)) {
+        if (const auto error = mRuntime->store->lastReadError()) return error;
+        return {MaiErrorCode::NotFound, "Session not found."};
+    }
+    if (const auto error = mRuntime->store->lastReadError()) return error;
+    std::string model = session.model;
+    if (model.empty()) {
+        std::lock_guard<std::mutex> lock(mRuntime->mutex);
+        model = mRuntime->options.defaultModel;
+    }
+    const auto* client = mRuntime->model.get();
+    const auto provider = client ? client->usageProviderForModel(model) : std::string{};
+    auto result = maiReadModelContextUsage(*mRuntime->store, sessionId, model, provider);
+    if (result && (!client ||
+                   result.value().windowTokens != client->contextLimits(model).contextWindowTokens))
+        result.value().samplingValid = false;
+    return result;
+}
+
 MaiResult<MaiTurnOutcome> MaiAgent::getTurnOutcome(const std::string& sessionId,
                                                    const std::string& turnId) const {
     MaiSession session;
@@ -1371,6 +1814,11 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 session.created = MaiTime::getCurrentTime();
                 session.updated = session.created;
                 mRuntime->store->putSession(session);
+                if (const auto error = mRuntime->store->lastWriteError()) return error;
+                if (mRuntime->toolCatalog) {
+                    const auto error = mRuntime->toolCatalog->initializeNewSession(session.id);
+                    if (error) return error;
+                }
                 mRuntime->emitter.emitSession(MaiEventType::SessionCreated, session.id,
                                               session.title);
                 return session.id;
@@ -1466,6 +1914,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                                 "a turn is still running; interrupt it before deleting"};
                     if (!mRuntime->store->removeSession(operation.sessionId))
                         return {MaiErrorCode::NotFound, "session not found"};
+                    mRuntime->forgetSkills(operation.sessionId);
                     mRuntime->inputQueues.erase(operation.sessionId);
                     mRuntime->loadedInputQueues.erase(operation.sessionId);
                     mRuntime->pausedInputs.erase(operation.sessionId);
@@ -1494,6 +1943,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                                 "a turn is still running; interrupt it before clearing"};
                     if (!mRuntime->store->clearMessages(operation.sessionId))
                         return {MaiErrorCode::NotFound, "session not found"};
+                    mRuntime->forgetSkills(operation.sessionId);
                     // 清历史也撤销旧输入队列，不能在下一次发送时把已清掉的消息写回。
                     mRuntime->inputQueues.erase(operation.sessionId);
                     mRuntime->loadedInputQueues.erase(operation.sessionId);

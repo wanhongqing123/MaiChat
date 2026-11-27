@@ -71,6 +71,7 @@ public final class AIAssistantController {
     static final class State {
         final JSONObject data;
         final JSONObject remoteSession;
+        final AIAssistantContextUsage contextUsage;
         final String selected, baseUrl, model, reasoningEffort, policy, error, syncStatus, restoreDraft;
         final int restoreGeneration;
         final boolean remoteCommandPending;
@@ -87,6 +88,8 @@ public final class AIAssistantController {
             this.selected = selected;
             this.model = AIAssistantSessionModels.model(data, remoteSession, selected,
                 remoteSession == null ? model : "");
+            // 普通状态从当前所选快照读取，核对会话和实际型号，切页/切模型后不保留旧占用。
+            this.contextUsage = AIAssistantContextUsage.from(data.optJSONObject("contextUsage"), selected, this.model);
             String modelBaseUrl = AIAssistantModelSettings.baseUrlForModel(this.model);
             this.baseUrl = modelBaseUrl.isEmpty() ? baseUrl : modelBaseUrl;
             this.reasoningEffort = AIAssistantModelSettings.normalizeEffortForModel(this.model,
@@ -326,6 +329,7 @@ public final class AIAssistantController {
     private volatile String deepseekApiKey = "";
     private volatile String glmApiKey = "";
     private volatile String openrouterApiKey = "";
+    private volatile String openaiApiKey = "";
     private volatile String arkApiKey = "";
     private volatile long arkExpiresAt;
     private long nextArkRefreshAt;
@@ -1036,6 +1040,16 @@ public final class AIAssistantController {
                 return hostToolFailure("GLM key is unavailable", "not_configured");
             }
         }
+        // Internal credential callback: never registered as a model-visible tool.
+        if (tool.equals("openai_api_key")) {
+            try {
+                return new JSONObject().put("ok", true)
+                    .put("output", new JSONObject().put("key", testEndpoint == null ? openaiApiKey : "test-key"))
+                    .toString().getBytes(StandardCharsets.UTF_8);
+            } catch (Exception failure) {
+                return hostToolFailure("OpenAI key is unavailable", "not_configured");
+            }
+        }
         if (tool.equals("openrouter_api_key")) {
             try {
                 return new JSONObject().put("ok", true)
@@ -1341,6 +1355,7 @@ public final class AIAssistantController {
         }
     }
     static String supportedModelOrDefault(String selected) {
+        selected = AIAssistantModelSettings.restoredCloudModel(selected);
         return AIAssistantModelSettings.supportedCloud(selected) ? selected : DEFAULT_MODEL;
     }
     private static String safeMessage(Throwable error) {
@@ -1427,10 +1442,11 @@ public final class AIAssistantController {
         request.put("localModelName", AIAssistantSessionModels.LOCAL)
             .put("glmBaseUrl", testEndpoint == null ? GLM_RESPONSES_URL : testEndpoint)
             .put("deepseekBaseUrl", testEndpoint == null ? DEEPSEEK_URL : testEndpoint)
-            .put("openrouterBaseUrl", testEndpoint == null ? OPENROUTER_URL : testEndpoint);
+            .put("openrouterBaseUrl", testEndpoint == null ? OPENROUTER_URL : testEndpoint)
+            .put("openaiBaseUrl", testEndpoint == null ? "https://api.openai.com/v1" : testEndpoint);
         if (testEndpoint != null && !settings.isLocal()) {
             request.put("baseUrl", testEndpoint).put("model", "test-model")
-                .put("wire", "chat_completions").put("apiKey", "test-key");
+                .put("wire", "responses").put("apiKey", "test-key");
         }
         return request.put("op", "configure").put("session", selected)
                 .put("database", new File(root, "sessions.sqlite").getPath())
@@ -1464,9 +1480,10 @@ public final class AIAssistantController {
 
     private String cloudKey(String model) {
         if (testEndpoint != null) return "test-key";
+        if (AIAssistantModelSettings.OPENAI_MODEL.equals(model)) return openaiApiKey;
         if (AIAssistantModelSettings.isOpenRouterModel(model)) return openrouterApiKey;
         if ("deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model)) return deepseekApiKey;
-        if ("glm-5.3".equals(model) || "glm-5.3-flash".equals(model)) return glmApiKey;
+        if ("glm-5.4".equals(model) || "glm-5.3-flash".equals(model)) return glmApiKey;
         return "";
     }
 
@@ -2832,6 +2849,8 @@ public final class AIAssistantController {
                 if (payload.has("permissions")) remoteData.put("permissions", payload.optJSONArray("permissions"));
                 if (payload.has("questions")) remoteData.put("questions", payload.optJSONArray("questions"));
                 if (payload.has("questionMessages")) remoteData.put("questionMessages", payload.optJSONArray("questionMessages"));
+                // 老版本所属设备未提供时清除旧值，不能无限复用上次成功计量。
+                remoteData.put("contextUsage", payload.optJSONObject("contextUsage"));
             } catch (Exception failure) { error = safeMessage(failure); publishState(); return; }
             error = "";
             publishState();
@@ -3776,6 +3795,7 @@ public final class AIAssistantController {
         deepseekApiKey = keys.deepseek;
         miniMaxApiKey = keys.minimax;
         openrouterApiKey = keys.openrouter;
+        openaiApiKey = keys.openai;
     }
 
     private void refreshSeedanceCredential(boolean force) {

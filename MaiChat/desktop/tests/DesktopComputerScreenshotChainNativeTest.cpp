@@ -17,7 +17,9 @@
 #include <atomic>
 #include <algorithm>
 #include <limits>
+#include <iterator>
 #include <optional>
+#include <sstream>
 #include <thread>
 #include <vector>
 #include <json.hpp>
@@ -95,16 +97,21 @@ bool ownsDisplay(const DesktopNativeDisplay& display, HWND backdrop) {
     return false;
 }
 
-MaiToolResult invoke(MaiTool* tool, const Json& arguments, const MaiToolContext& context) {
-    std::optional<MaiToolResult> result;
+template <class Work> auto nativeWork(Work work) {
+    using Result = decltype(work());
+    std::optional<Result> result;
     std::atomic<bool> finished{false};
     std::thread worker([&] {
-        result.emplace(tool->execute(arguments.dump(), context));
+        result.emplace(work());
         finished = true;
     });
     while (!finished.load()) QTest::qWait(5);
     worker.join();
     return std::move(*result);
+}
+
+MaiToolResult invoke(MaiTool* tool, const Json& arguments, const MaiToolContext& context) {
+    return nativeWork([&] { return tool->execute(arguments.dump(), context); });
 }
 
 QPointF markerCenter(const QImage& image, QRgb color = 0xcc33ff) {
@@ -253,9 +260,10 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     context.model = "glm-5.3-flash";
     context.cancel = &canceled;
     MaiToolRegistry registry;
-    registerDesktopComputerTools(registry, std::make_shared<DesktopComputerController>());
+    const auto controller = std::make_shared<DesktopComputerController>();
+    registerDesktopComputerTools(registry, controller);
     registry.add(makeMaiScreenshotTool());
-    MaiTool* computer = registry.find("desktop_computer");
+    MaiTool* computer = registry.find("computer");
     MaiTool* screenshot = registry.find("screenshot");
     QVERIFY(computer && screenshot);
     DesktopScreenCaptureControl captureControl;
@@ -295,31 +303,37 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     QVERIFY(captureControl.captureState().capturing);
     const auto initialCapture = captureControl.captureState();
 
+    const auto selected = invoke(computer, {{"method", "get_window"},
+        {"parameters", {{"id", std::uint64_t(form.winId())}}}}, context);
+    QVERIFY2(!selected.hasError(), selected.error().message().c_str());
+    const Json selectedWindow = Json::parse(selected.output());
+    const auto nativeWindows = controller->windows();
+    QVERIFY(nativeWindows);
+    const auto native = std::find_if(nativeWindows.value().begin(), nativeWindows.value().end(),
+        [&](const DesktopNativeWindow& window) { return window.id == std::uint64_t(form.winId()); });
+    QVERIFY(native != nativeWindows.value().end());
+    const DesktopNativeWindow target = *native;
+    const double scale = target.coordinateScale;
+    QVERIFY(scale > 0);
     const auto observeWindow = [&] {
-        return invoke(
-            computer,
-            {{"action", "observe"}, {"target", "window"}, {"window_id", std::to_string(std::uint64_t(form.winId()))}},
-            context);
+        return invoke(computer, {{"method", "get_window_state"},
+            {"parameters", {{"window", selectedWindow}, {"include_text", true}}}}, context);
     };
     auto observed = observeWindow();
     QVERIFY2(!observed.hasError(), observed.error().message().c_str());
     Json window = Json::parse(observed.output());
-    const Json bounds = window.at("bounds");
-    QCOMPARE(bounds.at("height").get<double>(), display.height - 72);
+    QCOMPARE(target.height, display.height - 72);
+    QVERIFY(observed.images().size() == 1);
+    QCOMPARE(window.at("screenshots").at(0).at("image_attachment_index").get<int>(), 0);
+    QVERIFY(!window.at("screenshots").at(0).contains("url"));
     const auto click = [&](const Json& snapshot, bool screenRatios) {
-        return invoke(
-            computer,
-            {{"action", "click"},
-             {"target", "window"},
-             {"window_id", snapshot.at("window_id")},
-             {"snapshot_id", snapshot.at("snapshot_id")},
-             {"x_ratio", screenRatios ? point.x() / (image.width() - 1)
-                                      : (display.x + point.x() - snapshot.at("bounds").at("x").get<double>()) /
-                                            (snapshot.at("bounds").at("width").get<double>() - 1)},
-             {"y_ratio", screenRatios ? point.y() / (image.height() - 1)
-                                      : (display.y + point.y() - snapshot.at("bounds").at("y").get<double>()) /
-                                            (snapshot.at("bounds").at("height").get<double>() - 1)}},
-            context);
+        const double x = screenRatios ? point.x() / (image.width() - 1) * (target.width - 1) / scale
+                                      : (display.x + point.x() - target.x) / scale;
+        const double y = screenRatios ? point.y() / (image.height() - 1) * (target.height - 1) / scale
+                                      : (display.y + point.y() - target.y) / scale;
+        return invoke(computer, {{"method", "click"}, {"parameters", {
+            {"window", snapshot.at("window")}, {"screenshotId", snapshot.at("screenshots").at(0).at("id")},
+            {"x", x}, {"y", y}}}}, context);
     };
     const auto wrong = click(window, true);
     QVERIFY2(!wrong.hasError(), wrong.error().message().c_str());
@@ -333,13 +347,10 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
                      {"nativeEventX", mouse.lastPress.x()},
                      {"nativeEventY", mouse.lastPress.y()},
                      {"displayHeight", image.height()},
-                     {"windowHeight", bounds.at("height")}});
+                     {"windowHeight", target.height}});
 
-    const Json staleInput{{"action", "type"},
-                          {"target", "window"},
-                          {"window_id", window.at("window_id")},
-                          {"snapshot_id", window.at("snapshot_id")},
-                          {"text", "must not type"}};
+    const Json staleInput{{"method", "type_text"}, {"parameters", {
+        {"window", selectedWindow}, {"text", "must not type"}}}};
     const auto stale = invoke(computer, staleInput, context);
     QVERIFY(stale.hasError());
     const auto anotherScreenshot = invoke(screenshot, {{"action", "capture"}}, context);
@@ -359,13 +370,8 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     QVERIFY(!observed.hasError());
     window = Json::parse(observed.output());
     const std::string expected = sampleText.toUtf8().toStdString();
-    const auto typed = invoke(computer,
-                              {{"action", "type"},
-                               {"target", "window"},
-                               {"window_id", window.at("window_id")},
-                               {"snapshot_id", window.at("snapshot_id")},
-                               {"text", expected}},
-                              context);
+    const auto typed = invoke(computer, {{"method", "type_text"},
+        {"parameters", {{"window", selectedWindow}, {"text", expected}}}}, context);
     QVERIFY2(!typed.hasError(), typed.error().message().c_str());
     QTest::qWait(50);
     qInfo() << "[unicode-order] nativeCharactersMatch" << (mouse.characters.toUtf8().toStdString() == expected)
@@ -374,29 +380,26 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     observed = observeWindow();
     QVERIFY(!observed.hasError());
     window = Json::parse(observed.output());
-    const auto verified = invoke(computer,
-                                 {{"action", "verify"},
-                                  {"target", "window"},
-                                  {"window_id", window.at("window_id")},
-                                  {"snapshot_id", window.at("snapshot_id")},
-                                  {"expected_text", expected}},
-                                 context);
-    QVERIFY2(!verified.hasError(), verified.error().message().c_str());
-    QVERIFY(Json::parse(verified.output()).value("verified", false));
+    const auto verified = nativeWork([&] { return maiDesktopFocusedText(target); });
+    QVERIFY2(verified, verified.error().message().c_str());
+    QCOMPARE(verified.value(), expected);
     trace.push_back({{"stage", "fresh_window_mapping_click_type_uia_readback"}, {"verified", true}});
     observed = observeWindow();
     QVERIFY(!observed.hasError());
     window = Json::parse(observed.output());
-    const auto replaced = invoke(computer,
-                                 {{"action", "replace_text"},
-                                  {"target", "window"},
-                                  {"window_id", window.at("window_id")},
-                                  {"snapshot_id", window.at("snapshot_id")},
-                                  {"text", expected}},
-                                 context);
+    std::optional<std::size_t> inputIndex;
+    std::istringstream tree(window.at("accessibility").at("tree").get<std::string>());
+    for (std::string line; std::getline(tree, line);) {
+        if (line.find("Owned screenshot coordinate input") == std::string::npos) continue;
+        std::size_t index = 0;
+        if (std::istringstream(line) >> index) inputIndex = index;
+    }
+    QVERIFY(inputIndex.has_value());
+    const auto replaced = invoke(computer, {{"method", "set_value"}, {"parameters", {
+        {"window", selectedWindow}, {"element_index", *inputIndex}, {"value", expected}}}}, context);
     QVERIFY2(!replaced.hasError(), replaced.error().message().c_str());
     QTRY_COMPARE(input.text().toStdString(), expected);
-    trace.push_back({{"stage", "selected_text_replacement_keeps_complete_unicode_order"}, {"verified", true}});
+    trace.push_back({{"stage", "native_value_replacement_keeps_complete_unicode_order"}, {"verified", true}});
 
     QWidget other(&backdrop, Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
     other.setStyleSheet(QStringLiteral("background:#34805f"));
@@ -413,12 +416,8 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     observed = observeWindow();
     QVERIFY(!observed.hasError());
     window = Json::parse(observed.output());
-    const auto focused = invoke(computer,
-                                {{"action", "focus"},
-                                 {"target", "window"},
-                                 {"window_id", window.at("window_id")},
-                                 {"snapshot_id", window.at("snapshot_id")}},
-                                context);
+    const auto focused = invoke(computer, {{"method", "activate_window"},
+        {"parameters", {{"window", selectedWindow}}}}, context);
     qInfo() << "[focus-native-immediate] returnedError" << focused.hasError() << "foregroundMatches"
             << (GetForegroundWindow() == handle);
     if (focused.hasError()) {
@@ -427,14 +426,21 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     }
     QVERIFY2(!focused.hasError(), focused.error().message().c_str());
     QTRY_COMPARE(GetForegroundWindow(), handle);
-    QVERIFY(invoke(computer,
-                   {{"action", "type"},
-                    {"target", "window"},
-                    {"window_id", window.at("window_id")},
-                    {"snapshot_id", window.at("snapshot_id")},
-                    {"text", "must not type after focus without observing"}},
-                   context)
-                .hasError());
+    // Explicit activation has no token parameter. Exercise the existing
+    // ordinary focus operation separately to retain its single-use contract.
+    const auto focusBinding = nativeWork([&] { return controller->observe(context.sessionId, {}, context.root,
+        false, target.id, false, [&] { return canceled.load(); }); });
+    QVERIFY2(focusBinding, focusBinding.error().message().c_str());
+    DesktopComputerAction focusAction;
+    focusAction.action = "focus";
+    focusAction.windowId = target.id;
+    focusAction.snapshotId = Json::parse(focusBinding.value().json).at("snapshot_id").get<std::string>();
+    focusAction.isCanceled = [&] { return canceled.load(); };
+    const auto consumedFocus = nativeWork([&] { return controller->perform(context.sessionId, focusAction); });
+    QVERIFY2(consumedFocus, consumedFocus.error().message().c_str());
+    QVERIFY(!nativeWork([&] { return controller->perform(context.sessionId, focusAction); }));
+    QVERIFY(invoke(computer, {{"method", "type_text"}, {"parameters", {
+        {"window", selectedWindow}, {"text", "must not type after focus without observing"}}}}, context).hasError());
     QCOMPARE(input.text().toStdString(), expected);
     trace.push_back({{"stage", "other_owned_foreground_then_explicit_focus"},
                      {"nativeForegroundRestored", true},
@@ -448,13 +454,8 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     QTest::qWait(100);
     POINT beforeGeometryAttempt{};
     QVERIFY(GetCursorPos(&beforeGeometryAttempt));
-    const auto staleGeometry = invoke(computer,
-                                      {{"action", "type"},
-                                       {"target", "window"},
-                                       {"window_id", window.at("window_id")},
-                                       {"snapshot_id", window.at("snapshot_id")},
-                                       {"text", "must not type using old geometry"}},
-                                      context);
+    const auto staleGeometry = invoke(computer, {{"method", "type_text"}, {"parameters", {
+        {"window", selectedWindow}, {"text", "must not type using old geometry"}}}}, context);
     QVERIFY(staleGeometry.hasError());
     QCOMPARE(input.text().toStdString(), expected);
     POINT afterGeometryAttempt{};
@@ -473,77 +474,76 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPixelsFocusAndFreshSnap
     form.setFocus();
     QTest::qWait(50);
     QVERIFY(!input.hasFocus());
-    const auto displayObserved = invoke(
-        computer, {{"action", "observe"}, {"target", "display"}, {"display_id", std::to_string(display.id)}}, context);
-    QVERIFY2(!displayObserved.hasError(), displayObserved.error().message().c_str());
-    Json displaySnapshot = Json::parse(displayObserved.output());
+    const auto observeDisplay = [&] {
+        return nativeWork([&] { return controller->observeDisplay(context.sessionId, context.root, display.id,
+            [&] { return canceled.load(); }); });
+    };
+    const auto performDisplay = [&](DesktopComputerAction action) {
+        action.desktopScope = true;
+        action.workspace = context.root;
+        action.displayId = display.id;
+        action.isCanceled = [&] { return canceled.load(); };
+        return nativeWork([&] { return controller->perform(context.sessionId, action); });
+    };
+    const auto displayObserved = observeDisplay();
+    QVERIFY2(displayObserved, displayObserved.error().message().c_str());
+    Json displaySnapshot = Json::parse(displayObserved.value().json);
     // Select from the very image bound to this token, not the earlier standalone
     // screenshot. The following click -> returned observation -> type is the
-    // exact sequence described to the model.
-    const QImage boundImage(QString::fromStdString(displayObserved.images().at(0).path));
+    // ordinary API sequence; the standalone screenshot does not grant input.
+    const QImage boundImage(QString::fromStdString(displayObserved.value().imagePath));
     QVERIFY(!boundImage.isNull());
     const QPointF boundPoint = markerCenter(boundImage);
     QVERIFY(boundPoint.x() >= 0);
-    const auto displayClick = invoke(computer,
-                                     {{"action", "click"},
-                                      {"target", "display"},
-                                      {"display_id", std::to_string(display.id)},
-                                      {"snapshot_id", displaySnapshot.at("snapshot_id")},
-                                      {"x_ratio", boundPoint.x() / (boundImage.width() - 1)},
-                                      {"y_ratio", boundPoint.y() / (boundImage.height() - 1)}},
-                                     context);
-    QVERIFY2(!displayClick.hasError(), displayClick.error().message().c_str());
-    const Json displayResult = Json::parse(displayClick.output());
-    QVERIFY(displayResult.value("dispatched", false));
-    QVERIFY(displayResult.at("observation").at("frame_sequence").get<std::uint64_t>() >
+    DesktopComputerAction displayClickAction;
+    displayClickAction.action = "click";
+    displayClickAction.snapshotId = displaySnapshot.at("snapshot_id").get<std::string>();
+    displayClickAction.xRatio = boundPoint.x() / (boundImage.width() - 1);
+    displayClickAction.yRatio = boundPoint.y() / (boundImage.height() - 1);
+    const auto displayClick = performDisplay(displayClickAction);
+    QVERIFY2(displayClick, displayClick.error().message().c_str());
+    const Json displayResult = Json::parse(displayClick.value().observation.json);
+    QVERIFY(displayClick.value().dispatched);
+    QVERIFY(displayResult.at("frame_sequence").get<std::uint64_t>() >
             displaySnapshot.at("frame_sequence").get<std::uint64_t>());
     QTRY_VERIFY(input.hasFocus());
-    QVERIFY(displayClick.images().size() == 1);
-    QVERIFY(displayResult.at("observation").at("snapshot_id") != displaySnapshot.at("snapshot_id"));
+    QVERIFY(!displayClick.value().observation.imagePath.empty());
+    QVERIFY(displayResult.at("snapshot_id") != displaySnapshot.at("snapshot_id"));
     const auto displayType = [&](const Json& token, const std::string& text) {
-        return invoke(computer,
-                      {{"action", "type"},
-                       {"target", "display"},
-                       {"display_id", std::to_string(display.id)},
-                       {"snapshot_id", token.at("snapshot_id")},
-                       {"text", text}},
-                      context);
+        DesktopComputerAction action;
+        action.action = "type";
+        action.snapshotId = token.at("snapshot_id").get<std::string>();
+        action.text = text;
+        return performDisplay(action);
     };
-    QVERIFY(displayType(displaySnapshot, "must not type with the consumed click token").hasError());
+    QVERIFY(!displayType(displaySnapshot, "must not type with the consumed click token"));
     const std::string suffix = " [fresh display token]";
-    const auto displayTyped = displayType(displayResult.at("observation"), expected + suffix);
-    QVERIFY2(!displayTyped.hasError(), displayTyped.error().message().c_str());
+    const auto displayTyped = displayType(displayResult, expected + suffix);
+    QVERIFY2(displayTyped, displayTyped.error().message().c_str());
     QTRY_COMPARE(input.text().toUtf8().toStdString(), expected + suffix);
-    QVERIFY(displayTyped.images().size() == 1);
-    const Json typedDisplay = Json::parse(displayTyped.output());
-    QVERIFY(typedDisplay.at("observation").at("snapshot_id") != displayResult.at("observation").at("snapshot_id"));
+    QVERIFY(!displayTyped.value().observation.imagePath.empty());
+    const Json typedDisplay = Json::parse(displayTyped.value().observation.json);
+    QVERIFY(typedDisplay.at("snapshot_id") != displayResult.at("snapshot_id"));
     if (QString::fromLatin1(QTest::currentDataTag()) == QStringLiteral("ascii")) {
         for (const char* action : {"type", "replace_text"}) {
-            const auto current = invoke(
-                computer, {{"action", "observe"}, {"target", "display"}, {"display_id", std::to_string(display.id)}},
-                context);
-            QVERIFY2(!current.hasError(), current.error().message().c_str());
-            const auto held = invoke(computer,
-                                     {{"action", "key_down"},
-                                      {"target", "display"},
-                                      {"display_id", std::to_string(display.id)},
-                                      {"snapshot_id", Json::parse(current.output()).at("snapshot_id")},
-                                      {"key", "Ctrl"}},
-                                     context);
-            QVERIFY2(!held.hasError(), held.error().message().c_str());
+            const auto current = observeDisplay();
+            QVERIFY2(current, current.error().message().c_str());
+            DesktopComputerAction down;
+            down.action = "key_down";
+            down.snapshotId = Json::parse(current.value().json).at("snapshot_id").get<std::string>();
+            down.key = "Ctrl";
+            const auto held = performDisplay(down);
+            QVERIFY2(held, held.error().message().c_str());
             QTRY_VERIFY(GetAsyncKeyState(VK_CONTROL) & 0x8000);
             const QString textBefore = input.text();
-            const auto literal =
-                invoke(computer,
-                       {{"action", action},
-                        {"target", "display"},
-                        {"display_id", std::to_string(display.id)},
-                        {"snapshot_id", Json::parse(held.output()).at("observation").at("snapshot_id")},
-                        {"text", "literal text must not become a shortcut"}},
-                       context);
-            qInfo() << "[literal-held-modifier]" << action << "error" << literal.hasError() << "textUnchanged"
+            DesktopComputerAction literalAction;
+            literalAction.action = action;
+            literalAction.snapshotId = Json::parse(held.value().observation.json).at("snapshot_id").get<std::string>();
+            literalAction.text = "literal text must not become a shortcut";
+            const auto literal = performDisplay(literalAction);
+            qInfo() << "[literal-held-modifier]" << action << "error" << !literal << "textUnchanged"
                     << (input.text() == textBefore);
-            QVERIFY2(literal.hasError(), "Literal text insertion must reject a held shortcut modifier");
+            QVERIFY2(!literal, "Literal text insertion must reject a held shortcut modifier");
             QCOMPARE(literal.error().code(), MaiErrorCode::Busy);
             QCOMPARE(input.text(), textBefore);
             QTRY_VERIFY(!(GetAsyncKeyState(VK_CONTROL) & 0x8000));
@@ -659,10 +659,20 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPreservesHeldButtonAndA
     context.model = "glm-5.3-flash";
     context.cancel = &canceled;
     MaiToolRegistry registry;
-    registerDesktopComputerTools(registry, std::make_shared<DesktopComputerController>());
+    const auto controller = std::make_shared<DesktopComputerController>();
     registry.add(makeMaiScreenshotTool());
-    auto* computer = registry.find("desktop_computer");
     auto* screenshot = registry.find("screenshot");
+    const auto observeOwned = [&] {
+        return nativeWork([&] { return controller->observeDisplay(context.sessionId, context.root, display.id,
+            [&] { return canceled.load(); }); });
+    };
+    const auto performOwned = [&](DesktopComputerAction action) {
+        action.desktopScope = true;
+        action.workspace = context.root;
+        action.displayId = display.id;
+        action.isCanceled = [&] { return canceled.load(); };
+        return nativeWork([&] { return controller->perform(context.sessionId, action); });
+    };
     const auto stop = qScopeGuard([&] { maiStopScreenshotCapture(); });
     // This fixture alone supplies the down/up pair. It is not a model action or
     // a proposed way to bypass the production "user already holds a button" guard.
@@ -686,12 +696,18 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPreservesHeldButtonAndA
     QTRY_VERIFY(slider.held && slider.presses == 1);
     Json trace = Json::array();
     for (const bool bound : {false, true}) {
-        const Json args =
-            bound ? Json{{"action", "observe"}, {"target", "display"}, {"display_id", std::to_string(display.id)}}
-                  : Json{{"action", "capture"}};
-        const auto captured = invoke(bound ? computer : screenshot, args, context);
-        QVERIFY2(!captured.hasError(), captured.error().message().c_str());
-        QVERIFY(captured.images().size() == 1);
+        std::string imagePath;
+        if (bound) {
+            const auto captured = observeOwned();
+            QVERIFY2(captured, captured.error().message().c_str());
+            imagePath = captured.value().imagePath;
+        } else {
+            const auto captured = invoke(screenshot, {{"action", "capture"}}, context);
+            QVERIFY2(!captured.hasError(), captured.error().message().c_str());
+            QVERIFY(captured.images().size() == 1);
+            imagePath = captured.images().front().path;
+        }
+        QVERIFY(!imagePath.empty());
         QVERIFY(slider.held && slider.releases == 0);
         QVERIFY(GetAsyncKeyState(VK_LBUTTON) & 0x8000);
         trace.push_back({{"stage", bound ? "bound_observe_while_held" : "screenshot_while_held"},
@@ -699,7 +715,7 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPreservesHeldButtonAndA
                          {"receiverReleases", slider.releases}});
         const QString evidence = qEnvironmentVariable("MAICHAT_CHAIN_EVIDENCE");
         if (!evidence.isEmpty())
-            QVERIFY(QImage(QString::fromStdString(captured.images().at(0).path))
+            QVERIFY(QImage(QString::fromStdString(imagePath))
                         .save(evidence +
                               (bound ? QStringLiteral("-held-observe.png") : QStringLiteral("-held-screenshot.png"))));
     }
@@ -708,82 +724,68 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPreservesHeldButtonAndA
 
     // Generic independent button input must compose with observation and move;
     // this is an input capability check, not an application-specific recipe.
-    const auto independentObservation = invoke(
-        computer, {{"action", "observe"}, {"target", "display"}, {"display_id", std::to_string(display.id)}}, context);
-    QVERIFY2(!independentObservation.hasError(), independentObservation.error().message().c_str());
-    const Json independentSnapshot = Json::parse(independentObservation.output());
-    const QImage independentImage(QString::fromStdString(independentObservation.images().at(0).path));
+    const auto independentObservation = observeOwned();
+    QVERIFY2(independentObservation, independentObservation.error().message().c_str());
+    const Json independentSnapshot = Json::parse(independentObservation.value().json);
+    const QImage independentImage(QString::fromStdString(independentObservation.value().imagePath));
     const QPointF independentStart = markerCenter(independentImage, QColor("#28af77").rgb());
     QVERIFY(independentStart.x() >= 0);
     const int beforeIndependentRelease = slider.releases;
-    const auto independentCleanup = qScopeGuard([&] { invoke(computer, {{"action", "release_all"}}, context); });
-    const auto independentDown = invoke(computer,
-                                        {{"action", "mouse_down"},
-                                         {"target", "display"},
-                                         {"display_id", std::to_string(display.id)},
-                                         {"snapshot_id", independentSnapshot.at("snapshot_id")},
-                                         {"button", "left"},
-                                         {"x_ratio", independentStart.x() / (independentImage.width() - 1)},
-                                         {"y_ratio", independentStart.y() / (independentImage.height() - 1)}},
-                                        context);
-    QVERIFY2(!independentDown.hasError(), independentDown.error().message().c_str());
+    const auto independentCleanup = qScopeGuard([&] { controller->releaseInput(context.sessionId); });
+    DesktopComputerAction independentDownAction;
+    independentDownAction.action = "mouse_down";
+    independentDownAction.snapshotId = independentSnapshot.at("snapshot_id").get<std::string>();
+    independentDownAction.xRatio = independentStart.x() / (independentImage.width() - 1);
+    independentDownAction.yRatio = independentStart.y() / (independentImage.height() - 1);
+    const auto independentDown = performOwned(independentDownAction);
+    QVERIFY2(independentDown, independentDown.error().message().c_str());
     QTRY_VERIFY(slider.held);
-    const auto whileHeld = invoke(
-        computer, {{"action", "observe"}, {"target", "display"}, {"display_id", std::to_string(display.id)}}, context);
-    QVERIFY2(!whileHeld.hasError(), whileHeld.error().message().c_str());
+    const auto whileHeld = observeOwned();
+    QVERIFY2(whileHeld, whileHeld.error().message().c_str());
     QCOMPARE(slider.releases, beforeIndependentRelease);
-    const auto independentMove =
-        invoke(computer,
-               {{"action", "move"},
-                {"target", "display"},
-                {"display_id", std::to_string(display.id)},
-                {"snapshot_id", Json::parse(whileHeld.output()).at("snapshot_id")},
-                {"x_ratio", (independentStart.x() + 30 * slider.devicePixelRatioF()) / (independentImage.width() - 1)},
-                {"y_ratio", independentStart.y() / (independentImage.height() - 1)}},
-               context);
-    QVERIFY2(!independentMove.hasError(), independentMove.error().message().c_str());
+    DesktopComputerAction independentMoveAction;
+    independentMoveAction.action = "move";
+    independentMoveAction.snapshotId = Json::parse(whileHeld.value().json).at("snapshot_id").get<std::string>();
+    independentMoveAction.xRatio = (independentStart.x() + 30 * slider.devicePixelRatioF()) /
+                                   (independentImage.width() - 1);
+    independentMoveAction.yRatio = independentStart.y() / (independentImage.height() - 1);
+    const auto independentMove = performOwned(independentMoveAction);
+    QVERIFY2(independentMove, independentMove.error().message().c_str());
     QVERIFY(slider.held && slider.releases == beforeIndependentRelease);
-    const auto independentUp = invoke(
-        computer,
-        {{"action", "mouse_up"}, {"target", "display"}, {"display_id", std::to_string(display.id)}, {"button", "left"}},
-        context);
-    QVERIFY2(!independentUp.hasError(), independentUp.error().message().c_str());
+    DesktopComputerAction independentUpAction;
+    independentUpAction.action = "mouse_up";
+    const auto independentUp = performOwned(independentUpAction);
+    QVERIFY2(independentUp, independentUp.error().message().c_str());
     QTRY_VERIFY(!slider.held && slider.releases == beforeIndependentRelease + 1);
     trace.push_back({{"stage", "independent_down_observe_move_up"}, {"heldAcrossObservation", true}});
 
     // First stop short; the tool must not be mistaken for an alignment checker.
     // Then use a fresh image to reach the marker with one complete drag.
     for (const int offset : {-40, 0}) {
-        const auto observed =
-            invoke(computer, {{"action", "observe"}, {"target", "display"}, {"display_id", std::to_string(display.id)}},
-                   context);
-        QVERIFY2(!observed.hasError(), observed.error().message().c_str());
-        const QImage image(QString::fromStdString(observed.images().at(0).path));
+        const auto observed = observeOwned();
+        QVERIFY2(observed, observed.error().message().c_str());
+        const QImage image(QString::fromStdString(observed.value().imagePath));
         QVERIFY(!image.isNull());
         const QPointF point = markerCenter(image, QColor("#28af77").rgb());
         const QPointF target = markerCenter(image, QColor("#df8547").rgb());
         QVERIFY(point.x() >= 0 && target.x() >= 0);
         const int releasesBefore = slider.releases;
-        const auto dragged =
-            invoke(computer,
-                   {{"action", "drag"},
-                    {"target", "display"},
-                    {"display_id", std::to_string(display.id)},
-                    {"snapshot_id", Json::parse(observed.output()).at("snapshot_id")},
-                    {"x_ratio", point.x() / (image.width() - 1)},
-                    {"y_ratio", point.y() / (image.height() - 1)},
-                    {"to_x_ratio", (target.x() + offset * slider.devicePixelRatioF()) / (image.width() - 1)},
-                    {"to_y_ratio", target.y() / (image.height() - 1)},
-                    {"duration_ms", 200}},
-                   context);
-        QVERIFY2(!dragged.hasError(), dragged.error().message().c_str());
+        DesktopComputerAction drag;
+        drag.action = "drag";
+        drag.snapshotId = Json::parse(observed.value().json).at("snapshot_id").get<std::string>();
+        drag.xRatio = point.x() / (image.width() - 1);
+        drag.yRatio = point.y() / (image.height() - 1);
+        drag.toXRatio = (target.x() + offset * slider.devicePixelRatioF()) / (image.width() - 1);
+        drag.toYRatio = target.y() / (image.height() - 1);
+        drag.durationMs = 200;
+        const auto dragged = performOwned(drag);
+        QVERIFY2(dragged, dragged.error().message().c_str());
         QTRY_COMPARE(slider.releases, releasesBefore + 1);
         QVERIFY(!slider.held && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000));
         QVERIFY(slider.heldMoves > 0);
         QVERIFY(std::abs(slider.handleX - HeldSlider::targetX - offset) <= 1);
-        const Json result = Json::parse(dragged.output());
-        QVERIFY(result.value("dispatched", false) && !result.value("verified", true));
-        QVERIFY(result.contains("observation") && dragged.images().size() == 1);
+        QVERIFY(dragged.value().dispatched && !dragged.value().verified);
+        QVERIFY(!dragged.value().observation.imagePath.empty());
         const bool aligned = std::abs(slider.handleX - HeldSlider::targetX) <= 1;
         QCOMPARE(aligned, offset == 0);
         trace.push_back({{"stage", offset ? "short_drag_then_returned_image" : "aligned_drag_then_returned_image"},
@@ -795,57 +797,63 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPreservesHeldButtonAndA
         const QString evidence = qEnvironmentVariable("MAICHAT_CHAIN_EVIDENCE");
         if (!evidence.isEmpty()) {
             const QString base = evidence + QStringLiteral("-slider-%1").arg(offset);
-            QVERIFY(QImage(QString::fromStdString(dragged.images().at(0).path)).save(base + QStringLiteral(".png")));
+            QVERIFY(QImage(QString::fromStdString(dragged.value().observation.imagePath)).save(base + QStringLiteral(".png")));
         }
     }
-    const auto observeOwned = [&] {
-        return invoke(computer,
-                      {{"action", "observe"}, {"target", "display"}, {"display_id", std::to_string(display.id)}},
-                      context);
-    };
-    const auto mutate = [&](Json args) {
+    const auto mutate = [&](DesktopComputerAction action) -> MaiResult<DesktopComputerActionResult> {
         const auto image = observeOwned();
-        if (image.hasError()) return image;
-        args["target"] = "display";
-        args["display_id"] = std::to_string(display.id);
-        args["snapshot_id"] = Json::parse(image.output()).at("snapshot_id");
-        return invoke(computer, args, context);
+        if (!image) return image.error();
+        action.snapshotId = Json::parse(image.value().json).at("snapshot_id").get<std::string>();
+        return performOwned(action);
     };
     const QPoint safePoint = nativePoint(QPoint(70, 70));
     const double safeX = (safePoint.x() - display.x) / (display.width - 1);
     const double safeY = (safePoint.y() - display.y) / (display.height - 1);
+    const auto pointRequest = [](const char* kind, double x, double y,
+                                 DesktopMouseButton button = DesktopMouseButton::Left) {
+        DesktopComputerAction action;
+        action.action = kind;
+        action.xRatio = x;
+        action.yRatio = y;
+        action.button = button;
+        return action;
+    };
+    const auto keyRequest = [](const char* kind, const char* key) {
+        DesktopComputerAction action;
+        action.action = kind;
+        action.key = key;
+        return action;
+    };
     const std::pair<const char*, int> buttons[] = {{"left", VK_LBUTTON},
                                                    {"right", VK_RBUTTON},
                                                    {"middle", VK_MBUTTON},
                                                    {"back", VK_XBUTTON1},
                                                    {"forward", VK_XBUTTON2}};
-    for (const auto& button : buttons) {
-        const auto down =
-            mutate({{"action", "mouse_down"}, {"button", button.first}, {"x_ratio", safeX}, {"y_ratio", safeY}});
-        QVERIFY2(!down.hasError(), down.error().message().c_str());
+    const DesktopMouseButton nativeButtons[] = {DesktopMouseButton::Left, DesktopMouseButton::Right,
+        DesktopMouseButton::Middle, DesktopMouseButton::Back, DesktopMouseButton::Forward};
+    for (std::size_t index = 0; index < std::size(buttons); ++index) {
+        const auto& button = buttons[index];
+        const auto down = mutate(pointRequest("mouse_down", safeX, safeY, nativeButtons[index]));
+        QVERIFY2(down, down.error().message().c_str());
         QTRY_VERIFY(GetAsyncKeyState(button.second) & 0x8000);
-        const auto state = invoke(computer, {{"action", "input_state"}}, context);
-        QVERIFY(!state.hasError());
-        QVERIFY(Json::parse(state.output()).at("buttons_down") == Json::array({button.first}));
+        const auto state = controller->inputState(context.sessionId);
+        QVERIFY(state.buttonsDown == std::vector<std::string>{button.first});
         POINT beforeDuplicate{};
         QVERIFY(GetCursorPos(&beforeDuplicate));
-        const auto duplicate =
-            mutate({{"action", "mouse_down"}, {"button", button.first}, {"x_ratio", safeX + 0.1}, {"y_ratio", safeY}});
-        QVERIFY2(!duplicate.hasError(), duplicate.error().message().c_str());
+        const auto duplicate = mutate(pointRequest("mouse_down", safeX + 0.1, safeY, nativeButtons[index]));
+        QVERIFY2(duplicate, duplicate.error().message().c_str());
         POINT afterDuplicate{};
         QVERIFY(GetCursorPos(&afterDuplicate));
         QCOMPARE(QPoint(beforeDuplicate.x, beforeDuplicate.y), QPoint(afterDuplicate.x, afterDuplicate.y));
-        const auto up = invoke(computer, {{"action", "mouse_up"}, {"button", button.first}}, context);
-        QVERIFY2(!up.hasError(), up.error().message().c_str());
+        const auto up = performOwned(pointRequest("mouse_up", 0, 0, nativeButtons[index]));
+        QVERIFY2(up, up.error().message().c_str());
         QTRY_VERIFY(!(GetAsyncKeyState(button.second) & 0x8000));
-        const auto tapped =
-            mutate({{"action", "click"}, {"button", button.first}, {"x_ratio", safeX}, {"y_ratio", safeY}});
-        QVERIFY2(!tapped.hasError(), tapped.error().message().c_str());
+        const auto tapped = mutate(pointRequest("click", safeX, safeY, nativeButtons[index]));
+        QVERIFY2(tapped, tapped.error().message().c_str());
         QTRY_VERIFY(!(GetAsyncKeyState(button.second) & 0x8000));
         const auto releasesBeforeDouble = events.buttonUps.size();
-        const auto doubled =
-            mutate({{"action", "double_click"}, {"button", button.first}, {"x_ratio", safeX}, {"y_ratio", safeY}});
-        QVERIFY2(!doubled.hasError(), doubled.error().message().c_str());
+        const auto doubled = mutate(pointRequest("double_click", safeX, safeY, nativeButtons[index]));
+        QVERIFY2(doubled, doubled.error().message().c_str());
         QTRY_VERIFY(events.buttonUps.size() >= releasesBeforeDouble + 2);
     }
     QVERIFY(std::find(events.buttonDowns.begin(), events.buttonDowns.end(), WM_MBUTTONDOWN) !=
@@ -854,57 +862,59 @@ void DesktopComputerScreenshotChainNativeTest::screenshotPreservesHeldButtonAndA
             events.buttonDowns.end());
     trace.push_back({{"stage", "five_buttons_independent_and_click"}, {"duplicateDownDoesNotMove", true}});
 
-    const auto controlDown = mutate({{"action", "key_down"}, {"key", "Ctrl"}});
-    QVERIFY2(!controlDown.hasError(), controlDown.error().message().c_str());
+    const auto controlDown = mutate(keyRequest("key_down", "Ctrl"));
+    QVERIFY2(controlDown, controlDown.error().message().c_str());
     QTRY_VERIFY(GetAsyncKeyState(VK_CONTROL) & 0x8000);
     const int controlClicksBefore = events.controlClicks;
-    const auto controlClick = mutate({{"action", "click"}, {"x_ratio", safeX}, {"y_ratio", safeY}});
-    QVERIFY2(!controlClick.hasError(), controlClick.error().message().c_str());
+    const auto controlClick = mutate(pointRequest("click", safeX, safeY));
+    QVERIFY2(controlClick, controlClick.error().message().c_str());
     QTRY_VERIFY(events.controlClicks > controlClicksBefore);
     QVERIFY(GetAsyncKeyState(VK_CONTROL) & 0x8000);
-    const auto tappedKey = mutate({{"action", "key"}, {"key", "A"}});
-    QVERIFY2(!tappedKey.hasError(), tappedKey.error().message().c_str());
+    const auto tappedKey = mutate(keyRequest("key", "A"));
+    QVERIFY2(tappedKey, tappedKey.error().message().c_str());
     QVERIFY(GetAsyncKeyState(VK_CONTROL) & 0x8000);
-    const auto horizontal =
-        mutate({{"action", "scroll"}, {"axis", "horizontal"}, {"lines", 1}, {"x_ratio", safeX}, {"y_ratio", safeY}});
-    QVERIFY2(!horizontal.hasError(), horizontal.error().message().c_str());
+    auto scroll = pointRequest("scroll", safeX, safeY);
+    scroll.scrollAxis = DesktopScrollAxis::Horizontal;
+    scroll.scrollLines = 1;
+    const auto horizontal = mutate(scroll);
+    QVERIFY2(horizontal, horizontal.error().message().c_str());
     QTRY_VERIFY(events.horizontalWheel >= WHEEL_DELTA);
-    const auto vertical = mutate({{"action", "scroll"}, {"lines", 1}, {"x_ratio", safeX}, {"y_ratio", safeY}});
-    QVERIFY2(!vertical.hasError(), vertical.error().message().c_str());
+    scroll.scrollAxis = DesktopScrollAxis::Vertical;
+    const auto vertical = mutate(scroll);
+    QVERIFY2(vertical, vertical.error().message().c_str());
     QTRY_VERIFY(events.verticalWheel >= WHEEL_DELTA);
     QVERIFY(GetAsyncKeyState(VK_CONTROL) & 0x8000);
-    const auto controlUp = invoke(computer, {{"action", "key_up"}, {"key", "Control"}}, context);
-    QVERIFY2(!controlUp.hasError(), controlUp.error().message().c_str());
+    const auto controlUp = performOwned(keyRequest("key_up", "Control"));
+    QVERIFY2(controlUp, controlUp.error().message().c_str());
     QTRY_VERIFY(!(GetAsyncKeyState(VK_CONTROL) & 0x8000));
     trace.push_back({{"stage", "held_control_click_key_and_both_scroll_axes"}, {"modifierPreserved", true}});
 
-    const auto shiftDown = mutate({{"action", "key_down"}, {"key", "Shift"}});
-    QVERIFY2(!shiftDown.hasError(), shiftDown.error().message().c_str());
+    const auto shiftDown = mutate(keyRequest("key_down", "Shift"));
+    QVERIFY2(shiftDown, shiftDown.error().message().c_str());
     const int shiftClicksBefore = events.shiftClicks;
-    const auto shiftDrag = mutate({{"action", "drag"},
-                                   {"x_ratio", safeX},
-                                   {"y_ratio", safeY},
-                                   {"to_x_ratio", safeX + 0.05},
-                                   {"to_y_ratio", safeY},
-                                   {"duration_ms", 100}});
-    QVERIFY2(!shiftDrag.hasError(), shiftDrag.error().message().c_str());
+    auto drag = pointRequest("drag", safeX, safeY);
+    drag.toXRatio = safeX + 0.05;
+    drag.toYRatio = safeY;
+    drag.durationMs = 100;
+    const auto shiftDrag = mutate(drag);
+    QVERIFY2(shiftDrag, shiftDrag.error().message().c_str());
     QTRY_VERIFY(events.shiftClicks > shiftClicksBefore);
     QVERIFY(GetAsyncKeyState(VK_SHIFT) & 0x8000);
     QVERIFY(!(GetAsyncKeyState(VK_LBUTTON) & 0x8000));
     canceled = true;
-    const auto canceledRelease = invoke(computer, {{"action", "release_all"}}, context);
-    QVERIFY2(!canceledRelease.hasError(), canceledRelease.error().message().c_str());
+    const auto canceledRelease = nativeWork([&] { return controller->releaseInput(context.sessionId); });
+    QVERIFY2(!canceledRelease, canceledRelease.message().c_str());
     QTRY_VERIFY(!(GetAsyncKeyState(VK_SHIFT) & 0x8000));
     canceled = false;
     trace.push_back({{"stage", "shift_drag_and_cancelled_release_all"}, {"onlyTransientMouseReleased", true}});
     for (const char* key : {"ShiftLeft", "ShiftRight"}) {
-        const auto down = mutate({{"action", "key_down"}, {"key", key}});
-        QVERIFY2(!down.hasError(), down.error().message().c_str());
+        const auto down = mutate(keyRequest("key_down", key));
+        QVERIFY2(down, down.error().message().c_str());
     }
-    QVERIFY(!invoke(computer, {{"action", "key_up"}, {"key", "ShiftLeft"}}, context).hasError());
+    QVERIFY(performOwned(keyRequest("key_up", "ShiftLeft")));
     QTRY_VERIFY(!(GetAsyncKeyState(VK_LSHIFT) & 0x8000));
     QVERIFY(GetAsyncKeyState(VK_RSHIFT) & 0x8000);
-    QVERIFY(!invoke(computer, {{"action", "key_up"}, {"key", "ShiftRight"}}, context).hasError());
+    QVERIFY(performOwned(keyRequest("key_up", "ShiftRight")));
     QTRY_VERIFY(!(GetAsyncKeyState(VK_SHIFT) & 0x8000));
     trace.push_back({{"stage", "independent_modifier_sides"}, {"otherSidePreserved", true}});
 

@@ -14,7 +14,7 @@
 #      能用才算数，编译过不算。
 #
 # 唯一还剩的 HTTP 是**客户端**那一侧：核心用 libcurl 调模型。
-# 这个脚本起的假模型就是个真的 Chat Completions 端点，那条线本来就该在。
+# 这个脚本起的假模型只提供 Responses 端点，与唯一产品协议保持一致。
 #
 # 一切收发都在 Python 里显式 UTF-8，不经过 shell 传参——
 # 这台机器的 bash/PowerShell 会把中文按 GBK 毁掉，之前两次误判服务端有 bug。
@@ -92,6 +92,9 @@ class ModelHandler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
+        if self.path != "/responses":
+            self.send_error(404)
+            return
         n = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(n)
         with served_lock:
@@ -100,23 +103,39 @@ class ModelHandler(BaseHTTPRequestHandler):
             ModelHandler.bodies.append(body)
         entry = SCRIPTS[idx] if idx < len(SCRIPTS) else ("", "", "")
         text, tool, args = entry[0], entry[1], entry[2]
-        # 第四项是思考过程，走 reasoning_content——真实的推理模型就是这么发的
-        # （拿 GLM-5.3 抓过：先几百帧 reasoning_content，再开始 content）。
+        # 第四项是独立 reasoning item，不能拼入可见助手正文。
         reasoning = entry[3] if len(entry) > 3 else ""
 
-        def frame(delta):
-            return ("data: " + json.dumps({"choices": [{"delta": delta}]}, ensure_ascii=False)
+        def frame(event):
+            return ("data: " + json.dumps(event, ensure_ascii=False)
                     + "\n\n").encode("utf-8")
 
-        reasoning_frames = [frame({"reasoning_content": piece}) for piece in reasoning]
-        tool_frame = frame({"tool_calls": [{
-            "index": 0,
-            "id": "call_%d" % idx,
-            "function": {"name": tool, "arguments": args},
-        }]}) if tool else b""
-        text_frames = [frame({"content": piece}) for piece in text]
+        items = []
+        reasoning_frames = []
+        if reasoning:
+            items.append({"type": "reasoning", "id": "rs_%d" % idx, "summary": [],
+                          "content": [{"type": "reasoning_text", "text": reasoning}]})
+            reasoning_frames = [frame({"type": "response.reasoning_text.delta",
+                                       "output_index": 0, "content_index": 0, "delta": piece})
+                                for piece in reasoning]
+        tool_frame = b""
+        if tool:
+            item = {"type": "function_call", "id": "fc_%d" % idx,
+                    "call_id": "call_%d" % idx, "name": tool, "arguments": args}
+            tool_frame = frame({"type": "response.output_item.done",
+                                "output_index": len(items), "item": item})
+            items.append(item)
+        text_index = len(items)
+        if text:
+            items.append({"type": "message", "id": "msg_%d" % idx, "role": "assistant",
+                          "status": "completed",
+                          "content": [{"type": "output_text", "text": text}]})
+        text_frames = [frame({"type": "response.output_text.delta", "output_index": text_index,
+                              "content_index": 0, "delta": piece}) for piece in text]
         # 第五项仅供断流用例：以合法 HTTP EOF 结束，却不给模型协议终止帧。
-        done = b"" if len(entry) > 4 and entry[4] else b"data: [DONE]\n\n"
+        done = b"" if len(entry) > 4 and entry[4] else frame({
+            "type": "response.completed",
+            "response": {"id": "resp_%d" % idx, "status": "completed", "output": items}})
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         # HTTP/1.0 默认靠关闭连接界定正文；本地 Windows 定点复现会在首字后报告接收错误。
@@ -159,6 +178,7 @@ GREETING = ("\u4f60\u597d\uff01\u6211\u662f\u8dd1\u5728 C++ "
 
 SCRIPTS[:] = [
     (GREETING, "", ""),                                                    # 第一轮：纯聊天
+    ("", "tool_search", json.dumps({"select": ["file_write"]})),           # 先发现，再在下一请求调用
     ("", "file_write", json.dumps({"path": "note.txt", "content": "written after approval"})),
     ("Done, I wrote note.txt.", "", ""),                                   # 第二轮的收尾
 ]
@@ -308,11 +328,49 @@ if os.path.exists(note):
 # 回灌给模型的那一轮里必须带上 tool 结果，否则它是在凭空接话。
 with served_lock:
     bodies = list(ModelHandler.bodies)
-check("three model calls happened", len(bodies) == 3, "%d" % len(bodies))
-if len(bodies) == 3:
-    fed = json.loads(bodies[2].decode("utf-8"))
-    roles = [m.get("role") for m in fed.get("messages", [])]
-    check("the tool result was fed back", "tool" in roles, repr(roles))
+check("four model calls include one discovery request", len(bodies) == 4, "%d" % len(bodies))
+if len(bodies) == 4:
+    first = json.loads(bodies[0].decode("utf-8"))
+    declared = json.loads(bodies[2].decode("utf-8"))
+    fed = json.loads(bodies[3].decode("utf-8"))
+    check("initial tool set remains small", len(first.get("tools", [])) <= 8)
+    check("write is not advertised before discovery", "file_write" not in
+          [tool.get("name") for tool in first.get("tools", [])])
+    check("discovered schema appends without changing earlier declarations",
+          declared.get("tools", [])[:len(first.get("tools", []))] == first.get("tools", []) and
+          "file_write" in [tool.get("name") for tool in declared.get("tools", [])])
+    check("selected declarations remain fixed for the next tool follow-up",
+          declared.get("tools", []) == fed.get("tools", []))
+    types = [item.get("type") for item in fed.get("input", [])]
+    check("the tool result was fed back", "function_call_output" in types, repr(types))
+
+# ── 基础补丁工具直接可用，不依赖 shell 中存在同名程序 ─────────
+with served_lock:
+    served["n"] = 0
+    patch_body_mark = len(ModelHandler.bodies)
+PATCH = ("*** Begin Patch\n*** Update File: note.txt\n@@\n"
+         "-written after approval\n+updated with apply_patch\n*** End Patch\n")
+SCRIPTS[:] = [("", "apply_patch", json.dumps({"patch": PATCH})),
+              ("Applied the Codex patch.", "", "")]
+mark = len(text())
+turns = prompts_seen()
+send("update note.txt with apply_patch")
+check("canonical patch tool is pending without metadata discovery",
+      wait_after("[tool] apply_patch  pending", mark))
+send("/y")
+check("canonical patch tool completes", wait_after("[tool] apply_patch  completed", mark))
+check("patch turn gets its final answer", wait_after("Applied the Codex patch.", mark))
+check("patch turn went idle", wait_prompts(turns + 1))
+with open(note, "rb") as updated:
+    check("patch edits existing bytes and adds the Codex final newline",
+          updated.read() == b"updated with apply_patch\n")
+with served_lock:
+    patch_requests = list(ModelHandler.bodies[patch_body_mark:])
+check("patch uses only the apply and follow-up model requests", len(patch_requests) == 2)
+if patch_requests:
+    declarations = json.loads(patch_requests[0].decode("utf-8")).get("tools", [])
+    check("canonical patch is in the initial selected declarations",
+          "apply_patch" in [tool.get("name") for tool in declarations])
 
 # ── 上下文是累积的 ────────────────────────────────────────
 # 模型拿到的不能只是最新那一句。这条以前在 m2 里，靠翻 REST 请求体验；
@@ -330,7 +388,13 @@ check("third turn answered", wait_after("I still remember.", mark))
 
 with served_lock:
     latest = json.loads(ModelHandler.bodies[-1].decode("utf-8"))
-contents = [m.get("content", "") for m in latest.get("messages", [])]
+contents = []
+for item in latest.get("input", []):
+    content = item.get("content", "")
+    if isinstance(content, str):
+        contents.append(content)
+    elif isinstance(content, list):
+        contents.extend(part["text"] for part in content if isinstance(part.get("text"), str))
 check("history carries the first answer", GREETING in contents,
       "%d messages" % len(contents))
 check("history carries the latest prompt", "what did you say first" in contents)
@@ -431,7 +495,7 @@ char_delay["s"] = 0.0
 # 那个 part 还没入库（规范第 10 节"先落库再广播"只在工具那条路径上落实了）。
 # 订阅方拿 id 去查查不到，就分不出这是正文还是思考——两者的增量 field 都是 "text"。
 #
-# 假模型以前不发 reasoning_content，所以这个洞测不到。现在发了。
+# 假模型以前不发 reasoning_text，所以这个洞测不到。现在发了。
 DRAFT = "I should answer briefly. No tools needed here."
 ANSWER = "Briefly: yes."
 with served_lock:
@@ -541,8 +605,8 @@ say("")
 # 用户直接叉掉窗口、进程被杀、机器断电。
 #
 # 这一段用 terminate() 硬杀，一个析构函数都不跑，然后重开看数据还在不在。
-# 验的是 WAL：提交过的数据先落在 <db>-wal 里，下次打开时由 SQLite 自己重放。
-# （顺带说明为什么只拷 agent.db 不算备份——wal 里那部分会丢。）
+# 验证完成 item 的 JSONL 权威提交和 SQLite 投影恢复。可见正文的尾字不等于
+# item 已完成：必须先观察本轮 SessionIdle 提示符，再硬杀，不能误测 RAM 草稿持久化。
 say("== 4. survives a hard kill ==")
 
 workspace2 = tempfile.mkdtemp(prefix="maiagent-kill-")
@@ -573,11 +637,13 @@ victim.stdin.flush()
 
 deadline = time.time() + 20
 while time.time() < deadline:
-    if SURVIVOR in b"".join(seen).decode("utf-8", "replace"):
+    completed_screen = b"".join(seen).decode("utf-8", "replace")
+    if SURVIVOR in completed_screen and completed_screen.count("\n> ") >= 2:
         break
     time.sleep(0.05)
 victim_screen = b"".join(seen).decode("utf-8", "replace")
 check("the answer came through before the kill", SURVIVOR in victim_screen)
+check("completed item was acknowledged before the kill", victim_screen.count("\n> ") >= 2)
 
 old_session = ""
 for token in victim_screen.split():

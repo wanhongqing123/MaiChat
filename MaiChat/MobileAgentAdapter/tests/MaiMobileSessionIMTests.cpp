@@ -78,7 +78,7 @@ class ScriptedModel final : public MaiModelClient {
 public:
     explicit ScriptedModel(std::shared_ptr<ModelState> state) : state_(std::move(state)) {}
     MaiWireApi wireApi() const override {
-        return MaiWireApi::ChatCompletions;
+        return MaiWireApi::Responses;
     }
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                     const std::atomic<bool>& cancel) override {

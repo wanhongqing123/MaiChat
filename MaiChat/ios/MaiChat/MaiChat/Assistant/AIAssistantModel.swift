@@ -48,18 +48,30 @@ private func aiMobileAgentSessionChanged(_ sessionID: UnsafePointer<CChar>?) {
 struct AIModelSettings: Codable, Sendable, Equatable {
     // All supported cloud models use Responses; provider keys remain distinct.
     static let glmResponsesUrl = "https://open.bigmodel.cn/api/v1"
+    static let openAiUrl = "https://api.openai.com/v1"
+    static let solModel = "gpt-6.1-sol"
     static let openRouterUrl = "https://openrouter.ai/api/v1"
     static let fableModel = "anthropic/claude-fable-5.2"
     static let opusModel = "anthropic/claude-opus-5.5"
     static let particleFreeModel = "particle-ai/particle-1:free"
-    static let cloudModels = ["deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash",
-                              fableModel, opusModel, particleFreeModel]
+    static let cloudModels = ["deepseek-flash", "deepseek-v4-pro", "glm-5.4", "glm-5.3-flash",
+                              fableModel, opusModel, particleFreeModel, solModel]
     static let deepSeekUrl = "https://api.deepseek.com"
     static let ordinaryReasoningEfforts = ["low", "high", "max"]
     static let fableReasoningEfforts = ["low", "medium", "high", "xhigh", "max"]
 
+    // Exact read migration: Flash/custom IDs and stored history retain their identity.
+    static func restoredCloudModel(_ model: String) -> String {
+        model == "glm-5.3" ? "glm-5.4" : model
+    }
+
+    mutating func migrateLegacyCloudSelection() {
+        model = Self.restoredCloudModel(model)
+        cloudModel = cloudModel.map(Self.restoredCloudModel)
+    }
+
     static func reasoningEfforts(for model: String, advertised: [String]? = nil) -> [String] {
-        let known = [fableModel, opusModel].contains(model) ? fableReasoningEfforts : ordinaryReasoningEfforts
+        let known = [fableModel, opusModel, solModel].contains(model) ? fableReasoningEfforts : ordinaryReasoningEfforts
         guard let advertised else { return known }
         // Choice metadata may narrow capability, but cannot grant an unknown model extra values.
         return !advertised.isEmpty && Set(advertised).count == advertised.count &&
@@ -84,7 +96,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
             return supported.contains("high") ? "high" : (supported.first ?? "high")
         }
         if supported.contains(value) { return value }
-        // Only a known five-level Claude default crosses to a three-level model
+        // Only a known five-level model default crosses to a three-level model
         // as high. Unknown strings (or inconsistent capability metadata) remain
         // invalid so callers reject them instead of reporting a made-up default.
         if fableReasoningEfforts.contains(value) && !reasoningEfforts(for: model).contains(value) {
@@ -94,7 +106,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     }
 
     static func reasoningEffortTitle(_ value: String, for model: String) -> String {
-        if [Self.fableModel, Self.opusModel].contains(model) {
+        if [Self.fableModel, Self.opusModel, Self.solModel].contains(model) {
             switch value {
             case "low": return "低"
             case "medium": return "中"
@@ -116,8 +128,9 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     static func cloudProvider(for model: String) -> String? {
         switch model {
         case "deepseek-flash", "deepseek-v4-pro": return "deepseek"
-        case "glm-5.3", "glm-5.3-flash": return "glm"
+        case "glm-5.4", "glm-5.3-flash": return "glm"
         case fableModel, opusModel, particleFreeModel: return "openrouter"
+        case solModel: return "openai"
         default: return nil
         }
     }
@@ -145,7 +158,7 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     var displayName: String {
         if isLocalModel { return "本地模型" }
         switch model {
-        case "glm-5.3": return "GLM-5.3"
+        case "glm-5.4": return "GLM-5.4"
         case "glm-5.3-flash": return "GLM-5.3-Flash"
         case "deepseek-v4-pro": return "DeepSeek V4 Pro"
         case Self.fableModel: return "Claude Fable 5.2"
@@ -206,8 +219,10 @@ struct AIModelSettings: Codable, Sendable, Equatable {
         model = selected
         if ["deepseek-flash", "deepseek-v4-pro"].contains(selected) {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.deepSeekUrl
-        } else if ["glm-5.3", "glm-5.3-flash"].contains(selected) {
+        } else if ["glm-5.4", "glm-5.3-flash"].contains(selected) {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.glmResponsesUrl
+        } else if selected == Self.solModel {
+            cloudModel = selected; modelProvider = "remote"; baseUrl = Self.openAiUrl
         } else if [Self.fableModel, Self.opusModel, Self.particleFreeModel].contains(selected) {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.openRouterUrl
         }
@@ -289,7 +304,7 @@ final class AICloudCredentialStore: @unchecked Sendable {
 
     func replaceAccountModelKeys(_ next: [String: String]) {
         lock.lock()
-        for provider in ["glm", "deepseek", "minimax", "openrouter"] {
+        for provider in ["glm", "deepseek", "minimax", "openrouter", "openai"] {
             if let key = next[provider], !key.isEmpty { values[provider] = key }
             else { values.removeValue(forKey: provider) }
         }
@@ -382,12 +397,14 @@ enum AICloudCredentialSync {
         guard let issued = try await MaiChatAuthClient.shared.accountModelKeysIfAvailable()
         else { return false }
         var valid: [String: String] = [:]
-        for provider in ["glm", "deepseek", "minimax", "openrouter"] {
-            guard let key = issued.apiKeys[provider], !key.isEmpty,
-                  key.utf8.count <= 4_096,
+        for provider in ["glm", "deepseek", "minimax", "openrouter", "openai"] {
+            // Missing optional credentials are unavailable; malformed issued values
+            // reject the complete response before replacing this account's cache.
+            guard let key = issued.apiKeys[provider], !key.isEmpty else { continue }
+            guard key.utf8.count <= 4_096,
                   key.unicodeScalars.allSatisfy({
                       !CharacterSet.controlCharacters.contains($0)
-                  }) else { continue }
+                  }) else { throw MaiChatAuthError.invalidServerResponse }
             valid[provider] = key
         }
         guard !valid.isEmpty else {
@@ -1882,6 +1899,7 @@ actor AIAssistantBackend {
         let file = directory.appendingPathComponent("settings.json")
         if FileManager.default.fileExists(atPath: file.path) {
             settings = try JSONDecoder().decode(AIModelSettings.self, from: Data(contentsOf: file))
+            settings.migrateLegacyCloudSelection()
         }
         // 旧全局 model 不再覆盖任何 session；新/未设置会话统一使用固定默认。
         // 本地会话是否需要准备由稍后的 owner snapshot 决定，不为云端首次打开复制 GGUF。
@@ -1960,7 +1978,8 @@ actor AIAssistantBackend {
         let appRootPath = AIAssistantPathPolicy.appRoot(workspacePath: workspace.path)
         var routeURLs: [String: Any] = ["glmBaseUrl": AIModelSettings.glmResponsesUrl,
                                         "deepseekBaseUrl": AIModelSettings.deepSeekUrl,
-                                        "openrouterBaseUrl": AIModelSettings.openRouterUrl]
+                                        "openrouterBaseUrl": AIModelSettings.openRouterUrl,
+                                        "openaiBaseUrl": AIModelSettings.openAiUrl]
         #if DEBUG && targetEnvironment(simulator)
         if AIPrimaryModelUITestSupport.isSessionConfigurationRequested {
             let environment = ProcessInfo.processInfo.environment

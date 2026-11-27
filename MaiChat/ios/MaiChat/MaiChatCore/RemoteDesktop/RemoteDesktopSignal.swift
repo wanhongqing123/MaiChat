@@ -3,6 +3,7 @@
 // 此处拒绝版本和字段不合法的载荷；发送方及会话匹配由上层连接状态核验。
 import CoreGraphics
 import Foundation
+import CryptoKit
 
 public struct CaptureGeometry: Codable, Equatable, Sendable {
     public static let fitContentMode = "fit"
@@ -179,6 +180,8 @@ public enum RemoteDesktopCoordinateMapper {
 
 public struct RemoteDesktopSignal: Equatable, Sendable {
     public enum Kind: String, Codable, Sendable {
+        case discover
+        case device
         case invite
         case accept
         case reject
@@ -186,9 +189,16 @@ public struct RemoteDesktopSignal: Equatable, Sendable {
         case notice
     }
 
-    public static let protocolVersion = 1
+    public static let protocolVersion = 2
     public static let prefix = "\u{2063}\u{200B}[remote-desktop]"
 
+    public var version = Self.protocolVersion
+    public var sourceDeviceID = ""
+    public var targetDeviceID = ""
+    public var deviceName = ""
+    public var platform = ""
+    public var canShareScreen = false
+    public var available = false
     public let kind: Kind
     public let sessionID: String
     public let roomID: String
@@ -222,20 +232,34 @@ public struct RemoteDesktopSignal: Equatable, Sendable {
             : .absent
     }
 
+    /// 只用作 TRTC 参与者 ID，签名由已登录账号服务按同一格式签发；IM 仍用原账号。
+    public static func mediaUserID(ownerUserID: String, deviceID: String) -> String {
+        guard !ownerUserID.isEmpty, !deviceID.isEmpty else { return "" }
+        let bytes = Data(("maichat-remote-v2\0" + ownerUserID + "\0" + deviceID).utf8)
+        let hex = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        return "rd_" + hex.prefix(24)
+    }
+
     public static func isSignalText(_ text: String) -> Bool {
         text.hasPrefix(prefix)
     }
 
     public func encodedText() throws -> String {
         let payload = Payload(
-            version: Self.protocolVersion,
+            version: version,
             kind: kind,
             sessionID: sessionID.nilIfEmpty,
             roomID: roomID.nilIfEmpty,
             authProof: authProof.nilIfEmpty,
             reason: reason.nilIfEmpty,
             noticeCode: noticeCode.nilIfEmpty,
-            captureGeometry: captureGeometry
+            captureGeometry: captureGeometry,
+            sourceDeviceID: sourceDeviceID.nilIfEmpty,
+            targetDeviceID: targetDeviceID.nilIfEmpty,
+            deviceName: deviceName.nilIfEmpty,
+            platform: platform.nilIfEmpty,
+            canShareScreen: kind == .device ? canShareScreen : nil,
+            available: kind == .device ? available : nil
         )
         let data = try JSONEncoder().encode(payload)
         guard let json = String(data: data, encoding: .utf8) else {
@@ -252,14 +276,14 @@ public struct RemoteDesktopSignal: Equatable, Sendable {
         let payloadText = String(text.dropFirst(prefix.count))
         guard let data = payloadText.data(using: .utf8),
               let payload = try? JSONDecoder().decode(Payload.self, from: data),
-              payload.version == protocolVersion
+              (payload.version == 1 || payload.version == protocolVersion)
         else {
             return nil
         }
         if payload.kind == .notice, payload.noticeCode?.isEmpty != false {
             return nil
         }
-        return RemoteDesktopSignal(
+        var signal = RemoteDesktopSignal(
             kind: payload.kind,
             sessionID: payload.sessionID ?? "",
             roomID: payload.roomID ?? "",
@@ -268,9 +292,23 @@ public struct RemoteDesktopSignal: Equatable, Sendable {
             noticeCode: payload.noticeCode ?? "",
             captureGeometryDisposition: payload.captureGeometryDisposition
         )
+        signal.version = payload.version
+        signal.sourceDeviceID = payload.sourceDeviceID ?? ""
+        signal.targetDeviceID = payload.targetDeviceID ?? ""
+        signal.deviceName = String((payload.deviceName ?? "").prefix(80))
+        signal.platform = String((payload.platform ?? "").prefix(24))
+        signal.canShareScreen = payload.canShareScreen ?? false
+        signal.available = payload.available ?? false
+        return signal
     }
 
     private struct Payload: Codable {
+        let sourceDeviceID: String?
+        let targetDeviceID: String?
+        let deviceName: String?
+        let platform: String?
+        let canShareScreen: Bool?
+        let available: Bool?
         let version: Int
         let kind: Kind
         let sessionID: String?
@@ -289,8 +327,20 @@ public struct RemoteDesktopSignal: Equatable, Sendable {
             authProof: String?,
             reason: String?,
             noticeCode: String?,
-            captureGeometry: CaptureGeometry?
+            captureGeometry: CaptureGeometry?,
+            sourceDeviceID: String?,
+            targetDeviceID: String?,
+            deviceName: String?,
+            platform: String?,
+            canShareScreen: Bool?,
+            available: Bool?
         ) {
+            self.sourceDeviceID = sourceDeviceID
+            self.targetDeviceID = targetDeviceID
+            self.deviceName = deviceName
+            self.platform = platform
+            self.canShareScreen = canShareScreen
+            self.available = available
             self.version = version
             self.kind = kind
             self.sessionID = sessionID
@@ -306,6 +356,12 @@ public struct RemoteDesktopSignal: Equatable, Sendable {
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
+            sourceDeviceID = try container.decodeIfPresent(String.self, forKey: .sourceDeviceID)
+            targetDeviceID = try container.decodeIfPresent(String.self, forKey: .targetDeviceID)
+            deviceName = try container.decodeIfPresent(String.self, forKey: .deviceName)
+            platform = try container.decodeIfPresent(String.self, forKey: .platform)
+            canShareScreen = try container.decodeIfPresent(Bool.self, forKey: .canShareScreen)
+            available = try container.decodeIfPresent(Bool.self, forKey: .available)
             version = try container.decode(Int.self, forKey: .version)
             kind = try container.decode(Kind.self, forKey: .kind)
             sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
@@ -339,6 +395,12 @@ public struct RemoteDesktopSignal: Equatable, Sendable {
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(sourceDeviceID, forKey: .sourceDeviceID)
+            try container.encodeIfPresent(targetDeviceID, forKey: .targetDeviceID)
+            try container.encodeIfPresent(deviceName, forKey: .deviceName)
+            try container.encodeIfPresent(platform, forKey: .platform)
+            try container.encodeIfPresent(canShareScreen, forKey: .canShareScreen)
+            try container.encodeIfPresent(available, forKey: .available)
             try container.encode(version, forKey: .version)
             try container.encode(kind, forKey: .kind)
             try container.encodeIfPresent(sessionID, forKey: .sessionID)
@@ -350,6 +412,9 @@ public struct RemoteDesktopSignal: Equatable, Sendable {
         }
 
         enum CodingKeys: String, CodingKey {
+            case sourceDeviceID = "sourceDeviceId"
+            case targetDeviceID = "targetDeviceId"
+            case deviceName, platform, canShareScreen, available
             case version = "v"
             case kind = "type"
             case sessionID = "sessionId"

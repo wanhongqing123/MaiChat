@@ -1,4 +1,4 @@
-// Opt-in owned multi-touch acceptance through the real Controller/tool core.
+// 自有多点触控 fixture 通过普通控制器和事件 DTO 编解码器执行。
 // Sender success is never substituted for native pointer/frame observations.
 #include <QApplication>
 #include <QCloseEvent>
@@ -31,6 +31,7 @@
 #include <windowsx.h>
 
 #include "MaiChatTools/DesktopComputerTools.h"
+#include "MaiChatTools/DesktopComputerInputProtocol.h"
 #include "MaiScreenshot.h"
 #include "MaiTool.h"
 
@@ -232,8 +233,6 @@ class Fixture {
 public:
     explicit Fixture(QString output)
         : output_(std::move(output)), controller_(std::make_shared<DesktopComputerController>()) {
-        registerDesktopComputerTools(registry_, controller_);
-        tool_ = registry_.findForModel("desktop_computer");
         context_.sessionId = "owned-touch-session-" + std::to_string(GetCurrentProcessId());
         context_.turnId = "owned-touch-turn-" + std::to_string(GetCurrentProcessId());
         context_.root = workspace_.path().toUtf8().toStdString();
@@ -245,7 +244,7 @@ public:
     bool prepare() {
         receiver_.move(150, 110);
         receiver_.show();
-        if (!workspace_.isValid() || !tool_ || !receiver_.createSurface())
+        if (!workspace_.isValid() || !receiver_.createSurface())
             return precondition("owned_fixture_unavailable");
         SetWindowPos(receiver_.root(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
         SetForegroundWindow(receiver_.root());
@@ -408,19 +407,8 @@ private:
         dispatchFor(15);
         return error;
     }
-    bool observe(bool model, const char* name) {
+    bool observe(bool, const char* name) {
         const auto error = run(name, [&] {
-            if (model) {
-                const auto result = tool_->execute(Json{{"action", "observe"},
-                                                        {"window_id", std::to_string(id(receiver_.root()))},
-                                                        {"include_elements", false}}
-                                                       .dump(),
-                                                   context_);
-                if (result.hasError()) return result.error();
-                snapshot_ = Json::parse(result.output(), nullptr, false);
-                if (!result.images().empty())
-                    return MaiError{MaiErrorCode::Protocol, "metadata observe returned images"};
-            } else {
                 const auto result = controller_->observe(
                     context_.sessionId, "", context_.root, false, id(receiver_.root()), false,
                     [&] { return receiver_.canceled.load(); }, context_.turnId);
@@ -428,7 +416,6 @@ private:
                 snapshot_ = Json::parse(result.value().json, nullptr, false);
                 if (!result.value().imagePath.empty())
                     return MaiError{MaiErrorCode::Protocol, "metadata observe captured an image"};
-            }
             if (!snapshot_.is_object() ||
                 snapshot_.value("window_id", std::string()) != std::to_string(id(receiver_.root())) ||
                 snapshot_.value("process_id", std::uint64_t(0)) != GetCurrentProcessId() ||
@@ -482,7 +469,7 @@ private:
             default: return "invalid";
         }
     }
-    bool batch(const std::vector<DesktopInputTouch>& contacts, bool model, bool cleanup, const char* name) {
+    bool batch(const std::vector<DesktopInputTouch>& contacts, bool encoded, bool cleanup, const char* name) {
         if (!cleanup)
             for (const auto& c : contacts)
                 if (!admitted(projected(c.x, c.y))) {
@@ -492,7 +479,7 @@ private:
                 }
         inputStarted_ = true;
         const auto error = run(name, [&] {
-            if (model) {
+            if (encoded) {
                 Json values = Json::array();
                 for (const auto& c : contacts) {
                     Json value{{"phase", phaseName(c.phase)}, {"pointer_id", c.pointerId}};
@@ -505,17 +492,18 @@ private:
                                       {"rotation", c.rotation}});
                     values.push_back(value);
                 }
-                Json request{{"action", "input_events"},
-                             {"events", Json::array({{{"type", "touch"}, {"contacts", values}}})}};
-                if (!cleanup)
-                    request.update({{"window_id", std::to_string(id(receiver_.root()))},
-                                    {"snapshot_id", snapshot_.value("snapshot_id", std::string())}});
-                const auto result = tool_->execute(request.dump(), context_);
-                if (result.hasError()) return result.error();
-                const auto output = Json::parse(result.output(), nullptr, false);
-                if (!output.is_object() || !output.value("dispatched", false) ||
-                    output.value("accepted_events", 0) != 1)
-                    return MaiError{MaiErrorCode::Protocol, "tool did not dispatch one full contact event"};
+                // 编码入口只解析事件 DTO；高级指针能力由普通控制器执行。
+                const auto parsed =
+                    maiDesktopParseInputBatch(Json::array({{{"type", "touch"}, {"contacts", values}}}).dump());
+                if (!parsed) return parsed.error();
+                auto request = action("input_events", cleanup);
+                request.events = parsed.value().events;
+                request.inputOptions = parsed.value().options;
+                request.inputOptions.inheritExisting = true;
+                const auto result = controller_->perform(context_.sessionId, request);
+                if (!result) return result.error();
+                if (!result.value().dispatched || result.value().acceptedEvents != 1)
+                    return MaiError{MaiErrorCode::Protocol, "encoded ordinary input did not accept one pointer event"};
                 return MaiError{};
             }
             auto request = action("input_events", cleanup);
@@ -634,7 +622,7 @@ private:
         if (nativeA && nativeB) check("cold_frame_has_both_peers", fullFrame(begin, {*nativeA, *nativeB}));
         receiver_.stage = "hold_before_observe";
         dispatchFor(450);
-        if (!observe(true, "model_observe_while_two_held")) return;
+        if (!observe(true, "ordinary_observe_while_two_held")) return;
         check("observation_keeps_two_owned_contacts",
               controller_->inputState(context_.sessionId).touchPointers.size() == 2);
         captureWhileHeld(begin);
@@ -669,7 +657,7 @@ private:
         const auto moveBegin = receiver_.events.size();
         auto moved = contact(secondId, Phase::Move, .65F, .6F, .65F);
         const auto movedPoint = projected(moved.x, moved.y);
-        if (!batch({moved}, true, false, "model_one_contact_move_preserves_peer")) return;
+        if (!batch({moved}, true, false, "encoded_one_contact_move_preserves_peer")) return;
         dispatchFor(60);
         if (nativeA && nativeB) {
             check("move_frame_keeps_stable_native_peers", fullFrame(moveBegin, {*nativeA, *nativeB}));
@@ -694,13 +682,13 @@ private:
         const auto thirdBegin = receiver_.events.size();
         auto third = contact(thirdId, Phase::Down, .5F, .7F, .6F);
         const auto thirdPoint = projected(third.x, third.y);
-        if (!batch({third}, true, false, "model_add_third_while_peer_survives")) return;
+        if (!batch({third}, true, false, "encoded_add_third_while_peer_survives")) return;
         dispatchFor(80);
         const auto nativeC = downAt(thirdPoint, thirdBegin);
         if (nativeB)
             check("third_contact_joins_same_full_peer_frame",
                   nativeC && *nativeC != *nativeB && fullFrame(thirdBegin, {*nativeB, *nativeC}));
-        if (!batch({contact(thirdId, Phase::Cancel)}, true, true, "model_cancel_only_third_without_token")) return;
+        if (!batch({contact(thirdId, Phase::Cancel)}, true, true, "encoded_cancel_only_third_without_token")) return;
         dispatchFor(80);
         check("survivor_remains_after_peer_cancel",
               controller_->inputState(context_.sessionId).touchPointers == std::vector<std::uint32_t>{secondId});
@@ -713,7 +701,7 @@ private:
         check("all_touch_controls_and_source_released", controller_->inputState(context_.sessionId).empty());
     }
     void coldTen() {
-        if (!observe(true, "model_observe_before_cold_ten")) return;
+        if (!observe(true, "ordinary_observe_before_cold_ten")) return;
         std::vector<DesktopInputTouch> contacts;
         std::vector<POINT> expected;
         for (int i = 0; i < 10; ++i) {
@@ -723,7 +711,7 @@ private:
             contacts.push_back(c);
         }
         const auto begin = receiver_.events.size();
-        if (!batch(contacts, true, false, "model_cold_ten_contacts_one_batch")) return;
+        if (!batch(contacts, true, false, "encoded_cold_ten_contacts_one_batch")) return;
         waitFor(
             [&] {
                 return std::all_of(expected.begin(), expected.end(),
@@ -819,8 +807,6 @@ private:
     QTemporaryDir workspace_;
     Receiver receiver_;
     std::shared_ptr<DesktopComputerController> controller_;
-    MaiToolRegistry registry_;
-    MaiTool* tool_ = nullptr;
     MaiToolContext context_;
     RECT initialBounds_{};
     POINT anchor_{};

@@ -147,8 +147,20 @@ Windows 上要先进 MSVC 环境（`vcvars64.bat`）。
 
 ## 工具输出补读与恢复事实
 
-`shell` 只执行一次，初始结果显示至多 48 KiB 的预览；宿主提供标准会话存储时，
-结束后保存至多 16 MiB 的输出快照。模型从宿主执行观察中取得 `output_id`，再调用
+`exec_command` 启动一个进程，参数为 `cmd`；等待窗口到期时返回数字 `session_id`，
+后续使用 `write_stdin` 续接。默认不设整个进程的硬期限；`yield_time_ms` 只限制本次等待。
+默认管道关闭标准输入；普通交互输入要求启动时指定 `tty:true`，Ctrl-C 中断原进程。
+两种工具都返回统一 JSON，仅包含本次新输出、等待时间及已观察到的会话/退出事实。
+输出默认预算 10000 个近似 token、策略上限 1 MiB，超出时保留头尾并标明截断前数量。
+不再注册旧 `shell` / `shell_input`；历史记录仍按原始工具名称展示。
+
+Windows 管道和 ConPTY 的前台命令正常退出不再误杀其后台服务。结果可同时包含
+`exit_code` 和 `background_running:true`：前者属于启动命令，后者表示原 Job 仍拥有后台成员。
+后台组继续占用每会话/全局进程额度；自然退出、显式期限、取消、清空/删除所有者或析构仍会回收。
+使用服务自己的关闭命令结束正常工作流，不要因为启动命令退出就重复启动服务。
+
+宿主提供标准会话存储时，每次调用保存至多 16 MiB 的原始输出快照。
+模型从宿主执行观察或截断结果中取得 `output_id`，再调用
 `tool_output_read`，每页至多 4096 个源字节。普通代码使用同一个存储实现：
 
 ```cpp
@@ -156,9 +168,10 @@ auto page = agent.readToolOutput(sessionId, {outputId, offsetBytes, 4096});
 // 成功后以 page.value().nextOffsetBytes 继续；0 表示保留快照读完。
 ```
 
-句柄不赋予跨会话权限。SQLite 重新打开后仍可读；清空或删除会话同时清理快照。
+句柄不赋予跨会话权限。正式后端重新打开后仍可读；清空或删除会话会使快照不可查询。
 保留输出的逻辑载荷配额为每会话 64 MiB、全库 256 MiB，超额淘汰最旧快照；
-这不限制 SQLite 文件/WAL 的实际磁盘大小。存储失败或句柄已淘汰时明确报错，
+这不限制 SQLite 文件/WAL 或追加 JSONL 的实际磁盘大小；权威历史不因配额淘汰而改写。
+存储失败或句柄已淘汰时明确报错，
 不会重新执行命令来补日志。捕获达到上限、超时、取消或采集失败时标记不完整；
 完整性与“是否还有下一页”是两个独立事实。Windows 沿用 UTF-8/OEM 文本解码，
 POSIX 和独立存储接口保留原字节；非法 UTF-8 的模型页附带 `raw_base64`。
@@ -179,28 +192,113 @@ POSIX 和独立存储接口保留原字节；非法 UTF-8 的模型页附带 `ra
 ```
 
 库里直接用是 `makeMaiSqliteStore(path)`，返回 `MaiResult`——打不开就是错误，
-不会给你一个用起来处处出错的半死对象。传 `":memory:"` 能拿到一个走完整 SQL
-路径但不落盘的库（测试里用它验 SQL 本身）。
+不会给你一个用起来处处出错的半死对象。正式实现是同一账户根下的追加 JSONL 权威原文
+与可重建 SQLite 索引。传 `":memory:"` 会使用内存索引和自有临时日志目录，析构清理，
+仍有文件 I/O；真正不落盘应使用 `makeMaiMemoryStore()`。
 
-表结构是 `sessions` / `messages` / `parts` 三张，part 的三种形态展开成列而不是
-塞 JSON——这样 `sqlite3` 命令行能直接查，排障时看得见"那次 write 的 input
-到底是什么"，也不用把 nlohmann 拖进核心。
+会话日志为 `sessions/YYYY/MM/DD/rollout-<UTC>-<UUIDv7>.jsonl`，外壳固定为
+`timestamp`、`ordinal`、`type`、`payload`。正文、思考、原始 Responses item 与工具结果
+保留在日志；索引使用偏移和长度，`item_json` 等虚拟字段通过受限回读取得原文。
+普通 sqlite3 可查元数据；查询正文生成列需要正式后端注册的读取函数，不能把缺少函数
+解释成正文丢失。原有 `sessions/messages/parts` 领域查询和导入扩展仍共用该后端。
+旧 1..15 数据库只读迁移，验证新索引后发布，原库保留为迁移备份。
+
+完成 item 才持久化；新流式未完成草稿只保留在内存，不承诺重启恢复。旧库已有的草稿
+迁移时仍完整保留。已完成 A 后 B 尚未完成就失败，A 留在历史，B 不回灌给模型。
 
 消息和 part 的顺序靠 `ORDER BY id`。这不是偷懒：`MaiIdGenerator` 产出的 id 是
 定长的"时间戳 + 同毫秒序号 + 随机"，用的 base32 字母表在 ASCII 里递增，
 所以字典序就是生成顺序。`MaiStoreTests` 里有一条用例专门盯着这个性质。
 
-**备份注意**：开了 WAL，已提交的数据先落在 `<db>-wal` 里，要到 checkpoint
-才并回主文件。实测跑完一轮对话，`agent.db` 还是 4096 字节，数据全在
-`agent.db-wal`。所以只拷 `agent.db` 不算备份。进程被硬杀不会丢数据——
-下次打开时会从 `-wal` 恢复。
+**备份注意**：必须保留整个账号的 `sessions/`，包括其中 `.journal/` 事务账本；
+只拷 `agent.db` 无法备份正文。SQLite 仍使用 WAL，在线拷贝需要一致性快照，不能仅复制
+主文件。源记录缺失或尾部损坏会明确失败并保留原文件，不自动截断或制造空历史。
 
 **写失败不再无声无息**：存储的写接口返回 void（它们在流式热路径上，
 每次都检查会把代码淹掉），但每轮结束时 `MaiTurnRunner` 会查一次
 `lastWriteError()`，失败就把会话标成错误让界面看见。磁盘满了还假装存上了，
 是用户第二天打开发现对话没了的那种 bug。
 
+## Skills
+
+桌面、控制台和移动宿主启用标准 `.agents/skills` 目录；库使用者通过
+`MaiAgent::Options::skillsEnabled` 显式选择。扫描用户 home 和工作目录祖先，项目内遇到
+Git 根停止向上；移动端 home 是宿主沙盒。每个技能为 `<name>/SKILL.md`，包含名称与
+描述的 frontmatter。没有引入 YAML 或其他新依赖，无法解析的元数据明确列为发现错误。
+
+目录只发送名称、描述和路径，正文按需读取。用户写 `$name` 或链接到具体 SKILL.md 时，
+只加载明确选中的技能；重名只允许路径消歧。同一输入的技能正文固定保存到会话日志，
+后续工具跟进和重启不因文件改变而改写旧输入。新输入可以读取更新后的正文。
+工作目录变化只影响新输入的目录上下文；已发送基础提示保持稳定。
+新用户输入会重新发现安装/移除后的目录。元数据仅在相对上一条适用输入发生变化时追加，
+每输入保存小型目录摘要以跨重启去重，不在每条消息重复整个技能目录，也不改写历史正文。
+
+用户要求从公开 GitHub 链接安装时，模型通过 `skill_install` 的 `mode=discover` 查看实际
+SKILL.md 候选与 README 链接，再用 `mode=install` 选择目录及固定提交。普通宿主使用同一个
+`MaiSkillInstaller`。默认安装到用户 `.agents/skills`，工作区作用域须显式选择；目录整体无覆盖发布，
+保留资源、执行位和来源清单，不执行下载脚本或安装运行依赖。框架根仓库不等于某一个技能。
+
+普通调用使用 `MaiSkillManager` 的 snapshot/find/read/readCurrent/explicitContext；
+模型使用 `skill_read`，复用同一实现。技能内容是用户级上下文，不提升权限，也不自动
+运行技能脚本。脚本和附带资源的读取仍遵守现有路径与工具授权规则。
+
+初始技能目录按 Codex 0.172 的预算提供：容量未知时最多 8000 Unicode 字符；
+容量已知时取窗口的 2%，显式 `maxCatalogTokens` 最多 10000 tokens。先缩短描述，
+再省略整项，并明确数量；`skill_read` 的 `mode=discover` 可搜索完整元数据及分页，
+不读取未选中的正文。`agents/openai.yaml` 中普通布尔形式的
+`policy.allow_implicit_invocation=false` 排除隐式清单，但仍可显式选择。
+
+## PC 工具声明与实际用量
+
+基础文件流程按 Codex 对齐：通过 `exec_command` 使用实际系统 Shell 读取和搜索，
+通过 `apply_patch` 修改文本。Windows PowerShell 启动时设置 UTF-8 输出；Unix 可执行
+工具是否存在取决于实际 PATH，缺少 rg 时使用原生替代命令，不假装产品附带它。
+
+`apply_patch` 在 OpenAI 型号使用原生自由文本/Lark 输入，在兼容型号使用相同补丁的
+`patch` 字符串函数参数，执行核心共用普通 `maiApplyPatch()`。按上游顺序应用文件块，
+Add 可覆盖、Move 先写目标后移除源；失败列出已应用路径，不提供整体事务回滚。
+原 `file_patch` 名称只保留历史分类。工具快照 v2 显式记录本次协议升级，v1 原文不改写。
+
+桌面账号客户端和控制台启用 `toolDiscoveryEnabled`，新会话只提供 Shell、Skills、
+补丁、图像和必要原史补读等已注册的基础工具；其它能力通过 `tool_search` 的有界
+元数据搜索和 `select` 选择。Schema 从下一次请求开始追加，同一次响应抢先调用会拒绝。
+旧历史没有目录快照时保持原声明范围，避免追改旧前缀。普通注入客户端和库默认完整目录，
+调用者可显式开启相同功能。
+
+HTTP Responses 仍发送完整有效上下文和已选声明，保持历史消息与已保存声明字节稳定；
+不把 HTTP 传输说成只发送新增内容，也不承诺供应商缓存一定命中。缓存输入仍占窗口。
+
+状态展示使用 `MaiModelContextUsage` 和普通 `getModelContextUsage()`，窗口占用取最近
+主请求的服务端 `total_tokens`，不使用会话累计或本地 tokenizer 估算。缺失总数只能由
+已知 input/output 安全相加并标为推导；缺失/失效窗口不显示百分比。摘要消耗进入累计，
+不能覆盖主请求占用。12000 基线只用于显示归一化，不用于压缩触发。
+
+发送保护使用实测输入前缀加未覆盖尾部估计。最多 2 KiB 的版本化指纹和边界随用量记录
+持久化，不重复保存整份请求；型号、路由、窗口、检查点或既有前缀不匹配就回退普通估计。
+路径图片的像素不能仅凭路径证明不变，因此采用保守回退。此保护估计不是实际 usage。
+
 ## 文件操作
+
+桌面宿主默认不注册独立 `file_*` 模型工具，读取/搜索通过 `exec_command`，文本修改通过
+`apply_patch`；共享文件核心不删除。iOS/Android 同样不向模型注册独立 `file_*`，
+改由不创建外部进程的 `exec_command` 脚本入口处理：引号、变量、顺序/短路、有界管道与重定向
+调到同一普通文件核心。它不是完整 Bash，不支持外部程序、PTY、后台或命令替换，也没有
+`write_stdin`。curl/FFmpeg 仍是各自独立的内嵌工具，不宣称已被该解释器调度。
+
+原生命令开放 `ls/cat/cp/mv/mkdir/rm/touch/echo/head/tail/grep/find/stat/rmdir/read-text` 的有界子集；
+以工具说明为准，不推断所有 Unix 标志均可用。`cp/mv` 无覆盖，`rm` 仅单文件，`touch`
+只确保文件存在而不更新已有时间戳。目录与变量只存在于一次脚本内，进程环境不改变。
+文件访问受宿主 App 容器边界约束；相册/文档的系统授权不是普通路径授权，当前尚未挂载。
+外部原件不提供删除入口，App 内副本可按授权修改/清理。
+
+`read-text --encoding E --offset N --limit N PATH` 复用普通流式读取核心，返回编码、行号、
+EOF、截断与可信 `next_cursor`；后继调用传 `--cursor` 并保持路径/编码，不能同时传 offset。
+长行片段可以按行号和行内 UTF-8 偏移连续拼回。根、会话、路径、编码和文件快照均核对，
+源变化或游标过期时拒绝；游标不是权限。`find/grep` 同样可按 `--limit/--cursor` 续页。
+`grep` 默认安全正则，`-F` 为字面串，模式需引用以免被脚本语法解释。
+搜索 stdout 为数据，stderr 为完整 search_status JSON；read-text stdout 为 text_page JSON。
+命令输出预算包含续页事实，不把拿不到尾部游标的截断页冒充完整结果。文本修改统一用
+`apply_patch`，不另推荐 `file_edit`。库内原有工厂仍用于协议/算法回归，不代表产品公开声明。
 
 **库代码里不出现 `std::filesystem` 和 `fstream`。** 路径是 `MaiFilePath`，
 操作是 `MaiFileSystem`：Windows 走宽字符 Win32 API（`CreateFileW` /
@@ -221,9 +319,9 @@ UTF-8——POSIX 的文件名是任意字节序列，不保证是合法 UTF-8，
 1. **公开头 `include/` 里不出现 JSON、HTTP、Qt。** 对外 API 一律原生结构体——
    这是"能被到处链进去"的前提。
 
-   实现里 JSON 只在三个文件出现，每一个都是因为**协议本身就是 JSON**：
-   `MaiOpenAiClient.cpp`（SSE 载荷）、`MaiFileTools.cpp`（工具参数）、
-   `MaiSqliteStore.cpp`（片段存列）。核心自己的数据结构不经过 JSON。
+   JSON 只在实现内部的协议、工具参数、JSONL 和持久化 codec 边界使用。
+   普通业务接口仍使用原生值；内部 codec 可返回不透明序列化字符串，不把 JSON 类型
+   或 HTTP 类型暴露给宿主。
 
    分层可以直接量：
 

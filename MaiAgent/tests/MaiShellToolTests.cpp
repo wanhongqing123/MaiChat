@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,7 +35,7 @@
 #include "MaiFileSystem.h"
 #include "MaiProcess.h"
 #include "MaiTool.h"
-#include "MaiShellTool.h"
+#include "MaiExecCommandTool.h"
 #include "MaiShellSessionManager.h"
 #include "MaiShellEnvironment.h"
 
@@ -53,6 +54,22 @@ namespace {
 
 std::string executablePath;
 
+json sessionSnapshot(const MaiToolResult& result);
+std::string toolOutput(const MaiToolResult& result) {
+    const auto snapshot = sessionSnapshot(result);
+    return snapshot.value("output", std::string{});
+}
+std::string sessionId(const json& snapshot) {
+    if (!snapshot.contains("session_id")) return {};
+    const auto& value = snapshot["session_id"];
+    CHECK(value.is_number_integer());
+    if (!value.is_number_integer()) return {};
+    const auto number = value.get<std::int64_t>();
+    CHECK(number > 0 && number <= std::numeric_limits<std::int32_t>::max());
+    return number > 0 && number <= std::numeric_limits<std::int32_t>::max() ? std::to_string(number)
+                                                                            : std::string{};
+}
+
 std::string legacyShellPath() {
 #if defined(_WIN32)
     wchar_t directory[32768];
@@ -70,11 +87,18 @@ std::string legacyShellPath() {
 
 std::string args(const json& j) {
     auto request = j;
-    // 旧语法和本机子进程素材固定解释器，避免默认 PowerShell 切换污染旧回归。
-    // 真正的默认解释器测试直接构造 JSON，不经过此兼容素材适配器。
-    if (request.contains("command")) {
+    // 自有 cmd/sh 子进程素材固定解释器；默认解释器测试直接构造请求验证真实选择。
+    if (request.contains("cmd")) {
         if (!request.contains("shell")) request["shell"] = legacyShellPath();
         if (!request.contains("login")) request["login"] = false;
+    }
+    if (request.contains("session_id") && request["session_id"].is_string()) {
+        const auto id = request["session_id"].get<std::string>();
+        if (!id.empty() && id.find_first_not_of("0123456789") == std::string::npos) {
+            const auto value = std::stoll(id);
+            if (value > 0 && value <= std::numeric_limits<std::int32_t>::max())
+                request["session_id"] = static_cast<std::int32_t>(value);
+        }
     }
     return request.dump();
 }
@@ -163,7 +187,7 @@ struct StoredCall {
     std::unique_ptr<MaiSessionStore> store = makeMaiMemoryStore();
     MaiToolContext context;
 
-    explicit StoredCall(const Workspace& workspace, const std::string& toolName = "shell")
+    explicit StoredCall(const Workspace& workspace, const std::string& toolName = "exec_command")
         : context(workspace.context()) {
         MaiSession session;
         session.id = context.sessionId;
@@ -216,6 +240,18 @@ std::string readAll(const StoredCall& call, const MaiToolResult& result) {
 
 std::string childCommand(const char* mode) {
     return "\"" + executablePath + "\" " + mode;
+}
+
+MaiShellSessionOptions ownedOptions(const Workspace& workspace, const char* mode, bool tty = false,
+                                    int timeoutMs = 0) {
+    MaiShellSessionOptions options;
+    options.command = childCommand(mode);
+    options.workdir = workspace.root.toUtf8();
+    options.shell = legacyShellPath();
+    options.login = false;
+    options.tty = tty;
+    options.timeoutMs = timeoutMs;
+    return options;
 }
 
 std::uint64_t nativeProcessId() {
@@ -307,6 +343,33 @@ int runCaptureChild(const std::string& mode) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     char buffer[4096];
     std::fill(std::begin(buffer), std::end(buffer), 'a');
+    if (mode == "--capture-child-fragment-gated" || mode == "--capture-child-ring-gated") {
+#if defined(_WIN32)
+        if (::_setmode(::_fileno(stdout), _O_BINARY) < 0) return 25;
+#endif
+        std::puts("native-ready");
+        const bool fragment = mode == "--capture-child-fragment-gated";
+        const auto release = MaiFilePath::fromUtf8(fragment ? "fragment-release" : "ring-release");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!MaiFileSystem::exists(release) && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!MaiFileSystem::exists(release)) return 26;
+        if (fragment) {
+            const unsigned char byte = 0xf0;
+            std::fwrite(&byte, 1, 1, stdout);
+        } else {
+            const std::string block(4096, 'x');
+            for (unsigned index = 0; index < 6000; ++index)
+                std::fwrite(block.data(), 1, block.size(), stdout);
+            std::puts("native-flood-final-marker");
+        }
+        if (MaiFileSystem::writeFile(
+                MaiFilePath::fromUtf8(fragment ? "fragment-complete" : "flood-complete"), "ready"))
+            return 27;
+        while (std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return 28;
+    }
     if (mode == "--capture-child-bash-startup") return runOwnedBashStartupChild();
     if (mode == "--capture-child-sh-startup") return runOwnedShStartupChild();
     if (mode == "--capture-child-pipeline") return runOwnedPipelineChild();
@@ -341,7 +404,12 @@ int runCaptureChild(const std::string& mode) {
         return 0;
     }
     if (mode == "--capture-child-marker") {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        // 初次 exec_command 可等待 10 秒；显式门闩让后代始终活到清理检查结束。
+        const auto release = MaiFilePath::fromUtf8("descendant-release");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
+        while (!MaiFileSystem::exists(release) && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!MaiFileSystem::exists(release)) return 29;
         return MaiFileSystem::writeFile(MaiFilePath::fromUtf8("descendant-marker"), "still-alive")
                    ? 13
                    : 0;
@@ -401,19 +469,19 @@ int runCaptureChild(const std::string& mode) {
 void test_batch6_builtin_schema_and_workdir_contract() {
     MaiToolRegistry registry;
     registerMaiBuiltinTools(registry);
-    auto* shell = registry.find("shell");
-    CHECK((registry.find("shell_input") != nullptr) == maiIsProcessExecutionSupported());
+    auto* shell = registry.find("exec_command");
+    CHECK((registry.find("write_stdin") != nullptr) == maiIsProcessExecutionSupported());
     if (!shell) return;
     const auto schema = json::parse(shell->parametersSchema());
     for (const char* key : {"workdir", "yield_time_ms", "max_output_tokens"})
         CHECK(schema["properties"].contains(key));
     CHECK(schema["properties"]["yield_time_ms"].value("default", 0) == 10000);
     CHECK(schema["properties"]["max_output_tokens"].value("default", 0) == 10000);
-    CHECK(schema["properties"]["timeout_ms"].value("default", 0) == 120000);
+    CHECK(!schema["properties"].contains("timeout_ms"));
     Workspace workspace;
     const auto root = MaiFilePath::fromUtf8(workspace.root.toUtf8());
     CHECK(!MaiFileSystem::createDirectories(root.append(MaiFilePath::fromUtf8("nested"))));
-    const auto result = shell->execute(args({{"command", childCommand("--capture-child-workdir")},
+    const auto result = shell->execute(args({{"cmd", childCommand("--capture-child-workdir")},
                                              {"workdir", "nested"},
                                              {"yield_time_ms", 1000},
                                              {"max_output_tokens", 1000}}),
@@ -426,14 +494,46 @@ void test_batch6_builtin_schema_and_workdir_contract() {
 void test_explicit_cmd_preserves_quoted_executable_and_argument() {
 #if defined(_WIN32)
     Workspace workspace;
-    auto shell = makeMaiShellTool();
+    auto shell = makeMaiExecCommandTool();
     const auto result = shell->execute(
-        args(
-            {{"command", R"MAI("D:/Program Files/CMake/bin/cmake.exe" -E echo "owned space")MAI"}}),
+        args({{"cmd", R"MAI("D:/Program Files/CMake/bin/cmake.exe" -E echo "owned space")MAI"}}),
         workspace.context());
     CHECK(!result.hasError());
     CHECK(result.execution() && result.execution()->exitCode == 0);
-    CHECK(result.output().find("owned space") != std::string::npos);
+    CHECK(toolOutput(result).find("owned space") != std::string::npos);
+#endif
+}
+
+void test_powershell_streaming_output_uses_utf8_before_completion() {
+    const MaiShellEnvironment fake{MaiShellType::PowerShell, "pwsh", "/owned/pwsh"};
+    const std::string command = "Write-Output owned-output";
+    const std::string prefix =
+        "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
+    for (const bool login : {false, true}) {
+        const auto script = maiShellStartupCommand(fake, command, login, "C:/owned/workdir");
+        CHECK(script.find(prefix) == 0);
+        CHECK(script.size() >= command.size() &&
+              script.substr(script.size() - command.size()) == command);
+    }
+#if defined(_WIN32)
+    Workspace workspace;
+    MaiShellSessionManager manager;
+    MaiShellSessionOptions options;
+    options.workdir = workspace.root.toUtf8();
+    options.shell = "powershell";
+    // 不执行用户 profile；直接核对未结束进程的原始输出，避免完成后的代码页转换掩盖问题。
+    options.login = false;
+    const std::string expected = u8"\u4e2d\u6587\u8def\u5f84";
+    options.command = "Write-Output '" + expected + "'; Start-Sleep -Milliseconds 1500; exit 7";
+    const auto id = manager.start("owned-utf8-output", options);
+    CHECK(id);
+    if (!id) return;
+    const auto running = manager.interact("owned-utf8-output", id.value(), "", 1000);
+    CHECK(running && !running.value().completed);
+    CHECK(running && running.value().output.find(expected) != std::string::npos);
+    const auto completed =
+        manager.interact("owned-utf8-output", id.value(), "", 5000, false, {}, true);
+    CHECK(completed && completed.value().completed && completed.value().exitCode == 7);
 #endif
 }
 
@@ -518,7 +618,7 @@ void test_shell_startup_script_refreshes_rc_and_restores_workdir() {
     CHECK(bashScript.find("pipefail") == std::string::npos);
     CHECK(zshScript.find("pipefail") == std::string::npos);
     CHECK(maiShellStartupCommand({MaiShellType::PowerShell, "pwsh", "/owned/pwsh"}, command, false,
-                                 workdir) == command);
+                                 workdir).find(command) != std::string::npos);
     CHECK(maiShellStartupCommand({MaiShellType::Cmd, "cmd", "/owned/cmd"}, command, true,
                                  workdir) == command);
 }
@@ -750,11 +850,11 @@ void test_windows_shell_discovery_honors_owned_path_fixture_without_execution() 
 }
 
 void test_powershell_expression_punctuation_requires_approval() {
-    const auto tool = makeMaiShellTool();
+    const auto tool = makeMaiExecCommandTool();
     for (const char* command :
          {"echo (Write-Output owned-marker)", "echo { Write-Output owned-marker }", "echo @(1,2)",
           "echo safe\rWrite-Output owned-marker"}) {
-        CHECK(tool->requiresApproval(args({{"command", command}})));
+        CHECK(tool->requiresApproval(args({{"cmd", command}})));
     }
 }
 
@@ -763,8 +863,8 @@ void test_codex_shell_parity_schema_default_and_head_tail_preview() {
     Workspace workspace;
     MaiToolRegistry registry;
     registerMaiBuiltinTools(registry);
-    auto* shell = registry.find("shell");
-    auto* input = registry.find("shell_input");
+    auto* shell = registry.find("exec_command");
+    auto* input = registry.find("write_stdin");
     CHECK(shell && input);
     if (!shell || !input) return;
     const auto schema = json::parse(shell->parametersSchema());
@@ -772,15 +872,15 @@ void test_codex_shell_parity_schema_default_and_head_tail_preview() {
     CHECK(schema["properties"].contains("login"));
     StoredCall previewCapture(workspace);
     const auto preview = shell->execute(
-        args({{"command", childCommand("--capture-child-head-tail")}, {"max_output_tokens", 128}}),
+        args({{"cmd", childCommand("--capture-child-head-tail")}, {"max_output_tokens", 128}}),
         previewCapture.context);
     CHECK(!preview.hasError());
-    CHECK(preview.output().find("HEAD-parity-marker") != std::string::npos);
-    CHECK(preview.output().find("TAIL-parity-error") != std::string::npos);
-    CHECK(preview.output().find("omitted") != std::string::npos);
+    CHECK(toolOutput(preview).find("HEAD-parity-marker") != std::string::npos);
+    CHECK(toolOutput(preview).find("TAIL-parity-error") != std::string::npos);
+    CHECK(toolOutput(preview).find("omitted") != std::string::npos);
     bool validPreviewJson = true;
     try {
-        (void)json(preview.output()).dump();
+        (void)json(toolOutput(preview)).dump();
     } catch (...) {
         validPreviewJson = false;
     }
@@ -790,27 +890,21 @@ void test_codex_shell_parity_schema_default_and_head_tail_preview() {
     complete += "\nTAIL-parity-error \xe4\xb8\xad\n";
     CHECK(readAll(previewCapture, preview) == complete);
 
-    for (const unsigned tokens : {1u, 2u, 3u}) {
-        const auto tiny =
-            shell->execute(args({{"command", childCommand("--capture-child-head-tail")},
-                                 {"max_output_tokens", tokens}}),
-                           previewCapture.context);
+    for (const unsigned tokens : {0u, 1u, 2u, 3u}) {
+        const auto tiny = shell->execute(args({{"cmd", childCommand("--capture-child-head-tail")},
+                                               {"max_output_tokens", tokens}}),
+                                         previewCapture.context);
         CHECK(!tiny.hasError());
-        const std::string marker = "[shell_result]\n";
-        const auto position = tiny.output().rfind(marker);
-        const auto meta = json::parse(position == std::string::npos
-                                          ? tiny.output()
-                                          : tiny.output().substr(position + marker.size()),
-                                      nullptr, false);
+        const auto meta = sessionSnapshot(tiny);
         CHECK(meta.is_object());
         if (meta.is_object()) {
-            CHECK(meta.value("output_token_estimate", 99999u) <= tokens);
-            CHECK(meta.value("preview_omitted_bytes", std::size_t{0}) > 0);
-            CHECK(!meta.value("invalid_source_bytes_escaped", true));
+            CHECK((meta.value("output", std::string{}).size() + 3) / 4 <= tokens);
+            CHECK(meta.value("original_token_count", std::size_t{0}) > tokens);
+            CHECK(!meta.value("invalid_source_bytes_escaped", false));
         }
         bool serializable = true;
         try {
-            (void)json(tiny.output()).dump();
+            (void)json(toolOutput(tiny)).dump();
         } catch (...) {
             serializable = false;
         }
@@ -819,55 +913,65 @@ void test_codex_shell_parity_schema_default_and_head_tail_preview() {
     }
 
     const auto finished =
-        shell->execute(args({{"command", "echo completed-parity"}}), workspace.context());
+        shell->execute(args({{"cmd", "echo completed-parity"}}), workspace.context());
     CHECK(!finished.hasError());
-    const std::string footer = "[shell_result]\n";
-    const auto at = finished.output().rfind(footer);
-    const auto metadata = json::parse(
-        at == std::string::npos ? finished.output() : finished.output().substr(at + footer.size()),
-        nullptr, false);
-    CHECK(metadata.is_object());
-    if (metadata.is_object()) {
-        const auto id = metadata.value("session_id", "");
+    const auto metadata = sessionSnapshot(finished);
+    CHECK(metadata.contains("exit_code") && metadata["exit_code"] == 0);
+    CHECK(!metadata.contains("session_id"));
+    // 工具完成后不暴露句柄；已完成记录的长轮询能力仍由普通 manager 验证。
+    MaiShellSessionManager completedManager;
+    auto completedOptions = ownedOptions(workspace, "--capture-child-head-tail");
+    const auto completed = completedManager.start("completed-owner", completedOptions);
+    CHECK(completed);
+    if (completed) {
+        const auto first = completedManager.interact("completed-owner", completed.value(), "", 1000,
+                                                     false, {}, true);
+        CHECK(first && first.value().completed);
         const auto began = std::chrono::steady_clock::now();
         const auto poll =
-            input->execute(args({{"session_id", id}, {"chars", ""}, {"yield_time_ms", 300000}}),
-                           workspace.context());
-        CHECK(!poll.hasError());
+            completedManager.interact("completed-owner", completed.value(), "", 300000);
+        CHECK(poll && poll.value().completed && poll.value().output.empty());
         CHECK(std::chrono::steady_clock::now() - began < std::chrono::seconds(2));
     }
 #if defined(_WIN32)
     // 不运行用户 profile；只验证默认解析成 PowerShell 且可访问解释器自身状态。
     const json defaultRequest = {
-        {"command", "Write-Output ('MAI-PS-' + $PSVersionTable.PSEdition + '-' + [bool]$PSHOME)"},
+        {"cmd", "Write-Output ('MAI-PS-' + $PSVersionTable.PSEdition + '-' + [bool]$PSHOME)"},
         {"login", false}};
     const auto defaultShell = shell->execute(defaultRequest.dump(), workspace.context());
     CHECK(!defaultShell.hasError());
-    CHECK(defaultShell.output().find("MAI-PS-") != std::string::npos);
-    CHECK(defaultShell.output().find("True") != std::string::npos);
+    CHECK(toolOutput(defaultShell).find("MAI-PS-") != std::string::npos);
+    CHECK(toolOutput(defaultShell).find("True") != std::string::npos);
     const json quotedRequest = {
-        {"command", R"MAI($value='owned a"b\tail'; [Console]::WriteLine($value))MAI"},
+        {"cmd", R"MAI($value='owned a"b\tail'; [Console]::WriteLine($value))MAI"},
         {"login", false}};
     const auto quoted = shell->execute(quotedRequest.dump(), workspace.context());
     CHECK(!quoted.hasError());
-    CHECK(quoted.output().find(R"MAI(owned a"b\tail)MAI") != std::string::npos);
+    CHECK(toolOutput(quoted).find(R"MAI(owned a"b\tail)MAI") != std::string::npos);
 #endif
 }
 
 json sessionSnapshot(const MaiToolResult& result) {
-    CHECK(!result.hasError());
-    if (result.hasError()) {
-        std::printf("shell failure: %s\n", result.error().message().c_str());
+    const auto& wire = result.hasError() ? result.error().message() : result.output();
+    const auto snapshot = json::parse(wire, nullptr, false);
+    CHECK(snapshot.is_object());
+    if (!snapshot.is_object()) {
+        std::printf("exec result is not JSON: %s\n", wire.c_str());
         return json::object();
     }
-    const std::string footer = "[shell_result]\n";
-    const auto position = result.output().rfind(footer);
-    const auto payload = position == std::string::npos
-                             ? result.output()
-                             : result.output().substr(position + footer.size());
-    const auto snapshot = json::parse(payload, nullptr, false);
-    CHECK(snapshot.is_object());
-    return snapshot.is_object() ? snapshot : json::object();
+    CHECK(snapshot.contains("chunk_id") && snapshot["chunk_id"].is_string());
+    CHECK(snapshot.contains("wall_time_seconds") && snapshot["wall_time_seconds"].is_number());
+    CHECK(snapshot.contains("output") && snapshot["output"].is_string());
+    if (snapshot.contains("session_id")) {
+        CHECK(!sessionId(snapshot).empty());
+        CHECK(!snapshot.contains("exit_code"));
+    } else if (snapshot.contains("exit_code")) {
+        CHECK(snapshot["exit_code"].is_number_integer());
+    } else {
+        CHECK(snapshot.value("terminated", false) || snapshot.value("canceled", false) ||
+              snapshot.value("timed_out", false) || snapshot.contains("error"));
+    }
+    return snapshot;
 }
 
 int runOwnedPipelineChild() {
@@ -881,9 +985,9 @@ int runOwnedPipelineChild() {
     ScopedOwnedEnvironment bashEnvironment("BASH_ENV", "");
     Workspace workspace;
     StoredCall capture(workspace);
-    auto shell = makeMaiShellTool();
+    auto shell = makeMaiExecCommandTool();
     const auto invoke = [&](const std::string& command, const std::string& interpreter) {
-        return shell->execute(json{{"command", command},
+        return shell->execute(json{{"cmd", command},
                                    {"shell", interpreter},
                                    {"login", false},
                                    {"yield_time_ms", 30000}}
@@ -897,16 +1001,16 @@ int runOwnedPipelineChild() {
     CHECK(failed.execution() && failed.execution()->exitCode == 0);
     CHECK(readAll(capture, failed).find("owned-producer-error") != std::string::npos);
     const auto failedMetadata = sessionSnapshot(failed);
-    CHECK(failedMetadata.value("exit_status_scope", "") == "shell_process");
-    CHECK(failedMetadata.value("pipeline_stage_status", "") == "not_observed");
+    CHECK(!failedMetadata.contains("exit_status_scope"));
+    CHECK(!failedMetadata.contains("pipeline_stage_status"));
     CHECK(!failedMetadata.contains("initial_pipeline_policy"));
-    CHECK(failedMetadata.value("output_streams", "") == "combined_stdout_stderr");
+    CHECK(!failedMetadata.contains("output_streams"));
 
     const auto handled =
         invoke("set -o pipefail; " + failure + " || printf 'owned-handled\\n'", "bash");
     CHECK(!handled.hasError());
     CHECK(handled.execution() && handled.execution()->exitCode == 0);
-    CHECK(handled.output().find("owned-handled") != std::string::npos);
+    CHECK(toolOutput(handled).find("owned-handled") != std::string::npos);
     const auto explicitPipefail = invoke("set -o pipefail; " + failure, "bash");
     CHECK(!explicitPipefail.hasError());
     CHECK(explicitPipefail.execution() && explicitPipefail.execution()->exitCode == 7);
@@ -944,7 +1048,7 @@ int runOwnedPipelineChild() {
     CHECK(!cmd.hasError());
     CHECK(cmd.execution() && cmd.execution()->exitCode == 0);
     const auto cmdMetadata = sessionSnapshot(cmd);
-    CHECK(cmdMetadata.value("pipeline_stage_status", "") == "not_observed");
+    CHECK(!cmdMetadata.contains("pipeline_stage_status"));
     CHECK(!cmdMetadata.contains("initial_pipeline_policy"));
 #endif
     return failures == 0 ? 0 : 31;
@@ -972,12 +1076,45 @@ void test_pipeline_failure_policy_and_native_status_scope() {
     }
 }
 
+// ConPTY 可把标题/光标序列插到 printf 的第一个字符与后续字符之间。
+// 仅为测试的 PID 识别去掉 CSI/OSC；正文、存储字节和工具输出断言始终保留原文。
+std::string terminalMarkerText(const std::string& output) {
+    std::string text;
+    for (std::size_t offset = 0; offset < output.size();) {
+        if (output[offset] != '\x1b') {
+            text.push_back(output[offset++]);
+            continue;
+        }
+        if (++offset == output.size()) break;
+        const char kind = output[offset++];
+        if (kind == '[') {
+            while (offset < output.size()) {
+                const auto byte = static_cast<unsigned char>(output[offset++]);
+                if (byte >= 0x40 && byte <= 0x7e) break;
+            }
+        } else if (kind == ']') {
+            while (offset < output.size()) {
+                if (output[offset++] == '\x07') break;
+                if (offset >= 2 && output[offset - 2] == '\x1b' && output[offset - 1] == '\\')
+                    break;
+            }
+        }
+    }
+    return text;
+}
+
 std::uint64_t outputProcessId(const std::string& output, const char* prefix) {
-    const auto position = output.find(prefix);
-    return position == std::string::npos
-               ? 0
-               : std::strtoull(output.c_str() + position + std::char_traits<char>::length(prefix),
-                               nullptr, 10);
+    const auto markerText = terminalMarkerText(output);
+    const auto position = markerText.find(prefix);
+    const auto processId =
+        position == std::string::npos
+            ? 0
+            : std::strtoull(markerText.c_str() + position + std::char_traits<char>::length(prefix),
+                            nullptr, 10);
+    if (!processId || !processIsAlive(processId))
+        std::printf("Owned PID evidence marker=%s parsed=%llu output=%s\n", prefix,
+                    static_cast<unsigned long long>(processId), json(output).dump().c_str());
+    return processId;
 }
 
 struct InteractiveChild {
@@ -991,15 +1128,15 @@ InteractiveChild startInteractive(MaiTool& shell, MaiTool& input, const MaiToolC
                                   bool descendant = false) {
     const auto began = std::chrono::steady_clock::now();
     const auto result = shell.execute(
-        args({{"command",
+        args({{"cmd",
                childCommand(descendant ? "--capture-child-descendant" : "--capture-child-session")},
               {"yield_time_ms", 50},
-              {"timeout_ms", 30000}}),
+              {"tty", true}}),
         context);
     auto snapshot = sessionSnapshot(result);
-    CHECK(snapshot.value("state", "") == "running");
+    CHECK(snapshot.contains("session_id"));
     InteractiveChild child;
-    child.id = snapshot.value("session_id", "");
+    child.id = sessionId(snapshot);
     CHECK(!child.id.empty());
     CHECK(result.execution() && result.execution()->status == MaiToolExecutionStatus::Running);
     if (result.execution()) CHECK(result.execution()->taskId == child.id);
@@ -1012,7 +1149,12 @@ InteractiveChild startInteractive(MaiTool& shell, MaiTool& input, const MaiToolC
             args({{"session_id", child.id}, {"chars", ""}, {"yield_time_ms", 50}}), context));
         child.output += snapshot.value("output", "");
     }
+#if defined(_WIN32)
+    CHECK(std::chrono::steady_clock::now() - began >= std::chrono::seconds(10));
+    CHECK(std::chrono::steady_clock::now() - began < std::chrono::seconds(16));
+#else
     CHECK(std::chrono::steady_clock::now() - began < std::chrono::seconds(5));
+#endif
     CHECK(child.output.find("native-ready") != std::string::npos);
     child.processId = outputProcessId(child.output, "native-pid=");
     child.descendantId = outputProcessId(child.output, "descendant-pid=");
@@ -1022,21 +1164,30 @@ InteractiveChild startInteractive(MaiTool& shell, MaiTool& input, const MaiToolC
 
 void stopInteractive(MaiTool& input, const MaiToolContext& context, const InteractiveChild& child) {
     if (child.id.empty()) return;
-    auto stopped = input.execute(
-        args({{"session_id", child.id}, {"terminate", true}, {"yield_time_ms", 100}}), context);
+    auto stopped = input.execute(args({{"session_id", child.id},
+                                       {"chars", std::string(1, static_cast<char>(3))},
+                                       {"yield_time_ms", 100}}),
+                                 context);
     auto snapshot = sessionSnapshot(stopped);
-    for (unsigned attempt = 0; snapshot.value("state", "") == "running" && attempt < 3; ++attempt) {
+    for (unsigned attempt = 0; snapshot.contains("session_id") && attempt < 3; ++attempt) {
         stopped = input.execute(args({{"session_id", child.id}, {"yield_time_ms", 1000}}), context);
         snapshot = sessionSnapshot(stopped);
     }
-    CHECK(snapshot.value("state", "") == "completed");
-    CHECK(snapshot.value("terminated", false));
-    CHECK(snapshot.contains("exit_code") && snapshot["exit_code"].is_null());
-    CHECK(snapshot.contains("exit_status") && snapshot["exit_status"].is_null());
-    CHECK(stopped.execution() && !stopped.execution()->exitCode);
+    CHECK(!snapshot.contains("session_id"));
+    CHECK(snapshot.value("terminated", false) || snapshot.value("canceled", false) ||
+          snapshot.contains("exit_code"));
+    CHECK(!snapshot.contains("exit_status"));
+    CHECK(stopped.execution() && stopped.execution()->started == true);
     if (stopped.execution()) {
-        CHECK(stopped.execution()->status == MaiToolExecutionStatus::Unknown);
-        CHECK(stopped.execution()->nextAction == MaiToolNextAction::InspectState);
+        if (stopped.execution()->exitCode) {
+            CHECK(snapshot.contains("exit_code"));
+            CHECK(snapshot["exit_code"] == *stopped.execution()->exitCode);
+            CHECK(stopped.execution()->status == MaiToolExecutionStatus::Completed);
+        } else {
+            CHECK(!snapshot.contains("exit_code"));
+            CHECK(stopped.execution()->status == MaiToolExecutionStatus::Unknown);
+            CHECK(stopped.execution()->nextAction == MaiToolNextAction::InspectState);
+        }
     }
 }
 
@@ -1052,8 +1203,8 @@ void test_shell_sessions_input_poll_cross_turn_and_owner_isolation() {
     Workspace workspace;
     MaiToolRegistry registry;
     registerMaiBuiltinTools(registry);
-    auto* shell = registry.find("shell");
-    auto* input = registry.find("shell_input");
+    auto* shell = registry.find("exec_command");
+    auto* input = registry.find("write_stdin");
     CHECK(shell && input);
     if (!shell || !input) return;
     auto context = workspace.context();
@@ -1064,26 +1215,31 @@ void test_shell_sessions_input_poll_cross_turn_and_owner_isolation() {
     context.turnId = "turn_next";
     auto snapshot = sessionSnapshot(input->execute(
         args({{"session_id", child.id}, {"chars", ""}, {"yield_time_ms", 0}}), context));
-    CHECK(snapshot.value("state", "") == "running");
+    CHECK(snapshot.contains("session_id"));
     CHECK(processIsAlive(child.processId));
     const auto write =
-        args({{"session_id", child.id}, {"chars", "echo-after-turn\n"}, {"yield_time_ms", 500}});
+        args({{"session_id", child.id}, {"chars", "echo-after-turn\r"}, {"yield_time_ms", 500}});
     CHECK(input->requiresApproval(write));
     CHECK(!input->requiresApproval(args({{"session_id", child.id}, {"chars", ""}})));
-    CHECK(input->requiresApproval(args({{"session_id", child.id}, {"terminate", true}})));
+    CHECK(input->requiresApproval(
+        args({{"session_id", child.id}, {"chars", std::string(1, static_cast<char>(3))}})));
     snapshot = sessionSnapshot(input->execute(write, context));
     CHECK(snapshot.value("output", "").find("native-input:echo-after-turn") != std::string::npos);
     auto other = context;
     other.sessionId = "ses_other_owner";
     CHECK(
-        input->execute(args({{"session_id", child.id}, {"chars", "stolen\n"}}), other).hasError());
-    CHECK(input->execute(args({{"session_id", child.id}, {"terminate", true}}), other).hasError());
+        input->execute(args({{"session_id", child.id}, {"chars", "stolen\r"}}), other).hasError());
+    CHECK(input
+              ->execute(
+                  args({{"session_id", child.id}, {"chars", std::string(1, static_cast<char>(3))}}),
+                  other)
+              .hasError());
     CHECK(input->approvalKeys(write, context) != input->approvalKeys(write, other));
     CHECK(input->approvalKeys(write, context) !=
-          input->approvalKeys(args({{"session_id", child.id}, {"chars", "other\n"}}), context));
+          input->approvalKeys(args({{"session_id", child.id}, {"chars", "other\r"}}), context));
     snapshot = sessionSnapshot(input->execute(
-        args({{"session_id", child.id}, {"chars", "exit\n"}, {"yield_time_ms", 1000}}), context));
-    CHECK(snapshot.value("state", "") == "completed");
+        args({{"session_id", child.id}, {"chars", "exit\r"}, {"yield_time_ms", 1000}}), context));
+    CHECK(snapshot.contains("exit_code"));
     CHECK(snapshot.contains("exit_code") && snapshot["exit_code"] == 0);
     CHECK(waitForProcessExit(child.processId));
 }
@@ -1093,23 +1249,23 @@ void test_default_powershell_native_child_remains_interactive() {
     Workspace workspace;
     MaiToolRegistry registry;
     registerMaiBuiltinTools(registry);
-    auto* shell = registry.find("shell");
-    auto* input = registry.find("shell_input");
+    auto* shell = registry.find("exec_command");
+    auto* input = registry.find("write_stdin");
     CHECK(shell && input);
     if (!shell || !input) return;
     std::string quoted = "'";
     for (char character : MaiFilePath::fromUtf8(executablePath).toGenericUtf8())
         quoted += character == '\'' ? "''" : std::string(1, character);
     quoted += "'";
-    const json request = {{"command", "& " + quoted + " --capture-child-session"},
+    const json request = {{"cmd", "& " + quoted + " --capture-child-session"},
                           {"login", false},
                           {"yield_time_ms", 50},
-                          {"timeout_ms", 10000}};
+                          {"tty", true}};
     const auto context = workspace.context();
     auto result = shell->execute(request.dump(), context);
     auto snapshot = sessionSnapshot(result);
-    const auto id = snapshot.value("session_id", "");
-    CHECK(snapshot.value("state", "") == "running");
+    const auto id = sessionId(snapshot);
+    CHECK(snapshot.contains("session_id"));
     if (id.empty()) return;
     std::string ready = snapshot.value("output", "");
     for (unsigned attempt = 0; ready.find("native-ready") == std::string::npos && attempt < 40;
@@ -1124,7 +1280,7 @@ void test_default_powershell_native_child_remains_interactive() {
     child.processId = outputProcessId(ready, "native-pid=");
     CHECK(child.processId && processIsAlive(child.processId));
     snapshot = sessionSnapshot(input->execute(
-        args({{"session_id", id}, {"chars", "write-marker\n"}, {"yield_time_ms", 500}}), context));
+        args({{"session_id", id}, {"chars", "write-marker\r"}, {"yield_time_ms", 500}}), context));
     std::string response = snapshot.value("output", "");
     for (unsigned attempt = 0;
          response.find("native-input:write-marker") == std::string::npos && attempt < 20;
@@ -1145,19 +1301,19 @@ void test_first_completed_big_capture_preview_shows_actual_tail_without_changing
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
     StoredCall capture(workspace);
-    auto shell = makeMaiShellTool();
-    const auto result =
-        shell->execute(args({{"command", childCommand("--capture-child-big-head-tail")},
-                             {"yield_time_ms", 30000},
-                             {"timeout_ms", 30000},
-                             {"max_output_tokens", 128}}),
-                       capture.context);
+    auto shell = makeMaiExecCommandTool();
+    const auto result = shell->execute(args({{"cmd", childCommand("--capture-child-big-head-tail")},
+                                             {"yield_time_ms", 30000},
+                                             {"max_output_tokens", 128}}),
+                                       capture.context);
     CHECK(!result.hasError());
     CHECK(result.execution() && result.execution()->status == MaiToolExecutionStatus::Completed);
-    CHECK(result.output().find("BIG-HEAD-owned") != std::string::npos);
-    CHECK(result.output().find("BIG-TAIL-owned-error") != std::string::npos);
+    CHECK(toolOutput(result).find("BIG-HEAD-owned") != std::string::npos);
+    CHECK(toolOutput(result).find("BIG-TAIL-owned-error") != std::string::npos);
     const auto snapshot = sessionSnapshot(result);
-    CHECK(snapshot.value("state", "") == "completed");
+    // 进程结束而原始尾环尚未消费时，继续返回可续读的数字句柄。
+    CHECK(snapshot.contains("session_id") ||
+          (snapshot.contains("exit_code") && snapshot["exit_code"] == 0));
     CHECK(result.execution() && !result.execution()->outputId.empty());
     if (!result.execution() || result.execution()->outputId.empty()) return;
     MaiToolOutputQuery query;
@@ -1177,52 +1333,49 @@ void test_shell_session_workdir_budget_validation_and_token_preview() {
     Workspace outside;
     MaiToolRegistry registry;
     registerMaiBuiltinTools(registry);
-    auto* shell = registry.find("shell");
-    auto* input = registry.find("shell_input");
+    auto* shell = registry.find("exec_command");
+    auto* input = registry.find("write_stdin");
     CHECK(shell && input);
     if (!shell || !input) return;
     auto context = workspace.context();
     const auto command = childCommand("--capture-child-workdir");
-    CHECK(shell->execute(args({{"command", command}, {"workdir", outside.root.toUtf8()}}), context)
+    CHECK(shell->execute(args({{"cmd", command}, {"workdir", outside.root.toUtf8()}}), context)
               .hasError());
     CHECK(!MaiFileSystem::exists(outside.root.append(MaiFilePath::fromUtf8("workdir-marker"))));
     CHECK(!MaiFileSystem::createDirectories(workspace.root.append(MaiFilePath::fromUtf8("other"))));
-    CHECK(shell->approvalKeys(args({{"command", command}, {"workdir", "."}}), context) !=
-          shell->approvalKeys(args({{"command", command}, {"workdir", "other"}}), context));
-    for (const json& invalid :
-         {json{{"yield_time_ms", -1}}, json{{"yield_time_ms", 30001}},
-          json{{"max_output_tokens", 0}}, json{{"workdir", 42}}, json{{"yield_time_ms", "1"}}}) {
+    CHECK(shell->approvalKeys(args({{"cmd", command}, {"workdir", "."}}), context) !=
+          shell->approvalKeys(args({{"cmd", command}, {"workdir", "other"}}), context));
+    for (const json& invalid : {json{{"yield_time_ms", -1}}, json{{"max_output_tokens", -1}},
+                                json{{"workdir", 42}}, json{{"yield_time_ms", "1"}}}) {
         auto request = invalid;
-        request["command"] = command;
+        request["cmd"] = command;
         CHECK(shell->execute(request.dump(), context).hasError());
     }
     const auto preview = shell->execute(
-        args({{"command", childCommand("--capture-child-cap")}, {"max_output_tokens", 64}}),
-        context);
+        args({{"cmd", childCommand("--capture-child-cap")}, {"max_output_tokens", 64}}), context);
     const auto snapshot = sessionSnapshot(preview);
     CHECK(snapshot.value("output", "").size() <= 256);
-    CHECK(snapshot.value("output_truncated", false));
-    CHECK(snapshot.value("output_token_estimate", std::size_t{99999}) > 0 &&
-          snapshot.value("output_token_estimate", std::size_t{99999}) <= 64);
-    CHECK(preview.output().find("retained-final-marker") != std::string::npos);
-    CHECK(preview.output().find("omitted") != std::string::npos);
-    CHECK(snapshot.value("output_token_estimate_method", "") ==
-          "utf8_bytes_divided_by_4_approximation");
+    CHECK(preview.isTruncated());
+    CHECK(snapshot.value("original_token_count", std::size_t{0}) > 64);
+    CHECK((snapshot.value("output", std::string{}).size() + 3) / 4 <= 64);
+    CHECK(toolOutput(preview).find("retained-final-marker") != std::string::npos);
+    CHECK(toolOutput(preview).find("omitted") != std::string::npos);
+    CHECK(!snapshot.contains("output_token_estimate_method"));
     const auto capped = shell->execute(
-        args({{"command", childCommand("--capture-child-cap")}, {"max_output_tokens", 1000000}}),
+        args({{"cmd", childCommand("--capture-child-cap")}, {"max_output_tokens", 1000000}}),
         context);
     const auto cappedSnapshot = sessionSnapshot(capped);
-    CHECK(cappedSnapshot.value("output_token_estimate", std::size_t{0}) > 0 &&
-          cappedSnapshot.value("output_token_estimate", std::size_t{0}) <= 12288);
-    CHECK(capped.output().find("retained-final-marker") != std::string::npos);
-    CHECK(capped.output().find("omitted") != std::string::npos);
+    CHECK(cappedSnapshot.value("output", std::string{}).size() <= 1024 * 1024);
+    CHECK(cappedSnapshot.value("original_token_count", std::size_t{0}) > 262144);
+    CHECK(toolOutput(capped).find("retained-final-marker") != std::string::npos);
+    CHECK(toolOutput(capped).find("omitted") != std::string::npos);
     const auto child = startInteractive(*shell, *input, context);
     if (child.id.empty()) return;
-    for (const json& invalid : {json{{"chars", 42}}, json{{"yield_time_ms", -1}},
-                                json{{"yield_time_ms", 30001}, {"chars", "write-marker\n"}},
-                                json{{"terminate", true}, {"chars", "bad"}}}) {
+    for (const json& invalid :
+         {json{{"chars", 42}}, json{{"yield_time_ms", -1}}, json{{"max_output_tokens", "bad"}},
+          json{{"terminate", true}, {"chars", "bad"}}}) {
         auto request = invalid;
-        request["session_id"] = child.id;
+        request["session_id"] = std::stoi(child.id);
         CHECK(input->execute(request.dump(), context).hasError());
     }
     stopInteractive(*input, context, child);
@@ -1232,133 +1385,139 @@ void test_shell_session_workdir_budget_validation_and_token_preview() {
 void test_shell_partial_utf8_fragments_are_visible_and_recoverable() {
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    MaiToolRegistry registry;
-    registerMaiBuiltinTools(registry);
-    auto* shell = registry.find("shell");
-    auto* input = registry.find("shell_input");
-    CHECK(shell && input);
-    if (!shell || !input) return;
+    auto manager = std::make_shared<MaiShellSessionManager>();
+    auto shell = makeMaiExecCommandTool(manager);
+    auto input = makeMaiWriteStdinTool(manager);
     StoredCall completed(workspace);
     const auto result = shell->execute(
-        args({{"command", childCommand("--capture-child-utf8-incomplete")}}), completed.context);
+        args({{"cmd", childCommand("--capture-child-utf8-incomplete")}}), completed.context);
     CHECK(!result.hasError());
-    CHECK(result.output().find("(no output)") == std::string::npos);
+    CHECK(!toolOutput(result).empty());
     CHECK(readAll(completed, result) == std::string("\xe4\xb8", 2));
-    const auto child = startInteractive(*shell, *input, workspace.context());
-    if (child.id.empty()) return;
-    StoredCall running(workspace, "shell_input");
+    // 原始管道不可写；自有文件门闩在已消费 READY 后单独释放非法字节。
+    const auto owner = workspace.context().sessionId;
+    const auto started =
+        manager->start(owner, ownedOptions(workspace, "--capture-child-fragment-gated"));
+    CHECK(started);
+    if (!started) return;
+    std::string ready;
+    for (unsigned attempt = 0; ready.find("native-ready") == std::string::npos && attempt < 40;
+         ++attempt) {
+        const auto page = manager->interact(owner, started.value(), "", 50);
+        CHECK(page);
+        if (!page) break;
+        ready += page.value().output;
+    }
+    CHECK(ready.find("native-ready") != std::string::npos);
+    CHECK(!MaiFileSystem::writeFile(
+        workspace.root.append(MaiFilePath::fromUtf8("fragment-release")), "ready"));
+    const auto done = workspace.root.append(MaiFilePath::fromUtf8("fragment-complete"));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!MaiFileSystem::exists(done) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(MaiFileSystem::exists(done));
+    StoredCall running(workspace, "write_stdin");
     const auto fragment = input->execute(
-        args({{"session_id", child.id}, {"chars", "utf8-fragment\n"}, {"yield_time_ms", 500}}),
-        running.context);
+        args({{"session_id", started.value()}, {"yield_time_ms", 0}}), running.context);
     const auto snapshot = sessionSnapshot(fragment);
-    CHECK(snapshot.value("state", "") == "running");
+    CHECK(snapshot.contains("session_id"));
     CHECK(snapshot.value("output", "").find("\\xF0") != std::string::npos);
     CHECK(readAll(running, fragment) == std::string("\xf0", 1));
-    stopInteractive(*input, running.context, child);
-    CHECK(waitForProcessExit(child.processId));
+    manager->stopOwner(owner);
 }
 
 void test_shell_input_retains_original_hard_timeout() {
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    MaiToolRegistry registry;
-    registerMaiBuiltinTools(registry);
-    auto* shell = registry.find("shell");
-    auto* input = registry.find("shell_input");
-    CHECK(shell && input);
-    if (!shell || !input) return;
-    const auto context = workspace.context();
-    auto result = shell->execute(args({{"command", childCommand("--capture-child-sleep")},
-                                       {"timeout_ms", 1200},
-                                       {"yield_time_ms", 0}}),
-                                 context);
-    auto snapshot = sessionSnapshot(result);
-    const auto id = snapshot.value("session_id", "");
-    CHECK(snapshot.value("state", "") == "running");
-    if (id.empty()) return;
-    for (unsigned attempt = 0; snapshot.value("state", "") == "running" && attempt < 15;
-         ++attempt) {
-        result = input->execute(args({{"session_id", id}, {"yield_time_ms", 250}}), context);
-        snapshot = sessionSnapshot(result);
+    MaiShellSessionManager manager;
+    const auto started =
+        manager.start(workspace.context().sessionId,
+                      ownedOptions(workspace, "--capture-child-sleep", false, 1200));
+    CHECK(started);
+    if (!started) return;
+    auto result = manager.interact(workspace.context().sessionId, started.value(), "", 0);
+    CHECK(result && !result.value().completed);
+    for (unsigned attempt = 0; result && !result.value().completed && attempt < 15; ++attempt) {
+        CHECK(result.value().timeoutMs == 1200);
+        result = manager.interact(workspace.context().sessionId, started.value(), "", 250);
     }
-    CHECK(snapshot.value("state", "") == "completed");
-    CHECK(snapshot.value("timed_out", false));
-    CHECK(result.output().find("timed out after 1200 ms") != std::string::npos);
-    CHECK(result.execution() && result.execution()->timedOut && !result.execution()->exitCode);
+    CHECK(result && result.value().completed && result.value().timedOut);
+    if (result) CHECK(result.value().timeoutMs == 1200 && !result.value().exitCode);
 }
 
 void test_shell_session_ring_discard_count_and_per_owner_limit() {
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    MaiToolRegistry registry;
-    registerMaiBuiltinTools(registry);
-    auto* shell = registry.find("shell");
-    auto* input = registry.find("shell_input");
-    CHECK(shell && input);
-    if (!shell || !input) return;
-    const auto context = workspace.context();
-    const auto child = startInteractive(*shell, *input, context);
-    if (child.id.empty()) return;
-    StoredCall capture(workspace, "shell_input");
-    const auto floodStarted = std::chrono::steady_clock::now();
-    (void)sessionSnapshot(input->execute(args({{"session_id", child.id},
-                                               {"chars", "flood\n"},
-                                               {"yield_time_ms", 0},
-                                               {"max_output_tokens", 64}}),
-                                         capture.context));
-    const auto ready = workspace.root.append(MaiFilePath::fromUtf8("flood-complete"));
+    MaiShellSessionManager manager;
+    const std::string owner = "ring-owner";
+    const auto started =
+        manager.start(owner, ownedOptions(workspace, "--capture-child-ring-gated"));
+    CHECK(started);
+    if (!started) return;
+    std::string ready;
+    for (unsigned attempt = 0; ready.find("native-ready") == std::string::npos && attempt < 40;
+         ++attempt) {
+        const auto page = manager.interact(owner, started.value(), "", 50);
+        CHECK(page);
+        if (!page) break;
+        ready += page.value().output;
+    }
+    CHECK(ready.find("native-ready") != std::string::npos);
+    const auto began = std::chrono::steady_clock::now();
+    CHECK(!MaiFileSystem::writeFile(workspace.root.append(MaiFilePath::fromUtf8("ring-release")),
+                                    "ready"));
+    const auto complete = workspace.root.append(MaiFilePath::fromUtf8("flood-complete"));
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!MaiFileSystem::exists(ready) && std::chrono::steady_clock::now() < deadline)
+    while (!MaiFileSystem::exists(complete) && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    CHECK(MaiFileSystem::exists(ready));
-    const auto floodMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - floodStarted)
-                             .count();
-    auto prefix = input->execute(
-        args({{"session_id", child.id}, {"yield_time_ms", 0}, {"max_output_tokens", 64}}),
-        capture.context);
-    auto snapshot = sessionSnapshot(prefix);
-    std::printf(
-        "shell-perf flood_bytes=24576000 elapsed_ms=%lld captured_total=%llu\n",
-        static_cast<long long>(floodMs),
-        static_cast<unsigned long long>(snapshot.value("total_output_bytes", std::uint64_t{0})));
-    CHECK(snapshot.value("ring_discarded_bytes", std::size_t{0}) > 0);
-    CHECK(snapshot.value("output", "").size() <= 256);
-    CHECK(snapshot.value("has_more_output", false));
-    CHECK(prefix.execution() && !prefix.execution()->outputId.empty());
-    const auto tail = input->execute(
-        args({{"session_id", child.id}, {"yield_time_ms", 0}, {"max_output_tokens", 12288}}),
-        capture.context);
-    snapshot = sessionSnapshot(tail);
-    CHECK(snapshot.value("discarded_bytes", std::size_t{0}) > 0);
-    CHECK(snapshot.value("output", "").size() <= 48 * 1024);
-    CHECK(!snapshot.value("has_more_output", true));
-    auto retained = readAll(capture, tail);
-    CHECK(retained.size() <= 1024 * 1024);
+    CHECK(MaiFileSystem::exists(complete));
+    auto prefix = manager.interact(owner, started.value(), "", 0);
+    CHECK(prefix);
+    if (prefix) {
+        std::printf("exec-perf flood_bytes=24576000 elapsed_ms=%lld captured_total=%llu\n",
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::steady_clock::now() - began)
+                                               .count()),
+                    static_cast<unsigned long long>(prefix.value().totalOutputBytes));
+        CHECK(prefix.value().ringDiscardedBytes > 0);
+        CHECK(prefix.value().output.size() <= kMaiToolOutputMaxBytes);
+        CHECK(prefix.value().hasMoreOutput);
+    }
+    auto tail = manager.interact(owner, started.value(), "", 0);
+    CHECK(tail);
+    std::string retained;
+    if (tail) {
+        CHECK(tail.value().discardedBytes > 0);
+        CHECK(tail.value().output.size() <= 1024 * 1024);
+        CHECK(!tail.value().hasMoreOutput);
+        retained = tail.value().output;
+    }
     for (unsigned attempt = 0;
          retained.find("native-flood-final-marker") == std::string::npos && attempt < 40;
          ++attempt) {
-        const auto last = input->execute(args({{"session_id", child.id}, {"yield_time_ms", 50}}),
-                                         capture.context);
-        const auto lastSnapshot = sessionSnapshot(last);
-        if (!lastSnapshot.value("output", "").empty()) retained += readAll(capture, last);
+        const auto page = manager.interact(owner, started.value(), "", 50);
+        CHECK(page);
+        if (!page) break;
+        retained += page.value().output;
     }
     CHECK(retained.find("native-flood-final-marker") != std::string::npos);
-    std::vector<InteractiveChild> children{child};
-    for (unsigned index = 1; index < 12; ++index)
-        children.push_back(startInteractive(*shell, *input, context));
-    const auto excess = shell->execute(args({{"command", childCommand("--capture-child-session")},
-                                             {"yield_time_ms", 0},
-                                             {"timeout_ms", 10000}}),
-                                       context);
-    CHECK(excess.hasError());
-    CHECK(excess.error().code() == MaiErrorCode::Busy);
-    auto other = context;
-    other.sessionId = "ses_limit_other";
-    const auto independent = startInteractive(*shell, *input, other);
-    stopInteractive(*input, other, independent);
-    for (const auto& current : children) stopInteractive(*input, context, current);
-    for (const auto& current : children) CHECK(waitForProcessExit(current.processId));
+    std::vector<std::string> ids{started.value()};
+    for (unsigned index = 1; index < 12; ++index) {
+        const auto child =
+            manager.start(owner, ownedOptions(workspace, "--capture-child-session", true));
+        CHECK(child);
+        if (child) ids.push_back(child.value());
+    }
+    const auto excess =
+        manager.start(owner, ownedOptions(workspace, "--capture-child-session", true));
+    CHECK(!excess && excess.error().code() == MaiErrorCode::Busy);
+    const auto independent = manager.start(
+        "independent-owner", ownedOptions(workspace, "--capture-child-session", true));
+    CHECK(independent);
+    manager.stopOwner("independent-owner");
+    manager.stopOwner(owner);
+    for (const auto& id : ids)
+        CHECK(manager.interact(owner, id, "", 0).error().code() == MaiErrorCode::NotFound);
 }
 
 void test_ordinary_shell_manager_precancel_writes_nothing_and_terminate_kills_descendants() {
@@ -1369,6 +1528,7 @@ void test_ordinary_shell_manager_precancel_writes_nothing_and_terminate_kills_de
     options.shell = legacyShellPath();
     options.login = false;
     options.command = childCommand("--capture-child-session");
+    options.tty = true;
     options.workdir = workspace.root.toUtf8();
     options.timeoutMs = 10000;
     const auto started = manager.start("ordinary-owner", options);
@@ -1384,7 +1544,7 @@ void test_ordinary_shell_manager_precancel_writes_nothing_and_terminate_kills_de
     }
     const auto pid = outputProcessId(output, "native-pid=");
     CHECK(pid != 0 && processIsAlive(pid));
-    const auto canceled = manager.interact("ordinary-owner", started.value(), "write-marker\n",
+    const auto canceled = manager.interact("ordinary-owner", started.value(), "write-marker\r",
                                            1000, false, [] { return true; });
     CHECK(canceled ? canceled.value().canceled : canceled.error().code() == MaiErrorCode::Canceled);
     CHECK(waitForProcessExit(pid));
@@ -1410,6 +1570,8 @@ void test_ordinary_shell_manager_precancel_writes_nothing_and_terminate_kills_de
     CHECK(stopped && stopped.value().completed && stopped.value().terminated);
     CHECK(waitForProcessExit(parentPid));
     CHECK(waitForProcessExit(childPid));
+    CHECK(!MaiFileSystem::writeFile(
+        workspace.root.append(MaiFilePath::fromUtf8("descendant-release")), "ready"));
     std::this_thread::sleep_for(std::chrono::milliseconds(1300));
     CHECK(
         !MaiFileSystem::exists(workspace.root.append(MaiFilePath::fromUtf8("descendant-marker"))));
@@ -1477,6 +1639,7 @@ void test_ordinary_empty_poll_supports_300000_and_remains_cancellable() {
     CHECK(!manager.interact("poll-owner", completed.value(), "", 300001));
     CHECK(std::chrono::steady_clock::now() - began < std::chrono::seconds(2));
     options.command = childCommand("--capture-child-session");
+    options.tty = true;
     const auto running = manager.start("poll-owner", options);
     CHECK(running);
     if (!running) return;
@@ -1490,7 +1653,7 @@ void test_ordinary_empty_poll_supports_300000_and_remains_cancellable() {
     }
     const auto processId = outputProcessId(ready, "native-pid=");
     CHECK(processId && processIsAlive(processId));
-    CHECK(!manager.interact("poll-owner", running.value(), "write-marker\n", 30001));
+    CHECK(!manager.interact("poll-owner", running.value(), "write-marker\r", 30001));
     CHECK(
         !MaiFileSystem::exists(workspace.root.append(MaiFilePath::fromUtf8("stdin-write-marker"))));
     std::atomic<bool> cancel{false};
@@ -1514,8 +1677,8 @@ void test_agent_session_delete_and_destructor_stop_owned_process_trees() {
     {
         auto registry = std::make_unique<MaiToolRegistry>();
         registerMaiBuiltinTools(*registry);
-        auto* shell = registry->find("shell");
-        auto* input = registry->find("shell_input");
+        auto* shell = registry->find("exec_command");
+        auto* input = registry->find("write_stdin");
         CHECK(shell && input);
         if (!shell || !input) return;
         MaiAgent agent(makeMaiMemoryStore(), nullptr, std::move(registry));
@@ -1540,11 +1703,13 @@ void test_agent_session_delete_and_destructor_stop_owned_process_trees() {
                   .hasError());
         const auto snapshot = sessionSnapshot(
             input->execute(args({{"session_id", survivor.id}, {"yield_time_ms", 0}}), other));
-        CHECK(snapshot.value("state", "") == "running");
+        CHECK(snapshot.contains("session_id"));
         CHECK(processIsAlive(survivor.processId));
     }
     CHECK(waitForProcessExit(survivor.processId));
     CHECK(waitForProcessExit(survivor.descendantId));
+    CHECK(!MaiFileSystem::writeFile(
+        workspace.root.append(MaiFilePath::fromUtf8("descendant-release")), "ready"));
     std::this_thread::sleep_for(std::chrono::milliseconds(1300));
     CHECK(
         !MaiFileSystem::exists(workspace.root.append(MaiFilePath::fromUtf8("descendant-marker"))));
@@ -1553,18 +1718,18 @@ void test_agent_session_delete_and_destructor_stop_owned_process_trees() {
 // ── 审批：只读的放行，别的都问 ──────────────────────────────────
 
 void test_read_only_commands_run_without_asking() {
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const char* const safe[] = {
         "ls -la",    "pwd",        "echo hello",         "cat README.md", "grep -rn foo src",
         "which git", "git status", "git rev-parse HEAD", "git ls-files",  "git describe --always",
     };
     for (const char* command : safe) {
-        CHECK(!tool->requiresApproval(args({{"command", command}})));
+        CHECK(!tool->requiresApproval(args({{"cmd", command}})));
     }
 }
 
 void test_anything_that_can_change_things_asks_first() {
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const char* const risky[] = {
         "rm -rf build",
         "npm install",
@@ -1596,7 +1761,7 @@ void test_anything_that_can_change_things_asks_first() {
         "git config --global user.email a@b.c",
     };
     for (const char* command : risky) {
-        CHECK(tool->requiresApproval(args({{"command", command}})));
+        CHECK(tool->requiresApproval(args({{"cmd", command}})));
     }
 }
 
@@ -1605,27 +1770,27 @@ void test_shell_metacharacters_always_ask() {
     //
     // `ls; rm -rf .` 的第一个词是 ls，可它真正干的是 rm。只看第一个词的话
     // 白名单就成了绕过通道——随便找个只读程序打头，后面接什么都放行。
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const char* const sneaky[] = {
         "ls; rm -rf .",    "echo hi && rm x",  "pwd | sh",     "cat x > y",
         "echo `rm -rf .`", "echo $(rm -rf .)", "ls\nrm -rf .",
     };
     for (const char* command : sneaky) {
-        CHECK(tool->requiresApproval(args({{"command", command}})));
+        CHECK(tool->requiresApproval(args({{"cmd", command}})));
     }
 }
 
 void test_unparsable_arguments_ask() {
     // 兜底方向永远是「不放行」。看不懂的东西不能当成安全的。
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     CHECK(tool->requiresApproval("not json at all"));
     CHECK(tool->requiresApproval("{}"));
-    CHECK(tool->requiresApproval(args({{"command", ""}})));
-    CHECK(tool->requiresApproval(args({{"command", "   "}})));
+    CHECK(tool->requiresApproval(args({{"cmd", ""}})));
+    CHECK(tool->requiresApproval(args({{"cmd", "   "}})));
     bool rejectedWrongType = false;
     try {
-        rejectedWrongType = tool->requiresApproval(R"({"command":42})") &&
-                            tool->execute(R"({"command":42})", MaiToolContext{}).hasError();
+        rejectedWrongType = tool->requiresApproval(R"({"cmd":42})") &&
+                            tool->execute(R"({"cmd":42})", MaiToolContext{}).hasError();
     } catch (...) {
         rejectedWrongType = false;
     }
@@ -1634,23 +1799,23 @@ void test_unparsable_arguments_ask() {
 
 void test_session_approval_is_scoped_to_the_exact_command() {
     // 给 `npm test` 点一次「以后都允许」，不该连 `rm -rf` 一起放行。
-    auto tool = makeMaiShellTool();
-    CHECK(tool->approvalKey(args({{"command", "npm test"}})) == "shell:command:npm test");
-    CHECK(tool->approvalKey(args({{"command", "npm run build"}})) == "shell:command:npm run build");
-    CHECK(tool->approvalKey(args({{"command", "rm -rf x"}})) == "shell:command:rm -rf x");
-    CHECK(tool->approvalKey(args({{"command", "npm test"}})) !=
-          tool->approvalKey(args({{"command", "rm -rf x"}})));
+    auto tool = makeMaiExecCommandTool();
+    CHECK(tool->approvalKey(args({{"cmd", "npm test"}})) == "exec_command:command:npm test");
+    CHECK(tool->approvalKey(args({{"cmd", "npm run build"}})) ==
+          "exec_command:command:npm run build");
+    CHECK(tool->approvalKey(args({{"cmd", "rm -rf x"}})) == "exec_command:command:rm -rf x");
+    CHECK(tool->approvalKey(args({{"cmd", "npm test"}})) !=
+          tool->approvalKey(args({{"cmd", "rm -rf x"}})));
 
     // 同一程序的不同写命令也不能共用豁免。
-    CHECK(tool->approvalKey(args({{"command", "/usr/bin/git push"}})) ==
-          "shell:command:/usr/bin/git push");
-    CHECK(tool->approvalKey(args({{"command", "C:\\\\tools\\\\git.exe push"}})) ==
-          "shell:command:C:\\\\tools\\\\git.exe push");
+    CHECK(tool->approvalKey(args({{"cmd", "/usr/bin/git push"}})) ==
+          "exec_command:command:/usr/bin/git push");
+    CHECK(tool->approvalKey(args({{"cmd", "C:\\\\tools\\\\git.exe push"}})) ==
+          "exec_command:command:C:\\\\tools\\\\git.exe push");
 
     // 带控制字符的命令按完整命令收窄，不能让一条复合命令的会话授权放行另一条。
-    const std::string firstCompound = tool->approvalKey(args({{"command", "ls; rm -rf ."}}));
-    const std::string secondCompound =
-        tool->approvalKey(args({{"command", "echo hi && rm other"}}));
+    const std::string firstCompound = tool->approvalKey(args({{"cmd", "ls; rm -rf ."}}));
+    const std::string secondCompound = tool->approvalKey(args({{"cmd", "echo hi && rm other"}}));
     CHECK(firstCompound.find("ls; rm -rf .") != std::string::npos);
     CHECK(secondCompound.find("echo hi && rm other") != std::string::npos);
     CHECK(firstCompound != secondCompound);
@@ -1661,11 +1826,11 @@ void test_session_approval_is_scoped_to_the_exact_command() {
 void test_runs_a_command_and_returns_its_output() {
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const MaiToolResult result =
-        tool->execute(args({{"command", "echo maiagent-marker"}}), workspace.context());
+        tool->execute(args({{"cmd", "echo maiagent-marker"}}), workspace.context());
     CHECK(!result.hasError());
-    CHECK(result.output().find("maiagent-marker") != std::string::npos);
+    CHECK(toolOutput(result).find("maiagent-marker") != std::string::npos);
 }
 
 void test_a_failing_command_is_a_normal_result_not_an_error() {
@@ -1673,11 +1838,11 @@ void test_a_failing_command_is_a_normal_result_not_an_error() {
     // 当成错误抛上去的话，那一轮直接断掉，模型连失败原因都看不到。
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const MaiToolResult result =
-        tool->execute(args({{"command", "maiagent-no-such-command-xyz"}}), workspace.context());
+        tool->execute(args({{"cmd", "maiagent-no-such-command-xyz"}}), workspace.context());
     CHECK(!result.hasError());
-    CHECK(result.output().find("exit code") != std::string::npos);
+    CHECK(sessionSnapshot(result).contains("exit_code"));
     CHECK(result.execution().has_value());
     if (!result.execution()) return;
     CHECK(result.execution()->status == MaiToolExecutionStatus::Completed);
@@ -1692,41 +1857,41 @@ void test_stderr_is_interleaved_with_stdout() {
     // 所以两股合成一股。
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
 #if defined(_WIN32)
     const char* command = "echo out-marker && maiagent-no-such-command-xyz";
 #else
     const char* command = "echo out-marker; maiagent-no-such-command-xyz";
 #endif
-    const MaiToolResult result = tool->execute(args({{"command", command}}), workspace.context());
+    const MaiToolResult result = tool->execute(args({{"cmd", command}}), workspace.context());
     CHECK(!result.hasError());
-    CHECK(result.output().find("out-marker") != std::string::npos);
+    CHECK(toolOutput(result).find("out-marker") != std::string::npos);
     // 找不到命令这句话是 shell 写到 stderr 上的。收不到就说明两股没合。
-    CHECK(result.output().size() > std::string("out-marker").size() + 4);
+    CHECK(toolOutput(result).size() > std::string("out-marker").size() + 4);
 }
 
 void test_the_command_runs_in_the_working_directory() {
     // 不设工作目录的话模型会在**进程的当前目录**里跑命令，而那通常不是用户的项目。
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
 #if defined(_WIN32)
     const char* command = "cd";
 #else
     const char* command = "pwd";
 #endif
-    const MaiToolResult result = tool->execute(args({{"command", command}}), workspace.context());
+    const MaiToolResult result = tool->execute(args({{"cmd", command}}), workspace.context());
     CHECK(!result.hasError());
     // 临时目录可能有符号链接（macOS 的 /var -> /private/var），所以只比最后一段。
     const std::string leaf = workspace.root.baseName().toUtf8();
-    CHECK(result.output().find(leaf) != std::string::npos);
+    CHECK(toolOutput(result).find(leaf) != std::string::npos);
 }
 
 void test_without_a_working_directory_it_refuses() {
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     MaiToolContext bare;
     bare.sessionId = "ses_shell";
-    const MaiToolResult result = tool->execute(args({{"command", "echo hi"}}), bare);
+    const MaiToolResult result = tool->execute(args({{"cmd", "echo hi"}}), bare);
     CHECK(result.hasError());
     CHECK(result.execution().has_value());
     if (!result.execution()) return;
@@ -1736,29 +1901,28 @@ void test_without_a_working_directory_it_refuses() {
 }
 
 void test_a_hanging_command_is_killed_at_the_timeout() {
-    // 模型写出 `tail -f` 这种命令是常事。没有超时的话那一轮就永远不结束。
+    // 模型的等待预算不再是命令寿命；显式硬超时仍由普通 manager 执行并如实保留。
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    auto tool = makeMaiShellTool();
-    const std::string command = childCommand("--capture-child-sleep");
+    MaiShellSessionManager manager;
     const auto began = std::chrono::steady_clock::now();
-    const MaiToolResult result =
-        tool->execute(args({{"command", command}, {"timeout_ms", 1200}}), workspace.context());
-    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - began)
-                          .count();
-    CHECK(!result.hasError());
-    // 到点就杀，不能等它自己跑完 20 秒。
-    CHECK(took < 8000);
-    // 回给模型的话必须说清是**超时被杀**，不能说成「命令失败了」——
-    // 后者会让它以为是代码有问题，然后去改不该改的地方。
-    CHECK(result.output().find("timed out") != std::string::npos);
+    const auto started = manager.start(
+        "timeout-owner", ownedOptions(workspace, "--capture-child-sleep", false, 1200));
+    CHECK(started);
+    if (!started) return;
+    const auto result =
+        manager.interact("timeout-owner", started.value(), "", 3000, false, {}, true);
+    CHECK(result && result.value().started && result.value().completed);
+    CHECK(std::chrono::steady_clock::now() - began < std::chrono::seconds(8));
+    if (result)
+        CHECK(result.value().timedOut && !result.value().exitCode &&
+              result.value().timeoutMs == 1200);
 }
 
 void test_cancel_stops_a_running_command() {
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     std::atomic<bool> cancel{false};
     MaiToolContext context = workspace.context();
     context.cancel = &cancel;
@@ -1769,8 +1933,7 @@ void test_cancel_stops_a_running_command() {
     });
     const std::string command = childCommand("--capture-child-sleep");
     const auto began = std::chrono::steady_clock::now();
-    const MaiToolResult result =
-        tool->execute(args({{"command", command}, {"timeout_ms", 60000}}), context);
+    const MaiToolResult result = tool->execute(args({{"cmd", command}}), context);
     const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - began)
                           .count();
@@ -1779,6 +1942,8 @@ void test_cancel_stops_a_running_command() {
     CHECK(took < 8000);
     CHECK(result.hasError());
     CHECK(result.error().code() == MaiErrorCode::Canceled);
+    CHECK(sessionSnapshot(result).value("canceled", false));
+    CHECK(result.execution() && result.execution()->started == true);
 }
 
 void test_output_is_capped_and_says_so() {
@@ -1786,15 +1951,14 @@ void test_output_is_capped_and_says_so() {
     // 封了就必须如实说截断过——不说的话模型会把看到的当成全部。
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const std::string command = childCommand("--capture-child-cap");
-    const MaiToolResult result =
-        tool->execute(args({{"command", command}, {"timeout_ms", 30000}}), workspace.context());
+    const MaiToolResult result = tool->execute(args({{"cmd", command}}), workspace.context());
     CHECK(!result.hasError());
     CHECK(result.isTruncated());
-    CHECK(result.output().find("truncated") != std::string::npos);
+    CHECK(sessionSnapshot(result).contains("original_token_count"));
     // 上限是 48KB，加上尾巴那几句提示，总长不该失控。
-    CHECK(result.output().size() < 64 * 1024);
+    CHECK(toolOutput(result).size() < 64 * 1024);
 }
 
 void test_long_output_can_be_read_without_running_the_command_again() {
@@ -1802,14 +1966,13 @@ void test_long_output_can_be_read_without_running_the_command_again() {
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
     StoredCall call(workspace);
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const std::string command = childCommand("--capture-child-once-long");
-    const MaiToolResult result =
-        tool->execute(args({{"command", command}, {"timeout_ms", 30000}}), call.context);
+    const MaiToolResult result = tool->execute(args({{"cmd", command}}), call.context);
     CHECK(!result.hasError());
     CHECK(executionCount(workspace) == 1);
-    CHECK(result.output().size() < 64 * 1024);
-    CHECK(result.output().find("tool_output_read") != std::string::npos);
+    CHECK(toolOutput(result).size() < 64 * 1024);
+    CHECK(sessionSnapshot(result).contains("output_id"));
     const std::string captured = readAll(call, result);
     CHECK(captured.size() > 100 * 1024);
     CHECK(captured.find("retained-final-marker") != std::string::npos);
@@ -1878,25 +2041,20 @@ void test_interruption_retains_partial_output_and_requires_state_inspection() {
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
     StoredCall call(workspace);
-    auto tool = makeMaiShellTool();
-    const MaiToolResult timeout = tool->execute(
-        args({{"command", childCommand("--capture-child-partial")}, {"timeout_ms", 1000}}),
-        call.context);
-    CHECK(!timeout.hasError());
-    CHECK(timeout.execution().has_value());
-    if (!timeout.execution()) return;
-    CHECK(timeout.execution()->timedOut);
-    CHECK(timeout.execution()->nextAction == MaiToolNextAction::InspectState);
-    CHECK(timeout.execution()->effectStatus == MaiToolEffectStatus::Unknown);
-    CHECK(timeout.execution()->outputTruncated);
-    CHECK(timeout.isTruncated());
-    CHECK(!timeout.execution()->exitCode.has_value());
-    CHECK(readAll(call, timeout).find("captured-before-interruption") != std::string::npos);
-    MaiToolOutputQuery timeoutQuery;
-    timeoutQuery.outputId = timeout.execution()->outputId;
-    const auto timeoutPage = call.store->readToolOutput(call.context.sessionId, timeoutQuery);
-    CHECK(timeoutPage.isOk());
-    if (timeoutPage.isOk()) CHECK(timeoutPage.value().truncated);
+    auto tool = makeMaiExecCommandTool();
+    MaiShellSessionManager timeoutManager;
+    const auto timeoutId = timeoutManager.start(
+        call.context.sessionId, ownedOptions(workspace, "--capture-child-partial", false, 1000));
+    CHECK(timeoutId);
+    if (timeoutId) {
+        const auto timeout = timeoutManager.interact(call.context.sessionId, timeoutId.value(), "",
+                                                     3000, false, {}, true);
+        CHECK(timeout && timeout.value().timedOut && timeout.value().completed);
+        if (timeout) {
+            CHECK(timeout.value().started && !timeout.value().exitCode);
+            CHECK(timeout.value().output.find("captured-before-interruption") != std::string::npos);
+        }
+    }
 
     std::atomic<bool> cancel{false};
     call.context.cancel = &cancel;
@@ -1915,9 +2073,8 @@ void test_interruption_retains_partial_output_and_requires_state_inspection() {
         }
         cancel.store(true);
     });
-    const MaiToolResult canceled = tool->execute(
-        args({{"command", childCommand("--capture-child-partial")}, {"timeout_ms", 10000}}),
-        call.context);
+    const MaiToolResult canceled =
+        tool->execute(args({{"cmd", childCommand("--capture-child-partial")}}), call.context);
     stopper.join();
     CHECK(canceled.hasError());
     CHECK(readyObserved.load());
@@ -1928,7 +2085,7 @@ void test_interruption_retains_partial_output_and_requires_state_inspection() {
     CHECK(canceled.execution()->outputTruncated);
     CHECK(canceled.isTruncated());
     CHECK(canceled.execution()->nextAction == MaiToolNextAction::InspectState);
-    CHECK(canceled.error().message().find("captured-before-interruption") != std::string::npos);
+    CHECK(toolOutput(canceled).find("captured-before-interruption") != std::string::npos);
     CHECK(readAll(call, canceled).find("captured-before-interruption") != std::string::npos);
     MaiToolOutputQuery canceledQuery;
     canceledQuery.outputId = canceled.execution()->outputId;
@@ -1941,11 +2098,11 @@ void test_capture_limit_and_utf8_preview_are_explicit() {
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
     StoredCall call(workspace);
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const MaiToolResult oversized =
-        tool->execute(args({{"command", childCommand("--capture-child-oversized")}}), call.context);
+        tool->execute(args({{"cmd", childCommand("--capture-child-oversized")}}), call.context);
     CHECK(!oversized.hasError());
-    CHECK(oversized.output().find("capture truncated") != std::string::npos);
+    CHECK(sessionSnapshot(oversized).value("capture_truncated", false));
     CHECK(oversized.execution().has_value());
     if (!oversized.execution()) return;
     MaiToolOutputQuery query;
@@ -1958,16 +2115,16 @@ void test_capture_limit_and_utf8_preview_are_explicit() {
     }
 
     const MaiToolResult utf8 =
-        tool->execute(args({{"command", childCommand("--capture-child-utf8")}}), call.context);
+        tool->execute(args({{"cmd", childCommand("--capture-child-utf8")}}), call.context);
     CHECK(!utf8.hasError());
     bool serializable = true;
     try {
-        (void)json(utf8.output()).dump();
+        (void)json(toolOutput(utf8)).dump();
     } catch (...) {
         serializable = false;
     }
     CHECK(serializable);
-    CHECK(utf8.output().find("\xf0\x9f\x98\x80") != std::string::npos);
+    CHECK(toolOutput(utf8).find("\xf0\x9f\x98\x80") != std::string::npos);
     CHECK(readAll(call, utf8).find("\xf0\x9f\x98\x80utf8-final-marker") != std::string::npos);
 #if defined(_WIN32)
     // Windows 的原始捕获边界也不能将完整 UTF-8 前缀整段误解码为 OEM。
@@ -2004,24 +2161,23 @@ void test_windows_capture_can_end_inside_the_first_utf8_scalar() {
 void test_unavailable_or_rejected_storage_does_not_advertise_a_handle() {
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const std::string command = childCommand("--capture-child-utf8");
-    const MaiToolResult unavailable =
-        tool->execute(args({{"command", command}}), workspace.context());
+    const MaiToolResult unavailable = tool->execute(args({{"cmd", command}}), workspace.context());
     CHECK(unavailable.execution().has_value());
     if (!unavailable.execution()) return;
     CHECK(unavailable.execution()->outputId.empty());
-    CHECK(unavailable.output().find("cannot be recovered") != std::string::npos);
-    CHECK(unavailable.output().find("tool_output_read") == std::string::npos);
+    CHECK(sessionSnapshot(unavailable).value("output_unavailable", false));
+    CHECK(!sessionSnapshot(unavailable).contains("output_id"));
 
     StoredCall call(workspace);
     call.context.callId = "call_wrong";
-    const MaiToolResult rejected = tool->execute(args({{"command", command}}), call.context);
+    const MaiToolResult rejected = tool->execute(args({{"cmd", command}}), call.context);
     CHECK(rejected.execution().has_value());
     if (!rejected.execution()) return;
     CHECK(rejected.execution()->outputId.empty());
-    CHECK(rejected.output().find("cannot be recovered") != std::string::npos);
-    CHECK(rejected.output().find("tool_output_read") == std::string::npos);
+    CHECK(sessionSnapshot(rejected).value("output_unavailable", false));
+    CHECK(!sessionSnapshot(rejected).contains("output_id"));
 }
 
 void test_invalid_posix_bytes_are_retained_and_previewed_truthfully() {
@@ -2029,11 +2185,11 @@ void test_invalid_posix_bytes_are_retained_and_previewed_truthfully() {
     if (!maiIsProcessExecutionSupported()) return;
     Workspace workspace;
     StoredCall call(workspace);
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const MaiToolResult result =
-        tool->execute(args({{"command", childCommand("--capture-child-invalid")}}), call.context);
+        tool->execute(args({{"cmd", childCommand("--capture-child-invalid")}}), call.context);
     CHECK(!result.hasError());
-    CHECK(result.output().find("a\\xFFb") != std::string::npos);
+    CHECK(toolOutput(result).find("a\\xFFb") != std::string::npos);
     CHECK(readAll(call, result) == std::string("a\xff"
                                                "b",
                                                3));
@@ -2043,14 +2199,14 @@ void test_invalid_posix_bytes_are_retained_and_previewed_truthfully() {
 void test_windows_shell_output_is_valid_utf8() {
 #if defined(_WIN32)
     Workspace workspace;
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const std::string command = childCommand("--capture-child-oem");
-    const MaiToolResult result = tool->execute(args({{"command", command}}), workspace.context());
+    const MaiToolResult result = tool->execute(args({{"cmd", command}}), workspace.context());
     CHECK(!result.hasError());
 
     bool serializable = true;
     try {
-        (void)json(result.output()).dump();
+        (void)json(toolOutput(result)).dump();
     } catch (...) {
         serializable = false;
     }
@@ -2061,11 +2217,11 @@ void test_windows_shell_output_is_valid_utf8() {
 void test_windows_localized_shell_output_is_preserved() {
 #if defined(_WIN32)
     Workspace workspace;
-    auto tool = makeMaiShellTool();
+    auto tool = makeMaiExecCommandTool();
     const char* command = "echo \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84";
-    const MaiToolResult result = tool->execute(args({{"command", command}}), workspace.context());
+    const MaiToolResult result = tool->execute(args({{"cmd", command}}), workspace.context());
     CHECK(!result.hasError());
-    CHECK(result.output().find("\u7cfb\u7edf\u627e\u4e0d\u5230") != std::string::npos);
+    CHECK(toolOutput(result).find("\u7cfb\u7edf\u627e\u4e0d\u5230") != std::string::npos);
 #endif
 }
 
@@ -2074,7 +2230,7 @@ void test_shell_is_only_registered_where_processes_are_allowed() {
     // 而它收到的「失败」听起来像临时故障，于是换个写法再试一遍。
     MaiToolRegistry registry;
     registerMaiBuiltinTools(registry);
-    const bool listed = registry.find("shell") != nullptr;
+    const bool listed = registry.find("exec_command") != nullptr;
     CHECK(listed == maiIsProcessExecutionSupported());
 
     // 其余工具不受平台影响，哪儿都该在。
@@ -2097,6 +2253,9 @@ int main(int argc, char* argv[]) {
     if (argc == 2 && std::string(argv[1]).find("--capture-child-") == 0) {
         return runCaptureChild(argv[1]);
     }
+    // 固定来自自有进程失败日志的最小反例：VT 元数据拆开了 native-pid 标记。
+    CHECK(terminalMarkerText("\x1b[Hn\x1b]0;cmd.exe\x07\x1b[?25hative-pid=36860\r\n") ==
+          "native-pid=36860\r\n");
     if (argc == 2 && std::string(argv[1]) == "--pipeline-status") {
         RUN(test_pipeline_failure_policy_and_native_status_scope);
         return failures == 0 ? 0 : 1;
@@ -2112,6 +2271,10 @@ int main(int argc, char* argv[]) {
     }
     if (argc == 2 && std::string(argv[1]) == "--codex-shell-ps-cwd") {
         RUN(test_powershell_login_startup_restores_approved_workdir);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--codex-shell-ps-utf8") {
+        RUN(test_powershell_streaming_output_uses_utf8_before_completion);
         return failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--codex-shell-cmd-quote") {
@@ -2163,6 +2326,7 @@ int main(int argc, char* argv[]) {
         return failures == 0 ? 0 : 1;
     }
     RUN(test_pipeline_failure_policy_and_native_status_scope);
+    RUN(test_powershell_streaming_output_uses_utf8_before_completion);
     RUN(test_explicit_cmd_preserves_quoted_executable_and_argument);
     RUN(test_powershell_login_startup_restores_approved_workdir);
     RUN(test_shell_startup_script_refreshes_rc_and_restores_workdir);

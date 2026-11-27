@@ -331,7 +331,7 @@ AgentUnderTest makeAgent(std::vector<MaiFakeModelClient::Turn> script,
     tools->add(std::make_unique<MaiPaidChargeTool>());
 
     MaiAgent::Options options;
-    options.defaultModel = "glm-5.3";
+    options.defaultModel = "glm-5.4";
     options.approvalPolicy = approvalPolicy;
     return {std::make_unique<MaiAgent>(makeMaiMemoryStore(), std::move(model), std::move(tools),
                                        options),
@@ -709,7 +709,7 @@ void test_unless_trusted_asks_once_per_file() {
 void test_unless_trusted_still_asks_for_risky_shell() {
     Workspace workspace;
     auto underTest =
-        makeAgent({callTurn("shell", R"({"command":"rm -rf build"})"), sayTurn("Skipped.")},
+        makeAgent({callTurn("exec_command", R"({"cmd":"rm -rf build"})"), sayTurn("Skipped.")},
                   MaiApprovalPolicy::UnlessTrusted);
     const std::string sessionId =
         underTest.agent->submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();

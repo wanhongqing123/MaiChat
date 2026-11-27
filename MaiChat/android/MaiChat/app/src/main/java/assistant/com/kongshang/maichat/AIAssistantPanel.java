@@ -77,6 +77,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private final Button voiceHoldButton;
     private final TextView error;
     private final TextView syncStatus;
+    private final TextView contextUsage;
+    private final ProgressBar contextUsageBar;
+    private AlertDialog contextUsageDialog;
     private final LatestMessageList list;
     private final LinearLayout pending;
     private final LinearLayout attachmentSection, attachmentTray, attachmentPanel;
@@ -349,6 +352,26 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         View composerDivider = new View(activity);
         composerDivider.setBackgroundColor(MaiChatTheme.BORDER);
         addView(composerDivider, new LayoutParams(LayoutParams.MATCH_PARENT, dp(1)));
+        // 紧邻输入框显示主请求窗口占用；点击展开真实来源与累计，避免把费用统计当上下文。
+        contextUsage = text("服务端未提供上下文用量", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
+        contextUsage.setTag("ai-context-usage");
+        contextUsage.setPadding(dp(16), dp(5), dp(16), dp(5));
+        contextUsage.setMinHeight(dp(32));
+        contextUsage.setGravity(Gravity.CENTER_VERTICAL);
+        contextUsage.setVisibility(GONE);
+        contextUsage.setOnClickListener(view -> {
+            if (state == null || contextUsageDialog != null) return;
+            contextUsageDialog = new AlertDialog.Builder(activity).setTitle("上下文与用量")
+                .setMessage(state.contextUsage.detail).setPositiveButton("知道了", null).create();
+            contextUsageDialog.setOnDismissListener(dialog -> contextUsageDialog = null);
+            contextUsageDialog.show();
+        });
+        addView(contextUsage, matchWrap());
+        contextUsageBar = new ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal);
+        contextUsageBar.setTag("ai-context-usage-bar");
+        contextUsageBar.setMax(100);
+        contextUsageBar.setVisibility(GONE);
+        addView(contextUsageBar, new LayoutParams(LayoutParams.MATCH_PARENT, dp(3)));
         LinearLayout composerArea = column();
         composerArea.setBackgroundColor(MaiChatTheme.PANEL);
         quoteSection = row();
@@ -594,6 +617,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     @Override
     protected void onDetachedFromWindow() {
         ++artifactPreviewGeneration;
+        if (contextUsageDialog != null) contextUsageDialog.dismiss();
         setForeground(false);
         if (browser != null) browser.detach(browserHost);
         videoCircle.cancel();
@@ -661,6 +685,16 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             pendingLatestSession = selected;
         }
         state = next;
+        // 明细跟随同一会话的新计量，切页时关闭旧窗口，防止旧占用串到另一会话。
+        if (contextUsageDialog != null) {
+            if (changedSession) contextUsageDialog.dismiss();
+            else contextUsageDialog.setMessage(next.contextUsage.detail);
+        }
+        contextUsage.setText(next.contextUsage.text);
+        contextUsage.setContentDescription("上下文用量：" + next.contextUsage.text + "；点击查看明细");
+        contextUsage.setVisibility(next.selected.isEmpty() ? GONE : VISIBLE);
+        contextUsageBar.setVisibility(!next.selected.isEmpty() && next.contextUsage.usedPercent >= 0 ? VISIBLE : GONE);
+        if (next.contextUsage.usedPercent >= 0) contextUsageBar.setProgress(next.contextUsage.usedPercent);
         applyOutgoingRecovery();
         String account = MaiChatAuthClient.shared(activity).accountId();
         if (!account.equals(videoCircleAccount)) probeVideoCircle();

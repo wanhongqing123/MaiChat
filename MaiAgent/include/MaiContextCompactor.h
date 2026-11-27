@@ -33,8 +33,10 @@ struct MaiContextPreparation {
 // prepare 在调用线程同步推理，不能在事件/流式回调中调用。调用方保持依赖和源快照有效。
 // 有原史回查能力时，每轮先逐步缩减工具详情，约回收触发前完整输入的20%即停止。
 // 保留未选中的工具详情/正文/像素；字段预算写入检查点，下一轮不会恢复已省略的字节。
-// 工具已到必要骨架才选取部分旧助手正文做语义摘要，必要时才选更早的用户正文。
-// 未选正文仍以原样来源字段保留；当前用户/保护尾部不参与裁减。原始字节始终参与来源校验。
+// 产品 preserveDialogue 模式下，工具到必要骨架后也不裁正文；超硬限则显式失败。
+// 仅普通调用者未启用正文保护时，才允许选择旧正文做其显式语义归档。
+// 正文保护会从原史补回旧语义检查点省略的正文，不恢复已省略的工具明细；
+// 新检查点成功前旧检查点保持不变。当前用户/保护尾部不裁减，原始字节参与来源校验。
 // 先总结尚未覆盖的完整旧轮次。单轮工具结果过长时可总结 assistant 的稳定工具前缀，
 // 当前 user、未覆盖的原始观察及 Pending/Running tail 保持原文。工具调用与回执成对封存；
 // 大工具组可整体摘要，像素仍保留并带真实组来源，不能声称知道不存在的单图调用归属。
@@ -77,6 +79,10 @@ public:
         // 工具优先策略每次相对触发前完整输入回收约此百分比；不是窗口的固定目标占比。
         // 达标就停止，后续检查点继续缩减剩余工具；仍须满足真实硬输入预算。
         unsigned int priorityReductionPercent = 20;
+        // 产品 Runner 固定启用：用户和助手正文逐字保留，仅缩减工具详情/旧工具图片。
+        // 无足够工具内容可缩时保留正文；硬限放不下则失败，不自动做正文语义摘要。
+        // 普通摘要调用者可保持 false，显式采用其已有的语义归档契约；模型不能设置此项。
+        bool preserveDialogue = false;
         // 摘要请求的初始编码字节预算（通常来自该模型已学到的 413 上限）；0 表示未知。
         // 只约束整理自己发出的摘要请求，不参与主请求的 token 容量判断；主请求体由
         // MaiRequestBodyFitter 在发送前适配。摘要请求仍被 413 拒绝时自动重新分块。
@@ -84,7 +90,10 @@ public:
         // 在 prepare 的调用线程、模型流回调之外交付进度。不得抛异常；需要异步处理须
         // 复制快照，不能保留引用。开始/完成/延后/失败均有状态，容量未知保持 0。
         std::function<void(const MaiContextStatus&)> onStatus;
-
+        // 内部真实摘要请求的供应商 usage，同一 prepare 线程同步交付，不合成缺失用量。
+        // 可为空；返回源持久化错误时终止整理，不能降级成一次成功的模型计量。
+        // 调用方在 prepare 前加载累计状态；摘要与主采样分开标记操作范围。
+        std::function<MaiError(const MaiModelUsage&)> onUsage;
     };
 
     // 特殊宿主可注入“从消息/片段边界构建原文并保留指定 user”的同线程回调。
@@ -105,11 +114,25 @@ public:
                                              const std::atomic<bool>& cancel,
                                              const BuildContext& buildContext = {}) const;
 
+    // 可信宿主在同一会话撤下工具、只生成最后补答时使用。复用通过来源校验的既有
+    // 检查点（含先前合法生成的工具投影），不扩大工具权限，也不创建或推进检查点。
+    // 新尾部仍按原文追加；超过真实输入硬限时失败并保留检查点，不退回整段摘要。
+    MaiResult<MaiContextPreparation> prepareFinalResponse(
+        MaiSessionStore& store, MaiModelClient& model, const MaiContextBuilder& builder,
+        const std::string& sessionId, const std::vector<MaiMessage>& history,
+        MaiModelRequest request, const std::atomic<bool>& cancel,
+        const BuildContext& buildContext = {}) const;
+
 private:
+    MaiResult<MaiContextPreparation> prepareWithMode(
+        MaiSessionStore& store, MaiModelClient& model, const MaiContextBuilder& builder,
+        const std::string& sessionId, const std::vector<MaiMessage>& history,
+        MaiModelRequest request, const std::atomic<bool>& cancel, const BuildContext& buildContext,
+        bool reuseOnly) const;
     MaiResult<MaiContextPreparation> prepareImpl(
         MaiSessionStore& store, MaiModelClient& model, const MaiContextBuilder& builder,
         const std::string& sessionId, const std::vector<MaiMessage>& history,
         MaiModelRequest request, const std::atomic<bool>& cancel, const BuildContext& buildContext,
-        MaiContextStatus& status) const;
+        MaiContextStatus& status, bool reuseOnly) const;
     Options mOptions;
 };

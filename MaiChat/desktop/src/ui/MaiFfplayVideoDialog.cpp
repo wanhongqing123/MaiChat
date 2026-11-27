@@ -1,15 +1,16 @@
 // 文件作用：桌面端共用界面；MaiFfplayVideoDialog 负责对话框呈现、确认交互和结果回传，本文件给出其实现。
 // 主要入口：setForwardAction、forwardVideo、saveCopy、activeDialog。
 // 直接依赖：MaiGraphicsPresenter.h；实现与这些接口协作。
-#include "ui/UiZoom.h"
 #include "ui/MaiFfplayVideoDialog.h"
-#include "ui/MaiVideoSpeedSelector.h"
-#include "ui/MaiVideoHud.h"
-#include "ui/MaiVideoBufferingIndicator.h"
-#include "ui/MaiVideoVolumePopup.h"
 #include "MaiCloudVod.h"
-#include "ui/DesktopMusicPlayerDialog.h"
 #include "ui/DesktopAudioPlayback.h"
+#include "ui/DesktopMusicPlayerDialog.h"
+#include "ui/MaiVideoBufferingIndicator.h"
+#include "ui/MaiVideoHud.h"
+#include "ui/MaiVideoSeekSlider.h"
+#include "ui/MaiVideoSpeedSelector.h"
+#include "ui/MaiVideoVolumePopup.h"
+#include "ui/UiZoom.h"
 
 #include <QCloseEvent>
 #include <QWidgetAction>
@@ -143,57 +144,6 @@ QIcon videoControlIcon(const char* name) {
     renderer.render(&painter, QRectF(0, 0, 24, 24));
     return QIcon(pixels);
 }
-
-// 进度条按点击/拖动位置定位，避免 QSlider 默认的整页跳动和整数百分比量化。
-class MaiVideoSeekSlider final : public QSlider {
-public:
-    explicit MaiVideoSeekSlider(QWidget* parent) : QSlider(Qt::Horizontal, parent) {}
-
-protected:
-    void mousePressEvent(QMouseEvent* event) override {
-        if (event->button() != Qt::LeftButton) {
-            QSlider::mousePressEvent(event);
-            return;
-        }
-        QStyleOptionSlider option;
-        initStyleOption(&option);
-        const QRect handle = style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderHandle, this);
-        dragOffset_ = handle.contains(event->pos()) ? event->pos().x() - handle.center().x() : 0;
-        setSliderDown(true);
-        moveTo(event->pos().x());
-        event->accept();
-    }
-
-    void mouseMoveEvent(QMouseEvent* event) override {
-        if (isSliderDown()) {
-            moveTo(event->pos().x());
-            event->accept();
-        } else
-            QSlider::mouseMoveEvent(event);
-    }
-
-    void mouseReleaseEvent(QMouseEvent* event) override {
-        if (event->button() == Qt::LeftButton && isSliderDown()) {
-            moveTo(event->pos().x());
-            setSliderDown(false);
-            event->accept();
-        } else
-            QSlider::mouseReleaseEvent(event);
-    }
-
-private:
-    void moveTo(int x) {
-        QStyleOptionSlider option;
-        initStyleOption(&option);
-        const QRect groove = style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderGroove, this);
-        const QRect handle = style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderHandle, this);
-        const int span = std::max(1, groove.width() - handle.width());
-        setSliderPosition(QStyle::sliderValueFromPosition(
-            minimum(), maximum(), x - dragOffset_ - groove.x() - handle.width() / 2, span, option.upsideDown));
-    }
-
-    int dragOffset_ = 0;
-};
 
 // Qt 在 Windows 上仅为覆盖 paintEngine() 的原生绘制控件保留 WA_PaintOnScreen。
 // 普通 QWidget 会忽略该属性，窗口恢复时 backingstore 可用背景覆盖刚提交的 D3D 帧。
@@ -476,8 +426,13 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
             playing_ = status.paused == 0;
         }
         // 松手后 seek 仍可能在等待云盘读取/解码，旧时钟不能拉回用户选中的滑块。
+        static_cast<MaiVideoSeekSlider *>(seekSlider_)->setDurationUs(status.duration_us);
         const auto position =
-            std::clamp(status.seeking ? status.seek_target_us : status.position_us, int64_t{0}, status.duration_us);
+            seekSlider_->isSliderDown() && seekSlider_->maximum() > 0
+                ? int64_t(std::llround(seekSlider_->sliderPosition() * double(status.duration_us) /
+                                       seekSlider_->maximum()))
+                : std::clamp(status.seeking ? status.seek_target_us : status.position_us,
+                             int64_t{0}, status.duration_us);
         if (!seekSlider_->isSliderDown()) {
             const int range =
                 static_cast<int>(std::clamp<int64_t>(status.duration_us / 1000, 1, std::numeric_limits<int>::max()));
@@ -502,11 +457,47 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
         updatePlayButton();
     });
     connect(pauseButton_, &QPushButton::clicked, this, [this] { sendCommand(QStringLiteral("pause")); });
+    // 同一 seek 核心在暂停时也会呈现定位帧。拖动只提交最新落点，每150ms至多一次，
+    // 不临时切换播放状态、不累积过时请求；松手始终精确提交最终目标。
+    scrubPreviewTimer_ = new QTimer(this);
+    scrubPreviewTimer_->setSingleShot(true);
+    scrubPreviewTimer_->setInterval(150);
+    connect(scrubPreviewTimer_, &QTimer::timeout, this, [this] {
+        if (!seekSlider_->isSliderDown() || !scrubPreviewPending_)
+            return;
+        MaiFfplayPlaybackStatus status{};
+        if (playbackStatus(&status) && status.seeking) {
+            scrubPreviewTimer_->start();
+            return; // 只保留最新位置，不能不断打断尚未完成的云端读取/定位。
+        }
+        scrubPreviewPending_ = !seekPercent(scrubPreviewFraction_);
+        scrubPreviewTimer_->start();
+    });
+    connect(seekSlider_, &QSlider::sliderMoved, this, [this](int value) {
+        MaiFfplayPlaybackStatus status{};
+        if (seekSlider_->maximum() <= 0 || !playbackStatus(&status) || status.duration_us <= 0)
+            return;
+        scrubPreviewFraction_ = value / double(seekSlider_->maximum());
+        const auto seconds =
+            int64_t(std::llround(scrubPreviewFraction_ * status.duration_us)) / 1000000;
+        timeLabel_->setText(
+            QStringLiteral("%1:%2").arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0')));
+        scrubPreviewPending_ = true;
+        if (!scrubPreviewTimer_->isActive()) {
+            if (!status.seeking) {
+                scrubPreviewPending_ = !seekPercent(scrubPreviewFraction_);
+            }
+            scrubPreviewTimer_->start();
+        }
+    });
     connect(seekSlider_, &QSlider::sliderReleased, this, [this] {
-        if (seekSlider_->maximum() > 0) seekPercent(seekSlider_->sliderPosition() / double(seekSlider_->maximum()));
+        scrubPreviewTimer_->stop();
+        scrubPreviewPending_ = false;
+        if (seekSlider_->maximum() > 0)
+            seekPercent(seekSlider_->sliderPosition() / double(seekSlider_->maximum()));
     });
     connect(seekSlider_, &QSlider::actionTriggered, this, [this](int) {
-        // 键盘步进也进入同一精确 seek；鼠标拖动只在释放时提交最终落点。
+        // 键盘步进进入同一精确 seek；鼠标拖动由上方节流，释放时补最终落点。
         if (!seekSlider_->isSliderDown() && seekSlider_->maximum() > 0)
             seekPercent(seekSlider_->sliderPosition() / double(seekSlider_->maximum()));
     });
@@ -901,6 +892,7 @@ void MaiFfplayVideoDialog::applyMacFullscreenRequest() {
     resizingFrame_ = {};
     if (QWidget::mouseGrabber() == this) releaseMouse();
     updateControlLayout();
+    maiPrepareMacVideoWindowState(this, requestedFullscreen_);
     if (requestedFullscreen_) showFullScreen();
     else if (hasPendingWindowedState_ ? pendingWindowedMaximized_ : windowWasMaximized_) showMaximized();
     else showNormal();
@@ -925,6 +917,7 @@ void MaiFfplayVideoDialog::onMacFullscreenPhase(MaiMacFullscreenPhase phase) {
     // 等 Qt 的原生 delegate 也完成本次状态同步，再处理最后的排队意图。
     QMetaObject::invokeMethod(this, [this] {
         if (!isVisible() && !closeAfterFullscreen_) return;
+        maiPrepareMacVideoWindowState(this, requestedFullscreen_);
         applyMacFullscreenRequest();
         updateControlLayout();
         revealControls();
@@ -1089,6 +1082,12 @@ void MaiFfplayVideoDialog::setSize(void* userData, int width, int height) {
     QMetaObject::invokeMethod(
         dialog,
         [dialog, width, height, generation] {
+            // 首开现场只记录尺寸/状态，不记录媒体路径或内容；区分未执行尺寸准备与随后被放大。
+            if (!dialog->initialPresentationDone_ && generation == dialog->playbackOpenGeneration_)
+                qInfo() << "[video-window] initial-size" << QSize(width, height)
+                        << "current" << dialog->size() << "state" << dialog->windowState()
+                        << "prepared" << dialog->initialShowPending_ << "applied" << dialog->initialVideoSizeApplied_
+                        << "customized" << dialog->windowGeometryCustomized_;
             if (generation != dialog->playbackOpenGeneration_ || dialog->stopRequested_ || width <= 0 || height <= 0 ||
                 dialog->initialVideoSizeApplied_)
                 return;
@@ -1105,15 +1104,23 @@ void MaiFfplayVideoDialog::setSize(void* userData, int width, int height) {
             const QScreen* screen = dialog->screen();
             if (!screen) screen = QGuiApplication::primaryScreen();
             const QRect available = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 800);
-            // 各桌面端以同一逻辑尺寸上限打开普通窗口。大素材不能因屏幕/DPI
-            // 差异近似铺满桌面；小屏再按可用区域缩小，显式最大化/全屏意图仍由上方处理。
+            // Mac 首开按用户约定适配可用屏幕宽、高各 2/3 的范围，不再受 800x450
+            // 固定上限或素材像素大小限制。用户调整、最大化和全屏意图仍由上方闸门保留。
+#if defined(Q_OS_MACOS)
+            const QSize limit = available.size() * (2.0 / 3.0);
+#else
             const QSize limit = (available.size() * 0.75).boundedTo(QSize(960, 540));
+#endif
             // 用同一个比例因子满足普通素材的最小尺寸与屏幕上限，不分别拉宽/拉高源比例。
             // 极端长宽比受控件最小宽高约束时仍由 Presenter fit，绝不裁剪或变形内容。
+            const double maximumScale = std::min(double(limit.width()) / width, double(limit.height()) / height);
+#if defined(Q_OS_MACOS)
+            const double scale = maximumScale;
+#else
             const double minimumScale =
                 std::max(double(dialog->minimumWidth()) / width, double(dialog->minimumHeight()) / height);
-            const double maximumScale = std::min(double(limit.width()) / width, double(limit.height()) / height);
             const double scale = std::min(std::max(1.0, minimumScale), maximumScale);
+#endif
             const QSize size(qRound(width * scale), qRound(height * scale));
             const auto requestedState = dialog->windowState();
             // 隐藏期间排队的最大化/全屏意图保留；正常还原尺寸也先准备为源视频比例。
@@ -1322,6 +1329,13 @@ bool MaiFfplayVideoDialog::startPlayback() {
 }
 
 void MaiFfplayVideoDialog::stopPlayback(bool cancelCloudSource) {
+    if (scrubPreviewTimer_)
+        scrubPreviewTimer_->stop();
+    scrubPreviewPending_ = false;
+    if (seekSlider_) {
+        const QSignalBlocker blocked(seekSlider_);
+        seekSlider_->setSliderDown(false); // 关闭/换片不能把旧拖动的最终落点提交给下一部视频。
+    }
     initialShowPending_ = false;
     ++playbackOpenGeneration_;
     setBuffering(false);
@@ -1605,6 +1619,7 @@ bool MaiFfplayVideoDialog::prepareAndShow() {
 
 void MaiFfplayVideoDialog::finishPreparedShow() {
     if (!initialShowPending_ || !started_ || stopRequested_) return;
+    qInfo() << "[video-window] before-map" << size() << "state" << windowState();
 #if defined(Q_OS_MAC)
     if (initialOwnerMapping_) return;
     initialOwnerMapping_ = true;
@@ -1619,6 +1634,7 @@ void MaiFfplayVideoDialog::finishPreparedShow() {
     // independent HUDs hidden until show() has mapped the prepared owner;
     // otherwise they first appear against its old 480x270 native frame.
     show();
+    qInfo() << "[video-window] after-map" << size() << "state" << windowState();
 #if defined(Q_OS_MAC)
     // show() 才将隐藏期间的 Qt 尺寸同步到 Cocoa。首次返回事件循环前完成
     // 同一原生视口/内容层的布局事务，避免先显示旧 480x270 子层再铺满窗口。

@@ -6,6 +6,7 @@
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
 #include "MaiMobileAgent.h"
+#include "MaiResponsesFixture.h"
 #include "MaiMobileHostTools.h"
 #include "MaiImageFilter.h"
 #include "MaiSqliteStore.h"
@@ -471,11 +472,6 @@ static std::atomic<int> localSessionChanges{0};
 static void localSessionChanged(const char* sessionId) {
     if (sessionId != nullptr && std::strncmp(sessionId, "ses_", 4) == 0)
         ++localSessionChanges;
-}
-static std::string frame(const Json& delta, const char* finish = nullptr) {
-    Json choice = {
-        {"delta", delta}, {"index", 0}, {"finish_reason", finish ? Json(finish) : Json(nullptr)}};
-    return "data: " + Json{{"choices", Json::array({choice})}}.dump() + "\n\n";
 }
 
 struct ScreenCaptureProbe {
@@ -1267,27 +1263,27 @@ static void toolOutputRegistrationContract() {
     Fixture fixture;
     CHECK(!MaiFileSystem::createDirectories(fixture.root));
     const std::string database = fixture.root.toUtf8() + "/sessions.db";
-    fixture.server.Post("/chat/completions", [&](const httplib::Request& request,
+    fixture.server.Post("/responses", [&](const httplib::Request& request,
                                                  httplib::Response& response) {
         try {
             const Json body = Json::parse(request.body);
             for (const auto& tool : body.at("tools")) {
-                if (tool.at("function").at("name") == "tool_output_read") advertised = true;
+                if (tool.at("name") == "tool_output_read") advertised = true;
             }
             const int index = requests.fetch_add(1);
             if (index == 0) {
                 response.set_content(
-                    frame({{"tool_calls", Json::array({
-                        {{"index", 0}, {"id", "owned_mobile_read_call"}, {"type", "function"},
-                         {"function", {{"name", "tool_output_read"},
-                                       {"arguments", Json{{"output_id", outputId}}.dump()}}}}
-                    })}}, "tool_calls") + "data: [DONE]\n\n", "text/event-stream");
+                    MaiResponsesFixture::completed(Json::array({
+                        {{"type", "function_call"}, {"call_id", "owned_mobile_read_call"},
+                         {"name", "tool_output_read"},
+                         {"arguments", Json{{"output_id", outputId}}.dump()}}
+                    })), "text/event-stream");
                 return;
             }
-            for (const auto& message : body.at("messages")) {
-                if (message.value("role", "") != "tool" ||
-                    message.value("tool_call_id", "") != "owned_mobile_read_call") continue;
-                const Json result = Json::parse(message.at("content").get<std::string>(), nullptr, false);
+            for (const auto& message : body.at("input")) {
+                if (message.value("type", "") != "function_call_output" ||
+                    message.value("call_id", "") != "owned_mobile_read_call") continue;
+                const Json result = Json::parse(message.at("output").get<std::string>(), nullptr, false);
                 if (result.is_object() && result.value("output_id", "") == outputId &&
                     result.value("message_id", "") == messageId &&
                     result.value("part_id", "") == partId &&
@@ -1295,8 +1291,7 @@ static void toolOutputRegistrationContract() {
                     result.value("text", "") == expectedText &&
                     result.value("next_offset_bytes", 1) == 0) readBack = true;
             }
-            response.set_content(frame({{"content", "owned read complete"}}, "stop") +
-                                     "data: [DONE]\n\n", "text/event-stream");
+            response.set_content(MaiResponsesFixture::text("owned read complete"), "text/event-stream");
         } catch (...) {
             invalidRequest = true;
             response.status = 500;
@@ -1306,7 +1301,7 @@ static void toolOutputRegistrationContract() {
     const int port = fixture.server.bind_to_any_port("127.0.0.1");
     CHECK(port > 0);
     const Json config{{"op", "configure"}, {"model", "test"}, {"apiKey", "test-key"},
-                      {"wire", "chat_completions"}, {"policy", "never"},
+                      {"wire", "responses"}, {"policy", "never"},
                       {"baseUrl", "http://127.0.0.1:" + std::to_string(port)},
                       {"workspace", fixture.root.toUtf8()}, {"database", database}};
     const auto open = [&] {
@@ -1468,6 +1463,90 @@ static void sessionIMCabiContract() {
 
 // 消费正常 configure/send 发出的真实模型请求，只连接自有环回 SSE 端点。
 // 付费视频及图片生成暂停后不能向模型公开；本地免费图像处理和文件交付继续可用。
+static void fileCommandRequestContract() {
+    struct Fixture {
+        MaiFilePath root = MaiFileSystem::temporaryDirectory().append(
+            MaiFilePath::fromUtf8("mai-mobile-file-contract-" + MaiIdGenerator::newEventId()));
+        httplib::Server server;
+        std::thread listener;
+        void* agent = nullptr;
+        ~Fixture() {
+            maiMobileAgentDestroy(agent);
+            server.stop();
+            if (listener.joinable()) listener.join();
+            MaiFileSystem::removeRecursively(root);
+        }
+    };
+    std::atomic<int> requests{0};
+    std::atomic<bool> valid{false};
+    Fixture fixture;
+    fixture.server.Post("/responses", [&](const httplib::Request& request, httplib::Response& response) {
+        try {
+            const Json body = Json::parse(request.body);
+            int commands = 0, patches = 0, legacyFiles = 0;
+            bool processTools = false, inProcess = false;
+            for (const auto& tool : body.at("tools")) {
+                const auto name = tool.at("name").get<std::string>();
+                if (name.find("file_") == 0) ++legacyFiles;
+                if (name == "shell" || name == "write_stdin") processTools = true;
+                if (name == "apply_patch") ++patches;
+                if (name == "exec_command") {
+                    ++commands;
+                    const auto& properties = tool.at("parameters").at("properties");
+                    inProcess = tool.value("description", "").find("in-process") != std::string::npos &&
+                                !properties.contains("tty") && !properties.contains("shell") &&
+                                !properties.contains("login");
+                }
+            }
+            const auto instructions = body.at("instructions").get<std::string>();
+            valid = legacyFiles == 0 && !processTools && commands == 1 && patches == 1 && inProcess &&
+                    instructions.find("file_read") == std::string::npos &&
+                    instructions.find("file_glob") == std::string::npos &&
+                    instructions.find("file_grep") == std::string::npos &&
+                    instructions.find("file_edit") == std::string::npos &&
+                    instructions.find("OS permission alone does not mount external content") != std::string::npos;
+            std::fprintf(stderr, "OBSERVE mobile file contract: legacy=%d exec=%d patch=%d process=%d valid=%d\n",
+                         legacyFiles, commands, patches, processTools, valid.load());
+            ++requests;
+            response.set_content(MaiResponsesFixture::text("mobile file command catalog checked"), "text/event-stream");
+        } catch (...) {
+            response.status = 500;
+            response.set_content("mobile file command request shape mismatch", "text/plain");
+        }
+    });
+    CHECK(!MaiFileSystem::createDirectories(fixture.root));
+    const int port = fixture.server.bind_to_any_port("127.0.0.1");
+    CHECK(port > 0);
+    fixture.agent = maiMobileAgentCreate();
+    CHECK(fixture.agent);
+    CHECK(call(fixture.agent, {{"op", "configure"},
+                               {"model", "owned-model"},
+                               {"apiKey", "test-key"},
+                               {"wire", "responses"},
+                               {"policy", "never"},
+                               {"baseUrl", "http://127.0.0.1:" + std::to_string(port)},
+                               {"workspace", fixture.root.toUtf8()},
+                               {"database", fixture.root.toUtf8() + "/sessions.db"}})
+              .at("ok") == true);
+    const std::string session = call(fixture.agent, {{"op", "create"}}).at("id");
+    fixture.listener = std::thread([&] { fixture.server.listen_after_bind(); });
+    fixture.server.wait_until_ready();
+    CHECK(call(fixture.agent,
+               {{"op", "send"}, {"session", session}, {"text", "Inspect the mobile file command catalog."}})
+              .at("ok") == true);
+    bool finished = false;
+    for (int index = 0; index < 160; ++index) {
+        const auto snapshot = call(fixture.agent, {{"op", "snapshot"}, {"session", session}, {"force", true}});
+        if (!snapshot.at("busy").get<bool>()) {
+            finished = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    CHECK(finished && requests.load() == 1 && valid.load());
+    std::puts("PASS: Mobile requests expose only in-process exec_command and apply_patch for files");
+}
+
 static void paidMediaPausedRequestContract() {
     struct Fixture {
         MaiFilePath root = MaiFileSystem::temporaryDirectory().append(
@@ -1486,14 +1565,14 @@ static void paidMediaPausedRequestContract() {
     std::atomic<bool> valid{false};
     // Destroy the Agent/listener before the callback state they capture.
     Fixture fixture;
-    fixture.server.Post("/chat/completions", [&](const httplib::Request& request, httplib::Response& response) {
+    fixture.server.Post("/responses", [&](const httplib::Request& request, httplib::Response& response) {
         try {
             const Json body = Json::parse(request.body);
             bool wanVideo = false, wanImage = false, klingVideo = false, klingImage = false;
             bool miniMaxVideo = false, miniMaxImage = false, glmImage = false, seedreamImage = false;
             bool viewImage = false, localTransform = false, fileDelivery = false;
             for (const auto& tool : body.at("tools")) {
-                const auto name = tool.at("function").at("name").get<std::string>();
+                const auto name = tool.at("name").get<std::string>();
                 wanVideo |= name == "wan_video";
                 wanImage |= name == "wan_image";
                 klingVideo |= name == "kling_bailian_video";
@@ -1505,22 +1584,22 @@ static void paidMediaPausedRequestContract() {
                 viewImage |= name == "view_image";
                 localTransform |= name == "mobile_transform_image";
                 if (name == "agent_send_file") {
-                    const auto& schema = tool.at("function").at("parameters");
+                    const auto& schema = tool.at("parameters");
                     const auto& properties = schema.at("properties");
                     fileDelivery = properties.size() == 2 && properties.contains("file_path") &&
                                    properties.contains("caption") &&
                                    schema.at("required") == Json::array({"file_path"});
                 }
             }
-            const auto& system = body.at("messages").front();
-            const std::string prompt = system.at("content").get<std::string>();
+            CHECK(body.contains("input") && !body.contains("messages"));
+            const std::string prompt = body.at("instructions").get<std::string>();
             std::fprintf(stderr,
                          "OBSERVE owned catalog: wan_video=%d wan_image=%d kling_image=%d minimax_image=%d "
                          "glm_image=%d seedream_image=%d kling_video=%d minimax_video=%d view_image=%d "
                          "local_transform=%d agent_file=%d\n",
                          wanVideo, wanImage, klingImage, miniMaxImage, glmImage, seedreamImage, klingVideo,
                          miniMaxVideo, viewImage, localTransform, fileDelivery);
-            valid = system.at("role") == "system" && !wanVideo && !wanImage && !klingVideo && !miniMaxVideo &&
+            valid = !wanVideo && !wanImage && !klingVideo && !miniMaxVideo &&
                     !klingImage && !miniMaxImage && !glmImage && !seedreamImage && viewImage && localTransform &&
                     fileDelivery &&
                     prompt.find("Paid image and video generation is temporarily disabled to control costs.") !=
@@ -1530,7 +1609,7 @@ static void paidMediaPausedRequestContract() {
                     prompt.find("Do not submit, revise, retry, or substitute another paid media model") !=
                         std::string::npos;
             ++requests;
-            response.set_content(frame({{"content", "owned catalog verified"}}, "stop") + "data: [DONE]\n\n",
+            response.set_content(MaiResponsesFixture::text("owned catalog verified"),
                                  "text/event-stream");
         } catch (...) {
             response.status = 500;
@@ -1545,7 +1624,7 @@ static void paidMediaPausedRequestContract() {
     CHECK(call(fixture.agent, {{"op", "configure"},
                                {"model", "owned-model"},
                                {"apiKey", "test-key"},
-                               {"wire", "chat_completions"},
+                               {"wire", "responses"},
                                {"policy", "never"},
                                {"baseUrl", "http://127.0.0.1:" + std::to_string(port)},
                                {"workspace", fixture.root.toUtf8()},
@@ -1673,7 +1752,92 @@ static void importedHistoryDisplayContract() {
     MaiFileSystem::removeRecursively(directory);
 }
 
+// 环回模型通过正式 send 路径提供 usage；验证 snapshot 的真实字段与会话身份，
+// 不凭消息长度造计数，不把累计消费拿来当窗口占用，重开仍从同一持久事实读取。
+static void contextUsageSnapshotContract() {
+    struct Fixture {
+        MaiFilePath root = MaiFileSystem::temporaryDirectory().append(
+            MaiFilePath::fromUtf8("mai-mobile-usage-" + MaiIdGenerator::newEventId()));
+        httplib::Server server;
+        std::thread listener;
+        void* agent = nullptr;
+        ~Fixture() {
+            maiMobileAgentDestroy(agent);
+            server.stop();
+            if (listener.joinable()) listener.join();
+            MaiFileSystem::removeRecursively(root);
+        }
+    } fixture;
+    fixture.server.Post("/responses", [](const httplib::Request&, httplib::Response& response) {
+        response.set_content(MaiResponsesFixture::event({{"type", "response.completed"}, {"response", {
+            {"id", "owned-usage-response"}, {"status", "completed"},
+            {"output", Json::array({MaiResponsesFixture::message("owned measured result")})},
+            {"usage", {{"input_tokens", 111}, {"output_tokens", 22}, {"total_tokens", 133}}}}}}),
+            "text/event-stream");
+    });
+    CHECK(!MaiFileSystem::createDirectories(fixture.root));
+    const int port = fixture.server.bind_to_any_port("127.0.0.1");
+    CHECK(port > 0);
+    const Json configuration{{"op", "configure"}, {"model", "owned-model"}, {"apiKey", "test-key"},
+                             {"wire", "responses"}, {"policy", "never"},
+                             {"baseUrl", "http://127.0.0.1:" + std::to_string(port)},
+                             {"workspace", fixture.root.toUtf8()},
+                             {"database", fixture.root.toUtf8() + "/sessions.db"}};
+    fixture.agent = maiMobileAgentCreate();
+    CHECK(call(fixture.agent, configuration).at("ok") == true);
+    const std::string first = call(fixture.agent, {{"op", "create"}}).at("id");
+    auto snapshot = [&](const std::string& session) {
+        return call(fixture.agent, {{"op", "snapshot"}, {"session", session}, {"force", true}});
+    };
+    CHECK(snapshot(first).at("contextUsage").at("latest_sampling").at("total_tokens").is_null());
+    fixture.listener = std::thread([&] { fixture.server.listen_after_bind(); });
+    fixture.server.wait_until_ready();
+    for (int turn = 1; turn <= 2; ++turn) {
+        CHECK(call(fixture.agent, {{"op", "send"}, {"session", first}, {"text", "owned usage input"}}).at("ok") == true);
+        Json finished;
+        for (int retry = 0; retry < 200; ++retry) {
+            finished = snapshot(first);
+            if (!finished.at("busy").get<bool>()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        CHECK(finished.at("busy") == false);
+        const auto& usage = finished.at("contextUsage");
+        CHECK(usage.at("session_id") == first && usage.at("sampling_valid") == true);
+        CHECK(usage.at("latest_sampling").at("input_tokens") == 111);
+        CHECK(usage.at("latest_sampling").at("output_tokens") == 22);
+        CHECK(usage.at("latest_sampling").at("total_tokens") == 133);
+        CHECK(usage.at("latest_sampling").at("total_tokens_source") == "provider");
+        CHECK(usage.at("latest_sampling").at("cached_input_tokens").is_null());
+        CHECK(usage.at("latest_sampling").at("cached_input_tokens_source") == "missing");
+        CHECK(usage.at("latest_sampling").at("blended_total_tokens") == 133);
+        CHECK(usage.at("latest_sampling").at("blended_total_tokens_source") == "derived");
+        CHECK(usage.at("turn_token_usage").at("total_tokens") == 133);
+        CHECK(usage.at("thread_token_usage").at("total_tokens") == turn * 133);
+        CHECK(usage.at("window_tokens") == 0 && usage.at("window_source") == "missing");
+        CHECK(usage.at("remaining_percent").is_null());
+        CHECK(call(fixture.agent, {{"op", "remote_snapshot"}, {"session", first}}).at("contextUsage") == usage);
+    }
+    const std::string second = call(fixture.agent, {{"op", "create"}}).at("id");
+    CHECK(snapshot(second).at("contextUsage").at("session_id") == second);
+    CHECK(snapshot(second).at("contextUsage").at("latest_sampling").at("total_tokens").is_null());
+    maiMobileAgentDestroy(fixture.agent);
+    fixture.agent = maiMobileAgentCreate();
+    CHECK(call(fixture.agent, configuration).at("ok") == true);
+    CHECK(snapshot(first).at("contextUsage").at("thread_token_usage").at("total_tokens") == 266);
+    CHECK(snapshot(first).at("contextUsage").at("latest_sampling").at("total_tokens") == 133);
+    std::puts("PASS: Mobile usage snapshot preserves measured provenance, unknown window, totals and session ownership");
+}
+
 int main(int argc, char** argv) {
+    const bool usageOnly = argc == 2 && std::strcmp(argv[1], "--context-usage-only") == 0;
+    if (argc == 1 || usageOnly) {
+        try { contextUsageSnapshotContract(); }
+        catch (const std::exception& error) {
+            std::fprintf(stderr, "FAIL: Mobile context usage snapshot: %s\n", error.what());
+            return 1;
+        }
+        if (usageOnly) return 0;
+    }
     const bool historyDisplayOnly = argc == 2 && std::strcmp(argv[1], "--history-display-only") == 0;
     if (argc == 1 || historyDisplayOnly) {
         try { importedHistoryDisplayContract(); }
@@ -1723,6 +1887,16 @@ int main(int argc, char** argv) {
         if (outputOnly) return 0;
     }
     const bool captureOnly = argc == 2 && std::strcmp(argv[1], "--capture-contract-only") == 0;
+    const bool fileCommandsOnly = argc == 2 && std::strcmp(argv[1], "--file-command-contract-only") == 0;
+    if (argc == 1 || fileCommandsOnly) {
+        try {
+            fileCommandRequestContract();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "FAIL: Mobile file command request contract: %s\n", error.what());
+            return 1;
+        }
+        if (fileCommandsOnly) return 0;
+    }
     const bool cameraOnly = argc == 2 && std::strcmp(argv[1], "--camera-routing-contract-only") == 0;
     const bool detailOnly = argc == 2 && std::strcmp(argv[1], "--tool-detail-contract-only") == 0;
     const bool bindingOnly = argc == 2 && std::strcmp(argv[1], "--tool-detail-binding-contract-only") == 0;
@@ -1730,7 +1904,7 @@ int main(int argc, char** argv) {
     if (argc != 1 && !captureOnly && !cameraOnly && !detailOnly && !bindingOnly && !callIdOnly) {
         std::fputs(
             "usage: MaiMobileAgentTests "
-            "[--capture-contract-only|--camera-routing-contract-only|--tool-detail-contract-only|"
+            "[--file-command-contract-only|--capture-contract-only|--camera-routing-contract-only|--tool-detail-contract-only|"
             "--tool-detail-binding-contract-only|--tool-detail-call-id-contract-only|"
             "--tool-output-registration-only|--message-history-host-only]\n",
             stderr);
@@ -1825,18 +1999,18 @@ int main(int argc, char** argv) {
     std::atomic<bool> sawSteeringInput{false};
     // 本地假模型端点核对 Agent 发出的请求体，并返回可控的流式事件。
     // 测试只连环回地址，不会向真实模型供应商提交任务。
-    server.Post("/chat/completions", [&](const httplib::Request& request, httplib::Response& response) {
+    server.Post("/responses", [&](const httplib::Request& request, httplib::Response& response) {
         const Json body = Json::parse(request.body);
         CHECK(request.get_header_value("Authorization") == "Bearer test-key");
-        CHECK(body["messages"].front()["role"] == "system");
-        CHECK(body["messages"].front()["content"].get<std::string>().find(
-                  "GitHub-Flavored Markdown") != std::string::npos);
-        const std::string instructions = body["messages"].front()["content"].get<std::string>();
+        CHECK(body.contains("input") && !body.contains("messages"));
+        const std::string instructions = body.at("instructions").get<std::string>();
+        CHECK(instructions.find("GitHub-Flavored Markdown") != std::string::npos);
         CHECK(instructions.find("Seedance") == std::string::npos);
         CHECK(instructions.find("Seedream") == std::string::npos);
         CHECK(instructions.find("ark_assets") == std::string::npos);
-        // 移动端不能向模型宣称可以执行桌面 shell。
-        bool hasCreateFile = false, hasCreateDirectory = false, hasDeleteFile = false, hasViewImage = false,
+        // 移动端统一使用共享进程内命令和补丁入口，不再公开旧文件工具或系统进程能力。
+        bool hasInProcessCommands = false;
+        bool hasApplyPatch = false, hasViewImage = false,
              hasMaiChatContacts = false, hasMaiChatRequestFriend = false, hasMaiChatNickname = false,
              hasMaiChatSend = false, hasMaiChatBroadcast = false, hasGeneratePdf = false, hasMobilePhotos = false,
              hasMobileAlbums = false, hasMobilePhotoRead = false, hasMobilePhotoOriginal = false,
@@ -1852,75 +2026,79 @@ int main(int argc, char** argv) {
              hasScreenShareStart = false, hasScreenShareStop = false,
              hasScreenCapture = false;
         for (const auto& tool : body["tools"]) {
-            CHECK(tool["function"]["name"] != "shell");
-            if (tool["function"]["name"] == "file_create") hasCreateFile = true;
-            if (tool["function"]["name"] == "file_create_directory") hasCreateDirectory = true;
-            if (tool["function"]["name"] == "file_delete") hasDeleteFile = true;
-            if (tool["function"]["name"] == "session_list") hasSessionList = true;
-            if (tool["function"]["name"] == "session_create") hasSessionCreate = true;
-            if (tool["function"]["name"] == "session_delete") hasSessionDelete = true;
-            if (tool["function"]["name"] == "session_set_workspace") hasLocalSessionWorkspace = true;
-            if (tool["function"]["name"] == "maichat_remote_session_list") hasRemoteSessionList = true;
-            if (tool["function"]["name"] == "maichat_remote_session_create") hasRemoteSessionCreate = true;
-            if (tool["function"]["name"] == "maichat_remote_session_delete") {
+            CHECK(tool.at("name").get<std::string>().find("file_") != 0);
+            CHECK(tool["name"] != "shell");
+            CHECK(tool["name"] != "write_stdin");
+            if (tool["name"] == "exec_command") {
+                hasInProcessCommands = true;
+                CHECK(tool.value("description", "").find("in-process") != std::string::npos);
+                CHECK(!tool["parameters"]["properties"].contains("tty"));
+            }
+            if (tool["name"] == "apply_patch") hasApplyPatch = true;
+            if (tool["name"] == "session_list") hasSessionList = true;
+            if (tool["name"] == "session_create") hasSessionCreate = true;
+            if (tool["name"] == "session_delete") hasSessionDelete = true;
+            if (tool["name"] == "session_set_workspace") hasLocalSessionWorkspace = true;
+            if (tool["name"] == "maichat_remote_session_list") hasRemoteSessionList = true;
+            if (tool["name"] == "maichat_remote_session_create") hasRemoteSessionCreate = true;
+            if (tool["name"] == "maichat_remote_session_delete") {
                 hasRemoteSessionDelete = true;
-                const auto& schema = tool["function"]["parameters"];
+                const auto& schema = tool["parameters"];
                 CHECK(schema["required"] == Json::array({"device_slot", "session_id"}));
             }
-            if (tool["function"]["name"] == "maichat_remote_session_set_workspace") {
+            if (tool["name"] == "maichat_remote_session_set_workspace") {
                 hasRemoteSessionWorkspace = true;
-                const auto& schema = tool["function"]["parameters"];
+                const auto& schema = tool["parameters"];
                 CHECK(schema["required"] ==
                       Json::array({"device_slot", "session_id", "workspace_path"}));
             }
-            if (tool["function"]["name"] == "mobile_browser") hasMobileBrowser = true;
-            if (tool["function"]["name"] == "mobile_start_screen_share") hasScreenShareStart = true;
-            if (tool["function"]["name"] == "mobile_stop_screen_share") hasScreenShareStop = true;
-            if (tool["function"]["name"] == "mobile_capture_screen") hasScreenCapture = true;
-            if (tool["function"]["name"] == "view_image") hasViewImage = true;
-            if (tool["function"]["name"] == "generate_pdf") hasGeneratePdf = true;
-            if (tool["function"]["name"] == "maichat_list_contacts") hasMaiChatContacts = true;
-            if (tool["function"]["name"] == "maichat_request_friend") hasMaiChatRequestFriend = true;
-            if (tool["function"]["name"] == "maichat_set_nickname") hasMaiChatNickname = true;
-            if (tool["function"]["name"] == "maichat_send_text") hasMaiChatSend = true;
-            if (tool["function"]["name"] == "maichat_send_media") hasMaiChatMedia = true;
-            if (tool["function"]["name"] == "agent_send_media") hasAgentMedia = true;
-            if (tool["function"]["name"] == "seedance_video") hasSeedance = true;
-            if (tool["function"]["name"] == "seedream_image") hasSeedream = true;
-            if (tool["function"]["name"] == "ark_assets") hasArkAssets = true;
-            if (tool["function"]["name"] == "curl") hasDownloadFile = true;
-            if (tool["function"]["name"] == "maichat_broadcast_text")
+            if (tool["name"] == "mobile_browser") hasMobileBrowser = true;
+            if (tool["name"] == "mobile_start_screen_share") hasScreenShareStart = true;
+            if (tool["name"] == "mobile_stop_screen_share") hasScreenShareStop = true;
+            if (tool["name"] == "mobile_capture_screen") hasScreenCapture = true;
+            if (tool["name"] == "view_image") hasViewImage = true;
+            if (tool["name"] == "generate_pdf") hasGeneratePdf = true;
+            if (tool["name"] == "maichat_list_contacts") hasMaiChatContacts = true;
+            if (tool["name"] == "maichat_request_friend") hasMaiChatRequestFriend = true;
+            if (tool["name"] == "maichat_set_nickname") hasMaiChatNickname = true;
+            if (tool["name"] == "maichat_send_text") hasMaiChatSend = true;
+            if (tool["name"] == "maichat_send_media") hasMaiChatMedia = true;
+            if (tool["name"] == "agent_send_media") hasAgentMedia = true;
+            if (tool["name"] == "seedance_video") hasSeedance = true;
+            if (tool["name"] == "seedream_image") hasSeedream = true;
+            if (tool["name"] == "ark_assets") hasArkAssets = true;
+            if (tool["name"] == "curl") hasDownloadFile = true;
+            if (tool["name"] == "maichat_broadcast_text")
                 hasMaiChatBroadcast = true;
-            if (tool["function"]["name"] == "mobile_list_photos") hasMobilePhotos = true;
-            if (tool["function"]["name"] == "mobile_take_photo") hasCamera = true;
-            if (tool["function"]["name"] == "mobile_play_local_music") hasLocalMusic = true;
-            if (tool["function"]["name"] == "mobile_list_albums") hasMobileAlbums = true;
-            if (tool["function"]["name"] == "mobile_read_photo") hasMobilePhotoRead = true;
-            if (tool["function"]["name"] == "mobile_export_photo_original")
+            if (tool["name"] == "mobile_list_photos") hasMobilePhotos = true;
+            if (tool["name"] == "mobile_take_photo") hasCamera = true;
+            if (tool["name"] == "mobile_play_local_music") hasLocalMusic = true;
+            if (tool["name"] == "mobile_list_albums") hasMobileAlbums = true;
+            if (tool["name"] == "mobile_read_photo") hasMobilePhotoRead = true;
+            if (tool["name"] == "mobile_export_photo_original")
                 hasMobilePhotoOriginal = true;
-            if (tool["function"]["name"] == "mobile_export_media_original")
+            if (tool["name"] == "mobile_export_media_original")
                 hasMobileMediaOriginal = true;
-            if (tool["function"]["name"] == "mobile_save_image") hasMobilePhotoSave = true;
-            if (tool["function"]["name"] == "mobile_transform_image")
+            if (tool["name"] == "mobile_save_image") hasMobilePhotoSave = true;
+            if (tool["name"] == "mobile_transform_image")
                 hasMobileTransform = true;
-            if (tool["function"]["name"] == "mobile_beautify_image")
+            if (tool["name"] == "mobile_beautify_image")
                 hasMobileBeautify = true;
-            if (tool["function"]["name"] == "ffprobe") hasFfprobe = true;
-            if (tool["function"]["name"] == "mobile_detect_faces") hasFaceDetection = true;
-            if (tool["function"]["name"] == "mobile_segment_person") hasPersonSegmentation = true;
-            if (tool["function"]["name"] == "mobile_preview_image") hasMobilePreview = true;
-            if (tool["function"]["name"] == "mobile_request_permission")
+            if (tool["name"] == "ffprobe") hasFfprobe = true;
+            if (tool["name"] == "mobile_detect_faces") hasFaceDetection = true;
+            if (tool["name"] == "mobile_segment_person") hasPersonSegmentation = true;
+            if (tool["name"] == "mobile_preview_image") hasMobilePreview = true;
+            if (tool["name"] == "mobile_request_permission")
                 hasPermissionRequest = true;
-            if (tool["function"]["name"] == "mobile_get_location") hasLocation = true;
-            if (tool["function"]["name"] == "cv_scene_detect") hasSceneDetect = true;
-            if (tool["function"]["name"] == "cv_motion_detect") hasMotionDetect = true;
-            if (tool["function"]["name"] == "cv_video_matting") hasVideoMatting = true;
-            if (kPhotoAlbumTool != nullptr && tool["function"]["name"] == kPhotoAlbumTool)
+            if (tool["name"] == "mobile_get_location") hasLocation = true;
+            if (tool["name"] == "cv_scene_detect") hasSceneDetect = true;
+            if (tool["name"] == "cv_motion_detect") hasMotionDetect = true;
+            if (tool["name"] == "cv_video_matting") hasVideoMatting = true;
+            if (kPhotoAlbumTool != nullptr && tool["name"] == kPhotoAlbumTool)
                 hasMobilePhotoAlbumWrite = true;
         }
-        CHECK(hasCreateFile);
-        CHECK(hasCreateDirectory);
-        CHECK(hasDeleteFile);
+        CHECK(hasInProcessCommands);
+        CHECK(hasApplyPatch);
         CHECK(hasSessionList && hasSessionCreate && hasSessionDelete);
         CHECK(!hasLocalSessionWorkspace);
         CHECK(hasRemoteSessionList && hasRemoteSessionCreate && hasRemoteSessionDelete);
@@ -1964,16 +2142,12 @@ int main(int argc, char** argv) {
         CHECK(hasMotionDetect);
         CHECK(hasVideoMatting);
         if (kPhotoAlbumTool != nullptr) CHECK(hasMobilePhotoAlbumWrite);
-        const auto& last = body["messages"].back();
-        std::string input;
-        if (last["content"].is_string()) {
-            input = last["content"].get<std::string>();
-        } else if (last["content"].is_array()) {
-            for (const auto& part : last["content"]) {
-                if (part.value("type", "") == "text") input = part.value("text", "");
-                if (part.value("type", "") == "image_url")
-                    CHECK(part["image_url"].value("url", "") == "data:image/png;base64,iVBORw==");
-            }
+        const auto& last = body["input"].back();
+        const std::string input = MaiResponsesFixture::inputText(last);
+        if (last.contains("content") && last.at("content").is_array()) {
+            for (const auto& part : last.at("content"))
+                if (part.value("type", "") == "input_image")
+                    CHECK(part.value("image_url", "") == "data:image/png;base64,iVBORw==");
         }
         if (input == "error") {
             response.status = 429;
@@ -1981,102 +2155,89 @@ int main(int argc, char** argv) {
             return;
         }
         if (input == "steer-adjustment") sawSteeringInput = true;
-        if (input == "file_write") {
+        if (input == "patch-write") {
             Json invocation = {
-                {"index", 0},
-                {"id", "call_write"},
-                {"type", "function"},
-                {"function",
-                 {{"name", "file_write"},
-                  {"arguments", "{\"path\":\"result.txt\",\"content\":\"saved\"}"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({invocation})}}, "tool_calls") +
-                                     "data: [DONE]\n\n",
+                {"call_id", "call_write"},
+                {"type", "function_call"},
+                {"name", "apply_patch"},
+                {"arguments",
+                 Json{{"patch", "*** Begin Patch\n*** Add File: result.txt\n+saved\n*** End Patch"}}.dump()}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({invocation})),
                                  "text/event-stream");
             return;
         }
         if (input == "read-app-sibling") {
-            Json invocation = {
-                {"index", 0}, {"id", "call_read_sibling"}, {"type", "function"},
-                {"function", {{"name", "file_read"},
-                              {"arguments", "{\"path\":\"../shared.txt\"}"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({invocation})}}, "tool_calls") +
-                                     "data: [DONE]\n\n", "text/event-stream");
+            Json invocation = {{"call_id", "call_read_sibling"},
+                               {"type", "function_call"},
+                               {"name", "exec_command"},
+                               {"arguments", Json{{"cmd", "cat ../shared.txt"}}.dump()}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({invocation})), "text/event-stream");
             return;
         }
         if (input == "read-legacy") {
-            Json invocation = {
-                {"index", 0}, {"id", "call_read_legacy"}, {"type", "function"},
-                {"function", {{"name", "file_read"},
-                              {"arguments", "{\"path\":\"legacy.txt\",\"encoding\":\"gb18030\"}"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({invocation})}}, "tool_calls") +
-                                     "data: [DONE]\n\n", "text/event-stream");
+            Json invocation = {{"call_id", "call_read_legacy"},
+                               {"type", "function_call"},
+                               {"name", "exec_command"},
+                               {"arguments", Json{{"cmd", "read-text --encoding gb18030 legacy.txt"}}.dump()}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({invocation})), "text/event-stream");
             return;
         }
         if (input == "host-send") {
             Json invocation = {
-                {"index", 0},
-                {"id", "call_host_send"},
-                {"type", "function"},
-                {"function",
-                 {{"name", "maichat_send_text"},
-                  {"arguments", "{\"peer_id\":\"alice\",\"text\":\"hello\"}"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({invocation})}}, "tool_calls") +
-                                     "data: [DONE]\n\n",
+                {"call_id", "call_host_send"},
+                {"type", "function_call"},
+                {"name", "maichat_send_text"},
+                  {"arguments", "{\"peer_id\":\"alice\",\"text\":\"hello\"}"}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({invocation})),
                                  "text/event-stream");
             return;
         }
         if (input == "camera-open") {
             Json invocation = {
-                {"index", 0}, {"id", "call_camera_open"}, {"type", "function"},
-                {"function", {{"name", kCameraTool}, {"arguments", kCameraArguments}}}};
-            response.set_content(frame({{"tool_calls", Json::array({invocation})}}, "tool_calls") +
-                                     "data: [DONE]\n\n",
+                {"call_id", "call_camera_open"}, {"type", "function_call"},
+                {"name", kCameraTool}, {"arguments", kCameraArguments}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({invocation})),
                                  "text/event-stream");
             return;
         }
         if (input == "music-open") {
             Json invocation = {
-                {"index", 0}, {"id", "call_music_open"}, {"type", "function"},
-                {"function", {{"name", "mobile_play_local_music"}, {"arguments", "{}"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({invocation})}}, "tool_calls") +
-                                     "data: [DONE]\n\n",
+                {"call_id", "call_music_open"}, {"type", "function_call"},
+                {"name", "mobile_play_local_music"}, {"arguments", "{}"}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({invocation})),
                                  "text/event-stream");
             return;
         }
         if (input == "photo-add") {
             Json invocation = {
-                {"index", 0}, {"id", "call_photo_add"}, {"type", "function"},
-                 {"function", {{"name", kPhotoAlbumTool == nullptr ? "unused" : kPhotoAlbumTool},
-                              {"arguments", "{\"album_name\":\"Trip\",\"photo_ids\":[\"one\"]}"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({invocation})}}, "tool_calls") +
-                                     "data: [DONE]\n\n", "text/event-stream");
+                {"call_id", "call_photo_add"}, {"type", "function_call"},
+                 {"name", kPhotoAlbumTool == nullptr ? "unused" : kPhotoAlbumTool},
+                              {"arguments", "{\"album_name\":\"Trip\",\"photo_ids\":[\"one\"]}"}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({invocation})), "text/event-stream");
             return;
         }
         if (input == "photo-save") {
             Json invocation = {
-                {"index", 0}, {"id", "call_photo_save"}, {"type", "function"},
-                {"function", {{"name", "mobile_save_image"},
-                              {"arguments", "{\"path\":\"created.png\"}"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({invocation})}}, "tool_calls") +
-                                     "data: [DONE]\n\n", "text/event-stream");
+                {"call_id", "call_photo_save"}, {"type", "function_call"},
+                {"name", "mobile_save_image"},
+                              {"arguments", "{\"path\":\"created.png\"}"}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({invocation})), "text/event-stream");
             return;
         }
         if (input == "photo-transform") {
             Json invocation = {
-                {"index", 0}, {"id", "call_photo_transform"}, {"type", "function"},
-                {"function", {{"name", "mobile_transform_image"},
-                              {"arguments", "{\"path\":\"photo.jpg\",\"operation\":\"beautify\"}"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({invocation})}}, "tool_calls") +
-                                     "data: [DONE]\n\n", "text/event-stream");
+                {"call_id", "call_photo_transform"}, {"type", "function_call"},
+                {"name", "mobile_transform_image"},
+                              {"arguments", "{\"path\":\"photo.jpg\",\"operation\":\"beautify\"}"}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({invocation})), "text/event-stream");
             return;
         }
         if (input == "photo-preview") {
             Json invocation = {
-                {"index", 0}, {"id", "call_photo_preview"}, {"type", "function"},
-                {"function", {{"name", "mobile_preview_image"},
-                              {"arguments", "{\"path\":\"created.png\"}"}}}};
-            response.set_content(frame({{"tool_calls", Json::array({invocation})}}, "tool_calls") +
-                                     "data: [DONE]\n\n", "text/event-stream");
+                {"call_id", "call_photo_preview"}, {"type", "function_call"},
+                {"name", "mobile_preview_image"},
+                              {"arguments", "{\"path\":\"created.png\"}"}};
+            response.set_content(MaiResponsesFixture::completed(Json::array({invocation})), "text/event-stream");
             return;
         }
         const bool slow = input == "stop";
@@ -2084,11 +2245,18 @@ int main(int argc, char** argv) {
             "text/event-stream", [slow, step = 0](size_t, httplib::DataSink& sink) mutable {
                 std::string text;
                 if (step == 0)
-                    text = frame({{"reasoning_content", "draft"}});
+                    text = MaiResponsesFixture::event({{"type", "response.reasoning_summary_text.delta"},
+                        {"output_index", 0}, {"summary_index", 0}, {"delta", "draft"}});
                 else if (step == 1)
-                    text = frame({{"content", "hello "}});
+                    text = MaiResponsesFixture::event({{"type", "response.output_text.delta"},
+                        {"output_index", 1}, {"content_index", 0}, {"delta", "hello "}});
                 else {
-                    text = frame({{"content", "world"}}, "stop") + "data: [DONE]\n\n";
+                    text = MaiResponsesFixture::event({{"type", "response.output_text.delta"},
+                        {"output_index", 1}, {"content_index", 0}, {"delta", "world"}}) +
+                        MaiResponsesFixture::completed(Json::array({
+                            {{"type", "reasoning"}, {"summary", Json::array({
+                                {{"type", "summary_text"}, {"text", "draft"}}})}},
+                            MaiResponsesFixture::message("hello world")}));
                 }
                 if (!sink.write(text.data(), text.size())) return false;
                 if (step++ >= 2) {
@@ -2161,6 +2329,14 @@ int main(int argc, char** argv) {
             }
             throw std::runtime_error("timed out waiting for native state: " +
                                      last.value("error", std::string{}));
+        };
+        const auto approveFileCommand = [&] {
+            const auto pending = wait([](const Json& state) { return !state["permissions"].empty(); });
+            CHECK(pending["permissions"][0]["tool"] == "exec_command");
+            CHECK(pending["permissions"][0]["allowForSession"] == false);
+            CHECK(call(agent, {{"op", "permission"},
+                               {"id", pending["permissions"][0]["id"]},
+                               {"decision", "approved"}})["ok"] == true);
         };
         CHECK(call(agent, {{"op", "send"}, {"session", session}, {"text", "host-send"}})["ok"] ==
               true);
@@ -2294,20 +2470,23 @@ int main(int argc, char** argv) {
                                         "app sibling content"));
         CHECK(call(agent, { {"op", "send"}, {"session", session},
                             {"text", "read-app-sibling"} })["ok"] == true);
+        approveFileCommand();
         const auto sibling = wait([](const Json& s) { return s["busy"] == false; });
         CHECK(sibling.dump().find("app sibling content") != std::string::npos);
 
         CHECK(!MaiFileSystem::writeFile(MaiFilePath::fromUtf8(movedWorkspace + "/legacy.txt"),
                                         std::string("\xC4\xE3\xBA\xC3", 4)));
         CHECK(call(agent, {{"op", "send"}, {"session", session}, {"text", "read-legacy"}})["ok"] == true);
+        approveFileCommand();
         const auto decoded = wait([](const Json& s) { return s["busy"] == false; });
         CHECK(decoded.dump().find("\u4f60\u597d") != std::string::npos);
         CHECK(hostProbe.lastTool == "mobile_decode_text");
         CHECK(Json::parse(hostProbe.lastArguments).value("encoding", "") == "gb18030");
         CHECK(Json::parse(hostProbe.lastArguments).value("base64", "") == "xOO6ww==");
 
-        CHECK(call(agent, {{"op", "send"}, {"session", session}, {"text", "file_write"}})["ok"] == true);
+        CHECK(call(agent, {{"op", "send"}, {"session", session}, {"text", "patch-write"}})["ok"] == true);
         auto pending = wait([](const Json& s) { return !s["permissions"].empty(); });
+        CHECK(pending["permissions"][0]["tool"] == "apply_patch");
         std::string permission = pending["permissions"][0]["id"];
         CHECK(!MaiFileSystem::exists(MaiFilePath::fromUtf8(movedWorkspace + "/result.txt")));
         CHECK(call(agent,
@@ -2319,6 +2498,9 @@ int main(int argc, char** argv) {
               true);
         wait([](const Json& s) { return s["busy"] == false; });
         CHECK(MaiFileSystem::exists(MaiFilePath::fromUtf8(movedWorkspace + "/result.txt")));
+        std::string patchedContent;
+        CHECK(!MaiFileSystem::readFile(MaiFilePath::fromUtf8(movedWorkspace + "/result.txt"), patchedContent));
+        CHECK(patchedContent == "saved\n");
         CHECK(call(agent, {{"op", "send"}, {"session", session}, {"text", "stop"}})["ok"] == true);
         wait([](const Json& s) {
             return s["busy"] == true && !s["messages"].back()["parts"].empty();

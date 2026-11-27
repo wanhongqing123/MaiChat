@@ -1,5 +1,5 @@
-// Opt-in product-chain acceptance: ordinary Controller and registry tool share
-// one real NativeSession. Only this process's receiver/workspace is inspected.
+// 自有 fixture 通过普通控制器和事件 DTO 编解码器共用原生输入会话。
+// 只检查本进程接收窗口与工作目录，不把高级指针能力暴露为模型方法。
 #include <QApplication>
 #include <QCloseEvent>
 #include <QDir>
@@ -29,6 +29,7 @@
 #include <windowsx.h>
 
 #include "MaiChatTools/DesktopComputerTools.h"
+#include "MaiChatTools/DesktopComputerInputProtocol.h"
 #include "MaiTool.h"
 
 namespace {
@@ -208,7 +209,7 @@ private:
             RECT area{};
             GetClientRect(value, &area);
             FillRect(dc, &area, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
-            DrawTextW(dc, L"Owned Controller / model-tool Pen acceptance", -1, &area, DT_CENTER | DT_TOP);
+            DrawTextW(dc, L"Owned Controller / encoded ordinary Pen acceptance", -1, &area, DT_CENTER | DT_TOP);
             EndPaint(value, &paint);
             return 0;
         }
@@ -221,8 +222,6 @@ class Fixture {
 public:
     explicit Fixture(QString directory)
         : directory_(std::move(directory)), controller_(std::make_shared<DesktopComputerController>()) {
-        registerDesktopComputerTools(registry_, controller_);
-        tool_ = registry_.findForModel("desktop_computer");
         context_.sessionId = "owned-pen-session-" + std::to_string(GetCurrentProcessId());
         context_.turnId = "owned-pen-turn-" + std::to_string(GetCurrentProcessId());
         context_.root = workspace_.path().toUtf8().toStdString();
@@ -236,7 +235,7 @@ public:
     bool prepare() {
         receiver_.move(170, 130);
         receiver_.show();
-        if (!workspace_.isValid() || !tool_ || !receiver_.createSurface())
+        if (!workspace_.isValid() || !receiver_.createSurface())
             return precondition("owned_fixture_unavailable");
         SetWindowPos(receiver_.root(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
         SetForegroundWindow(receiver_.root());
@@ -272,7 +271,7 @@ public:
             position.yRatio = .45;
             if (!ordinary(position, "owned_mouse_positioning")) return;
         }
-        if (!observe(true, "tool_observe_before_ctrl")) return;
+        if (!observe(true, "codec_observe_before_ctrl")) return;
         auto control = action("key_down");
         control.key = "Ctrl";
         if (!ordinary(control, "ordinary_ctrl_down")) return;
@@ -280,7 +279,7 @@ public:
         primaryBegin_ = receiver_.raw.size();
         auto hover = pen(Phase::Hover);
         hover.pressureOrDistance = .25F;
-        if (!batch(hover, true, false, "tool_hover")) return;
+        if (!batch(hover, true, false, "codec_hover")) return;
         if (!observe(false, "ordinary_observe_before_down")) return;
         auto down = pen(Phase::Down);
         if (!batch(down, false, false, "ordinary_down")) return;
@@ -288,7 +287,7 @@ public:
         receiver_.phase = "hold_before_observe";
         dispatchFor(450);
         const auto beforeObserveUps = count(WM_POINTERUP, primaryBegin_);
-        if (!observe(true, "tool_mid_hold_observe")) return;
+        if (!observe(true, "codec_mid_hold_observe")) return;
         const auto held = controller_->inputState(context_.sessionId);
         check("observe_keeps_pen_and_ctrl_owned", held.penActive && !held.keysDown.empty());
         check("observe_does_not_emit_pen_up", count(WM_POINTERUP, primaryBegin_) == beforeObserveUps);
@@ -302,7 +301,7 @@ public:
         move.pressureOrDistance = .75F;
         move.tilt = 45;
         move.rotation = 90;
-        if (!batch(move, true, false, "tool_move")) return;
+        if (!batch(move, true, false, "codec_move")) return;
         for (const auto bits : {1, 3, 2}) {
             if (!observe(bits != 3, ("observe_before_buttons_" + std::to_string(bits)).c_str())) return;
             auto button = pen(Phase::ButtonOnly);
@@ -316,7 +315,7 @@ public:
         auto noButtons = pen(Phase::ButtonOnly);
         noButtons.toolType = 0;
         const auto noButtonsBegin = receiver_.raw.size();
-        if (!batch(noButtons, true, true, "tool_buttons_zero_without_token")) return;
+        if (!batch(noButtons, true, true, "codec_buttons_zero_without_token")) return;
         dispatchFor(40);
         check("barrel_zero_releases_with_cached_position", hasBarrel(noButtonsBegin, false));
         plannedUp_ = GetTickCount64();
@@ -330,28 +329,28 @@ public:
                          !(event.pen.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT);
               }));
         const auto leaveBegin = receiver_.raw.size();
-        if (!batch(pen(Phase::HoverLeave), true, true, "tool_leave_without_token")) return;
+        if (!batch(pen(Phase::HoverLeave), true, true, "codec_leave_without_token")) return;
         dispatchFor(80);
         check("leave_has_native_exit_and_no_hover_state",
               count(WM_POINTERLEAVE, leaveBegin) > 0 && !controller_->inputState(context_.sessionId).penActive);
         primaryEnd_ = receiver_.raw.size();
         checkPrimary();
         const auto ctrlUps = receiver_.controlUps;
-        if (!release(true, "tool_release_all")) return;
+        if (!release(true, "codec_release_all")) return;
         check("release_all_emits_ctrl_up", receiver_.controlUps > ctrlUps && !(GetKeyState(VK_CONTROL) & 0x8000));
         check("release_all_empty_native_state", controller_->inputState(context_.sessionId).empty());
         // Exercise cleanup while the pen is actually down, not only after UP.
         for (bool cancel : {false, true}) {
-            if (!observe(cancel, cancel ? "tool_observe_before_cancel" : "ordinary_observe_before_eraser")) return;
+            if (!observe(cancel, cancel ? "codec_observe_before_cancel" : "ordinary_observe_before_eraser")) return;
             auto second = pen(Phase::Down);
             second.toolType = cancel ? 1 : 2;
             second.tilt = 0;
             second.rotation = 0;
             const auto begin = receiver_.raw.size();
-            if (!batch(second, cancel, false, cancel ? "tool_down_for_cancel" : "ordinary_eraser_down")) return;
+            if (!batch(second, cancel, false, cancel ? "codec_down_for_cancel" : "ordinary_eraser_down")) return;
             dispatchFor(100);
             if (cancel) {
-                if (!batch(pen(Phase::CancelAll), true, true, "tool_cancel_all_without_token")) return;
+                if (!batch(pen(Phase::CancelAll), true, true, "codec_cancel_all_without_token")) return;
             } else if (!release(false, "ordinary_release_held_eraser"))
                 return;
             dispatchFor(100);
@@ -402,7 +401,7 @@ public:
                            {"control", e.control}});
         }
         const auto final = controller_->inputState(context_.sessionId);
-        const Json report{{"fixture", "product-controller-and-model-tool-pen"},
+        const Json report{{"fixture", "ordinary-controller-and-event-codec-pen"},
                           {"pid", GetCurrentProcessId()},
                           {"session_id", context_.sessionId},
                           {"turn_id", context_.turnId},
@@ -497,19 +496,8 @@ private:
         std::printf("%s %s\n", ok ? "PASS" : "FAIL", name);
         if (!ok) ++failures_;
     }
-    bool observe(bool model, const char* label) {
+    bool observe(bool, const char* label) {
         const auto error = run(label, [&] {
-            if (model) {
-                const auto result = tool_->execute(Json{{"action", "observe"},
-                                                        {"window_id", std::to_string(identifier(receiver_.root()))},
-                                                        {"include_elements", false}}
-                                                       .dump(),
-                                                   context_);
-                if (result.hasError()) return result.error();
-                snapshot_ = Json::parse(result.output(), nullptr, false);
-                if (!result.images().empty())
-                    return MaiError{MaiErrorCode::Protocol, "metadata tool observe returned images"};
-            } else {
                 const auto result = controller_->observe(
                     context_.sessionId, "", context_.root, false, identifier(receiver_.root()), false,
                     [&] { return receiver_.canceled.load(); }, context_.turnId);
@@ -517,7 +505,6 @@ private:
                 snapshot_ = Json::parse(result.value().json, nullptr, false);
                 if (!result.value().imagePath.empty())
                     return MaiError{MaiErrorCode::Protocol, "metadata ordinary observe returned image"};
-            }
             if (!snapshot_.is_object() ||
                 snapshot_.value("window_id", std::string()) != std::to_string(identifier(receiver_.root())) ||
                 snapshot_.value("process_id", std::uint64_t(0)) != GetCurrentProcessId() ||
@@ -586,7 +573,7 @@ private:
         }
         return "invalid";
     }
-    bool batch(const DesktopInputPen& value, bool model, bool cleanup, const char* label) {
+    bool batch(const DesktopInputPen& value, bool encoded, bool cleanup, const char* label) {
         const bool positioned = value.phase == Phase::Hover || value.phase == Phase::Down || value.phase == Phase::Move;
         const auto target = positioned ? projected(value.x, value.y) : moved_;
         if (!cleanup && !admitted(target)) {
@@ -596,7 +583,7 @@ private:
         }
         inputStarted_ = true;
         const auto error = run(label, [&] {
-            if (model) {
+            if (encoded) {
                 Json event{{"type", "pen"},
                            {"phase", phaseName(value.phase)},
                            {"tool_type", value.toolType},
@@ -607,15 +594,17 @@ private:
                                   {"pressure_or_distance", value.pressureOrDistance},
                                   {"tilt", value.tilt},
                                   {"rotation", value.rotation}});
-                Json request{{"action", "input_events"}, {"events", Json::array({event})}};
-                if (!cleanup)
-                    request.update({{"window_id", std::to_string(identifier(receiver_.root()))},
-                                    {"snapshot_id", snapshot_.value("snapshot_id", std::string())}});
-                const auto result = tool_->execute(request.dump(), context_);
-                if (result.hasError()) return result.error();
-                const auto body = Json::parse(result.output(), nullptr, false);
-                if (!body.is_object() || !body.value("dispatched", false) || body.value("accepted_events", 0) != 1)
-                    return MaiError{MaiErrorCode::Protocol, "tool input did not accept exactly one pen event"};
+                // 编码入口只解析事件 DTO；高级指针能力由普通控制器执行。
+                const auto parsed = maiDesktopParseInputBatch(Json::array({event}).dump());
+                if (!parsed) return parsed.error();
+                auto request = action("input_events", cleanup);
+                request.events = parsed.value().events;
+                request.inputOptions = parsed.value().options;
+                request.inputOptions.inheritExisting = true;
+                const auto result = controller_->perform(context_.sessionId, request);
+                if (!result) return result.error();
+                if (!result.value().dispatched || result.value().acceptedEvents != 1)
+                    return MaiError{MaiErrorCode::Protocol, "encoded ordinary input did not accept one pointer event"};
                 return MaiError{};
             }
             auto request = action("input_events", cleanup);
@@ -633,14 +622,11 @@ private:
         check(label, !error);
         return !error;
     }
-    bool release(bool model, const char* label) {
+    bool release(bool, const char* label) {
         MaiError error;
         const auto began = GetTickCount64();
         do {
-            error = run(label, [&] {
-                if (!model) return controller_->releaseInput(context_.sessionId, context_.turnId);
-                const auto result = tool_->execute(R"({"action":"release_all"})", context_);
-                return result.hasError() ? result.error() : MaiError{};
+            error = run(label, [&] { return controller_->releaseInput(context_.sessionId, context_.turnId);
             });
             if (!error || error.code() != MaiErrorCode::Busy) break;
             dispatchFor(10);  // Cleanup is idempotent; mutation/token errors are never retried.
@@ -729,15 +715,13 @@ private:
         check("observed_hold_over_one_second", pair && observedHold_ >= 1000);
         check("no_early_up_before_requested_up", pair && plannedUp_ && up->observed >= plannedUp_);
         check("event_owned_coordinates_roundtrip", coords && pair);
-        check("ordinary_ctrl_survives_model_pen_events", control && pair);
+        check("ordinary_ctrl_survives_encoded_pen_events", control && pair);
         check("raw_record_not_truncated", !receiver_.truncated);
     }
     QString directory_;
     QTemporaryDir workspace_;
     Receiver receiver_;
     std::shared_ptr<DesktopComputerController> controller_;
-    MaiToolRegistry registry_;
-    MaiTool* tool_ = nullptr;
     MaiToolContext context_;
     RECT initialBounds_{};
     POINT anchor_{}, moved_{};

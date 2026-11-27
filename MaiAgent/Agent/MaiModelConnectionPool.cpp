@@ -1,5 +1,6 @@
 // 文件作用：独占租用 libcurl easy handle，避免凭据、回调及连接状态跨请求串用。
 #include "MaiModelConnectionPool.h"
+#include "MaiCurlNetworkRoute.h"
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -8,6 +9,7 @@
 struct MaiModelConnectionPool::State {
     std::mutex mutex;
     std::vector<CURL*> idle;
+    uint64_t generation = 0;
     ~State() {
         for (auto* handle : idle) curl_easy_cleanup(handle);
     }
@@ -15,29 +17,41 @@ struct MaiModelConnectionPool::State {
 MaiModelConnectionPool::MaiModelConnectionPool() : mState(std::make_shared<State>()) {}
 MaiModelConnectionPool::~MaiModelConnectionPool() = default;
 MaiModelConnectionPool::Lease MaiModelConnectionPool::acquire() {
+    return acquire(MaiCurlNetworkRoute::generation());
+}
+MaiModelConnectionPool::Lease MaiModelConnectionPool::acquire(uint64_t generation) {
     CURL* handle = nullptr;
     {
         std::lock_guard<std::mutex> lock(mState->mutex);
+        if (mState->generation != generation) {
+            for (auto* idle : mState->idle) curl_easy_cleanup(idle);
+            mState->idle.clear();
+            mState->generation = generation;
+        }
         if (!mState->idle.empty()) {
             handle = mState->idle.back();
             mState->idle.pop_back();
         }
     }
-    return Lease(mState, handle ? handle : curl_easy_init());
+    return Lease(mState, handle ? handle : curl_easy_init(), generation);
 }
 MaiModelConnectionPool::Lease::Lease() = default;
-MaiModelConnectionPool::Lease::Lease(std::shared_ptr<State> state, void* handle)
-    : mState(std::move(state)), mHandle(handle) {}
+MaiModelConnectionPool::Lease::Lease(std::shared_ptr<State> state, void* handle,
+                                     uint64_t generation)
+    : mState(std::move(state)), mHandle(handle), mGeneration(generation) {}
 MaiModelConnectionPool::Lease::~Lease() {
     finish(false);
 }
 MaiModelConnectionPool::Lease::Lease(Lease&& other) noexcept
-    : mState(std::move(other.mState)), mHandle(std::exchange(other.mHandle, nullptr)) {}
+    : mState(std::move(other.mState)),
+      mHandle(std::exchange(other.mHandle, nullptr)),
+      mGeneration(other.mGeneration) {}
 MaiModelConnectionPool::Lease& MaiModelConnectionPool::Lease::operator=(Lease&& other) noexcept {
     if (this != &other) {
         finish(false);
         mState = std::move(other.mState);
         mHandle = std::exchange(other.mHandle, nullptr);
+        mGeneration = other.mGeneration;
     }
     return *this;
 }
@@ -47,12 +61,12 @@ void* MaiModelConnectionPool::Lease::nativeHandle() const {
 void MaiModelConnectionPool::Lease::finish(bool reusable) {
     auto* handle = static_cast<CURL*>(std::exchange(mHandle, nullptr));
     if (!handle) return;
-    if (reusable && mState) {
+    if (reusable && mState && mGeneration == MaiCurlNetworkRoute::generation()) {
         // curl_easy_reset 清除借用的 POSTFIELDS/回调/代理/头选项，保留连接与 TLS 缓存。
         // 来源：third_party/curl/docs/libcurl/curl_easy_reset.md。
         curl_easy_reset(handle);
         std::lock_guard<std::mutex> lock(mState->mutex);
-        if (mState->idle.size() < 4) {
+        if (mState->generation == mGeneration && mState->idle.size() < 4) {
             mState->idle.push_back(handle);
             return;
         }

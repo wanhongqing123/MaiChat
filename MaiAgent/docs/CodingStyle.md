@@ -61,7 +61,7 @@ cmake --build build && ctest --test-dir build   # 或直接跑 build/bin/Mai*Tes
 |---|---|
 | `MaiAgent::submit(MaiOperation)` + 事件流 | `codex_thread.rs` 的 `submit(op)` / `next_event()` |
 | `MaiPermissionDecision` 的取值 | `protocol.rs` 的 `ReviewDecision` |
-| `MaiOpenAiClient` 里的行缓冲 | `ollama/src/line_buffer.rs` |
+| `MaiResponsesClient` 里的行缓冲 | `ollama/src/line_buffer.rs` |
 
 **opencode 只在一个地方还有影响力：线上 id 的前缀**（`ses_` / `msg_` /
 `prt_` / `evt_` / `per_`）。那不是我们选的风格，是当初那个 Electron 界面
@@ -183,7 +183,7 @@ include/MaiEditTool.h    AgentTools/MaiEditTool.cpp
 
 ```
 AgentTools/MaiEditTool.cpp  → include/MaiEditTool.h
-AgentTools/MaiShellTool.cpp → include/MaiShellTool.h
+AgentTools/MaiExecCommandTool.cpp → include/MaiExecCommandTool.h
 Agent/MaiSqliteStore.cpp    → include/MaiSqliteStore.h
 ```
 

@@ -20,6 +20,10 @@ extern "C" {
 // message 操作为 {op:"message",session,id}，只读精确查询该会话的一条记录；
 // 成功 {ok:true,messages:[记录]}，找不到/归属不符 {ok:false,errorCode:"not_found"}。
 // 不用 ID 前缀或游标模拟精读，不消费 snapshot 的增量状态，也不触发模型请求。
+// snapshot/remote_snapshot 的 contextUsage 复用 Core 版本化实测快照，session_id 绑定目标会话。
+// latest_sampling 表示最近主请求，turn/thread_token_usage 仅为累计；sampling_valid=false 时
+// 占用已失效。remaining_percent 为 Core 共用基线口径，缺失/小窗口为 null；绝无本地估计兜底。
+// 每项 *_source 区分 provider/derived/missing；读取错误为 available=false 和安全 error_code。
 // tool_detail 操作为 {op:"tool_detail",session,requestId,messageId,partId,
 // field:"input"|"output"|"error",offset?:0,limit?:4096,detailRevision?:string}。
 // 只读取一次已落库工具快照，不重跑命令；limit为1..4096源字节，offset>0须带前页版本。

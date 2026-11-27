@@ -1,20 +1,31 @@
-// 文件作用：使用 SQLite 持久化 Agent 会话和消息。
-// 对外契约：下方声明公开参数和返回值；实现位于同名源文件。
+// 文件作用：构造 JSONL 权威日志与可重建 SQLite 索引的正式会话后端。
 #pragma once
 
 #include <memory>
+#include <functional>
 #include <string>
 
 #include "MaiError.h"
 #include "MaiSessionStore.h"
 
-// SQLite 落库。databasePathUtf8 是 **UTF-8** 路径；父目录会自动建。
+// 回调在打开/迁移工作线程同步调用，不接管 UI 线程；必须线程安全且不得抛出异常。
+// 取消只在安全边界生效，不撤销已经发布的权威数据。对象只在构造期间借用回调。
+struct MaiSqliteStoreOpenOptions {
+    std::function<bool()> isCanceled;
+    std::function<void(const std::string&)> progress;
+};
+
+// databasePathUtf8 是账号根目录中的索引文件；父目录自动创建。
+// 消息、工具正文和续接状态只保存到 sessions/YYYY/MM/DD/ 的追加 JSONL，
+// SQLite 保存元数据和字节引用；删除索引后使用同账户 sessions/.journal 提交日志重建。
+// 旧版 1..15 数据库只读迁移，先验证自有快照与新日志/索引再发布，保留旧文件。
+// 损坏或未完成来源明确失败，不把正文读取错误伪装成空历史。
 //
-// 传 ":memory:" 可以拿到一个不落盘的 SQLite 库——那和 makeMaiMemoryStore() 不是一回事：
-// 后者是纯 STL 的哈希表，前者仍然走完整的 SQL 路径，测试里用它来验证 SQL 本身，
-// 而不用碰磁盘。
-//
-// 打不开（路径非法、磁盘只读、文件不是数据库）就返回错误，不返回一个半死的对象。
-// 这是唯一一处把存储错误做成返回值的地方，因为构造失败时调用方**能**做点什么：
-// 换个路径，或者退回内存存储。
+// ":memory:" 使用内存 SQLite 和自有临时目录中的同一种日志核心；目录仅用于当前对象，
+// 析构删除，不跨对象恢复。它仍会临时写磁盘，不能替代无文件 I/O 的 makeMaiMemoryStore。
+// 所有构造和迁移均同步阻塞，调用者必须安排在允许文件 I/O 的线程。
+// 构造失败返回错误；权威提交后的索引故障通过 lastProjectionError 单独报告，不能重发业务。
 MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(const std::string& databasePathUtf8);
+
+MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
+    const std::string& databasePathUtf8, const MaiSqliteStoreOpenOptions& options);

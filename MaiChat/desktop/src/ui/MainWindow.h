@@ -35,6 +35,7 @@
 #include "remote/RemoteDesktopController.h"
 #include "remote/RemoteDesktopSettings.h"
 #include "ui/RemoteInputCapture.h"
+#include "MaiSessionStore.h"
 
 class SharingIndicatorBar;
 class AgentController;
@@ -77,14 +78,15 @@ public:
     MainWindow(RemoteIMApplication& app, DesktopScreenCaptureControl& captureControl,
                QWidget* parent = nullptr);
     MainWindow(RemoteIMApplication& app, int imSdkAppId,
-               std::function<QString(const QString&)> userSigProvider,
                QWidget* parent = nullptr);
     MainWindow(RemoteIMApplication& app, int imSdkAppId,
-               std::function<QString(const QString&)> userSigProvider,
                std::function<QString()> arkApiKeyProvider,
                std::function<QPair<QString, QString>()> wanCredentialsProvider,
                QWidget* parent = nullptr,
-               DesktopScreenCaptureControl* captureControl = nullptr);
+               DesktopScreenCaptureControl* captureControl = nullptr,
+               std::unique_ptr<MaiSessionStore> preparedStore = nullptr,
+               std::function<QPair<QString, QString>()> initialMediaAccess = {},
+               std::function<DesktopVideoCircleAccess()> initialVideoAccess = {});
     ~MainWindow() override;
 
     // 开始回复某条消息：右键菜单调它，测试也直接调它。
@@ -100,6 +102,11 @@ public:
     void prepareForAccountDisconnect(std::function<void()> completion);
     void finishAccountDisconnect();
     void setLogoutHandler(std::function<void()> handler);
+    using RemoteDesktopCredentialCompletion =
+        std::function<void(const QString &, const QString &, qint64)>;
+    using RemoteDesktopCredentialProvider =
+        std::function<void(const QString &, RemoteDesktopCredentialCompletion)>;
+    void setRemoteDesktopCredentialProvider(RemoteDesktopCredentialProvider provider);
     // 账号服务下发的 GLM/DeepSeek Key 只存在当前窗口进程内，切换账号时清空。
     void setAccountModelKeys(QHash<QString, QString> keys, const QString& error = {});
     void setModelKeyRefreshHandler(std::function<void()> handler);
@@ -341,7 +348,6 @@ private:
 
     RemoteIMApplication& app_;
     int imSdkAppId_ = 0;
-    std::function<QString(const QString&)> userSigProvider_;
     std::function<QString()> arkApiKeyProvider_;
     std::function<QPair<QString, QString>()> wanCredentialsProvider_;
     std::function<QPair<QString, QString>()> mediaServiceAccessProvider_;
@@ -463,6 +469,8 @@ private:
     DesktopScreenCaptureControl* screenCaptureControl_ = nullptr;
     QPushButton* agentNavButton_ = nullptr;
     AgentController* agentController_ = nullptr;
+    // Consumed exactly once by the initial controller; no temporary store copy.
+    std::unique_ptr<MaiSessionStore> preparedAgentStore_;
     // The bridge borrows the controller and is explicitly destroyed first.
     // Settings keep only account-scoped peer/Session choices; live work stays
     // in the adapter and is revoked on controller rebuild or account logout.

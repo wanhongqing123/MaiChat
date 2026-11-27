@@ -181,7 +181,7 @@ void test_input_updates_and_automatic_title_have_distinct_fields() {
             return {};
         }
         MaiWireApi wireApi() const override {
-            return MaiWireApi::ChatCompletions;
+            return MaiWireApi::Responses;
         }
         std::function<void()> firstRequest;
         int requests = 0;

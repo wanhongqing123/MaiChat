@@ -7,6 +7,7 @@
 #include <optional>
 
 #include "MaiChatTools/DesktopComputerPlatform.h"
+#include "MaiChatTools/DesktopComputerSky.h"
 
 #include "MaiError.h"
 
@@ -98,6 +99,22 @@ public:
                                                   std::function<bool()> isCanceled = {},
                                                   const std::string& turnId = {});
     MaiResult<std::vector<DesktopNativeWindow>> windows();
+    // Sky 方法仅改变普通接口形式，不创建第二个原生后端或授权状态。
+    MaiResult<std::vector<DesktopComputerWindow>> listWindows(const std::function<bool()>& isCanceled = {});
+    MaiResult<DesktopComputerWindow> getWindow(const DesktopComputerWindow& window,
+                                               const std::function<bool()>& isCanceled = {});
+    MaiResult<std::vector<DesktopNativeApplication>> applications(const std::function<bool()>& isCanceled = {});
+    MaiError launchApplication(const std::string& app, const std::function<bool()>& isCanceled = {});
+    MaiError activateWindow(const DesktopComputerWindow& window, const std::function<bool()>& isCanceled = {});
+    MaiResult<DesktopComputerWindowState> getWindowState(const std::string& sessionId,
+                                                         const DesktopComputerWindow& window,
+                                                         const std::string& workspace, bool includeScreenshot = true,
+                                                         bool includeText = false,
+                                                         std::function<bool()> isCanceled = {},
+                                                         const std::string& turnId = {});
+    MaiResult<DesktopComputerActionResult> performSky(const std::string& sessionId,
+                                                      const DesktopComputerSkyAction& action,
+                                                      DesktopComputerActionProgress* progress = nullptr);
     MaiResult<std::vector<DesktopNativeDisplay>> displays();
     DesktopInputCapabilities capabilities() const;
     MaiResult<DesktopInputFeedbackBatch> feedback(const std::string& sessionId, std::uint64_t afterSequence = 0,
@@ -122,7 +139,7 @@ public:
                  std::uint64_t windowId, double xRatio, double yRatio, const std::string& text, const std::string& key,
                  int scrollLines);
     // Forget the selected window and snapshot; this never edits input text.
-    MaiError clear(const std::string& sessionId);
+    MaiError clear(const std::string& sessionId, const std::string& expectedTurn = {});
     DesktopNativeInputState inputState(const std::string& sessionId) const;
     // Empty expectedTurn releases this ordinary caller's session state. Hosts
     // pass the actual completed/interrupted turn to protect a replacement task.
@@ -138,3 +155,5 @@ private:
 };
 
 void registerDesktopComputerTools(MaiToolRegistry& registry, std::shared_ptr<DesktopComputerController> controller);
+void registerDesktopComputerInputTools(MaiToolRegistry& registry,
+                                       std::shared_ptr<DesktopComputerController> controller);

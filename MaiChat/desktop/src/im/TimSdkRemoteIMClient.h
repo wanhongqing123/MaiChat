@@ -103,7 +103,7 @@ private:
                               bool captionAbove, RemoteIMMessageOrigin origin, const RemoteIMQuote& quote,
                               bool hasQuote, RemoteIMSendCompletion completion);
     void syncInitialData();
-    void handleSelfProfilePayload(const QString& payload);
+    void handleSelfProfilePayload(const QString& payload, quint64 requestRevision);
     void fetchFriendList();
     void fetchConversationList();
     void fetchRecentMessages(const QString& conversationId, int conversationType);
@@ -172,6 +172,9 @@ private:
     quint64 currentRawSequence_ = 0;
     quint64 currentRawGeneration_ = 0;
     quint64 selfProfileRevision_ = 0;
+    // 稀疏推送只阻断对应字段的旧回执，不使尚未收到的其它资料永久缺失。
+    quint64 selfNameRevision_ = 0;
+    quint64 selfAvatarRevision_ = 0;
     quint64 conversationRevision_ = 0;
     quint64 conversationFetchGeneration_ = 0;
     quint64 friendFetchGeneration_ = 0;

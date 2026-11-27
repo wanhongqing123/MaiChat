@@ -28,6 +28,8 @@
 #include "MaiAgent.h"
 #include "MaiMemoryStore.h"
 #include "MaiSqliteStore.h"
+#include "MaiSessionJournal.h"
+#include "support/MaiLegacySessionFixture.h"
 #include "MaiTime.h"
 
 namespace fs = std::filesystem;
@@ -58,6 +60,88 @@ struct TempDir {
         return (root / name).u8string();
     }
 };
+
+// 仅用于自有测试目录：读取正式投影后以冻结 v15 DDL 导出旧夹具。
+// 日志改名保留在临时目录，测试随后操作的确实是普通旧表，不能降级正式生成列。
+bool freezeOwnedLegacyFixture(const std::string& path) {
+    sqlite3* source = nullptr;
+    sqlite3* legacy = nullptr;
+    if (sqlite3_open(path.c_str(), &source) != SQLITE_OK) return false;
+    const auto native = MaiFilePath::fromUtf8(path);
+    auto journal = MaiSessionJournal::open(source, native.dirName(), native.baseName().toUtf8());
+    if (!journal) {
+        sqlite3_close(source);
+        return false;
+    }
+    const std::string output = path + ".legacy-fixture";
+    bool ok =
+        sqlite3_open(output.c_str(), &legacy) == SQLITE_OK &&
+        sqlite3_exec(legacy, kMaiLegacySessionSchemaV15, nullptr, nullptr, nullptr) == SQLITE_OK;
+    ok = ok &&
+         sqlite3_exec(legacy, "CREATE INDEX parts_unfinished_tool ON parts(kind,state,message_id)",
+                      nullptr, nullptr, nullptr) == SQLITE_OK;
+    sqlite3_stmt* tables = nullptr;
+    ok = ok && sqlite3_prepare_v2(legacy, "SELECT name FROM sqlite_master WHERE type='table'", -1,
+                                  &tables, nullptr) == SQLITE_OK;
+    std::vector<std::string> names;
+    while (ok && sqlite3_step(tables) == SQLITE_ROW)
+        names.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(tables, 0)));
+    sqlite3_finalize(tables);
+    for (const auto& table : names) {
+        sqlite3_stmt* info = nullptr;
+        ok = ok && sqlite3_prepare_v2(legacy, ("PRAGMA table_info(" + table + ")").c_str(), -1,
+                                      &info, nullptr) == SQLITE_OK;
+        std::string columns, parameters;
+        int count = 0;
+        while (ok && sqlite3_step(info) == SQLITE_ROW) {
+            if (count) {
+                columns += ',';
+                parameters += ',';
+            }
+            columns += '"' +
+                       std::string(reinterpret_cast<const char*>(sqlite3_column_text(info, 1))) +
+                       '"';
+            parameters += '?' + std::to_string(++count);
+        }
+        sqlite3_finalize(info);
+        sqlite3_stmt* read = nullptr;
+        sqlite3_stmt* write = nullptr;
+        const std::string selection = table == "tool_outputs"
+                                          ? "id,session_id,message_id,part_id,call_id,mai_output_"
+                                            "slice(payload_ref,0,payload_size),truncated,created"
+                                          : columns;
+        ok = ok &&
+             sqlite3_prepare_v2(source, ("SELECT " + selection + " FROM " + table).c_str(), -1,
+                                &read, nullptr) == SQLITE_OK &&
+             sqlite3_prepare_v2(
+                 legacy,
+                 ("INSERT INTO " + table + "(" + columns + ") VALUES(" + parameters + ")").c_str(),
+                 -1, &write, nullptr) == SQLITE_OK;
+        int code = SQLITE_DONE;
+        while (ok && (code = sqlite3_step(read)) == SQLITE_ROW) {
+            for (int i = 0; i < count; ++i)
+                sqlite3_bind_value(write, i + 1, sqlite3_column_value(read, i));
+            ok = sqlite3_step(write) == SQLITE_DONE;
+            sqlite3_reset(write);
+            sqlite3_clear_bindings(write);
+        }
+        ok = ok && code == SQLITE_DONE;
+        sqlite3_finalize(read);
+        sqlite3_finalize(write);
+    }
+    journal.value().reset();
+    sqlite3_close(source);
+    sqlite3_close(legacy);
+    if (!ok) return false;
+    std::error_code error;
+    const auto directory = fs::u8path(path).parent_path();
+    fs::rename(directory / "sessions", directory / "sessions-formal-seed", error);
+    if (error) return false;
+    fs::remove(fs::u8path(path), error);
+    if (error) return false;
+    fs::rename(fs::u8path(output), fs::u8path(path), error);
+    return !error;
+}
 
 MaiSession makeSession(const std::string& id, const std::string& title, MaiMillis updated) {
     MaiSession session;
@@ -1032,6 +1116,7 @@ void test_continuation_v12_migration_preserves_history() {
         opened.value()->putMessage(sessionId, message);
         originalFingerprint = maiContextSourceFingerprint(sessionId, {message}, 1);
     }
+    CHECK(freezeOwnedLegacyFixture(path));
     sqlite3* database = nullptr;
     CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
     if (!database) return;
@@ -1075,22 +1160,28 @@ void test_continuation_v12_migration_preserves_history() {
         return 0;
     };
     CHECK(sqlite3_exec(database,
-                       "SELECT name FROM pragma_table_info('parts') WHERE name IN "
+                       "SELECT name FROM pragma_table_xinfo('parts') WHERE name IN "
                        "('continuation_format','continuation_provider','continuation_model',"
                        "'continuation_payload') AND type='TEXT'",
                        countColumn, &count, nullptr) == SQLITE_OK);
     CHECK(count == 4);
-    if (count == 4) {
-        CHECK(
-            sqlite3_exec(database,
-                         "UPDATE parts SET continuation_format=NULL,continuation_provider=NULL,"
-                         "continuation_model=NULL,continuation_payload=NULL;"
-                         "UPDATE parts SET continuation_format='',continuation_provider='',"
-                         "continuation_model='',continuation_payload='' WHERE id='prt_legacy_02';",
-                         nullptr, nullptr, nullptr) == SQLITE_OK);
-    }
     sqlite3_close(database);
-    auto reopened = makeMaiSqliteStore(path);
+    // NULL 与全空续接字段是另一份真实旧夹具，不能直接改写正式生成列。
+    TempDir nullableFixture;
+    const auto nullablePath = nullableFixture.file("nullable-continuation.db");
+    CHECK(sqlite3_open(nullablePath.c_str(), &database) == SQLITE_OK);
+    CHECK(sqlite3_exec(database, kMaiLegacySessionSchemaV15, nullptr, nullptr, nullptr) ==
+          SQLITE_OK);
+    const std::string nullableSql =
+        "INSERT INTO sessions(id) VALUES('" + sessionId +
+        "');INSERT INTO messages(id,session_id,role) VALUES('" + messageId + "','" + sessionId +
+        "',1);INSERT INTO "
+        "parts(id,message_id,kind,continuation_format,continuation_provider,continuation_model,"
+        "continuation_payload) VALUES('prt_legacy_01','" +
+        messageId + "',1,NULL,NULL,NULL,NULL),('prt_legacy_02','" + messageId + "',1,'','','','');";
+    CHECK(sqlite3_exec(database, nullableSql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(database);
+    auto reopened = makeMaiSqliteStore(nullablePath);
     CHECK(reopened);
     if (!reopened) return;
     MaiMessage loaded;
@@ -1199,8 +1290,8 @@ void test_survives_reopen() {
     }
 }
 
-// 失败草稿可见且持久化，但重启后仍不能被当作已完成的模型上下文。
-void test_model_draft_survives_reopen_without_becoming_model_history() {
+// 新流式草稿只保留在内存展示；重启只回读已完成的片段。旧草稿另由冻结迁移夹具保留。
+void test_new_model_draft_is_ephemeral_and_completed_history_survives() {
     TempDir temp;
     const auto path = temp.file("draft.db");
     std::string session;
@@ -1233,13 +1324,12 @@ void test_model_draft_survives_reopen_without_becoming_model_history() {
     auto store = std::move(reopened.value());
     const auto history = store->listMessages(session);
     CHECK(history.size() == 1);
-    if (history.empty() || history[0].parts.size() != 3) {
+    if (history.empty() || history[0].parts.size() != 1) {
         CHECK(false);
         return;
     }
-    CHECK(history[0].parts[0].modelDraft && history[0].parts[1].modelDraft);
-    CHECK(!history[0].parts[2].modelDraft);
-    CHECK(history[0].text().find("FAILED_PRIVATE_DRAFT") != std::string::npos);
+    CHECK(!history[0].parts[0].modelDraft);
+    CHECK(history[0].text().find("FAILED_PRIVATE_DRAFT") == std::string::npos);
     const auto context = MaiContextBuilder{}.build(history, 0, 0, {}, true);
     CHECK(context.size() == 1);
     if (!context.empty()) {
@@ -1310,6 +1400,7 @@ void test_migrates_unfinished_tool_index() {
         store->putSession(makeSession(sessionId, "before migration", 1));
     }
 
+    CHECK(freezeOwnedLegacyFixture(path));
     sqlite3* database = nullptr;
     CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
     if (!database) return;
@@ -1442,10 +1533,9 @@ void test_non_ascii_round_trip() {
     }
 }
 
-// 验证 SQLite 写入前处理非法 UTF-8，读回时不破坏会话结构。
-// 失败应明确返回，而不是保存以后无法再次解码的字节。
-void test_sqlite_sanitizes_invalid_utf8_before_write() {
-    std::printf("-> test_sqlite_sanitizes_invalid_utf8_before_write\n");
+// 正文在权威日志中无损保存非法 UTF-8；对外 JSON 协议单独负责展示编码。
+void test_journal_preserves_invalid_utf8_bytes() {
+    std::printf("-> test_journal_preserves_invalid_utf8_bytes\n");
     TempDir temp;
     const std::string path = temp.file("utf8.db");
     const std::string invalid("\xD5\xD2", 2);
@@ -1483,19 +1573,10 @@ void test_sqlite_sanitizes_invalid_utf8_before_write() {
     CHECK(reopened.isOk());
     if (!reopened.isOk()) return;
     auto store = std::move(reopened.value());
-    const auto isUtf8 = [](const std::string& value) {
-        try {
-            (void)nlohmann::json(value).dump();
-            return true;
-        } catch (...) {
-            return false;
-        }
-    };
 
     MaiSession session;
     CHECK(store->getSession(sessionId, session));
-    CHECK(isUtf8(session.title));
-    CHECK(session.title.find("\xEF\xBF\xBD") != std::string::npos);
+    CHECK(session.title == invalid);
 
     const auto messages = store->listMessages(sessionId);
     CHECK(messages.size() == 1);
@@ -1504,18 +1585,14 @@ void test_sqlite_sanitizes_invalid_utf8_before_write() {
     const auto* text = std::get_if<MaiTextPart>(&messages[0].parts[0].body);
     CHECK(text != nullptr);
     if (text == nullptr) return;
-    CHECK(isUtf8(text->text));
-    CHECK(text->text.find("\xEF\xBF\xBD") != std::string::npos);
+    CHECK(text->text == invalid);
 
     const auto* tool = std::get_if<MaiToolPart>(&messages[0].parts[1].body);
     CHECK(tool != nullptr);
     if (tool == nullptr) return;
-    CHECK(isUtf8(tool->input));
-    CHECK(isUtf8(tool->output));
-    CHECK(isUtf8(tool->error));
-    CHECK(tool->input.find("\xEF\xBF\xBD") != std::string::npos);
-    CHECK(tool->output.find("\xEF\xBF\xBD") != std::string::npos);
-    CHECK(tool->error.find("\xEF\xBF\xBD") != std::string::npos);
+    CHECK(tool->input == invalid);
+    CHECK(tool->output == invalid);
+    CHECK(tool->error == invalid);
 }
 
 void test_v8_checkpoint_migrates_without_changing_original_source() {
@@ -1542,6 +1619,7 @@ void test_v8_checkpoint_migrates_without_changing_original_source() {
     checkpoint.references = "[]";
     CHECK(!store->advanceContextCheckpoint(id, 0, checkpoint));
     store.reset();
+    CHECK(freezeOwnedLegacyFixture(path));
     sqlite3* database = nullptr;
     CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
     if (!database) return;
@@ -1596,6 +1674,7 @@ void test_session_effort_survives_reopen_and_v9_migration() {
         CHECK(first.model == "glm-5.3" && first.reasoningEffort == "low");
         CHECK(second.model == "deepseek-v4-pro" && second.reasoningEffort == "max");
     }
+    CHECK(freezeOwnedLegacyFixture(path));
     sqlite3* database = nullptr;
     CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
     CHECK(sqlite3_exec(database,
@@ -1744,6 +1823,7 @@ void test_v13_turn_migration_keeps_legacy_outcomes_unknown() {
         message.parts.push_back({"prt_legacy", MaiTextPart{"owned original"}, 1});
         opened.value()->putMessage("ses_legacy", message);
     }
+    CHECK(freezeOwnedLegacyFixture(path));
     sqlite3* database = nullptr;
     CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
     if (!database) return;
@@ -1763,12 +1843,19 @@ void test_v13_turn_migration_keeps_legacy_outcomes_unknown() {
         CHECK(message.turnId.empty());
         CHECK(!message.turnOutcome);
     }
-    // 列已存在但版本号较旧时同样安全，不重复 ALTER 或删除原史。
-    CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
-    CHECK(sqlite3_exec(database, "PRAGMA user_version=13;", nullptr, nullptr, nullptr) ==
+    // 列已存在但版本号较旧，使用另一份未迁移旧源验证，不将正式索引降级。
+    TempDir existingColumnFixture;
+    const auto existingPath = existingColumnFixture.file("v13-existing-column.db");
+    CHECK(sqlite3_open(existingPath.c_str(), &database) == SQLITE_OK);
+    CHECK(sqlite3_exec(database, kMaiLegacySessionSchemaV15, nullptr, nullptr, nullptr) ==
           SQLITE_OK);
+    CHECK(sqlite3_exec(database,
+                       "INSERT INTO sessions(id) VALUES('ses_legacy');INSERT INTO "
+                       "messages(id,session_id,role,completed) "
+                       "VALUES('msg_legacy','ses_legacy',1,7);PRAGMA user_version=13;",
+                       nullptr, nullptr, nullptr) == SQLITE_OK);
     sqlite3_close(database);
-    CHECK(makeMaiSqliteStore(path).isOk());
+    CHECK(makeMaiSqliteStore(existingPath).isOk());
 }
 
 void test_turn_metadata_does_not_hide_a_failed_terminal_write() {
@@ -1795,6 +1882,9 @@ void test_turn_metadata_does_not_hide_a_failed_terminal_write() {
                        "BEGIN SELECT RAISE(FAIL,'owned write failure'); END;",
                        nullptr, nullptr, nullptr) == SQLITE_OK);
     sqlite3_close(database);
+    initial.completed = 9;
+    initial.turnOutcome->completed = 9;
+    initial.turnOutcome->status = MaiTurnStatus::Completed;
     store->putMessage(session.value(), initial);
     CHECK(store->lastWriteError().hasError());
     CHECK(store->readTurnMetadata(session.value(), {}).isOk());
@@ -1937,7 +2027,7 @@ void test_fixed_tool_model_output() {
 int main(int argc, char** argv) {
     test_fixed_tool_model_output();
     if (argc == 2 && std::string(argv[1]) == "--fixed-model-output") return failures ? 1 : 0;
-    test_model_draft_survives_reopen_without_becoming_model_history();
+    test_new_model_draft_is_ephemeral_and_completed_history_survives();
     test_turn_outcomes_survive_storage_and_recover_without_replay();
     test_v13_turn_migration_keeps_legacy_outcomes_unknown();
     test_turn_metadata_does_not_hide_a_failed_terminal_write();
@@ -1981,7 +2071,7 @@ int main(int argc, char** argv) {
     test_bad_path_reports_error();
     test_message_order_follows_id_order();
     test_non_ascii_round_trip();
-    test_sqlite_sanitizes_invalid_utf8_before_write();
+    test_journal_preserves_invalid_utf8_bytes();
 
     if (failures) {
         std::printf("\n%d checks failed\n", failures);

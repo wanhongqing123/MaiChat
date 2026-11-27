@@ -7,6 +7,34 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class MaiCloudDriveDirectoryTest {
+    @Test public void parsedJsonNullRootMediaRemainsVisible() throws Exception {
+        MaiCloudDriveDirectory directory = new MaiCloudDriveDirectory();
+        directory.activate("account-a");
+        assertTrue(directory.accepts(new JSONObject("{\"folder_id\":null}")));
+        assertTrue(directory.accepts(new JSONObject("{\"folder_id\":\"\"}")));
+        assertFalse(directory.accepts(new JSONObject("{\"folder_id\":\"null\"}")));
+        assertFalse(directory.accepts(new JSONObject("{\"folder_id\":17}")));
+    }
+
+    @Test public void parsedJsonNullParentListsRootFoldersAndKeepsNestedFilesScoped() throws Exception {
+        MaiCloudDriveDirectory directory = new MaiCloudDriveDirectory();
+        directory.activate("account-a");
+        directory.updateFolders(new JSONArray("[{\"id\":\"trip\",\"parent_id\":null}," +
+            "{\"id\":\"day\",\"parent_id\":\"trip\"}," +
+            "{\"id\":\"malformed\",\"parent_id\":\"null\"}," +
+            "{\"id\":\"wrong-type\",\"parent_id\":17}]"));
+        assertEquals(1, directory.children().size());
+        assertEquals("trip", directory.children().get(0).getString("id"));
+        assertTrue(directory.browse("trip"));
+        assertEquals(1, directory.children().size());
+        assertEquals("day", directory.children().get(0).getString("id"));
+        assertFalse(directory.accepts(new JSONObject("{\"folder_id\":null}")));
+        assertTrue(directory.accepts(new JSONObject("{\"folder_id\":\"trip\"}")));
+        assertFalse(directory.accepts(new JSONObject("{\"folder_id\":\"day\"}")));
+        assertTrue(directory.back());
+        assertEquals("", directory.currentId());
+    }
+
     private MaiCloudDriveDirectory directory() throws Exception {
         MaiCloudDriveDirectory directory = new MaiCloudDriveDirectory();
         directory.activate("account-a");

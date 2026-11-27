@@ -148,7 +148,7 @@ public:
         state_->done = true;
         return {};
     }
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override { return MaiWireApi::Responses; }
 private:
     std::shared_ptr<ScriptState> state_;
     QSize pixels_;

@@ -2,6 +2,7 @@
 // 主要入口：isCurrentSession、sessionId、setModelLabel、setOpenVideoCallback。
 // 直接依赖：MaiPathGuard.h、agent/AgentController.h、markdown/MarkdownView.h、ui/ComposerResizeSplitter.h；实现与这些接口协作。
 #include "agent/AgentChatPanel.h"
+#include "agent/AgentContextUsagePresentation.h"
 #include "ui/DesktopRasterImage.h"
 
 #include "ui/DesktopCameraDialog.h"
@@ -1964,10 +1965,12 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     modelOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
     modelOptionsLayout->setSpacing(0);
     for (const QString& model :
-         {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
+         {QStringLiteral("glm-5.4"), QStringLiteral("glm-5.3-flash"), QStringLiteral("deepseek-flash"),
           QStringLiteral("deepseek-v4-pro"), QStringLiteral("anthropic/claude-fable-5.2"),
-          QStringLiteral("anthropic/claude-opus-5.5"), QStringLiteral("particle-ai/particle-1:free")}) {
+          QStringLiteral("anthropic/claude-opus-5.5"), QStringLiteral("particle-ai/particle-1:free"),
+          QStringLiteral("gpt-6.1-sol")}) {
         const QString title =
+            model == QStringLiteral("gpt-6.1-sol") ? QStringLiteral("GPT-6.1 Sol") :
             model == QStringLiteral("particle-ai/particle-1:free") ? QStringLiteral("Particle-1（免费）") : model;
         auto* option = new QPushButton(title, modelOptions);
         if (model == QStringLiteral("particle-ai/particle-1:free"))
@@ -2458,6 +2461,7 @@ QString AgentChatPanel::sessionId() const {
 
 void AgentChatPanel::setModelLabel(const QString& label, bool configured) {
     const QString displayLabel =
+        label == QStringLiteral("gpt-6.1-sol") ? QStringLiteral("GPT-6.1 Sol") :
         label == QStringLiteral("particle-ai/particle-1:free") ? QStringLiteral("Particle-1（免费）") : label;
     // The raw identifier remains the capability/selection source; only its visible label changes.
     runtime_->modelChip->setText(label);
@@ -4997,7 +5001,12 @@ void AgentChatPanel::scrollToBottom() {
 void AgentChatPanel::refreshContextSize() {
     const auto status = runtime_->controller->contextStatus(runtime_->sessionId);
     refreshCompactionNotice(status ? &*status : nullptr);
-    if (!status) { runtime_->contextSize->hide(); return; }
+    if (!status) {
+        runtime_->contextSize->hide();
+        if (runtime_->contextUsageBar) runtime_->contextUsageBar->hide();
+        return;
+    }
+    const auto usage = presentAgentContextUsage(status->usage);
     QString text;
     int usagePercent = -1;
     switch (status->phase) {
@@ -5007,47 +5016,33 @@ void AgentChatPanel::refreshContextSize() {
         case MaiContextPhase::Failed: text = QStringLiteral("对话整理未完成"); break;
         case MaiContextPhase::Interrupted: text = QStringLiteral("对话整理已中断"); break;
         case MaiContextPhase::Ready:
-            if (status->historyIndexRecovery) text = QStringLiteral("摘要不完整 · 原史可查");
-            else if (status->windowTokens != 0) {
-                const auto percent = static_cast<int>(std::min(100.0L, 100.0L * status->after.tokens /
-                    status->windowTokens));
-                usagePercent = percent;
-                // 百分比按占用档位变色：常规蓝、偏高橙、临压缩红；数字统一加粗深色。
-                const auto tone = percent >= 90 ? QStringLiteral("#dc2626")
-                                  : percent >= 70 ? QStringLiteral("#d97706")
-                                                  : QStringLiteral("#2563eb");
-                const auto ink = QStringLiteral("#172033");
-                text = QStringLiteral("<span style='color:%1;'>上次上下文已用</span>"
-                                       "<b style='color:%2;'>%3%4%</b>")
-                           .arg(ink, tone, status->after.exact ? QString() : QStringLiteral("约"))
-                           .arg(percent);
-                text += QStringLiteral("<span style='color:%1;'> · 输入</span>"
-                                       "<b style='color:%1;'>%2%3 / %4</b>"
-                                       "<span style='color:%1;'> tokens</span>")
-                            .arg(ink, status->after.exact ? QString() : QStringLiteral("约"))
-                            .arg(formatTokenCount(status->after.tokens))
-                            .arg(formatTokenCount(status->windowTokens));
-                if (status->outputTokens != 0)
-                    text += QStringLiteral("<span style='color:%1;'> · 输出 </span>"
-                                           "<b style='color:%1;'>%2</b>"
-                                           "<span style='color:%1;'> tokens</span>")
-                                .arg(ink, formatTokenCount(status->outputTokens));
-            } else if (status->checkpointRevision != 0) text = QStringLiteral("较早对话已整理");
+              if (status->error && !status->usage.samplingValid) text = QStringLiteral("上下文状态暂不可用");
+              else {
+                  usagePercent = usage.usedPercent.value_or(-1);
+                  const auto tone = usagePercent >= 90 ? QStringLiteral("#dc2626")
+                                    : usagePercent >= 70 ? QStringLiteral("#d97706")
+                                                         : QStringLiteral("#2563eb");
+                  text = QStringLiteral("<span style='color:#172033;'>%1</span>"
+                                        "<b style='color:%2;'>%3</b>")
+                      .arg(status->historyIndexRecovery ? QStringLiteral("摘要不完整 · ")
+                                                       : QStringLiteral("上下文 · "),
+                           tone, usage.text.toHtmlEscaped());
+              }
             break;
     }
     QStringList detail;
-    detail << QStringLiteral("显示最近一次请求的上下文状态，新的输入会在请求准备时更新。");
+    detail << usage.detail;
     const auto estimate = status->phase == MaiContextPhase::Ready || status->phase == MaiContextPhase::Deferred
                             ? status->after : status->before;
     if (status->windowTokens != 0)
-        detail << QStringLiteral("输入%1 %2 tokens / 窗口 %3；有效输入上限 %4。")
+          detail << QStringLiteral("发送前预算保护：输入%1 %2 tokens / 窗口 %3；有效输入上限 %4。此计数不作为状态栏实际占用。")
             .arg(estimate.exact ? QStringLiteral("计数") : QStringLiteral("估算"))
             .arg(qulonglong(estimate.tokens)).arg(qulonglong(status->windowTokens))
             .arg(qulonglong(status->inputBudgetTokens));
     if (status->historyIndexRecovery)
         detail << QStringLiteral("语义摘要未完整生成，当前使用部分来源索引继续；遗漏内容须从原始记录回查。");
     else if (status->checkpointRevision != 0)
-        detail << QStringLiteral("较早对话使用摘要；原始消息仍可回查，摘要不保证语义无损。");
+        detail << QStringLiteral("当前使用已保存的上下文窗口；原始消息仍可回查。");
     if (status->originalUserMessages != 0)
         detail << QStringLiteral("较早用户消息原文已纳入 %1 / %2 条；其余可从原始记录回查。")
             .arg(qulonglong(status->retainedUserMessages)).arg(qulonglong(status->originalUserMessages));

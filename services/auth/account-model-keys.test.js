@@ -22,7 +22,7 @@ test('account service reads only main chat keys over authenticated loopback', as
     });
   assert.deepEqual(await issue(), {
     api_keys: { glm: 'glm-model-key', deepseek: 'deepseek-model-key',
-      minimax: 'minimax-model-key', openrouter: '' }
+      minimax: 'minimax-model-key', openrouter: '', openai: '' }
   });
   assert.equal(requests, 1);
   await assert.rejects(createAccountModelKeyIssuer({})());
@@ -35,13 +35,56 @@ function issuerForRaw(raw) {
   }, async () => ({ ok: true, async text() { return raw; } }));
 }
 
+test('OpenAI credentials preserve existing providers and allow OpenAI alone', async () => {
+  for (const keys of [
+    { glm: 'glm-key', deepseek: 'deepseek-key', minimax: 'minimax-key',
+      openrouter: 'openrouter-key', openai: 'openai-key' },
+    { glm: '', deepseek: '', minimax: '', openrouter: '', openai: 'openai-key' }
+  ]) {
+    assert.deepEqual(await issuerForRaw(JSON.stringify({ api_keys: keys }))(), { api_keys: keys });
+  }
+});
+
+test('older issuer responses normalize absent OpenAI credentials to an empty string', async () => {
+  const keys = { glm: 'glm-key', deepseek: 'deepseek-key', minimax: 'minimax-key',
+    openrouter: 'openrouter-key' };
+  assert.deepEqual(await issuerForRaw(JSON.stringify({ api_keys: keys }))(), {
+    api_keys: { ...keys, openai: '' }
+  });
+});
+
+test('malformed optional OpenAI credentials and five empty credentials are rejected', async () => {
+  for (const openai of [null, 42, true, {}, [], 'bad\nkey', 'bad\x00key', 'bad\x7fkey',
+    'x'.repeat(4097)]) {
+    await assert.rejects(issuerForRaw(JSON.stringify({ api_keys: {
+      glm: 'glm-key', deepseek: '', minimax: '', openrouter: '', openai
+    } }))(), /response is invalid/);
+  }
+  await assert.rejects(issuerForRaw(JSON.stringify({ api_keys: {
+    glm: '', deepseek: '', minimax: '', openrouter: '', openai: ''
+  } }))(), /response is invalid/);
+});
+
+test('five bounded keys fit the existing limit with maximum UTF-8 and JSON escaping overhead', async () => {
+  for (const character of ['x', '\u0800', '\\', '"']) {
+    const key = character.repeat(4096);
+    const keys = { glm: key, deepseek: key, minimax: key, openrouter: key, openai: key };
+    const raw = JSON.stringify({ api_keys: keys });
+    assert.ok(Buffer.byteLength(raw) > 20_480);
+    assert.ok(Buffer.byteLength(raw) < 65_536);
+    assert.deepEqual(await issuerForRaw(raw)(), { api_keys: keys });
+  }
+});
+
 test('OpenRouter credentials preserve existing providers and allow OpenRouter alone', async () => {
   for (const keys of [
     { glm: 'glm-key', deepseek: 'deepseek-key', minimax: 'minimax-key', openrouter: 'openrouter-key' },
     { glm: '', deepseek: '', minimax: '', openrouter: 'openrouter-key' },
     { glm: 'glm-key', deepseek: '', minimax: '', openrouter: '' }
   ]) {
-    assert.deepEqual(await issuerForRaw(JSON.stringify({ api_keys: keys }))(), { api_keys: keys });
+    assert.deepEqual(await issuerForRaw(JSON.stringify({ api_keys: keys }))(), {
+      api_keys: { ...keys, openai: '' }
+    });
   }
 });
 
@@ -66,7 +109,7 @@ test('four bounded keys fit with UTF-8 and JSON escaping overhead', async () => 
     const raw = JSON.stringify({ api_keys: keys });
     assert.ok(Buffer.byteLength(raw) > 16_384);
     assert.ok(Buffer.byteLength(raw) < 65_536);
-    assert.deepEqual(await issuerForRaw(raw)(), { api_keys: keys });
+    assert.deepEqual(await issuerForRaw(raw)(), { api_keys: { ...keys, openai: '' } });
   }
 });
 
@@ -74,6 +117,6 @@ test('account model key responses have a 64 KiB raw byte limit', async () => {
   const keys = { glm: '', deepseek: '', minimax: '', openrouter: 'openrouter-key' };
   const raw = JSON.stringify({ api_keys: keys });
   const atLimit = raw + ' '.repeat(65_536 - Buffer.byteLength(raw));
-  assert.deepEqual(await issuerForRaw(atLimit)(), { api_keys: keys });
+  assert.deepEqual(await issuerForRaw(atLimit)(), { api_keys: { ...keys, openai: '' } });
   await assert.rejects(issuerForRaw(atLimit + ' ')(), /response is too large/);
 });

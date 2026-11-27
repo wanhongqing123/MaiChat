@@ -8,6 +8,7 @@
 
 #include <json.hpp>
 
+#include "MaiCloudModelCatalog.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
@@ -32,9 +33,9 @@ public:
         // 独立截图不绑定桌面输入坐标或快照；需要操作时应重新观察明确显示器，避免跨屏或跨区域选点。
         return "Capture the display containing the mouse pointer and inspect the returned image. "
                "This is a whole-display image, not a window crop or browser viewport. It returns "
-               "no desktop_computer display_id or snapshot_id and does not renew an input token. "
+               "no computer display_id or snapshot_id and does not renew an input token. "
                "Capture does not release held mouse buttons or keys. Choose observation timing "
-               "from the task and current state. desktop_computer display observations bind their "
+               "from the task and current state. computer display observations bind their "
                "own image, target and input token; this independent screenshot cannot substitute "
                "for that binding. Never apply whole-screen ratios directly to target=window, "
                "or mix a scaled preview's pixels with original image dimensions. "
@@ -51,8 +52,9 @@ public:
     }
 
     bool isAvailableForModel(const std::string& model) const override {
-        // 与 view_image 共用当前已接线的文本模型边界，避免宣告不能回灌像素的截图工具。
-        return model != "glm-5.3" && model.compare(0, 6, "local:") != 0;
+        // 与 view_image 共用云型号能力及本地文本边界，避免宣告不能回灌像素的截图工具。
+        if (const auto capability = maiCloudModelInfo(model)) return capability->supportsImages;
+        return model.compare(0, 6, "local:") != 0;
     }
 
     std::string parametersSchema() const override {
@@ -115,15 +117,10 @@ public:
             return MaiToolResult::failure(MaiErrorCode::Canceled, "screen capture was canceled");
         }
         if (!isAvailableForModel(context.model)) {
-            if (context.model != "glm-5.3")
-                return MaiToolResult::failure(
-                    MaiErrorCode::NotSupported,
-                    "The current local primary model accepts text only and cannot inspect "
-                    "screenshots. Ask the user to select an image-capable primary model.");
             return MaiToolResult::failure(
                 MaiErrorCode::NotSupported,
-                "The current glm-5.3 model accepts text only. Ask the user to switch to "
-                "glm-5.3-flash before taking a screenshot.");
+                "The current primary model accepts text only and cannot inspect "
+                "screenshots. Ask the user to select an image-capable primary model.");
         }
         if (context.root.empty() ||
             !MaiFileSystem::isDirectory(MaiFilePath::fromUtf8(context.root))) {

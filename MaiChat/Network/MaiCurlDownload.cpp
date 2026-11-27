@@ -1,8 +1,10 @@
 #include "MaiCurlDownload.h"
+#include "MaiCurlNetworkRoute.h"
 
 #include <curl/curl.h>
 
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -369,9 +371,10 @@ static void downloadFile(const MaiDownloadOptions* options,
         set(CURLOPT_HTTPGET, 1L);
         set(CURLOPT_CONNECTTIMEOUT_MS,
             long(options->connect_timeout_ms > 0 ? options->connect_timeout_ms : 10000));
-        set(CURLOPT_TIMEOUT_MS, long(options->transfer_timeout_ms > 0
+        const long transferTimeoutMs = long(options->transfer_timeout_ms > 0
                                          ? options->transfer_timeout_ms
-                                         : (options->max_bytes > 64ULL * 1024 * 1024 ? 600000 : 120000)));
+                                         : (options->max_bytes > 64ULL * 1024 * 1024 ? 600000 : 120000));
+        set(CURLOPT_TIMEOUT_MS, transferTimeoutMs);
         set(CURLOPT_LOW_SPEED_LIMIT, 1024L);
         set(CURLOPT_LOW_SPEED_TIME, 30L);
         set(CURLOPT_SSL_VERIFYPEER, 1L);
@@ -403,6 +406,18 @@ static void downloadFile(const MaiDownloadOptions* options,
         if (options->ca_path_utf8 && *options->ca_path_utf8)
             set(CURLOPT_CAINFO, options->ca_path_utf8);
 
+        const auto routingStarted = std::chrono::steady_clock::now();
+        MaiCurlNetworkRoute networkRoute;
+        if (setup == CURLE_OK)
+            setup = static_cast<CURLcode>(networkRoute.prepare(curl, currentUrl, !proxy.empty(),
+                options->connect_timeout_ms > 0 ? options->connect_timeout_ms : 10000,
+                [&] { return wasCanceled(cancel); }));
+        if (setup == CURLE_OK) {
+            const auto remaining = transferTimeoutMs - std::chrono::duration_cast<
+                std::chrono::milliseconds>(std::chrono::steady_clock::now() - routingStarted).count();
+            if (remaining <= 0) setup = CURLE_OPERATION_TIMEDOUT;
+            else set(CURLOPT_TIMEOUT_MS, static_cast<long>(remaining));
+        }
         CURLcode code = setup;
         long httpStatus = 0;
         if (setup == CURLE_OK && !wasCanceled(cancel)) {
