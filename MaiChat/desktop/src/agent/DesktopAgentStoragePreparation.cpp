@@ -1,4 +1,5 @@
 #include "agent/DesktopAgentStoragePreparation.h"
+#include "agent/DesktopSessionDatabaseUseCheck.h"
 
 #include <QApplication>
 #include <QCryptographicHash>
@@ -30,10 +31,16 @@ QString agentDatabasePath(const QString& ownerUserId) {
 DesktopAgentStoragePreparationResult prepareDesktopAgentStorage(
     const QString& databasePath, QWidget* parent, DesktopAgentStorageOpener opener, int progressDelayMs) {
     if (databasePath.isEmpty()) return {nullptr, QStringLiteral("无法确定本地会话保存位置。"), false};
-    if (!opener) opener = [](const QString& path, const MaiSqliteStoreOpenOptions& options) {
-        const QByteArray utf8 = path.toUtf8();
-        return makeMaiSqliteStore(std::string(utf8.constData(), static_cast<size_t>(utf8.size())), options);
-    };
+    if (!opener)
+        opener = [](const QString& path, const MaiSqliteStoreOpenOptions& options)
+            -> MaiResult<std::unique_ptr<MaiSessionStore>> {
+            const QByteArray utf8 = path.toUtf8();
+            const auto inUse = checkDesktopSessionDatabaseUse(MaiFilePath::fromUtf8(
+                std::string(utf8.constData(), static_cast<size_t>(utf8.size()))));
+            if (inUse) return inUse;
+            return makeMaiSqliteStore(
+                std::string(utf8.constData(), static_cast<size_t>(utf8.size())), options);
+        };
 
     QProgressDialog progress(QStringLiteral("正在准备本地会话…"), QStringLiteral("取消"), 0, 0, parent);
     progress.setObjectName(QStringLiteral("agentStoragePreparation"));
@@ -80,7 +87,11 @@ DesktopAgentStoragePreparationResult prepareDesktopAgentStorage(
         auto result = std::make_shared<DesktopAgentStoragePreparationResult>();
         auto opened = opener(databasePath, options);
         if (!opened) {
-            result->error = QString::fromUtf8(opened.error().message().c_str());
+            result->error = opened.error().code() == MaiErrorCode::Busy
+                                ? QStringLiteral(
+                                      "该账号的本地会话库仍被其他App占用。请先退出旧版或另一份MaiCh"
+                                      "at，再重试。")
+                                : QString::fromUtf8(opened.error().message().c_str());
             result->canceled = opened.error().code() == MaiErrorCode::Canceled;
         } else if (!opened.value()) {
             result->error = QStringLiteral("本地会话未能打开。");

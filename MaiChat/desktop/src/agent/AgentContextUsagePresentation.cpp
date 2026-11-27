@@ -20,7 +20,8 @@ AgentContextUsagePresentation presentAgentContextUsage(const MaiModelContextUsag
     QStringList details;
     details << QStringLiteral("窗口占用取最近一次主请求的 total_tokens；缓存仍占窗口，累计消耗不作为窗口占用。");
     if (!usage.samplingValid) {
-        result.text = QStringLiteral("上下文：等待新的服务端用量");
+        // 调用方的 header 已提供上下文标签，此处只返回等待状态，避免重复前缀。
+        result.text = QStringLiteral("等待新的服务端用量");
     } else if (usage.latestSampling.total.source == MaiUsageValueSource::Missing) {
         result.text = QStringLiteral("服务端未提供上下文用量");
     } else {

@@ -121,13 +121,18 @@ MaiResult<std::string> fileIdentity(const MaiFilePath& path, bool directory = fa
 #endif
 }
 
-// 只持有自有句柄。原库句柄允许删除共享，故可跨两次主文件重命名保留身份和写入排斥。
+// 仅持有自有句柄。Windows原库允许删除共享；Apple独立SQLite写保留允许只读快照。
+// 生命周期覆盖发布及失败返回，析构关闭连接自动回滚未写入的BEGIN并释放写保留。
 class MigrationGuard {
 public:
     ~MigrationGuard() {
 #ifdef _WIN32
         if (mHandle != INVALID_HANDLE_VALUE) ::CloseHandle(mHandle);
 #else
+#ifdef __APPLE__
+        // 先关闭专属SQLite连接，再关闭身份句柄；没有借出的statement或用户正文写入。
+        mWriteReservation.reset();
+#endif
         if (mHandle >= 0) ::close(mHandle);
 #endif
     }
@@ -154,7 +159,40 @@ public:
         struct stat info{};
         if (::fstat(mHandle, &info) != 0 || !S_ISREG(info.st_mode))
             return invalid("migration guard requires a non-link ordinary file");
-        // flock 与不协作的旧 SQLite 写者无关；宿主须先排除这些旧写者。
+#ifdef __APPLE__
+        if (!lockFile) {
+            // Darwin的源文件flock会同时阻塞本进程READONLY backup。使用独立连接的
+            // RESERVED写锁阻止旧SQLite提交，快照仍走另一个只读连接。这里只BEGIN，
+            // 不修改schema或正文；关闭时也不能checkpoint/删WAL改变已冻结证据。
+            sqlite3* database = nullptr;
+            const int status = sqlite3_open_v2(
+                path.toUtf8().c_str(), &database,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_NOFOLLOW, nullptr);
+            mWriteReservation.reset(database);
+            if (status != SQLITE_OK || sqlite3_db_readonly(database, "main") != 0)
+                return {status == SQLITE_BUSY || status == SQLITE_LOCKED ? MaiErrorCode::Busy
+                                                                         : MaiErrorCode::Internal,
+                        "cannot open writable legacy database for migration exclusion"};
+            int previous = 0;
+            int persist = 1;
+            if (sqlite3_db_config(database, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, &previous) !=
+                    SQLITE_OK ||
+                sqlite3_file_control(database, "main", SQLITE_FCNTL_PERSIST_WAL, &persist) !=
+                    SQLITE_OK)
+                return {MaiErrorCode::Internal,
+                        "cannot preserve legacy WAL while acquiring migration exclusion"};
+            sqlite3_busy_timeout(database, 0);
+            const int reserved =
+                sqlite3_exec(database, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+            if (reserved != SQLITE_OK)
+                return {reserved == SQLITE_BUSY || reserved == SQLITE_LOCKED
+                            ? MaiErrorCode::Busy
+                            : MaiErrorCode::Internal,
+                        "legacy session database is busy; close the old app and retry"};
+            return {};
+        }
+#endif
+        // 发布锁文件继续用flock；非Apple源文件保留原协作锁，宿主仍须排除旧版写者。
         if (::flock(mHandle, LOCK_EX | LOCK_NB) != 0)
             return nativeFailure("cannot acquire migration guard");
 #endif
@@ -180,6 +218,9 @@ private:
     HANDLE mHandle = INVALID_HANDLE_VALUE;
 #else
     int mHandle = -1;
+#ifdef __APPLE__
+    Database mWriteReservation;
+#endif
 #endif
 };
 
@@ -591,6 +632,74 @@ MaiError MaiSessionMigration::run(const MaiSessionMigrationOptions& options) {
     }
     error = canceled(options);
     if (error) return error;
+    int restoredPreservationSteps = 0;
+#ifdef __APPLE__
+    // SQLite按主文件名寻找WAL/SHM。中断若落在保全主库与保全sidecar之间，
+    // 不能直接打开retained，否则会创建另一组空sidecar。先按ready中的原证据
+    // 校验每个节点，再无覆盖地逆序还原已完成的保全步骤；不改DB正文。
+    // 每次rename后的中断仍是原发布协议可识别的前缀状态，下一次可继续还原。
+    // 这段只由发布锁串行化，不声称排斥此刻新启动的旧进程；宿主先检查外部FD，
+    // 还原后立即取得SQLite写保留，后续仍复核冻结指纹。
+    if (MaiFileSystem::exists(retained) && MaiFileSystem::exists(stagedIndex)) {
+        auto saved = readReceipt(root, receiptPath);
+        if (!saved || !validReceipt(saved.value(), root, source))
+            return invalid("cannot restore partial migration without a valid receipt");
+        error = matches(root, stagedIndex, saved.value()["index"]);
+        if (!error) error = matches(root, snapshotPath, saved.value()["snapshot"]);
+        if (!error) error = matchesTree(root, finalSessions, saved.value()["sessions"]);
+        if (error) return error;
+        const auto& files = saved.value()["source_files"];
+        for (const char* extension : {"", "-wal", "-shm"}) {
+            const auto originalPath = suffix(source, extension);
+            const auto backupPath = suffix(retained, extension);
+            const bool original = MaiFileSystem::exists(originalPath);
+            const bool backup = MaiFileSystem::exists(backupPath);
+            if (!files.contains(extension)) {
+                if (original || backup) return invalid("unexpected sidecar in partial migration");
+            } else {
+                if (original == backup) return invalid("ambiguous source in partial migration");
+                error = matches(root, backup ? backupPath : originalPath, files[extension]);
+                if (error) return error;
+            }
+        }
+        // 仅回退sidecar尚未全部保全的状态；完整备份可按retained名直接打开。
+        const bool partial =
+            (files.contains("-wal") && !MaiFileSystem::exists(suffix(retained, "-wal"))) ||
+            (files.contains("-shm") && !MaiFileSystem::exists(suffix(retained, "-shm")));
+        if (partial) {
+            int preserved = 0;
+            for (const char* extension : {"", "-wal", "-shm"})
+                if (MaiFileSystem::exists(suffix(retained, extension))) ++preserved;
+            const auto replayPath = child(stage, "apple-replay.json");
+            if (MaiFileSystem::exists(replayPath)) {
+                auto replay = readReceipt(root, replayPath);
+                if (!replay || !replay.value().contains("receipt") ||
+                    replay.value()["receipt"] != saved.value() ||
+                    !replay.value().contains("steps") ||
+                    !replay.value()["steps"].is_number_integer() ||
+                    replay.value()["steps"] < preserved || replay.value()["steps"] > 3)
+                    return invalid("invalid Apple migration replay boundary");
+            } else {
+                // 单独无覆盖落盘，不替换原ready收据。回退再次中断仍记得已通知边界。
+                error = writeReceipt(root, replayPath,
+                                     Json{{"receipt", saved.value()}, {"steps", preserved}});
+                if (error) return error;
+            }
+        }
+        if (partial)
+            for (const char* extension : {"-shm", "-wal", ""}) {
+                const auto backupPath = suffix(retained, extension);
+                if (!MaiFileSystem::exists(backupPath)) continue;
+                error = renameNew(root, backupPath, suffix(source, extension));
+                if (error) return error;
+                error = checkpoint(options, std::string(extension) == "-shm" ? "apple_shm_restored"
+                                            : std::string(extension) == "-wal"
+                                                ? "apple_wal_restored"
+                                                : "apple_source_restored");
+                if (error) return error;
+            }
+    }
+#endif
     MigrationGuard sourceGuard;
     error = sourceGuard.open(MaiFileSystem::exists(retained) ? retained : source, false);
     if (error) return error;
@@ -601,6 +710,18 @@ MaiError MaiSessionMigration::run(const MaiSessionMigrationOptions& options) {
         auto parsed = readReceipt(root, receiptPath);
         if (!parsed) return parsed.error();
         receipt = std::move(parsed.value());
+#ifdef __APPLE__
+        const auto replayPath = child(stage, "apple-replay.json");
+        if (MaiFileSystem::exists(replayPath)) {
+            auto replay = readReceipt(root, replayPath);
+            if (!replay || !replay.value().contains("receipt") ||
+                replay.value()["receipt"] != receipt || !replay.value().contains("steps") ||
+                !replay.value()["steps"].is_number_integer() || replay.value()["steps"] < 0 ||
+                replay.value()["steps"] > 3)
+                return invalid("invalid Apple migration replay boundary");
+            restoredPreservationSteps = replay.value()["steps"].get<int>();
+        }
+#endif
         if (!validReceipt(receipt, root, source) ||
             receipt["source_identity"].get<std::string>() != identity.value())
             return invalid("migration source identity or receipt changed");
@@ -761,7 +882,9 @@ MaiError MaiSessionMigration::run(const MaiSessionMigrationOptions& options) {
             error = canceled(options);
             if (!error) error = matches(root, originalPath, receipt["source_files"][extension]);
             if (!error) error = renameNew(root, originalPath, backupPath);
-            if (!error) error = checkpoint(options, steps[step]);
+            // Apple恢复只重放文件移动，不重复已对外完成的故障/进度边界。
+            if (!error && step >= restoredPreservationSteps)
+                error = checkpoint(options, steps[step]);
             if (error) return error;
         }
         ++step;

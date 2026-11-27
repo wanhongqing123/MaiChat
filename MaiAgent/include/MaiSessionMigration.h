@@ -30,7 +30,8 @@ struct MaiSessionMigrationOptions {
     // 仅用于测试或诊断的故障注入；返回错误保留所有原始及暂存文件。
     // 步骤为 building、snapshot_created、build_complete、ready、logs_published、
     // source_preserved、wal_preserved、shm_preserved、
-    // index_published、complete；恢复时不再调用已经完成步骤的 checkpoint。
+    // index_published、complete；Apple恢复另有apple_wal_restored、apple_source_restored。
+    // 恢复时不再调用已经完成步骤的checkpoint；完整sidecar组不需要逆向恢复。
     std::function<MaiError(const std::string&)> checkpoint;
 };
 
@@ -41,8 +42,11 @@ struct MaiSessionMigrationOptions {
 // 构建期间的旧写者提交不能被构建后重新采集的指纹掩盖。SHM 仅用于原字节保全。
 // 指纹核对本身不排斥核对与移动之间的写入，不能取代宿主排除旧版写者的契约。
 // Windows 原库 READ/share READ|DELETE 句柄从取快照前持有至发布结束，
-// 已打开的旧 RW SQLite 连接使本操作返回 Busy。POSIX 使用 flock 协作锁，
-// 调用者必须排除不遵循该锁的旧版写者；不宣称能防御不协作的旧版本。
+// 已打开的旧 RW SQLite 连接使本操作返回 Busy。Apple源库使用独立SQLite连接的
+// BEGIN IMMEDIATE写保留，从快照前持有到发布结束；快照使用另一READONLY连接。
+// 该连接不改正文，NO_CKPT_ON_CLOSE/PERSIST_WAL防止关闭时改变保全的sidecar。
+// Apple发布锁文件及非Apple POSIX源文件保留flock。宿主必须拒绝仍被旧App持有的库；
+// 不能将进程扫描或写保留释放后视为原子排斥未来旧写者的保证。
 // 每次移动均拒绝已有目标；不宣称多个路径的替换是单个原子事务。
 // 持久化使用文件 flush 及支持平台上的目录 fsync；Windows 保证进程中断恢复，
 // 不将多个 MoveFileEx 操作宣称为断电原子提交。损坏/替换/歧义均停止并保留证据。

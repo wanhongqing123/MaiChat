@@ -913,6 +913,8 @@ add_library(maichat_agent
   src/agent/AgentContextUsagePresentation.cpp
   src/agent/DesktopAgentStoragePreparation.h
   src/agent/DesktopAgentStoragePreparation.cpp
+  src/agent/DesktopSessionDatabaseUseCheck.h
+  src/agent/DesktopSessionDatabaseUseCheck.cpp
   src/agent/DesktopScreenCaptureControl.h
   src/agent/DesktopScreenCaptureControl.cpp
   src/agent/DesktopScreenCaptureBar.h
@@ -1211,6 +1213,16 @@ add_executable(agent_storage_preparation_test tests/AgentStoragePreparationTest.
 target_link_libraries(agent_storage_preparation_test PRIVATE remote_im_desktop_ui
   remote_im_desktop_app maichat_agent Qt6::Widgets Qt6::Concurrent)
 add_test(NAME agent_storage_preparation_test COMMAND agent_storage_preparation_test)
+if(APPLE AND NOT IOS)
+  add_executable(desktop_session_database_use_check_test
+    tests/DesktopSessionDatabaseUseCheckTest.cpp
+    src/agent/DesktopSessionDatabaseUseCheck.cpp
+    src/agent/DesktopAgentStoragePreparation.cpp)
+  target_include_directories(desktop_session_database_use_check_test PRIVATE src)
+  target_link_libraries(desktop_session_database_use_check_test PRIVATE maiagent Qt6::Widgets Qt6::Concurrent)
+  add_test(NAME desktop_session_database_use_check_test COMMAND desktop_session_database_use_check_test)
+endif()
+
 target_include_directories(agent_controller_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/httplib
   ../MaiChatTools)

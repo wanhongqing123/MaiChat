@@ -50,6 +50,10 @@ int main() {
     view = presentAgentContextUsage(usage);
     check(!view.usedPercent && view.text.contains(QStringLiteral("等待")),
           "changed window or model invalidates old sampling occupancy");
+    // 调用方已绘制上下文标签，等待状态拼入同一 header 后不能重复该前缀。
+    const QString waitingHeader = QStringLiteral("上下文 · %1").arg(view.text);
+    check(waitingHeader.count(QStringLiteral("上下文")) == 1,
+          "waiting status does not repeat the caller's context header label");
     usage.samplingValid = true;
     usage.latestSampling.total = {0, MaiUsageValueSource::Provider};
     view = presentAgentContextUsage(usage);

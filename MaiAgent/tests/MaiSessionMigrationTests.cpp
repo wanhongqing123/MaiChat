@@ -12,6 +12,9 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/stat.h>
+#endif
 #endif
 
 #include "MaiFileSystem.h"
@@ -186,6 +189,83 @@ void testEveryPublicationBoundary(const MaiFilePath& parent) {
     }
 }
 
+#ifdef __APPLE__
+void testApplePreservesSourceEvidence(const MaiFilePath& parent) {
+    const auto root = at(parent, "apple-preserved-evidence");
+    CHECK(makeLegacy(root));
+    int builds = 0;
+    auto request = options(root, builds);
+    struct Evidence {
+        std::string bytes;
+        struct stat info{};
+    };
+    std::vector<Evidence> original(3), ready(3);
+    const std::vector<std::string> extensions{"", "-wal", "-shm"};
+    const auto capture = [&](std::vector<Evidence>& evidence) {
+        for (std::size_t i = 0; i < extensions.size(); ++i) {
+            const auto path = at(root, ("agent.db" + extensions[i]).c_str());
+            CHECK(!MaiFileSystem::readFile(path, evidence[i].bytes));
+            CHECK(::stat(path.value().c_str(), &evidence[i].info) == 0);
+        }
+    };
+    capture(original);
+    request.checkpoint = [&](const std::string& step) -> MaiError {
+        if (step == "ready") capture(ready);
+        return {};
+    };
+    CHECK(!MaiSessionMigration::run(request));
+    for (std::size_t i = 0; i < extensions.size(); ++i) {
+        const auto path = at(root, ("agent.db.legacy-session-backup" + extensions[i]).c_str());
+        std::string bytes;
+        struct stat after{};
+        CHECK(!MaiFileSystem::readFile(path, bytes));
+        CHECK(::stat(path.value().c_str(), &after) == 0);
+        CHECK(bytes == ready[i].bytes);
+        // SHM是读者索引；只比较冻结ready后的保全值。正文主库/WAL从guard前就不变。
+        if (i < 2) CHECK(bytes == original[i].bytes);
+        CHECK(after.st_ino == original[i].info.st_ino && after.st_dev == original[i].info.st_dev);
+        CHECK(after.st_mode == original[i].info.st_mode);
+        CHECK(after.st_mtimespec.tv_sec == ready[i].info.st_mtimespec.tv_sec &&
+              after.st_mtimespec.tv_nsec == ready[i].info.st_mtimespec.tv_nsec);
+    }
+    verifyPublished(root);
+}
+
+void testAppleReplayInterruptedAgain(const MaiFilePath& parent) {
+    // 不改原发布断言；补充逆向rename自身再次中断后的同一请求重开。
+    for (const char* initial : {"source_preserved", "wal_preserved"}) {
+        for (const char* replay : {"apple_wal_restored", "apple_source_restored"}) {
+            if (std::string(initial) == "source_preserved" &&
+                std::string(replay) == "apple_wal_restored")
+                continue;
+            const auto root = at(parent, (std::string(initial) + "-" + replay).c_str());
+            CHECK(makeLegacy(root));
+            int builds = 0;
+            auto request = options(root, builds);
+            request.checkpoint = [&](const std::string& step) -> MaiError {
+                return step == initial ? MaiError{MaiErrorCode::Canceled, "initial interruption"}
+                                       : MaiError{};
+            };
+            CHECK(MaiSessionMigration::run(request).code() == MaiErrorCode::Canceled);
+            int replayInterruptions = 0;
+            request.checkpoint = [&](const std::string& step) -> MaiError {
+                if (step == replay) {
+                    ++replayInterruptions;
+                    return {MaiErrorCode::Canceled, "replay interruption"};
+                }
+                return {};
+            };
+            CHECK(MaiSessionMigration::run(request).code() == MaiErrorCode::Canceled);
+            CHECK(replayInterruptions == 1);
+            CHECK(!MaiSessionMigration::run(request));
+            CHECK(replayInterruptions == 1);
+            CHECK(builds == 1);
+            verifyPublished(root);
+        }
+    }
+}
+#endif
+
 void testCorruptionAndForeignSource(const MaiFilePath& parent) {
     const auto corrupt = at(parent, "corrupt");
     CHECK(makeLegacy(corrupt));
@@ -302,7 +382,8 @@ void testWriterAfterSnapshotCannotPublishOldBody(const MaiFilePath& parent) {
         };
         const auto error = MaiSessionMigration::run(request);
         CHECK(attempted);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
+        // Windows共享句柄与Apple独立SQLite写保留均拒绝此处的新提交。
         CHECK(!committed);
         CHECK(!error);
         verifyPublished(root);
@@ -537,9 +618,13 @@ void testRestartRejectsChangedIdentitiesAndLinks(const MaiFilePath& parent) {
 int main() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto parent =
-        MaiFileSystem::resolve(MaiFilePath::fromUtf8("fixtures-" + std::to_string(stamp)));
+        MaiFileSystem::resolve(MaiFilePath::fromUtf8("./fixtures-" + std::to_string(stamp)));
     CHECK(!MaiFileSystem::createDirectories(parent));
     testEveryPublicationBoundary(parent);
+#ifdef __APPLE__
+    testAppleReplayInterruptedAgain(parent);
+    testApplePreservesSourceEvidence(parent);
+#endif
     testCorruptionAndForeignSource(parent);
     testReplacedSourceAndVersion(parent);
     testAccountBoundaryAndActiveWriter(parent);
