@@ -657,6 +657,15 @@ npm test
 `/var/lib/maichat-auth/`，目录仅授权服务账号，定期备份 SQLite 数据库与 WAL。
 部署时使用示例 systemd 服务及 Nginx 路由，并独立启动模型凭据与素材服务。
 
+通用账号 API 的 Nginx 限流使用每 IP `60r/m` 稳态速率和 `burst=60 nodelay`：
+客户端启动会并发领取资料、好友和多种凭据，突发余量不能按单个请求设置。
+本地限流拒绝返回 HTTP 429、JSON `RATE_LIMITED`、`Retry-After: 1` 与
+`Cache-Control: no-store`，避免默认的 503 HTML 错误页触发客户端 JSON 解析失败。
+命名错误处理仅接管该 location 的本地拒绝；保持 `proxy_intercept_errors` 关闭，
+业务服务自身的 429、鉴权、body 限额和其他 location 原样处理。示例见
+`deploy/nginx-location.conf.example`。变更线上配置前须备份原文件并核摘要，执行
+`nginx -t`，通过后平滑 reload；不因修改代理限流重启 Auth、轮换令牌或迁移数据库。
+
 主模型凭据的 `api_keys` 保留 `glm`、`deepseek`、`minimax` 三个必需字符串，新增
 可选字符串 `openrouter`、`openai`；领取旧凭据进程的响应时，缺少新字段会归一化为空字符串。
 显式 `null`、其他类型、超过 4096 字符或含 ASCII 控制字符的 Key 均被拒绝；五字段
