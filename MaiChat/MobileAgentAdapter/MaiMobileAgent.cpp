@@ -642,8 +642,11 @@ struct MaiMobileAgent {
     void configure(const Json& request) {
         // 切换主模型时不能中断正在运行的任务；先创建共享存储，再配置线协议和工具集。
         if (anyBusy()) throw std::runtime_error("Stop active tasks before changing the model.");
-        const std::string databasePath = request.at("database").get<std::string>();
-        auto store = makeMaiSqliteStore(databasePath);
+        const auto selected = maiCurrentSessionDatabasePath(request.at("database").get<std::string>());
+        if (!selected) throw std::runtime_error(selected.error().message());
+        // session 调度与新版索引保持同一路径，不能从旧会话重新带入待运行任务。
+        const std::string databasePath = selected.value();
+        auto store = makeMaiCurrentSessionStore(request.at("database").get<std::string>());
         if (!store) throw std::runtime_error(store.error().message());
         const auto scheduleOpened = MaiSessionScheduleStore::open(
             databasePath == ":memory:" ? databasePath : databasePath + ".schedule.sqlite");

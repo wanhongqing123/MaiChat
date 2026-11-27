@@ -4,10 +4,13 @@
 #include "MaiMemoryStore.h"
 
 #include <QApplication>
+#include <QFile>
 #include <QProgressDialog>
 #include <QPushButton>
 #include <QThread>
 #include <QTemporaryDir>
+#include "../../../MaiAgent/third_party/sqlite/sqlite3.h"
+#include "../../../MaiAgent/tests/support/MaiLegacySessionFixture.h"
 #include <QTimer>
 #include <iostream>
 
@@ -31,6 +34,51 @@ int main(int argc, char** argv) {
     auto check = [&failures](bool condition, const char* message) {
         if (!condition) { std::cerr << "FAIL: " << message << '\n'; ++failures; }
     };
+    // 旧连接保持打开且 WAL 有内容；新版启动不得碰旧 writer，也不得自动导入。
+    QTemporaryDir legacyDirectory;
+    check(legacyDirectory.isValid(), "isolated legacy account directory");
+    if (legacyDirectory.isValid()) {
+        const QString legacyPath = legacyDirectory.filePath(QStringLiteral("agent.db"));
+        sqlite3* legacy = nullptr;
+        check(sqlite3_open(legacyPath.toUtf8().constData(), &legacy) == SQLITE_OK,
+              "create owned legacy database");
+        check(sqlite3_exec(legacy, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr) == SQLITE_OK,
+              "legacy fixture uses a live WAL connection");
+        check(sqlite3_exec(legacy, kMaiLegacySessionFrozenV15Sql, nullptr, nullptr, nullptr) == SQLITE_OK,
+              "populate frozen legacy history");
+        const QStringList originals{legacyPath, legacyPath + QStringLiteral("-wal"),
+                                    legacyPath + QStringLiteral("-shm")};
+        QList<QByteArray> before;
+        for (const QString& path : originals) {
+            QFile file(path);
+            check(file.open(QIODevice::ReadOnly), "legacy main and sidecars exist");
+            before.append(file.readAll());
+        }
+        auto fresh = prepareDesktopAgentStorage(legacyPath);
+        check(fresh.store != nullptr, "new session startup must ignore the live legacy database");
+        if (fresh.store) {
+            check(fresh.store->listSessions().empty(), "legacy session history must not be imported");
+            MaiSession session;
+            session.id = "new-format-only-session";
+            fresh.store->putSession(session);
+            check(!fresh.store->lastWriteError(), "new-format history remains writable");
+            fresh.store.reset();
+            auto reopened = prepareDesktopAgentStorage(legacyPath);
+            MaiSession restored;
+            check(reopened.store && reopened.store->getSession(session.id, restored),
+                  "new-format records survive reopen without importing legacy history");
+            check(reopened.store && reopened.store->listSessions().size() == 1,
+                  "reopen contains only the new-format session");
+        }
+        for (qsizetype i = 0; i < originals.size(); ++i) {
+            QFile file(originals[i]);
+            check(file.open(QIODevice::ReadOnly) && file.readAll() == before[i],
+                  "legacy main WAL and SHM remain byte-identical during new startup");
+        }
+        sqlite3_close(legacy);
+    }
+    if (app.arguments().contains(QStringLiteral("fresh-start-only")))
+        return failures ? 1 : 0;
     int ticks = 0;
     bool visible = false;
     QTimer heartbeat;

@@ -681,7 +681,13 @@ int main(int argc, char** argv) {
     if (databasePath.empty()) {
         store = makeMaiMemoryStore();
     } else {
-        auto opened = makeMaiSqliteStore(databasePath);
+        const auto selected = maiCurrentSessionDatabasePath(databasePath);
+        if (!selected) {
+            std::fprintf(stderr, "maiagent-console: %s\n", selected.error().message().c_str());
+            return 1;
+        }
+        auto opened = makeMaiCurrentSessionStore(databasePath);
+        databasePath = selected.value();
         if (!opened) {
             std::fprintf(stderr, "maiagent-console: %s\n", opened.error().message().c_str());
             return 1;

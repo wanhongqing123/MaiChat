@@ -2544,6 +2544,43 @@ int readUserVersion(sqlite3* database) {
 }
 }  // namespace
 
+MaiResult<std::string> maiCurrentSessionDatabasePath(
+    const std::string& configuredDatabasePathUtf8) {
+    maiAssertBlockingAllowed("maiCurrentSessionDatabasePath");
+    if (configuredDatabasePathUtf8 == ":memory:") return configuredDatabasePathUtf8;
+    if (configuredDatabasePathUtf8.empty() ||
+        configuredDatabasePathUtf8.find('\0') != std::string::npos)
+        return {MaiErrorCode::InvalidInput, "Invalid session database path."};
+    const auto original = MaiFileSystem::resolve(MaiFilePath::fromUtf8(configuredDatabasePathUtf8));
+    if (original.isEmpty())
+        return {MaiErrorCode::InvalidInput, "Cannot resolve session database path."};
+    const auto root = original.dirName();
+    const auto current = root.append(MaiFilePath::fromUtf8(original.baseName().toUtf8() + ".v16"));
+    const auto metadata = [&](const MaiFilePath& index) {
+        return root.append(MaiFilePath::fromUtf8("sessions/.journal"))
+            .append(MaiFilePath::fromUtf8(index.baseName().toUtf8() + ".jsonl"));
+    };
+    // 新索引的日志存在即保持选择，不能在索引删除或原旧库消失后重新导入旧历史。
+    // 原文件名仅在已有完整 JSONL 存储时沿用；单独旧 SQLite 从不被打开或探测正文。
+    auto selected = current;
+    if (!MaiFileSystem::exists(current) && !MaiFileSystem::exists(metadata(current)) &&
+        MaiFileSystem::exists(metadata(original)) &&
+        !MaiSessionMigration::hasPending(root, original))
+        selected = original;
+    return selected.toUtf8();
+}
+
+MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiCurrentSessionStore(
+    const std::string& configuredDatabasePathUtf8, const MaiSqliteStoreOpenOptions& options) {
+    if (options.isCanceled && options.isCanceled())
+        return {MaiErrorCode::Canceled, "Session storage opening was canceled."};
+    const auto selected = maiCurrentSessionDatabasePath(configuredDatabasePathUtf8);
+    if (!selected) return selected.error();
+    auto currentOptions = options;
+    currentOptions.allowLegacyMigration = false;
+    return makeMaiSqliteStore(selected.value(), currentOptions);
+}
+
 MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
     const std::string& databasePathUtf8) {
     return makeMaiSqliteStore(databasePathUtf8, {});
@@ -2567,6 +2604,8 @@ MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
     if (auto error = MaiFileSystem::createDirectories(root)) return error;
     // 未完成发布必须先恢复；不能因正式索引暂时不存在而建立空库。
     if (!ephemeral && MaiSessionMigration::hasPending(root, path)) {
+        if (!options.allowLegacyMigration)
+            return {MaiErrorCode::NotSupported, "Incomplete migration is not a current session store."};
         if (auto error = MaiSessionJournal::migrateLegacy(path, root, options)) return error;
     }
     if (!ephemeral && MaiFileSystem::exists(path)) {
@@ -2578,6 +2617,8 @@ MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
         if (version < 0)
             return {MaiErrorCode::Internal, "Cannot inspect the existing storage index."};
         if (version > 0 && version < 16) {
+            if (!options.allowLegacyMigration)
+                return {MaiErrorCode::NotSupported, "Legacy history is not imported by current session startup."};
             if (auto error = MaiSessionJournal::migrateLegacy(path, root, options)) return error;
         } else if (version != 0 && version != 16)
             return {MaiErrorCode::NotSupported, "Unsupported session storage version."};

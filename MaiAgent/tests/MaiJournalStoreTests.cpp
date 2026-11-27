@@ -660,8 +660,98 @@ void test_legacy_fixture_migrates() {
     CHECK(rebuilt);
     if (rebuilt) CHECK(!rebuilt.value()->listSessions().empty());
 }
+void test_current_startup_uses_its_own_journal() {
+    OwnedFixture f;
+    // 旧路径不是 SQLite 也无需读取；只测试新版从空历史开始并且保持选择稳定。
+    CHECK(!MaiFileSystem::writeFile(f.db, "untouched-legacy-session-file"));
+    const auto selected = maiCurrentSessionDatabasePath(f.db.toUtf8());
+    CHECK(selected && selected.value() == f.db.toUtf8() + ".v16");
+    if (!selected) return;
+    auto opened = makeMaiSqliteStore(selected.value());
+    CHECK(opened && opened.value()->listSessions().empty());
+    if (!opened) return;
+    createOwnedSession(*opened.value());
+    opened.value()->putMessage("ses_owned", makeOwnedMessage("new-only-body"));
+    CHECK(!opened.value()->lastWriteError());
+    opened.value().reset();
+    CHECK(!MaiFileSystem::removeFile(MaiFilePath::fromUtf8(selected.value())));
+    // 索引和旧文件都丢失也不能改变新版日志身份；新记录仍从同一个提交日志恢复。
+    CHECK(!MaiFileSystem::removeFile(f.db));
+    const auto rebuiltPath = maiCurrentSessionDatabasePath(f.db.toUtf8());
+    CHECK(rebuiltPath && rebuiltPath.value() == selected.value());
+    if (!rebuiltPath) return;
+    auto rebuilt = makeMaiSqliteStore(rebuiltPath.value());
+    MaiMessage restored;
+    CHECK(rebuilt && rebuilt.value()->getMessage("ses_owned", "msg_owned", restored));
+    if (rebuilt) CHECK(rebuilt.value()->listSessions().size() == 1);
+    rebuilt.value().reset();
+    CHECK(
+        !MaiFileSystem::writeFile(MaiFilePath::fromUtf8(selected.value()), "broken-current-index"));
+    CHECK(!makeMaiCurrentSessionStore(f.db.toUtf8()));
+}
+void test_current_startup_preserves_existing_native_location() {
+    OwnedFixture f;
+    auto opened = makeMaiSqliteStore(f.db.toUtf8());
+    CHECK(opened);
+    if (!opened) return;
+    createOwnedSession(*opened.value());
+    opened.value().reset();
+    const auto selected = maiCurrentSessionDatabasePath(f.db.toUtf8());
+    CHECK(selected && selected.value() == f.db.toUtf8());
+    CHECK(!maiCurrentSessionDatabasePath(""));
+    CHECK(!maiCurrentSessionDatabasePath(std::string("bad\0path", 8)));
+    const auto memory = maiCurrentSessionDatabasePath(":memory:");
+    CHECK(memory && memory.value() == ":memory:");
+}
+void test_current_startup_does_not_resume_partial_legacy_publication() {
+    OwnedFixture f;
+    auto opened = makeMaiSqliteStore(f.db.toUtf8());
+    CHECK(opened);
+    if (!opened) return;
+    createOwnedSession(*opened.value());
+    opened.value().reset();
+    // 模拟旧发布已留下日志但没有完成收据；普通启动不恢复该导入现场。
+    CHECK(!MaiFileSystem::createDirectories(
+        f.root.append(MaiFilePath::fromUtf8(".agent.db.session-migration"))));
+    const auto selected = maiCurrentSessionDatabasePath(f.db.toUtf8());
+    CHECK(selected && selected.value() == f.db.toUtf8() + ".v16");
+    if (!selected) return;
+    auto fresh = makeMaiSqliteStore(selected.value());
+    CHECK(fresh && fresh.value()->listSessions().empty());
+    if (!fresh) return;
+    fresh.value().reset();
+    // 选中的新版目标格式过新时必须拒绝，不能再找另一空库掩盖错误。
+    sqlite3* db = nullptr;
+    CHECK(sqlite3_open(selected.value().c_str(), &db) == SQLITE_OK);
+    CHECK(sqlite3_exec(db, "PRAGMA user_version=99", nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(db);
+    const auto unsupported = makeMaiCurrentSessionStore(f.db.toUtf8());
+    CHECK(!unsupported && unsupported.error().code() == MaiErrorCode::NotSupported);
+}
+void test_current_factory_cannot_enable_legacy_import() {
+    OwnedFixture f;
+    const std::string currentPath = f.db.toUtf8() + ".v16";
+    sqlite3* legacy = nullptr;
+    CHECK(sqlite3_open(currentPath.c_str(), &legacy) == SQLITE_OK);
+    CHECK(sqlite3_exec(legacy, kMaiLegacySessionFrozenV15Sql, nullptr, nullptr, nullptr) ==
+          SQLITE_OK);
+    sqlite3_close(legacy);
+    std::string before, after;
+    CHECK(!MaiFileSystem::readFile(MaiFilePath::fromUtf8(currentPath), before));
+    MaiSqliteStoreOpenOptions options;
+    options.allowLegacyMigration = true;
+    auto opened = makeMaiCurrentSessionStore(f.db.toUtf8(), options);
+    CHECK(!opened && opened.error().code() == MaiErrorCode::NotSupported);
+    CHECK(!MaiFileSystem::readFile(MaiFilePath::fromUtf8(currentPath), after));
+    CHECK(before == after);
+    CHECK(!MaiFileSystem::exists(f.root.append(MaiFilePath::fromUtf8("sessions"))));
+}
 }  // namespace
 int main() {
+    test_current_startup_uses_its_own_journal();
+    test_current_startup_preserves_existing_native_location();
+    test_current_startup_does_not_resume_partial_legacy_publication();
+    test_current_factory_cannot_enable_legacy_import();
     test_exact_bytes_context_native_and_drafts();
     test_missing_source_fails_closed();
     test_public_origin_cannot_enter_event_cache();

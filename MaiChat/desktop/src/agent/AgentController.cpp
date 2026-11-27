@@ -306,7 +306,7 @@ QString initialReasoningEffort(const QString& model, const QString& effort) {
 std::unique_ptr<MaiSessionStore> openStore(const QString& databasePath, QString& openError) {
     if (databasePath.isEmpty()) return makeMaiMemoryStore();
 
-    auto opened = makeMaiSqliteStore(toUtf8(databasePath));
+    auto opened = makeMaiCurrentSessionStore(toUtf8(databasePath));
     if (!opened) {
         openError = fromUtf8(opened.error().message());
         return makeMaiMemoryStore();
@@ -315,7 +315,10 @@ std::unique_ptr<MaiSessionStore> openStore(const QString& databasePath, QString&
 }
 
 std::shared_ptr<MaiSessionScheduleStore> openScheduleStore(const QString& databasePath) {
-    const std::string path = databasePath.isEmpty() ? ":memory:" : toUtf8(databasePath) + ".schedule.sqlite";
+    const auto selected = maiCurrentSessionDatabasePath(databasePath.isEmpty() ? ":memory:" : toUtf8(databasePath));
+    if (!selected) return nullptr;
+    // New-format startup must not resume schedules belonging to retired session history.
+    const std::string path = selected.value() == ":memory:" ? selected.value() : selected.value() + ".schedule.sqlite";
     const auto opened = MaiSessionScheduleStore::open(path);
     return opened ? opened.value() : nullptr;
 }

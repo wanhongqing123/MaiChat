@@ -34,12 +34,13 @@ DesktopAgentStoragePreparationResult prepareDesktopAgentStorage(
     if (!opener)
         opener = [](const QString& path, const MaiSqliteStoreOpenOptions& options)
             -> MaiResult<std::unique_ptr<MaiSessionStore>> {
-            const QByteArray utf8 = path.toUtf8();
-            const auto inUse = checkDesktopSessionDatabaseUse(MaiFilePath::fromUtf8(
-                std::string(utf8.constData(), static_cast<size_t>(utf8.size()))));
+            const auto selected = maiCurrentSessionDatabasePath(path.toStdString());
+            if (!selected) return selected.error();
+            // Only the current store participates in ownership checks. A legacy App may keep
+            // its separate old database open; it is not a source for this startup.
+            const auto inUse = checkDesktopSessionDatabaseUse(MaiFilePath::fromUtf8(selected.value()));
             if (inUse) return inUse;
-            return makeMaiSqliteStore(
-                std::string(utf8.constData(), static_cast<size_t>(utf8.size())), options);
+            return makeMaiCurrentSessionStore(path.toStdString(), options);
         };
 
     QProgressDialog progress(QStringLiteral("正在准备本地会话…"), QStringLiteral("取消"), 0, 0, parent);

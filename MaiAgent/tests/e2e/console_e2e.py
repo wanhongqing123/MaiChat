@@ -586,7 +586,7 @@ say("")
 # 控制台进程已经退了，数据库里应该留着两个会话和第一个会话的全部消息。
 # 用另一个进程去读——这里就借 maiagent-console 自己：同一个库，同一个文件。
 say("== 3. what the console wrote is still there ==")
-check("database file exists", os.path.exists(database))
+check("current session index exists", os.path.exists(database + ".v16"))
 
 reread = subprocess.run(
     [CONSOLE, "--dir", workspace, "--db", database],

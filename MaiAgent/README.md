@@ -191,7 +191,7 @@ POSIX 和独立存储接口保留原字节；非法 UTF-8 的模型页附带 `ra
 ./build/bin/maiagent-console --db ./agent.db
 ```
 
-库里直接用是 `makeMaiSqliteStore(path)`，返回 `MaiResult`——打不开就是错误，
+产品宿主使用 `makeMaiCurrentSessionStore(path)`，返回 `MaiResult`——打不开就是错误，
 不会给你一个用起来处处出错的半死对象。正式实现是同一账户根下的追加 JSONL 权威原文
 与可重建 SQLite 索引。传 `":memory:"` 会使用内存索引和自有临时日志目录，析构清理，
 仍有文件 I/O；真正不落盘应使用 `makeMaiMemoryStore()`。
@@ -201,10 +201,14 @@ POSIX 和独立存储接口保留原字节；非法 UTF-8 的模型页附带 `ra
 保留在日志；索引使用偏移和长度，`item_json` 等虚拟字段通过受限回读取得原文。
 普通 sqlite3 可查元数据；查询正文生成列需要正式后端注册的读取函数，不能把缺少函数
 解释成正文丢失。原有 `sessions/messages/parts` 领域查询和导入扩展仍共用该后端。
-旧 1..15 数据库只读迁移，验证新索引后发布，原库保留为迁移备份。
+旧 1..15 数据库不导入常规产品会话。首次使用当前格式时，索引选为配置路径加 `.v16`
+（例如 `agent.db.v16`），旧库与 sidecar 原地保留；JSONL 仍在同一账户的 `sessions/`。
+已有有效新版 JSONL 存储沿用原位置，新记录不会因重启清空。索引及定时任务索引使用同一
+选择路径；路径查询入口 `maiCurrentSessionDatabasePath` 不打开 SQLite。
+`makeMaiSqliteStore` 是保留显式迁移能力的底层诊断入口，不用于产品常规启动。
 
-完成 item 才持久化；新流式未完成草稿只保留在内存，不承诺重启恢复。旧库已有的草稿
-迁移时仍完整保留。已完成 A 后 B 尚未完成就失败，A 留在历史，B 不回灌给模型。
+完成 item 才持久化；新流式未完成草稿只保留在内存，不承诺重启恢复。旧库草稿不导入
+新会话。已完成 A 后 B 尚未完成就失败，A 留在历史，B 不回灌给模型。
 
 消息和 part 的顺序靠 `ORDER BY id`。这不是偷懒：`MaiIdGenerator` 产出的 id 是
 定长的"时间戳 + 同毫秒序号 + 随机"，用的 base32 字母表在 ASCII 里递增，

@@ -417,7 +417,7 @@ void AgentControllerTest::scheduledSessionCatchesUpAfterOwnerRestarts() {
         session = original.createSession(directory.path());
         QVERIFY(!session.isEmpty());
         const auto opened = MaiSessionScheduleStore::open(
-            database.toUtf8().toStdString() + ".schedule.sqlite");
+            maiCurrentSessionDatabasePath(database.toStdString()).value() + ".schedule.sqlite");
         QVERIFY(opened.isOk());
         QVERIFY(opened.value()->create(session.toStdString(), "恢复后检查",
             "设备恢复后继续", MaiTime::getCurrentTime() + 2'000,
@@ -431,7 +431,7 @@ void AgentControllerTest::scheduledSessionCatchesUpAfterOwnerRestarts() {
     QTRY_COMPARE_WITH_TIMEOUT(scripted->requests(), 1, 6'000);
     QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 6'000);
     const auto opened = MaiSessionScheduleStore::open(
-        database.toUtf8().toStdString() + ".schedule.sqlite");
+        maiCurrentSessionDatabasePath(database.toStdString()).value() + ".schedule.sqlite");
     QVERIFY(opened.isOk());
     QCOMPARE(QString::fromStdString(opened.value()->list(session.toStdString())
         .value().front().status), QStringLiteral("completed"));
@@ -447,7 +447,7 @@ void AgentControllerTest::scheduledSessionPromptRunsOnceOnOwner() {
     const QString session = controller.createSession(directory.path());
     QVERIFY(!session.isEmpty());
     const auto opened = MaiSessionScheduleStore::open(
-        database.toUtf8().toStdString() + ".schedule.sqlite");
+        maiCurrentSessionDatabasePath(database.toStdString()).value() + ".schedule.sqlite");
     QVERIFY(opened.isOk());
     const auto due = opened.value()->create(session.toStdString(), "测试提醒",
         "只执行一次", MaiTime::getCurrentTime() + 2'000, MaiTime::getCurrentTime());
