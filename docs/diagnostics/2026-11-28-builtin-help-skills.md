@@ -146,7 +146,7 @@ The initial4k Complete observations above only cover first sampling. An addition
 normal Agent fake-provider flow selects tool_help via tool_search, reads grouped
 help, then optionally reads builtin-media before sampling again. Every sampled
 request is independently checked against the actual window/reserve input budget.
-At4096/128 and4096/512+550base, first sample3384/3568 succeeds but the next step is
+On Windows at4096/128 and4096/512+550base, first sample3384/3568 succeeds but the next step is
 refused by the existing local capacity guard (InvalidInput with explicit budget/
 capacity wording, history retained). It does NOT complete the help loop. The first
 probe incorrectly expected the provider-only ContextWindowExceeded code; its two
@@ -158,3 +158,45 @@ completion guarantee is made.
 Whole integrated Mac and iOS normal consumers will be bound to the unified commit;
 Mac FFmpeg component passes alone do not establish those final integrations.
 No published tag/assets, installer, backend, credentials or supplier requests changed.
+
+
+## Exact-final Mac/iOS acceptance
+
+The unified code source is0afd03e114c27dd0b4d4409f8a9f66b78a100ed3,
+MaiAgent tree d37ceb09779efe47af5b2adbc2d6e4e916680514 and MaiChat tree
+5db0093c7e996203b5275847584c3402f51d9844. Root independently checked the
+671763-byte evidence ZIP SHA256
+0f828eae32ad6826d0913f7044b7baec489e1359dba6d6fa4f95dea3ab4fe241,
+all65 manifest members,42 canonical Git input hashes/blobs, six frozen test TUs,
+component trees, original test logs and separated help stdout/stderr markers.
+Large binaries were not supplied; their hashes, Mach-O records and embedded-body
+presence are Mac-reported artifact evidence, not independent Root binary rehashes.
+
+Normal Mac App plus6 test executables built0 (127.893s), followed by7/7 official
+CTest targets (6.803s wall time) and private-profile App smoke0 (2.752s). The final
+App SHA256 is83decf6f5b74af19454c4a7ad297341a2d8a9fcecfc9e4890d4a6c3cf1f42df8.
+The unmodified final CTest help driver verified actual help output and callback
+routing after the argv fix. This was macOS27.2 arm64 with a14.4 build target;
+older macOS/Intel runtime acceptance is not claimed.
+
+Normal iOS Simulator SDK27.1/arm64/min16.0 configuration and shared adapter/Core,
+Help and Skill consumer compile/link returned0 (4.160s configure/129.290s build).
+The actual Core and two linked consumers contain all five exact Skill source
+bodies; the adapter references the new text setter and the actual FFTools archive
+provides its three writer symbols. Reported LC_BUILD_VERSION records show
+platform7/min16.0/sdk27.1. simctl read-only query found no booted Simulator, so no
+iOS runtime, simulator boot, installation or user App launch is claimed.
+
+Platform context boundaries differ. The same unmodified Mac TU completed the
+4096/128/base0 grouped-help3-request loop at max3806/hard3891;4096/512+550base
+stopped after1 request by the local InvalidInput capacity guard (max3479/hard3584).
+The8192/512+550base full4-request help/Skill loop completed at max4831/hard7680.
+The Windows4k failure observations are not generalized to Mac. These are fake
+provider/real Runtime budgeting checks, not billed provider token counts.
+
+Both final component trees were clean at consumer verification. Root retained
+the original unrelated Qt/WIP directories, existing releases and all host evidence.
+The Android owned device fixture directory was removed only after rechecking its
+three executable hashes and all four final run results; host evidence remains.
+No implementation work remains. iOS runtime is the explicit validation boundary;
+no formal package, installer, signing or public-release change was made.

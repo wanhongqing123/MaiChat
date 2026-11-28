@@ -28,10 +28,12 @@ with its original engine/lock and reviewed writer plan.
   hashes and reviewed help argv list. Validate original real-engine -h RED to
   GREEN, topics/lists, long output, sequential failure/cancel cleanup, no
   cross-thread stdout capture. No real supplier calls.
-- [ ] Run required eight Core suites plus help/catalog/discovery/Skills/runtime
+- [x] Run required eight Core suites plus help/catalog/discovery/Skills/runtime
   and meaningful budget fixtures, normal Desktop build/PE/staging/ZIP smoke.
   Android arm64 JNI build validates shared resources and callback compilation.
   Bind exact commit/source/artifacts and inspect actual group/help tool output.
-- [ ] Independent scope/quality review; record diagnostics under docs/diagnostics;
+- [x] Independent scope/quality review; record diagnostics under docs/diagnostics;
   commit/push only authorized files. Give Mac final same-source consumers and
   report platform limits without claiming release or installation.
+
+Final source0afd03e validated: Windows normalApp/Core/FFmpeg/packaging; Android normalJNI and owned arm64 native runtime; Mac exact-source7/7+App smoke; iOS Simulator shared consumer normal compile/link only (no booted device). See diagnostics for real RED/GREEN and context-window boundaries.
