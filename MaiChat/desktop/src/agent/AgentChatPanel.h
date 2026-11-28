@@ -36,8 +36,9 @@ struct MaiContextStatus;
 //   **正文使用页面可用宽度。** 只保留 MarkdownView 自己的页边距，不在宽屏上
 //   人为留出两块空白。
 //
-//   **输入区与 IM 共用 ComposerTextEdit。** 发送按钮嵌在右下角；图片继续通过
-//   拖放或粘贴进入，工作目录入口在左下角。模型、权限和配置属于页面级设置，放到页头。
+//   **输入区与 IM 共用 ComposerTextEdit。** 发送按钮嵌在右下角；附件可通过
+//   文件选择、拖放或粘贴进入，普通文件仅保留路径引用，图像/视频沿用媒体导入。
+//   模型、权限和配置属于页面级设置，放到页头。
 //
 // ── 另外两种非气泡的东西 ────────────────────────────────────────
 //
@@ -143,6 +144,8 @@ private:
     // 只跟随实际摘要阶段，独立于消息历史；复用检查点/普通准备不创建新提示。
     void refreshCompactionNotice(const MaiContextStatus* status);
     bool insertComposerMimeData(const QMimeData* mime);
+    // 普通文件仅保留本地引用；+选择与拖放共用验证，不读取正文或自动提交。
+    void insertComposerFile(const QString& path);
     void insertComposerImage(const QImage& image);
     void insertComposerImageFile(const QString& path);
     void insertComposerVideoFile(const QString& path);
@@ -151,8 +154,9 @@ private:
     // the composer or attach media to an already canceled draft import.
     bool finishComposerMediaImport(const QString& destination);
     void cancelComposerMediaImports();
-    void insertComposerMediaMarker(const QString& path, bool video, const QString& sessionId);
+    void insertComposerAttachmentMarker(const QString& resourceName, const QString& sessionId);
     QString composerMediaDirectory() const;
+    QStringList composerFilePaths() const;
     QStringList composerImagePaths() const;
     QStringList composerVideoPaths() const;
     void refreshComposerMediaTray();

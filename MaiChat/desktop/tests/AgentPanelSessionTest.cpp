@@ -8,6 +8,8 @@
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
 #include <QDropEvent>
+#include <QFileDialog>
+#include <QLineEdit>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
@@ -75,6 +77,7 @@
 #include "MaiChatTools/DesktopMediaTools.h"
 #include "markdown/MarkdownView.h"
 #include "ui/ComposerTextEdit.h"
+#include "ui/DesktopRasterImage.h"
 #include "ui/DesktopAudioPlayback.h"
 #include "ui/ImagePreviewDialog.h"
 #include "ui/UiZoom.h"
@@ -731,6 +734,17 @@ private slots:
     void composerTextMimeUsesOnlyLiteralText();
     void composerMimeHandlerAndInlineImagesKeepTheirExistingPath();
     void normalAgentComposerDropsSourceFormattingAndSendsLiteralText();
+    void localFileDropKeepsDraftAndSendsReferences_data();
+    void localFileDropKeepsDraftAndSendsReferences();
+    void fileDraftValidationAndRemovalNeverDeleteSources();
+    void fileDraftSurvivesQuestionAnswer();
+    void fileDropWhileBusyWaitsForExplicitSteering();
+    void filePickerUsesTheSameAttachmentPath();
+    void localFileDropsNegotiateCopyWithoutMovingSources_data();
+    void localFileDropsNegotiateCopyWithoutMovingSources();
+    void boundedFileProbeKeepsMediaCandidates_data();
+    void boundedFileProbeKeepsMediaCandidates();
+    void largeDocumentsRemainReferencesWithinAttachmentBudget();
     void conversationAndComposerUseResizableSplitter();
     void composerResizeHandleAlignsWithEditorBorder();
     void composerPlaceholderFitsAtMinimumHeight();
@@ -4390,6 +4404,495 @@ void AgentPanelSessionTest::normalAgentComposerDropsSourceFormattingAndSendsLite
     const auto request = captured->request();
     QVERIFY(!request.messages.empty());
     QCOMPARE(QString::fromStdString(request.messages.back().content), ownedComposerText());
+}
+
+void AgentPanelSessionTest::localFileDropKeepsDraftAndSendsReferences_data() {
+    QTest::addColumn<bool>("editorFrame");
+    QTest::newRow("viewport") << false;
+    QTest::newRow("editor-frame") << true;
+}
+
+void AgentPanelSessionTest::localFileDropKeepsDraftAndSendsReferences() {
+    QFETCH(bool, editorFrame);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QStringList paths{directory.filePath(QStringLiteral("日志 副本.ulog")),
+#ifdef Q_OS_WIN
+                            directory.filePath(QStringLiteral("second file.txt"))};
+#else
+                            directory.filePath(QStringLiteral("quoted \"line\nfile.txt"))};
+#endif
+    const QByteArray contents("OWNED BODY MUST NOT BE INLINED");
+    for (const QString& path : paths) {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write(contents), contents.size());
+    }
+    auto model = std::make_unique<CapturingModel>();
+    auto* captured = model.get();
+    AgentController controller(std::move(model), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 720);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(directory.path());
+    panel.openSession(session);
+    auto* editor = panel.findChild<ComposerTextEdit*>(QStringLiteral("agentPromptEditor"));
+    QVERIFY(editor);
+    const QString draft = QStringLiteral("请分析这两份文件。");
+    editor->setPlainText(draft);
+    QMimeData mime;
+    mime.setUrls({QUrl::fromLocalFile(paths[0]), QUrl::fromLocalFile(paths[1]), QUrl::fromLocalFile(paths[0])});
+    auto* target = editorFrame ? static_cast<QWidget*>(editor) : editor->viewport();
+    const QPoint position(target->width() / 2, target->height() / 2);
+    QDragEnterEvent enter(position, Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(target, &enter);
+    QVERIFY(enter.isAccepted());
+    QDragMoveEvent move(position, Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(target, &move);
+    QDropEvent drop(position, Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(target, &drop);
+    QVERIFY(drop.isAccepted());
+    QTRY_COMPARE(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(), 2);
+    QString plain = editor->toPlainText();
+    plain.remove(QChar(0xFFFC));
+    QCOMPARE(plain, draft);
+    QVERIFY(captured->request().messages.empty());
+    QCOMPARE(controller.agent().listMessages(session.toStdString()).size(), size_t(0));
+    QVERIFY(panel.findChildren<QWidget*>(QStringLiteral("agentImageDraftCard")).isEmpty());
+    for (auto* card : panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")))
+        for (auto* label : card->findChildren<QLabel*>()) QCOMPARE(label->textFormat(), Qt::PlainText);
+    QVERIFY(captureAgentFixture(panel, editorFrame ? QStringLiteral("local-files-editor-drop")
+                                                 : QStringLiteral("local-files-viewport-drop")));
+    QSignalSpy finished(&controller, &AgentController::turnFinished);
+    QTest::mouseClick(panel.findChild<QPushButton*>(QStringLiteral("agentSendButton")), Qt::LeftButton);
+    QVERIFY(finished.wait(15000));
+    const auto request = captured->request();
+    QVERIFY(!request.messages.empty());
+    const QString sent = QString::fromStdString(request.messages.back().content);
+    QVERIFY(sent.startsWith(draft));
+    QVERIFY(!sent.contains(QString::fromUtf8(contents)));
+    const int start = sent.indexOf(QLatin1Char('['));
+    QVERIFY(start >= 0);
+    const QJsonDocument references = QJsonDocument::fromJson(sent.mid(start).toUtf8());
+    QVERIFY(references.isArray());
+    QCOMPARE(references.array(), QJsonArray::fromStringList(paths));
+    const QString evidence = qEnvironmentVariable("MAICHAT_AGENT_EVIDENCE_DIR");
+    if (!evidence.isEmpty()) {
+        QFile payload(QDir(evidence).filePath(editorFrame ? QStringLiteral("file-reference-payload-frame.json")
+                                                        : QStringLiteral("file-reference-payload-viewport.json")));
+        QVERIFY(payload.open(QIODevice::WriteOnly));
+        const QJsonObject value{{QStringLiteral("prompt"), sent},
+                                {QStringLiteral("references"), references.array()},
+                                {QStringLiteral("bodyInlined"), false}};
+        QVERIFY(payload.write(QJsonDocument(value).toJson()) > 0);
+    }
+    QVERIFY(editor->toPlainText().isEmpty());
+    for (const QString& path : paths) {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QCOMPARE(file.readAll(), contents);
+    }
+}
+
+void AgentPanelSessionTest::fileDraftValidationAndRemovalNeverDeleteSources() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    QStringList paths;
+    const QByteArray contents("OWNED SOURCE");
+    for (int i = 0; i < 11; ++i) {
+        const QString path = directory.filePath(QStringLiteral("文档 %1.txt").arg(i));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write(contents), contents.size());
+        paths.append(path);
+    }
+    {
+        auto model = std::make_unique<CapturingModel>();
+        auto* captured = model.get();
+        AgentController controller(std::move(model), QString());
+        AgentChatPanel panel(controller);
+        panel.resize(1000, 720);
+        panel.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&panel));
+        const QString first = controller.createSession(directory.path());
+        const QString other = controller.createSession(directory.path());
+        panel.openSession(first);
+        auto* editor = panel.findChild<ComposerTextEdit*>(QStringLiteral("agentPromptEditor"));
+        QVERIFY(editor);
+        editor->setPlainText(QStringLiteral("Keep this draft"));
+        QMimeData rejected;
+        rejected.setUrls({QUrl::fromLocalFile(directory.path()),
+                          QUrl::fromLocalFile(directory.filePath(QStringLiteral("missing.txt")))});
+        dropOwnedComposerMime(*editor, rejected);
+        QVERIFY(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).isEmpty());
+        QCOMPARE(editor->toPlainText(), QStringLiteral("Keep this draft"));
+        QMimeData remote;
+        remote.setUrls({QUrl(QStringLiteral("https://example.invalid/test.txt"))});
+        dropOwnedComposerMime(*editor, remote);
+        QVERIFY(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).isEmpty());
+        editor->setPlainText(QStringLiteral("Keep this draft"));
+        QMimeData files;
+        QList<QUrl> urls;
+        for (const QString& path : paths) urls.append(QUrl::fromLocalFile(path));
+        files.setUrls(urls);
+        dropOwnedComposerMime(*editor, files);
+        QTRY_COMPARE(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(), 10);
+        QVERIFY(captured->request().messages.empty());
+        panel.openSession(other);
+        QVERIFY(editor->toPlainText().isEmpty());
+        QTRY_VERIFY(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).isEmpty());
+        editor->setPlainText(QStringLiteral("other draft"));
+        panel.openSession(first);
+        QTRY_COMPARE(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(), 10);
+        QString plain = editor->toPlainText(); plain.remove(QChar(0xFFFC));
+        QCOMPARE(plain, QStringLiteral("Keep this draft"));
+        // Moving a reference before Send must keep its visible marker and text.
+        const QString moved = paths[0] + QStringLiteral(".moved");
+        QVERIFY(QFile::rename(paths[0], moved));
+        panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"))->click();
+        QVERIFY(captured->request().messages.empty());
+        QCOMPARE(editor->toPlainText(), plain + QString(10, QChar(0xFFFC)));
+        QTRY_COMPARE(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(), 10);
+        QVERIFY(QFile::rename(moved, paths[0]));
+        auto* card = panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).front();
+        card->findChild<QPushButton*>(QStringLiteral("agentRemoveDraftMedia"))->click();
+        QTRY_COMPARE(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(), 9);
+        // Clear, switch and destroy use the same marker lifecycle without owning files.
+        editor->clear();
+        QTRY_VERIFY(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).isEmpty());
+        files.setUrls({QUrl::fromLocalFile(paths[0])});
+        dropOwnedComposerMime(*editor, files);
+        panel.openSession(other);
+        QCOMPARE(editor->toPlainText(), QStringLiteral("other draft"));
+    }
+    QCoreApplication::processEvents();
+    for (const QString& path : paths) {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QCOMPARE(file.readAll(), contents);
+    }
+}
+
+void AgentPanelSessionTest::fileDraftSurvivesQuestionAnswer() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("answer attachment.txt"));
+    { QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); QCOMPARE(file.write("OWNED"), qint64(5)); }
+    AgentController controller(std::make_unique<QuestionModel>(), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 720);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString root = controller.createSession(directory.path());
+    panel.openSession(root);
+    const auto child = controller.agent().spawnSubAgent(root.toStdString(), "file-question", "Ask a question");
+    QVERIFY(child);
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    auto* editor = panel.findChild<ComposerTextEdit*>(QStringLiteral("agentPromptEditor"));
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    QVERIFY(editor && send);
+    QMimeData mime;
+    mime.setUrls({QUrl::fromLocalFile(path)});
+    dropOwnedComposerMime(*editor, mime);
+    QTRY_COMPARE(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(), 1);
+    send->click();
+    QCOMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    editor->textCursor().insertText(QStringLiteral("Use A"));
+    send->click();
+    controller.agent().waitIdle();
+    QTRY_VERIFY(controller.pendingQuestions().empty());
+    QVERIFY(editor->toPlainText().contains(QChar(0xFFFC)));
+    QVERIFY(!editor->toPlainText().contains(QStringLiteral("Use A")));
+    QTRY_COMPARE(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(), 1);
+    QCOMPARE(controller.agent().listMessages(root.toStdString()).size(), std::size_t(0));
+    QVERIFY(QFileInfo(path).isFile());
+}
+
+void AgentPanelSessionTest::fileDropWhileBusyWaitsForExplicitSteering() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("busy supplement.txt"));
+    { QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); QCOMPARE(file.write("OWNED"), qint64(5)); }
+    auto state = std::make_shared<IntermediateProgressState>();
+    AgentController controller(std::make_unique<IntermediateProgressModel>(), QString(),
+                               [state](MaiToolRegistry& tools) {
+                                   tools.add(std::make_unique<IntermediateProgressTool>(state, 1));
+                                   tools.add(std::make_unique<IntermediateProgressTool>(state, 2));
+                               });
+    struct ReleaseOnExit {
+        std::shared_ptr<IntermediateProgressState> state;
+        ~ReleaseOnExit() { state->released = 2; }
+    } release{state};
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 720);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(directory.path());
+    panel.openSession(session);
+    auto* editor = panel.findChild<ComposerTextEdit*>(QStringLiteral("agentPromptEditor"));
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    editor->setPlainText(QStringLiteral("Initial request"));
+    send->click();
+    QTRY_COMPARE_WITH_TIMEOUT(state->entered.load(), 1, 5000);
+    const auto turn = controller.agent().activeTurnId(session.toStdString());
+    QMimeData mime;
+    mime.setUrls({QUrl::fromLocalFile(path)});
+    dropOwnedComposerMime(*editor, mime);
+    QTRY_COMPARE(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(), 1);
+    int usersBeforeSend = 0;
+    for (const auto& message : controller.agent().listMessages(session.toStdString()))
+        if (message.role == MaiRole::User) ++usersBeforeSend;
+    QCOMPARE(usersBeforeSend, 1);
+    QCOMPARE(controller.agent().activeTurnId(session.toStdString()), turn);
+    QCOMPARE(state->released.load(), 0);
+    send->click();
+    QStringList users;
+    for (const auto& message : controller.agent().listMessages(session.toStdString()))
+        if (message.role == MaiRole::User) users.append(QString::fromStdString(message.text()));
+    QCOMPARE(users.size(), 2);
+    QVERIFY(users.back().contains(path));
+    QCOMPARE(controller.agent().activeTurnId(session.toStdString()), turn);
+    QCOMPARE(state->released.load(), 0);
+    state->released = 2;
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+    QVERIFY(QFileInfo(path).isFile());
+}
+
+void AgentPanelSessionTest::filePickerUsesTheSameAttachmentPath() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("chosen file.txt"));
+    { QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); QCOMPARE(file.write("OWNED"), qint64(5)); }
+    Harness harness;
+    QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
+    auto* editor = harness.panel->findChild<ComposerTextEdit*>(QStringLiteral("agentPromptEditor"));
+    editor->setPlainText(QStringLiteral("existing draft"));
+    auto* action = harness.panel->findChild<QAction*>(QStringLiteral("agentChooseFiles"));
+    QVERIFY(action);
+    const bool previous = QApplication::testAttribute(Qt::AA_DontUseNativeDialogs);
+    QApplication::setAttribute(Qt::AA_DontUseNativeDialogs, true);
+    bool selected = false;
+    QTimer select;
+    select.setInterval(30);
+    connect(&select, &QTimer::timeout, &select, [&] {
+        auto* dialog = harness.panel->findChild<QFileDialog*>();
+        if (!dialog || !dialog->isVisible()) return;
+        auto* name = dialog->findChild<QLineEdit*>(QStringLiteral("fileNameEdit"));
+        if (!name) return;
+        name->setText(path);
+        selected = true;
+        select.stop();
+        QTimer::singleShot(100, dialog, [dialog] {
+            QMetaObject::invokeMethod(dialog, "accept", Qt::QueuedConnection);
+        });
+    });
+    QTimer watchdog;
+    watchdog.setSingleShot(true);
+    connect(&watchdog, &QTimer::timeout, &watchdog, [&] {
+        if (auto* dialog = harness.panel->findChild<QFileDialog*>()) dialog->reject();
+    });
+    select.start();
+    watchdog.start(5000);
+    action->trigger();
+    select.stop();
+    watchdog.stop();
+    QApplication::setAttribute(Qt::AA_DontUseNativeDialogs, previous);
+    QVERIFY(selected);
+    QTRY_COMPARE(harness.panel->findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(), 1);
+    QString plain = editor->toPlainText(); plain.remove(QChar(0xFFFC));
+    QCOMPARE(plain, QStringLiteral("existing draft"));
+    QVERIFY(harness.controller->agent().listMessages(harness.mine.toStdString()).empty());
+    QVERIFY(QFileInfo(path).isFile());
+}
+
+void AgentPanelSessionTest::localFileDropsNegotiateCopyWithoutMovingSources_data() {
+    QTest::addColumn<bool>("editorFrame");
+    QTest::addColumn<bool>("copyAllowed");
+    QTest::newRow("viewport-copy") << false << true;
+    QTest::newRow("frame-copy") << true << true;
+    QTest::newRow("viewport-move-only") << false << false;
+    QTest::newRow("frame-move-only") << true << false;
+}
+
+void AgentPanelSessionTest::localFileDropsNegotiateCopyWithoutMovingSources() {
+    QFETCH(bool, editorFrame);
+    QFETCH(bool, copyAllowed);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("copy reference.txt"));
+    { QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); QCOMPARE(file.write("KEEP SOURCE"), qint64(11)); }
+    Harness harness;
+    QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
+    auto* editor = harness.panel->findChild<ComposerTextEdit*>(QStringLiteral("agentPromptEditor"));
+    editor->setPlainText(QStringLiteral("existing draft"));
+    QMimeData mime;
+    mime.setUrls({QUrl::fromLocalFile(path)});
+    QWidget* target = editorFrame ? editor : editor->viewport();
+    const QPoint point(target->width() / 2, target->height() / 2);
+    const Qt::DropActions actions = copyAllowed ? (Qt::MoveAction | Qt::CopyAction) : Qt::MoveAction;
+#ifdef Q_OS_MACOS
+    const auto modifiers = Qt::ControlModifier;
+#else
+    const auto modifiers = Qt::ShiftModifier;
+#endif
+    QDragEnterEvent enter(point, actions, &mime, Qt::LeftButton, modifiers);
+    QCOMPARE(enter.proposedAction(), Qt::MoveAction);
+    QApplication::sendEvent(target, &enter);
+    QCOMPARE(enter.isAccepted(), copyAllowed);
+    if (copyAllowed) QCOMPARE(enter.dropAction(), Qt::CopyAction);
+    QDragMoveEvent move(point, actions, &mime, Qt::LeftButton, modifiers);
+    QApplication::sendEvent(target, &move);
+    QCOMPARE(move.isAccepted(), copyAllowed);
+    if (copyAllowed) QCOMPARE(move.dropAction(), Qt::CopyAction);
+    QDropEvent drop(point, actions, &mime, Qt::LeftButton, modifiers);
+    QCOMPARE(drop.proposedAction(), Qt::MoveAction);
+    QApplication::sendEvent(target, &drop);
+    QCOMPARE(drop.isAccepted(), copyAllowed);
+    if (copyAllowed) QCOMPARE(drop.dropAction(), Qt::CopyAction);
+    QString plain = editor->toPlainText(); plain.remove(QChar(0xFFFC));
+    QCOMPARE(plain, QStringLiteral("existing draft"));
+    QTRY_COMPARE(harness.panel->findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(),
+                 copyAllowed ? 1 : 0);
+    QVERIFY(harness.controller->agent().listMessages(harness.mine.toStdString()).empty());
+    QFile source(path);
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    QCOMPARE(source.readAll(), QByteArray("KEEP SOURCE"));
+}
+
+void AgentPanelSessionTest::boundedFileProbeKeepsMediaCandidates_data() {
+    QTest::addColumn<QString>("kind");
+    for (const char* kind : {"png-suffix", "png-unknown", "jpeg-padded-unknown", "tiff-unknown",
+                              "heif-suffix", "heif-unknown", "video-suffix", "video-unknown", "corrupt-png"})
+        QTest::newRow(kind) << QString::fromLatin1(kind);
+}
+
+void AgentPanelSessionTest::boundedFileProbeKeepsMediaCandidates() {
+    QFETCH(QString, kind);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const bool video = kind.startsWith(QStringLiteral("video-"));
+    const bool corrupt = kind == QStringLiteral("corrupt-png");
+    QString suffix = QStringLiteral(".unknown-owned");
+    if (kind == QStringLiteral("png-suffix") || corrupt) suffix = QStringLiteral(".png");
+    if (kind == QStringLiteral("heif-suffix")) suffix = QStringLiteral(".heic");
+    if (kind == QStringLiteral("video-suffix")) suffix = QStringLiteral(".mp4");
+    const QString path = directory.filePath(QStringLiteral("媒体 candidate") + suffix);
+    if (video) {
+        QVERIFY(QFile::copy(QStringLiteral(MAICHAT_AGENT_VIDEO_FIXTURE), path));
+    } else if (kind.startsWith(QStringLiteral("heif-"))) {
+        const QString fixture = QFINDTESTDATA("fixtures/raster/extended/owned-padding.heic");
+        QVERIFY(!fixture.isEmpty());
+        QVERIFY(QFile::copy(fixture, path));
+    } else if (kind == QStringLiteral("tiff-unknown")) {
+        const QString fixture = QFINDTESTDATA("fixtures/raster/extended/owned.tiff");
+        QVERIFY(!fixture.isEmpty());
+        QVERIFY(QFile::copy(fixture, path));
+    } else if (kind == QStringLiteral("jpeg-padded-unknown")) {
+        const QString fixture = QFINDTESTDATA("fixtures/raster/source-asymmetric.jpg");
+        QVERIFY(!fixture.isEmpty());
+        QFile source(fixture);
+        QVERIFY(source.open(QIODevice::ReadOnly));
+        const QByteArray original = source.readAll();
+        QVERIFY(original.startsWith(QByteArray::fromHex("ffd8")));
+        // The complete JPEG is valid, but its dimensions follow an 8KiB APP15
+        // segment. A strict parse of the first4KiB cannot classify it as invalid.
+        const QByteArray padded = original.left(2) + QByteArray::fromHex("ffef2002") +
+                                  QByteArray(8192, '\0') + original.mid(2);
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write(padded), padded.size());
+        file.close();
+        QVERIFY(desktopInspectRasterBytes(padded.left(4096)).error_code != 0);
+    } else if (corrupt) {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write("OWNED TEXT NOT AN IMAGE"), qint64(23));
+    } else {
+        QImage image(12, 8, QImage::Format_RGB32);
+        image.fill(Qt::cyan);
+        QVERIFY(image.save(path, "PNG"));
+    }
+    if (!video && !corrupt) QCOMPARE(desktopInspectRasterFile(path).error_code, 0);
+    AgentController controller(std::make_unique<CapturingModel>(), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 720);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(directory.path());
+    panel.openSession(session);
+    auto* editor = panel.findChild<ComposerTextEdit*>(QStringLiteral("agentPromptEditor"));
+    editor->setPlainText(QStringLiteral("Preserve draft"));
+    QMimeData mime;
+    mime.setUrls({QUrl::fromLocalFile(path)});
+    dropOwnedComposerMime(*editor, mime);
+    const QString card = corrupt ? QStringLiteral("agentFileDraftCard")
+                                 : video ? QStringLiteral("agentVideoDraftCard") : QStringLiteral("agentImageDraftCard");
+    QTRY_COMPARE_WITH_TIMEOUT(panel.findChildren<QWidget*>(card).size(), 1, 10000);
+    if (!corrupt) QVERIFY(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).isEmpty());
+    QString plain = editor->toPlainText(); plain.remove(QChar(0xFFFC));
+    QCOMPARE(plain, QStringLiteral("Preserve draft"));
+    QVERIFY(controller.agent().listMessages(session.toStdString()).empty());
+    editor->clear();
+    QVERIFY(QFileInfo(path).isFile());
+}
+
+void AgentPanelSessionTest::largeDocumentsRemainReferencesWithinAttachmentBudget() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    QStringList paths;
+    const qint64 size = 100ll * 1024 * 1024;
+    const QByteArray header("OWNED large log file\n");
+    for (int i = 0; i < 11; ++i) {
+        const QString path = directory.filePath(QStringLiteral("large %1").arg(i) +
+                                               (i % 2 ? QStringLiteral(".zip") : QStringLiteral(".ulog")));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        const QByteArray first = i % 2 ? QByteArray::fromHex("504b0304") + header : header;
+        QCOMPARE(file.write(first), first.size());
+        QVERIFY(file.resize(size)); // Owned sparse fixture; no 100MiB allocation/readAll.
+        paths.append(path);
+    }
+    auto model = std::make_unique<CapturingModel>();
+    auto* captured = model.get();
+    AgentController controller(std::move(model), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 720);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(directory.path());
+    panel.openSession(session);
+    auto* editor = panel.findChild<ComposerTextEdit*>(QStringLiteral("agentPromptEditor"));
+    QMimeData mime;
+    QList<QUrl> urls;
+    for (const QString& path : paths) urls.append(QUrl::fromLocalFile(path));
+    urls.insert(1, urls.front()); // Duplicate must not consume the ten-file budget.
+    mime.setUrls(urls);
+    dropOwnedComposerMime(*editor, mime);
+    QTRY_COMPARE(panel.findChildren<QWidget*>(QStringLiteral("agentFileDraftCard")).size(), 10);
+    QVERIFY(panel.findChildren<QWidget*>(QStringLiteral("agentImageDraftCard")).isEmpty());
+    QVERIFY(panel.findChildren<QWidget*>(QStringLiteral("agentVideoDraftCard")).isEmpty());
+    QVERIFY(panel.findChildren<QWidget*>(QStringLiteral("agentPendingMediaImport")).isEmpty());
+    QVERIFY(captured->request().messages.empty());
+    QSignalSpy finished(&controller, &AgentController::turnFinished);
+    panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"))->click();
+    QVERIFY(finished.wait(15000));
+    const auto request = captured->request();
+    const QString prompt = QString::fromStdString(request.messages.back().content);
+    const int begin = prompt.indexOf(QLatin1Char('['));
+    QVERIFY(begin >= 0);
+    const auto references = QJsonDocument::fromJson(prompt.mid(begin).toUtf8());
+    QCOMPARE(references.array(), QJsonArray::fromStringList(paths.mid(0, 10)));
+    QVERIFY(!prompt.contains(QString::fromUtf8(header)));
+    // This is a functional boundary, not a wall-clock proof of syscall byte count.
+    // The product's Unbuffered read(4096) and candidate guards establish that bound.
+    for (int i = 0; i < paths.size(); ++i) {
+        QFile file(paths[i]);
+        QVERIFY(file.open(QIODevice::ReadOnly | QIODevice::Unbuffered));
+        const QByteArray first = i % 2 ? QByteArray::fromHex("504b0304") + header : header;
+        QCOMPARE(file.read(first.size()), first);
+        QCOMPARE(file.size(), size);
+    }
 }
 
 void AgentPanelSessionTest::conversationAndComposerUseResizableSplitter() {

@@ -21,6 +21,9 @@
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
+#include <QDropEvent>
+#include <QDragEnterEvent>
+#include <QDragMoveEvent>
 #include <QFileInfo>
 #include <QFontMetrics>
 #include <QFrame>
@@ -107,6 +110,7 @@ const char* const kLineSoft = "#f1f5f9";
 const char* const kAccent = "#0b67b7";
 const char* const kDanger = "#b42318";
 const QString kComposerVideoPrefix = QStringLiteral("maichat-video:");
+const QString kComposerFilePrefix = QStringLiteral("maichat-file:");
 
 QThreadPool* composerMediaImportPool() {
     // Called on the GUI thread. Local composer I/O must not queue behind shared
@@ -218,6 +222,14 @@ QString videoPathFromResource(const QString& name) {
     return name.startsWith(kComposerVideoPrefix) ? QUrl(name.mid(kComposerVideoPrefix.size())).toLocalFile()
                                                  : QString();
 }
+
+QString composerResourcePath(const QString& name) {
+    if (name.startsWith(kComposerVideoPrefix)) return videoPathFromResource(name);
+    if (name.startsWith(kComposerFilePrefix))
+        return QUrl(name.mid(kComposerFilePrefix.size())).toLocalFile();
+    return name;
+}
+
 
 QString videoMimeType(const QString& path) {
     const QString suffix = QFileInfo(path).suffix().toLower();
@@ -837,6 +849,68 @@ public:
     std::function<void(const QString&)> onOpenVideo;
 
 protected:
+    bool event(QEvent* event) override {
+        // QTextEdit normally dispatches drag/drop through its viewport. The
+        // surrounding editor border is also a drop target in the composer;
+        // forward local-file events into the same path, without a second handler
+        // or changing ordinary text drag, selection and paste behavior.
+        if (event->type() == QEvent::DragEnter || event->type() == QEvent::DragMove ||
+            event->type() == QEvent::Drop) {
+            const auto* drop = static_cast<QDropEvent*>(event);
+            if (drop->mimeData()->hasUrls()) {
+                for (const QUrl& url : drop->mimeData()->urls()) {
+                    if (!url.isLocalFile()) continue;
+                    // Sending the same event through QApplication would bubble
+                    // an editor-frame drag back to this object recursively.
+                    if (event->type() == QEvent::DragEnter)
+                        dragEnterEvent(static_cast<QDragEnterEvent*>(event));
+                    else if (event->type() == QEvent::DragMove)
+                        dragMoveEvent(static_cast<QDragMoveEvent*>(event));
+                    else
+                        dropEvent(static_cast<QDropEvent*>(event));
+                    return true;
+                }
+            }
+        }
+        return ComposerTextEdit::event(event);
+    }
+    static bool hasLocalUrls(const QMimeData* mime) {
+        if (!mime || !mime->hasUrls()) return false;
+        for (const QUrl& url : mime->urls())
+            if (url.isLocalFile()) return true;
+        return false;
+    }
+    void dragEnterEvent(QDragEnterEvent* event) override {
+        if (!hasLocalUrls(event->mimeData())) {
+            ComposerTextEdit::dragEnterEvent(event);
+            return;
+        }
+        if (!(event->possibleActions() & Qt::CopyAction)) { event->ignore(); return; }
+        event->setDropAction(Qt::CopyAction);
+        event->accept();
+    }
+    void dragMoveEvent(QDragMoveEvent* event) override {
+        if (!hasLocalUrls(event->mimeData())) {
+            ComposerTextEdit::dragMoveEvent(event);
+            return;
+        }
+        if (!(event->possibleActions() & Qt::CopyAction)) { event->ignore(); return; }
+        event->setDropAction(Qt::CopyAction);
+        event->accept();
+    }
+    void dropEvent(QDropEvent* event) override {
+        if (!hasLocalUrls(event->mimeData())) {
+            ComposerTextEdit::dropEvent(event);
+            return;
+        }
+        if (!(event->possibleActions() & Qt::CopyAction)) { event->ignore(); return; }
+        // Attachment drops add references/import media via the existing MIME
+        // handler. Do not let QTextEdit negotiate Move or remove source data;
+        // ordinary text drag/selection keeps the base editor's behavior.
+        ComposerTextEdit::insertFromMimeData(event->mimeData());
+        event->setDropAction(Qt::CopyAction);
+        event->accept();
+    }
     void mouseDoubleClickEvent(QMouseEvent* event) override {
         const QTextCursor clicked = cursorForPosition(event->pos());
         const QString path = videoPathFromResource(clicked.charFormat().toImageFormat().name());
@@ -1800,8 +1874,8 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     };
     auto* attachMedia = new QPushButton(QStringLiteral("+"), runtime_->editor);
     attachMedia->setObjectName(QStringLiteral("agentAttachMediaButton"));
-    attachMedia->setAccessibleName(QStringLiteral("添加媒体"));
-    attachMedia->setToolTip(QStringLiteral("添加媒体"));
+    attachMedia->setAccessibleName(QStringLiteral("添加文件"));
+    attachMedia->setToolTip(QStringLiteral("添加文件"));
     attachMedia->setCursor(Qt::PointingHandCursor);
     attachMedia->setFixedSize(UiZoom::s(36), UiZoom::s(36));
     UiZoom::setStyle(
@@ -1812,17 +1886,13 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     runtime_->editor->setLeadingAction(attachMedia);
     auto* attachMenu = new QMenu(attachMedia);
     applyAgentMenuStyle(attachMenu);
-    auto* fromFile = attachMenu->addAction(QStringLiteral("选择图片或视频"));
+    auto* fromFile = attachMenu->addAction(QStringLiteral("选择文件"));
+    fromFile->setObjectName(QStringLiteral("agentChooseFiles"));
     connect(fromFile, &QAction::triggered, this, [this] {
         const QStringList paths = QFileDialog::getOpenFileNames(
-            this, QStringLiteral("添加图片或视频"), QStandardPaths::writableLocation(QStandardPaths::PicturesLocation),
-            QStringLiteral("媒体文件 (*.png *.jpg *.jpeg *.webp *.gif *.mp4 *.mov *.webm)"));
-        for (const QString& path : paths) {
-            if (!videoMimeType(path).isEmpty())
-                insertComposerVideoFile(path);
-            else
-                insertComposerImageFile(path);
-        }
+            this, QStringLiteral("添加文件"), QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+            QStringLiteral("所有文件 (*)"));
+        for (const QString& path : paths) insertComposerFile(path);
     });
     auto* takePhoto = attachMenu->addAction(QStringLiteral("打开摄像头拍照"));
     connect(takePhoto, &QAction::triggered, this, [this] {
@@ -4366,21 +4436,20 @@ void AgentChatPanel::showApproval(const QString& permissionId) {
 
 bool AgentChatPanel::insertComposerMimeData(const QMimeData* mime) {
     if (!mime) return false;
-    bool inserted = false;
+    bool localFiles = false;
     if (mime->hasUrls()) {
         for (const QUrl& url : mime->urls()) {
             if (!url.isLocalFile()) continue;
-            const QString path = url.toLocalFile();
-            if (!QFileInfo(path).isFile()) continue;
-            if (!videoMimeType(path).isEmpty())
-                insertComposerVideoFile(path);
-            else if (desktopInspectRasterFile(path).error_code == 0)
-                insertComposerImageFile(path);
-            else
+            localFiles = true;
+            if (!url.host().isEmpty()) {
+                appendNotice(QStringLiteral("请添加本机上的文件。"), true);
                 continue;
-            inserted = true;
+            }
+            insertComposerFile(url.toLocalFile());
         }
-        if (inserted) return true;
+        // A rejected local file must not fall back to inserting its file:// URL
+        // as plain text. Ordinary text/remote-URL paste still follows the editor.
+        if (localFiles) return true;
     }
     if (mime->hasImage()) {
         const QImage image = qvariant_cast<QImage>(mime->imageData());
@@ -4390,6 +4459,81 @@ bool AgentChatPanel::insertComposerMimeData(const QMimeData* mime) {
         }
     }
     return false;
+}
+
+void AgentChatPanel::insertComposerFile(const QString& path) {
+    // File selection and URL drops share validation and the media import path.
+    // Generic files remain references; attaching never sends their body to a model or grants
+    // a tool permission, uploads them, executes them, or submits a turn.
+    if (path.startsWith(QStringLiteral("//")) || path.startsWith(QStringLiteral("\\\\"))) {
+        appendNotice(QStringLiteral("请添加本机上的文件。"), true);
+        return;
+    }
+    const QFileInfo file(path);
+    if (!file.isFile() || !file.isReadable()) {
+        appendNotice(QStringLiteral("无法添加文件：%1（请选择可读取的文件，不支持文件夹）").arg(file.fileName()), true);
+        return;
+    }
+    const QString absolute = file.absoluteFilePath();
+    // Reject duplicates and a full draft before opening or probing the source.
+    // Media imports keep their existing destination identity; generic references
+    // and already-attached native paths can be deduplicated without reading data.
+    const QStringList files = composerFilePaths();
+    const QStringList images = composerImagePaths();
+    const QStringList videos = composerVideoPaths();
+    if (files.contains(absolute) || images.contains(absolute) || videos.contains(absolute)) return;
+    if (files.size() + images.size() + videos.size() +
+            runtime_->pendingMediaImports.value(runtime_->sessionId) >= 10) {
+        appendNotice(QStringLiteral("每条消息最多添加 10 项附件。"), true);
+        return;
+    }
+    // A log/archive must not take the synchronous full-image-file reader merely
+    // to discover it is not an image. Probe a fixed prefix without QFile's extra
+    // read-ahead, then use only in-memory MIME and extension candidates. A prefix
+    // is not a strict image parse: JPEG/TIFF/HEIF metadata can be farther away.
+    QFile source(absolute);
+    if (!source.open(QIODevice::ReadOnly | QIODevice::Unbuffered)) {
+        appendNotice(QStringLiteral("无法读取文件：%1").arg(file.fileName()), true);
+        return;
+    }
+    constexpr qint64 probeBytes = 4096;
+    const QByteArray prefix = source.read(probeBytes);
+    const bool readFailed = source.error() != QFileDevice::NoError;
+    source.close();
+    if (readFailed) {
+        appendNotice(QStringLiteral("无法读取文件：%1").arg(file.fileName()), true);
+        return;
+    }
+    const QMimeDatabase mime;
+    const QString extensionMime = mime.mimeTypeForFile(file.fileName(), QMimeDatabase::MatchExtension).name();
+    const QString prefixMime = mime.mimeTypeForData(prefix).name();
+    const QString suffix = file.suffix().toLower();
+    static const QStringList imageSuffixes{
+        QStringLiteral("png"), QStringLiteral("apng"), QStringLiteral("jpg"), QStringLiteral("jpeg"),
+        QStringLiteral("jpe"), QStringLiteral("jfif"), QStringLiteral("webp"), QStringLiteral("bmp"),
+        QStringLiteral("dib"), QStringLiteral("gif"), QStringLiteral("ico"), QStringLiteral("tif"),
+        QStringLiteral("tiff"), QStringLiteral("pbm"), QStringLiteral("pgm"), QStringLiteral("ppm"),
+        QStringLiteral("pnm"), QStringLiteral("jp2"), QStringLiteral("j2k"), QStringLiteral("j2c"),
+        QStringLiteral("jpx"), QStringLiteral("heic"), QStringLiteral("heif"), QStringLiteral("avif")};
+    const bool imageCandidate = imageSuffixes.contains(suffix) ||
+                                extensionMime.startsWith(QStringLiteral("image/")) ||
+                                prefixMime.startsWith(QStringLiteral("image/"));
+    const bool videoCandidate = suffix == QStringLiteral("mp4") || suffix == QStringLiteral("mov") ||
+                                suffix == QStringLiteral("webm") ||
+                                extensionMime.startsWith(QStringLiteral("video/")) ||
+                                prefixMime.startsWith(QStringLiteral("video/"));
+    if (videoCandidate && !videoMimeType(absolute).isEmpty()) {
+        insertComposerVideoFile(absolute);
+    } else if (imageCandidate && desktopInspectRasterFile(absolute).error_code == 0) {
+        // Only candidates enter the unchanged strict whole-image validation and
+        // ordinary asynchronous media import, including unknown-suffix images.
+        insertComposerImageFile(absolute);
+    } else {
+        if (runtime_->sessionId.isEmpty()) openSession();
+        if (runtime_->sessionId.isEmpty()) return;
+        const QString resource = kComposerFilePrefix + QUrl::fromLocalFile(absolute).toString(QUrl::FullyEncoded);
+        insertComposerAttachmentMarker(resource, runtime_->sessionId);
+    }
 }
 
 void AgentChatPanel::insertComposerImage(const QImage& image) {
@@ -4423,13 +4567,13 @@ QString AgentChatPanel::composerMediaDirectory() const {
     return QDir(root).filePath(QStringLiteral("ComposerMedia"));
 }
 
-void AgentChatPanel::insertComposerMediaMarker(const QString& path, bool video, const QString& sessionId) {
+void AgentChatPanel::insertComposerAttachmentMarker(const QString& resourceName, const QString& sessionId) {
     QTextImageFormat format;
-    format.setName(video ? videoResourceName(path) : path);
+    format.setName(resourceName);
     format.setWidth(1);
     format.setHeight(1);
     if (sessionId == runtime_->sessionId) {
-        if (video) {
+        if (resourceName.startsWith(kComposerVideoPrefix) || resourceName.startsWith(kComposerFilePrefix)) {
             QImage marker(1, 1, QImage::Format_ARGB32_Premultiplied);
             marker.fill(Qt::transparent);
             runtime_->editor->document()->addResource(QTextDocument::ImageResource, QUrl(format.name()), marker);
@@ -4462,9 +4606,9 @@ void AgentChatPanel::importComposerMediaFile(const QString& path, bool video, bo
     if (runtime_->sessionId.isEmpty()) openSession();
     const QString targetSession = runtime_->sessionId;
     if (targetSession.isEmpty()) return;
-    const int existing = composerImagePaths().size() + composerVideoPaths().size();
+    const int existing = composerImagePaths().size() + composerVideoPaths().size() + composerFilePaths().size();
     if (existing + runtime_->pendingMediaImports.value(targetSession) >= 10) {
-        appendNotice(QStringLiteral("每条消息最多添加 10 项图片或视频。"), true);
+        appendNotice(QStringLiteral("每条消息最多添加 10 项附件。"), true);
         return;
     }
     const QString storage = composerMediaDirectory();
@@ -4526,7 +4670,7 @@ void AgentChatPanel::importComposerMediaFile(const QString& path, bool video, bo
                         appendNotice(QStringLiteral("媒体导入失败：%1").arg(fileName), true);
                 } else {
                     runtime_->unsentImportedPaths.insert(imported);
-                    insertComposerMediaMarker(imported, video, targetSession);
+                    insertComposerAttachmentMarker(video ? videoResourceName(imported) : imported, targetSession);
                 }
                 if (targetSession == runtime_->sessionId) refreshComposerMediaTray();
             });
@@ -4579,7 +4723,7 @@ QStringList AgentChatPanel::composerImagePaths() const {
             const QTextFragment fragment = it.fragment();
             if (!fragment.isValid() || !fragment.charFormat().isImageFormat()) continue;
             const QString path = fragment.charFormat().toImageFormat().name();
-            if (path.startsWith(kComposerVideoPrefix)) continue;
+            if (path.startsWith(kComposerVideoPrefix) || path.startsWith(kComposerFilePrefix)) continue;
             if (QFileInfo(path).isFile() && !paths.contains(path)) paths.push_back(path);
         }
     }
@@ -4595,6 +4739,24 @@ QStringList AgentChatPanel::composerVideoPaths() const {
             if (!fragment.isValid() || !fragment.charFormat().isImageFormat()) continue;
             const QString path = videoPathFromResource(fragment.charFormat().toImageFormat().name());
             if (QFileInfo(path).isFile() && !paths.contains(path)) paths.push_back(path);
+        }
+    }
+    return paths;
+}
+
+QStringList AgentChatPanel::composerFilePaths() const {
+    QStringList paths;
+    const QTextDocument* document = runtime_->editor->document();
+    for (QTextBlock block = document->begin(); block.isValid(); block = block.next()) {
+        for (auto it = block.begin(); !it.atEnd(); ++it) {
+            const QTextFragment fragment = it.fragment();
+            if (!fragment.isValid() || !fragment.charFormat().isImageFormat()) continue;
+            const QString name = fragment.charFormat().toImageFormat().name();
+            if (!name.startsWith(kComposerFilePrefix)) continue;
+            const QString path = composerResourcePath(name);
+            // Keep missing references visible so Send can report and retain the
+            // draft, rather than silently dropping a moved/deleted attachment.
+            if (!path.isEmpty() && !paths.contains(path)) paths.append(path);
         }
     }
     return paths;
@@ -4626,14 +4788,15 @@ void AgentChatPanel::refreshComposerMediaTray() {
             const QTextFragment fragment = it.fragment();
             if (!fragment.isValid() || !fragment.charFormat().isImageFormat()) continue;
             const QString name = fragment.charFormat().toImageFormat().name();
-            const QString path = name.startsWith(kComposerVideoPrefix) ? videoPathFromResource(name) : name;
-            if (QFileInfo(path).isFile() && !resources.contains(name)) resources.push_back(name);
+            const QString path = composerResourcePath(name);
+            if ((name.startsWith(kComposerFilePrefix) || QFileInfo(path).isFile()) && !resources.contains(name))
+                resources.push_back(name);
         }
     }
     if (runtime_->visibleDraftSession == runtime_->sessionId) {
         for (const QString& old : runtime_->visibleDraftMedia) {
-            if (resources.contains(old)) continue;
-            const QString path = old.startsWith(kComposerVideoPrefix) ? videoPathFromResource(old) : old;
+            if (resources.contains(old) || old.startsWith(kComposerFilePrefix)) continue;
+            const QString path = composerResourcePath(old);
             if (!runtime_->unsentImportedPaths.remove(path)) continue;
             QtConcurrent::run([path] { QDir(QFileInfo(path).absolutePath()).removeRecursively(); });
         }
@@ -4653,15 +4816,25 @@ void AgentChatPanel::refreshComposerMediaTray() {
         }
         for (const QString& name : resources) {
             const bool video = name.startsWith(kComposerVideoPrefix);
-            const QString path = video ? videoPathFromResource(name) : name;
+            const bool file = name.startsWith(kComposerFilePrefix);
+            const QString path = composerResourcePath(name);
             auto* card = new QWidget(runtime_->mediaTray);
-            card->setObjectName(video ? QStringLiteral("agentVideoDraftCard") : QStringLiteral("agentImageDraftCard"));
+            card->setObjectName(file ? QStringLiteral("agentFileDraftCard")
+                                     : video ? QStringLiteral("agentVideoDraftCard") : QStringLiteral("agentImageDraftCard"));
+            card->setToolTip(QStringLiteral("<qt>%1</qt>").arg(path.toHtmlEscaped()));
             card->setFixedSize(UiZoom::s(136), UiZoom::s(90));
             card->setStyleSheet(QStringLiteral("background:#f3f7fb;border-radius:8px;"));
             auto* cover = new QLabel(card);
             cover->setGeometry(0, 0, UiZoom::s(136), UiZoom::s(70));
             cover->setScaledContents(true);
-            if (video) {
+            cover->setTextFormat(Qt::PlainText);
+            if (file) {
+                QImage marker(1, 1, QImage::Format_ARGB32_Premultiplied);
+                marker.fill(Qt::transparent);
+                document->addResource(QTextDocument::ImageResource, QUrl(name), marker);
+                cover->setAlignment(Qt::AlignCenter);
+                cover->setText(QStringLiteral("文件\n%1").arg(QFileInfo(path).suffix().left(12).toUpper()));
+            } else if (video) {
                 QImage marker(1, 1, QImage::Format_ARGB32_Premultiplied);
                 marker.fill(Qt::transparent);
                 document->addResource(QTextDocument::ImageResource, QUrl(name), marker);
@@ -4675,13 +4848,14 @@ void AgentChatPanel::refreshComposerMediaTray() {
             auto* open = new QPushButton(card);
             open->setObjectName(video ? QStringLiteral("agentDraftVideoPreview")
                                       : QStringLiteral("agentDraftImagePreview"));
+            open->setVisible(!file); // Generic files are never decoded or launched by a draft card.
             open->setAccessibleName(
                 QStringLiteral("预览%1 %2")
                     .arg(video ? QStringLiteral("视频") : QStringLiteral("图片"), QFileInfo(path).fileName()));
             open->setGeometry(0, 0, UiZoom::s(136), UiZoom::s(70));
             open->setCursor(Qt::PointingHandCursor);
             open->setStyleSheet(QStringLiteral("QPushButton{background:transparent;border:0;}"));
-            connect(open, &QPushButton::clicked, this, [this, video, path, card] {
+            if (!file) connect(open, &QPushButton::clicked, this, [this, video, path, card] {
                 if (video) {
                     if (openVideo_) openVideo_(path, composerVideoPaths());
                 } else {
@@ -4697,13 +4871,15 @@ void AgentChatPanel::refreshComposerMediaTray() {
             remove->setObjectName(QStringLiteral("agentRemoveDraftMedia"));
             remove->setAccessibleName(
                 QStringLiteral("移除%1 %2")
-                    .arg(video ? QStringLiteral("视频") : QStringLiteral("图片"), QFileInfo(path).fileName()));
+                    .arg(file ? QStringLiteral("文件") : video ? QStringLiteral("视频") : QStringLiteral("图片"),
+                         QFileInfo(path).fileName()));
             remove->setGeometry(UiZoom::s(109), UiZoom::s(2), UiZoom::s(25), UiZoom::s(25));
             remove->setCursor(Qt::PointingHandCursor);
             remove->setStyleSheet(
                 QStringLiteral("QPushButton{background:rgba(0,0,0,180);border:0;border-radius:12px;color:white;}"));
             connect(remove, &QPushButton::clicked, this, [this, name] { removeComposerMedia(name); });
-            auto* label = new QLabel(QFileInfo(path).fileName(), card);
+            auto* label = new QLabel(QFileInfo(path).fileName().replace(QLatin1Char('\n'), QLatin1Char(' ')), card);
+            label->setTextFormat(Qt::PlainText);
             label->setGeometry(UiZoom::s(4), UiZoom::s(72), UiZoom::s(128), UiZoom::s(16));
             label->setText(label->fontMetrics().elidedText(label->text(), Qt::ElideMiddle, UiZoom::s(124)));
             UiZoom::setStyle(label, QStringLiteral("color:#172033;background:transparent;font-size: @metadata;"));
@@ -4758,7 +4934,8 @@ void AgentChatPanel::refreshComposerMediaTray() {
 }
 
 void AgentChatPanel::updateComposerPlaceholder() {
-    runtime_->editor->setPlaceholderText(composerImagePaths().isEmpty() && composerVideoPaths().isEmpty() &&
+    runtime_->editor->setPlaceholderText(composerFilePaths().isEmpty() && composerImagePaths().isEmpty() &&
+                                                 composerVideoPaths().isEmpty() &&
                                                  runtime_->pendingMediaImports.value(runtime_->sessionId) == 0
                                              ? QStringLiteral("交给它做点什么…")
                                              : QStringLiteral("添加说明（可选）"));
@@ -4875,7 +5052,7 @@ void AgentChatPanel::onSend() {
         answer.remove(QChar(0xFFFC));
         answer = answer.trimmed();
         if (answer.isEmpty()) {
-            if (!composerImagePaths().isEmpty() || !composerVideoPaths().isEmpty())
+            if (!composerFilePaths().isEmpty() || !composerImagePaths().isEmpty() || !composerVideoPaths().isEmpty())
                 appendNotice(QStringLiteral("请直接输入文字回答，附件会保留在输入框中。"), false);
             return;
         }
@@ -4899,7 +5076,7 @@ void AgentChatPanel::onSend() {
                 appendNotice(runtime_->controller->lastError(), true);
             return;
         }
-        // Consume text only. Media markers/resources and quoted context still
+        // Consume text only. File/media markers and quoted context still
         // belong to the next ordinary message in the same composer.
         QTextDocument* document = runtime_->editor->document();
         QList<QPair<int, int>> textRanges;
@@ -4917,7 +5094,8 @@ void AgentChatPanel::onSend() {
             cursor.removeSelectedText();
         }
         cursor.endEditBlock();
-        if (composerImagePaths().isEmpty() && composerVideoPaths().isEmpty()) runtime_->editor->clear();
+        if (composerFilePaths().isEmpty() && composerImagePaths().isEmpty() && composerVideoPaths().isEmpty())
+            runtime_->editor->clear();
         const QString answerItem = fromUtf8(captured.partId) + QStringLiteral("-answer");
         runtime_->view->addItem(answerItem, MarkdownView::Style::Bubble, answer);
         recordMessageItem(fromUtf8(captured.messageId), answerItem);
@@ -4943,7 +5121,24 @@ void AgentChatPanel::onSend() {
     text = text.trimmed();
     const QStringList imagePaths = composerImagePaths();
     const QStringList videoPaths = composerVideoPaths();
-    if (text.isEmpty() && imagePaths.isEmpty() && videoPaths.isEmpty()) return;
+    const QStringList filePaths = composerFilePaths();
+    if (text.isEmpty() && imagePaths.isEmpty() && videoPaths.isEmpty() && filePaths.isEmpty()) return;
+    for (const QString& path : filePaths) {
+        const QFileInfo file(path);
+        if (!file.isFile() || !file.isReadable()) {
+            appendNotice(QStringLiteral("附件已移动、删除或无法读取：%1。请移除或重新添加，输入内容已保留。")
+                             .arg(file.fileName()), true);
+            return;
+        }
+    }
+    if (!filePaths.isEmpty()) {
+        // These are local references, not uploaded/read bodies. JSON preserves
+        // spaces, quotes and newlines without generating shell syntax; ordinary
+        // file tools and their existing approval policy remain authoritative.
+        if (!text.isEmpty()) text += QStringLiteral("\n\n");
+        text += QStringLiteral("本地文件路径引用（尚未读取，请按需使用文件工具）：\n");
+        text += QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(filePaths)).toJson(QJsonDocument::Compact));
+    }
     if (!runtime_->modelConfigured) {
         emit modelConfigurationRequested();
         return;
