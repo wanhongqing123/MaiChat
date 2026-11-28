@@ -43,7 +43,7 @@ is private under .cache/ui-refresh-20261128/windows-final-02/.
 
 This does not claim manual Finder/Explorer drag or mobile runtime acceptance.
 No user installation, model/provider request, backend operation or published
-4.0.2 release asset is involved. Mac exact-source card verification is pending.
+4.0.2 release asset is involved. Mac exact-source card verification is recorded below.
 
 
 Final normal staging and independently extracted ZIP each passed bare-PATH smoke
@@ -52,3 +52,34 @@ with owned profiles and matching executable SHA256
 Package/stage/ZIP exits were0; receipt is private under
 .cache/ui-refresh-20261128/candidate-windows-final-01/receipt.json.
 This was a private validation package, not a replacement release asset.
+
+
+## Mac exact-source acceptance
+
+Mac consumed a3ec2d6c45e6e62fbd1c30964b1362b9e37dfead in its private lane.
+Normal configure/build returned0 (19.895s/10.954s), the unchanged43-case GUI
+consumer passed43/0 (12698ms), and the private-profile App smoke returned0
+(2.494s). Core archive bytes were reported identical to fd0; no unrelated Core,
+video or fullscreen suite was repeated.
+
+Root verified the supplied290582-byte ZIP SHA256
+6d53223b79e989c0a27e68914a4be3b69ddf848c61cc8c73becfaef63ec1ecc1,
+all24 manifest entries, three canonical source inputs and root/component tree
+bindings against the exact Git commit, and the43-pass log. App/test/helper
+binaries were not supplied; their hashes remain Mac-reported, not independent
+Root binary rehashes.
+
+Root viewed both final actual-component screenshots:1000x870 and640x870 logical
+sizes (Retina images are twice those dimensions). The displayed sample completed
+and error cards, status pills, output lines, file/image drafts and remove controls
+are readable at both widths. Details report Menlo/fixedPitch=true. These are
+owned synthetic stored receipts and local drafts, with no model request or
+command execution; they are not screenshots of the user's installed session.
+No claim is made that all arbitrary content lengths cannot clip.
+
+The first external visual helper omitted the error field; a follow-up compile
+failed due to its field type and a stale helper ran. Those outputs are explicitly
+invalid/excluded. Only the corrected helper, successful final build, frozen TU
+and final capture are accepted. Product code and the43-case test TU were not
+changed for that fixture correction. Private evidence is retained under
+.cache/ui-refresh-20261128/mac-a3/. No release package or installation changed.
