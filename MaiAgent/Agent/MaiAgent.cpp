@@ -81,12 +81,21 @@ struct ActiveTurn {
     std::condition_variable startWake;
     bool ready = false;
     std::mutex steeringMutex;
+    // 只属于当前同步模型请求；新输入只置此标志，不触及工具的任务取消。
+    // 注册、撤销和置位均受 steeringMutex 保护，防止构造请求与接受输入之间漏唤醒。
+    std::shared_ptr<std::atomic_bool> samplingCancel;
     std::string id;
     bool acceptingSteering = false;
     std::vector<std::string> pendingSteering;
     // 只统计尚未消费的显式 steering 图片；幂等重试不重复计数，消费后给下一组让出预算。
     std::size_t pendingSteeringImageCount = 0;
     std::vector<SteeringReceipt> steeringReceipts;
+
+    void cancelTask() {
+        cancel.store(true, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(steeringMutex);
+        if (samplingCancel) samplingCancel->store(true, std::memory_order_relaxed);
+    }
 
     void waitReady() {
         std::unique_lock<std::mutex> lock(startMutex);
@@ -443,7 +452,7 @@ struct MaiAgent::Runtime {
             std::lock_guard<std::mutex> lock(mutex);
             stopping = true;
             for (auto& [_, turn] : active) {
-                turn->cancel.store(true, std::memory_order_relaxed);
+                turn->cancelTask();
                 pending.push_back(turn);
             }
         }
@@ -764,6 +773,19 @@ struct MaiAgent::Runtime {
             std::lock_guard<std::mutex> lock(turn->steeringMutex);
             turn->acceptingSteering = false;
         };
+        dependencies.beginSampling = [turn](const std::shared_ptr<std::atomic_bool>& signal) {
+            std::lock_guard<std::mutex> lock(turn->steeringMutex);
+            signal->store(
+                turn->cancel.load(std::memory_order_relaxed) || !turn->pendingSteering.empty(),
+                std::memory_order_relaxed);
+            turn->samplingCancel = signal;
+        };
+        dependencies.endSampling = [turn](const std::shared_ptr<std::atomic_bool>& signal) {
+            std::lock_guard<std::mutex> lock(turn->steeringMutex);
+            const bool interrupted = signal->load(std::memory_order_relaxed);
+            if (turn->samplingCancel == signal) turn->samplingCancel.reset();
+            return interrupted;
+        };
         dependencies.advanceSteering =
             [this, sessionId, turn](
                 MaiMessage& assistant, bool closeIfEmpty,
@@ -853,6 +875,8 @@ struct MaiAgent::Runtime {
             if (std::find(turn->pendingSteering.begin(), turn->pendingSteering.end(), message.id) ==
                 turn->pendingSteering.end())
                 turn->pendingSteering.push_back(message.id);
+        if (!turn->pendingSteering.empty() && turn->samplingCancel)
+            turn->samplingCancel->store(true, std::memory_order_relaxed);
     }
 
     std::shared_ptr<ActiveTurn> startInputTurnLocked(const std::string& sessionId,
@@ -1751,7 +1775,7 @@ MaiResult<std::string> MaiAgent::interruptTurn(const std::string& sessionId,
     }
     // Stop also pauses queued inputs; a stale turn-targeted Stop must not pause a later task.
     mRuntime->pausedInputs.insert(sessionId);
-    found->second->cancel.store(true, std::memory_order_relaxed);
+    found->second->cancelTask();
     // Keep gate wakeups inside the same Runtime critical section. Their own
     // cancelSession methods only settle entries and notify; they invoke no user
     // callback. A replacement turn cannot enter until both old-turn gates wake.
@@ -2090,6 +2114,9 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                     turn.steeringReceipts.push_back(receipt);
                     mRuntime->recentSteering.push_back(std::move(receipt));
                     if (mRuntime->recentSteering.size() > 128) mRuntime->recentSteering.pop_front();
+                    // 只有已持久接收的输入才中断当前采样；幂等重发不会再次触发。
+                    if (turn.samplingCancel)
+                        turn.samplingCancel->store(true, std::memory_order_relaxed);
                 }
                 mRuntime->emitter.emitMessage(MaiEventType::MessageUpdated, operation.sessionId,
                                               user.id);

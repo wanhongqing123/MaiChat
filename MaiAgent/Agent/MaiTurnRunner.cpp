@@ -927,17 +927,25 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
     bool hasToolResults = false;
     std::map<MaiObservedToolBatch, int> observedBatches;
     const auto requestFinalAnswer = [&](const char* hint, const std::string& failure) {
-        // 最后的无工具请求先封闭接收，再消费已接受的补充，避免接受后再无模型调用。
-        if (mDependencies.closeSteering) mDependencies.closeSteering();
-        advanceSteering(false);
-        if (mError || cancel.load(std::memory_order_relaxed)) return;
-        const auto finalCalls = requestWithRecovery(false, cancel, hint);
-        const bool hasFinalText = mResponseHasVisibleText;
-        commitStreamedParts();
-        if (!mError && !cancel.load(std::memory_order_relaxed) &&
-            (!finalCalls.empty() || !hasFinalText))
-            mError = MaiError::make(MaiErrorCode::Internal, failure);
-        announceCommittedTextParts(cancel);
+        // 无工具收尾仍在生成，不提前封闭用户补充。直到一次同步响应结束后，
+        // 才与接受方原子判断“继续本轮”或“关闭接收”，避免忙时输入无端另起任务。
+        for (;;) {
+            advanceSteering(false);
+            if (mError || cancel.load(std::memory_order_relaxed)) return;
+            const auto finalCalls = requestWithRecovery(false, cancel, hint);
+            const bool hasFinalText = mResponseHasVisibleText;
+            commitStreamedParts();
+            if (mError || cancel.load(std::memory_order_relaxed)) return;
+            if (!finalCalls.empty()) {
+                mError = MaiError::make(MaiErrorCode::Internal, failure);
+                return;
+            }
+            announceCommittedTextParts(cancel);
+            if (advanceSteering(true)) continue;
+            if (mError || cancel.load(std::memory_order_relaxed)) return;
+            if (!hasFinalText) mError = MaiError::make(MaiErrorCode::Internal, failure);
+            return;
+        }
     };
     for (int iteration = 0; iteration < mDependencies.maxIterations; ++iteration) {
         if (cancel.load(std::memory_order_relaxed)) break;
@@ -956,9 +964,9 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
 
         if (mError) break;
         if (calls.empty()) {
-            // 与接收方共用闸门，把“还有补充”与“结束接收”变成一次原子判断。
-            // 流中的最后一段正文出现并不意味着后来接受的用户消息已被模型看到。
-            if (advanceSteering(true)) {
+            // 有可见回答才尝试关闭；空响应还要发收尾请求，期间继续接收补充。
+            // 与接收方共用闸门，原子判断结束或继续，不能把忙时输入提前留到下一轮。
+            if (advanceSteering(producedVisibleText)) {
                 if (iteration + 1 < mDependencies.maxIterations) {
                     observedBatches.clear();
                     continue;
@@ -1456,6 +1464,14 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestWithRecovery(bool includeTo
             }
             calls = requestCompletion(fit.request, cancel);
         }
+        if (mSamplingInterrupted && mError.code() == MaiErrorCode::Canceled &&
+            !cancel.load(std::memory_order_relaxed)) {
+            // 旧 stream 已同步退出，完成 item/实际 usage 已保存；下一圈重新消费输入。
+            // 不占用故障重试或工具迭代额度，也不把补充输入发布成任务中止。
+            mSamplingInterrupted = false;
+            mError = {};
+            continue;
+        }
         if (!mError) return calls;
         if (built && mError.code() == MaiErrorCode::RequestBodyTooLarge) {
             // 上限未知时 fit 未测量；此时补测一次实际被拒的副本。
@@ -1551,6 +1567,7 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     mResponseFirstPart = mAssistant.parts.size();
     mLastPersistedStreamBytes = 0;
     mResponseHasVisibleText = false;
+    mSamplingInterrupted = false;
     // 续接载体排在本次响应的所有投影之前，压缩器才能只在完整 response 之间切分。
     // 直到收到成功快照才插入/落库；失败的流不会产生可重放状态。
     const std::string continuationPartId = MaiIdGenerator::newPartId();
@@ -1710,16 +1727,47 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
         }
     };
 
-    mDependencies.emitter->emitTurnPhase(mContext.sessionId, mContext.turnId,
-                                         MaiTurnPhase::Sampling);
-    const auto streamError = mDependencies.model->stream(request, sink, cancel);
+    const bool hasSamplingLease =
+        bool(mDependencies.beginSampling) && bool(mDependencies.endSampling);
+    if (bool(mDependencies.beginSampling) != bool(mDependencies.endSampling)) {
+        mError = {MaiErrorCode::Internal, "Incomplete sampling cancellation registration."};
+        return {};
+    }
+    auto samplingCancel =
+        std::make_shared<std::atomic_bool>(cancel.load(std::memory_order_relaxed));
+    if (hasSamplingLease) mDependencies.beginSampling(samplingCancel);
+    const std::atomic_bool& samplingSignal = hasSamplingLease ? *samplingCancel : cancel;
+    MaiError streamError;
+    bool samplingCanceled = false;
+    try {
+        mDependencies.emitter->emitTurnPhase(mContext.sessionId, mContext.turnId,
+                                             MaiTurnPhase::Sampling);
+        streamError = samplingSignal.load(std::memory_order_relaxed)
+                          ? MaiError{MaiErrorCode::Canceled, "Sampling canceled before request."}
+                          : mDependencies.model->stream(request, sink, samplingSignal);
+    } catch (...) {
+        if (hasSamplingLease) mDependencies.endSampling(samplingCancel);
+        throw;
+    }
+    if (hasSamplingLease) samplingCanceled = mDependencies.endSampling(samplingCancel);
     mError = continuationError ? continuationError : streamError;
+    if (samplingCanceled && !continuationError && !cancel.load(std::memory_order_relaxed) &&
+        (!mError || mError.code() == MaiErrorCode::Canceled)) {
+        // 即使供应商在取消竞态中返回成功，也不能晋升未完成尾部或执行旧调用。
+        // 协议/持久化错误保持原样，不借补充输入掩盖失败。
+        mSamplingInterrupted = true;
+        mError = {MaiErrorCode::Canceled, "Sampling interrupted by accepted input."};
+        calls.clear();
+    }
     // 先核对整批身份，避免同一 callId 的两个操作已经执行后才发现无法配对结果。
     if (!mError) mError = MaiToolCallValidation::validateBatch(calls);
     // 未完成尾部仍是草稿；真实 item.done 已独立提交，不因后续失败撤回。
     commitStreamedParts();
     // 持久化失败不是模型网络故障，不能沿用断流恢复建议而继续采样。
-    if (const auto error = mDependencies.store->lastWriteError()) mError = error;
+    if (const auto error = mDependencies.store->lastWriteError()) {
+        mSamplingInterrupted = false;
+        mError = error;
+    }
     if (!mError && !cancel.load(std::memory_order_relaxed)) {
         std::vector<std::size_t> promoted;
         for (std::size_t index = mResponseFirstPart; index < mAssistant.parts.size(); ++index) {
@@ -1728,6 +1776,7 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
         }
         mDependencies.store->putMessage(mContext.sessionId, mAssistant);
         if (const auto error = mDependencies.store->lastWriteError()) {
+            mSamplingInterrupted = false;
             mError = error;
             for (const auto index : promoted) mAssistant.parts[index].modelDraft = true;
         }
@@ -1741,9 +1790,10 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
                                               }),
                                mAssistant.parts.end());
         mDependencies.store->putMessage(mContext.sessionId, mAssistant);
-        if (const auto writeError = mDependencies.store->lastWriteError())
+        if (const auto writeError = mDependencies.store->lastWriteError()) {
+            mSamplingInterrupted = false;
             mError = writeError;
-        else
+        } else
             mDependencies.emitter->emitMessage(MaiEventType::MessageUpdated, mContext.sessionId,
                                                mAssistant.id);
         calls.clear();

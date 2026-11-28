@@ -71,6 +71,10 @@ MaiFakeModelClient::Turn defaultTurn(int chunkDelayMilliseconds = 0) {
 class ContinuationWriteFailureStore final : public MaiSessionStore {
 public:
     int rejectedWrites = 0;
+    // 仅定点拒绝一个原始完成项；错误不污染后续消息写入，验证调用方保留错误来源。
+    std::string canceledOutputItemId;
+    int rejectedOutputRecords = 0;
+    std::function<void()> beforeCanceledOutputRecord;
     // Optional owned retention fault: existing continuation tests leave this
     // disabled and retain the default unsupported ToolOutput behavior.
     bool forwardToolOutput = false;
@@ -120,6 +124,18 @@ public:
     MaiError lastWriteError() const override {
         return mFailed ? MaiError{MaiErrorCode::Internal, "Owned storage write failed."}
                        : mInner->lastWriteError();
+    }
+    MaiError appendSessionRecord(const std::string& sessionId, const std::string& type,
+                                 const std::string& payload) override {
+        if (type == "response_item" && !canceledOutputItemId.empty()) {
+            const auto item = nlohmann::json::parse(payload, nullptr, false);
+            if (item.is_object() && item.value("id", std::string{}) == canceledOutputItemId) {
+                ++rejectedOutputRecords;
+                if (beforeCanceledOutputRecord) beforeCanceledOutputRecord();
+                return {MaiErrorCode::Canceled, "Owned completed-item persistence was canceled."};
+            }
+        }
+        return MaiSessionStore::appendSessionRecord(sessionId, type, payload);
     }
     MaiResult<std::string> getToolModelOutput(const MaiToolModelOutputKey& key) const override {
         return forwardToolOutput ? mInner->getToolModelOutput(key)
@@ -1233,6 +1249,162 @@ void test_continuation_write_failure_prevents_tool_execution() {
     CHECK(!fixture.errors.empty());
 }
 
+void test_steering_does_not_retry_canceled_completed_item_persistence() {
+    class Model final : public MaiModelClient {
+    public:
+        int requests = 0;
+        bool samplingCanceled = false;
+        MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
+                        const std::atomic<bool>& cancel) override {
+            if (++requests == 1) {
+                // 完成项写入期间接受新输入，复现取消与持久化错误同时出现的竞态。
+                sink.onOutputItemCompleted(
+                    {0, "owned_canceled_item", "message",
+                     R"({"id":"owned_canceled_item","type":"message","role":"assistant","content":[]})"});
+                samplingCanceled = cancel.load();
+                return {MaiErrorCode::Canceled, "Synthetic sampling canceled."};
+            }
+            sink.onText("Incorrectly replanned after persistence cancellation.");
+            return {};
+        }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::Responses;
+        }
+    };
+    auto store = std::make_unique<ContinuationWriteFailureStore>();
+    auto* observedStore = store.get();
+    store->canceledOutputItemId = "owned_canceled_item";
+    auto model = std::make_unique<Model>();
+    auto* observedModel = model.get();
+    MaiAgent::Options options;
+    options.defaultModel = "glm-5.4";
+    MaiAgent agent(std::move(store), std::move(model), nullptr, options);
+    const auto created = agent.submit(MaiCreateSession{});
+    CHECK(created.isOk());
+    if (!created) return;
+    const auto sessionId = created.value();
+    std::string originalTurnId;
+    std::string acceptedInputId;
+    observedStore->beforeCanceledOutputRecord = [&] {
+        originalTurnId = agent.activeTurnId(sessionId);
+        MaiSteerPrompt input;
+        input.sessionId = sessionId;
+        input.turnId = originalTurnId;
+        input.requestId = "owned-canceled-item-steer";
+        input.text = "Revise the current task.";
+        const auto accepted = agent.submit(input);
+        CHECK(accepted.isOk());
+        if (accepted) acceptedInputId = accepted.value();
+    };
+    CHECK(agent.submit(MaiSendPrompt{sessionId, "Start the owned task."}).isOk());
+    agent.waitIdle();
+    CHECK(!acceptedInputId.empty());
+    CHECK(observedStore->rejectedOutputRecords == 1);
+    CHECK(observedModel->samplingCanceled);
+    CHECK(observedModel->requests == 1);
+    MaiMessage original;
+    CHECK(observedStore->getMessage(sessionId, originalTurnId, original));
+    CHECK(original.turnOutcome.has_value());
+    if (original.turnOutcome) CHECK(original.turnOutcome->status != MaiTurnStatus::Completed);
+}
+
+void test_empty_response_final_answer_keeps_same_turn_input_open() {
+    for (const bool enqueue : {false, true}) {
+        class Model final : public MaiModelClient {
+        public:
+            std::mutex mutex;
+            std::condition_variable changed;
+            std::atomic<int> requests{0};
+            std::atomic<bool> fallbackEntered{false};
+            std::atomic<bool> samplingCanceled{false};
+            bool latestInputSeen = false;
+            MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                            const std::atomic<bool>& cancel) override {
+                const int number = ++requests;
+                if (number == 1) return {};
+                if (number == 2) {
+                    fallbackEntered.store(true);
+                    changed.notify_all();
+                    // 收尾请求只能由真实取消退出；测试没有提前放行旧流的后门。
+                    const auto deadline =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                    std::unique_lock<std::mutex> lock(mutex);
+                    while (!cancel.load() && std::chrono::steady_clock::now() < deadline)
+                        changed.wait_for(lock, std::chrono::milliseconds(10));
+                    samplingCanceled.store(cancel.load());
+                    changed.notify_all();
+                    return cancel.load()
+                               ? MaiError{MaiErrorCode::Canceled, "Owned fallback canceled."}
+                               : MaiError{MaiErrorCode::Internal, "Owned fallback wait expired."};
+                }
+                for (const auto& message : request.messages)
+                    if (message.role == MaiModelRole::User &&
+                        message.content.find("Revise the unfinished answer.") != std::string::npos)
+                        latestInputSeen = true;
+                sink.onText("Finished the revised answer.");
+                return {};
+            }
+            MaiWireApi wireApi() const override {
+                return MaiWireApi::Responses;
+            }
+        };
+        auto store = makeMaiMemoryStore();
+        auto* observedStore = store.get();
+        auto model = std::make_unique<Model>();
+        auto* observedModel = model.get();
+        MaiAgent::Options options;
+        options.defaultModel = "glm-5.4";
+        MaiAgent agent(std::move(store), std::move(model), nullptr, options);
+        Recorder recorder;
+        recorder.attach(agent);
+        const auto created = agent.submit(MaiCreateSession{});
+        CHECK(created.isOk());
+        if (!created) continue;
+        const auto sessionId = created.value();
+        CHECK(agent.submit(MaiSendPrompt{sessionId, "Start an answer."}).isOk());
+        {
+            std::unique_lock<std::mutex> lock(observedModel->mutex);
+            CHECK(observedModel->changed.wait_for(lock, std::chrono::seconds(2), [&] {
+                return observedModel->fallbackEntered.load();
+            }));
+        }
+        const auto originalTurnId = agent.activeTurnId(sessionId);
+        CHECK(!originalTurnId.empty());
+        MaiResult<std::string> accepted = [&]() -> MaiResult<std::string> {
+            if (enqueue)
+                return agent.submit(
+                    MaiEnqueuePrompt{MaiSendPrompt{sessionId, "Revise the unfinished answer."},
+                                     "owned-empty-fallback-input"});
+            return agent.submit(MaiSteerPrompt{sessionId, originalTurnId,
+                                               "owned-empty-fallback-input",
+                                               "Revise the unfinished answer."});
+        }();
+        CHECK(accepted.isOk());
+        bool interruptedSampling = false;
+        {
+            std::unique_lock<std::mutex> lock(observedModel->mutex);
+            interruptedSampling = observedModel->changed.wait_for(
+                lock, std::chrono::seconds(2),
+                [&] { return observedModel->samplingCanceled.load(); });
+        }
+        CHECK(interruptedSampling);
+        // 失败路径显式 Stop 清理，不能用手动放行伪造输入已经抢占采样。
+        if (!interruptedSampling) agent.interruptTurn(sessionId, originalTurnId);
+        agent.waitIdle();
+        CHECK(observedModel->requests.load() == 3);
+        CHECK(observedModel->latestInputSeen);
+        CHECK(recorder.count(MaiEventType::SessionStatus) == 1);
+        for (const auto& event : recorder.snapshot())
+            if (event.type == MaiEventType::SessionStatus ||
+                event.type == MaiEventType::TurnSteeringApplied)
+                CHECK(event.turnId == originalTurnId);
+        MaiMessage original;
+        CHECK(observedStore->getMessage(sessionId, originalTurnId, original));
+        CHECK(original.turnOutcome.has_value());
+        if (original.turnOutcome) CHECK(original.turnOutcome->status == MaiTurnStatus::Completed);
+    }
+}
+
 void checkCanceledContinuationHasNoOrphanCalls(const ContinuationRunnerFixture& fixture,
                                                bool firstToolExecuted) {
     const auto history = fixture.store->listMessages(fixture.session.id);
@@ -1352,6 +1524,8 @@ void test_response_continuation_contracts() {
     test_response_state_is_durable_before_every_tool_and_not_duplicated();
     test_failed_or_canceled_response_has_no_replayable_success_state();
     test_continuation_write_failure_prevents_tool_execution();
+    test_steering_does_not_retry_canceled_completed_item_persistence();
+    test_empty_response_final_answer_keeps_same_turn_input_open();
     test_response_continuation_cancel_contracts();
 }
 

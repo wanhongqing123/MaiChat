@@ -89,6 +89,14 @@ public:
         // 可选的会话工具声明选择器；为空保持旧宿主全部声明行为。
         // 工作线程调用，返回冻结的追加式 Schema；错误终止请求，不回退全目录。
         std::function<MaiResult<std::vector<MaiToolSpec>>(const MaiTurnContext&)> prepareTools;
+        // 内部采样租约：begin 在发出 Sampling 事件前注册非空请求级信号，
+        // 与输入接受共用闸门，已到达的补充或任务 Stop 必须立即置位。
+        // end 在同步 stream 返回后原子读取取消并撤销同一注册，异常路径也须调用。
+        // 两回调须同时提供或同时为空；只在 run 工作线程调用，不得广播事件或抛异常。
+        // 信号仅交给模型采样；工具/上下文继续使用真正的任务 cancel。
+        // 末尾追加保留既有聚合初始化字段顺序；所有 C++ 消费者仍须统一重新编译。
+        std::function<void(const std::shared_ptr<std::atomic_bool>&)> beginSampling;
+        std::function<bool(const std::shared_ptr<std::atomic_bool>&)> endSampling;
     };
 
     MaiTurnRunner(Dependencies dependencies, std::string sessionId, MaiMessage assistant);
@@ -195,6 +203,8 @@ private:
     std::size_t mResponseFirstPart = 0;
     // item 切换会更换当前正文缓冲，整次响应是否有可见正文须独立记录。
     bool mResponseHasVisibleText = false;
+    // 新输入仅抢占这次采样；同步退出后重新消费输入，不将其作为任务失败/Stop发布。
+    bool mSamplingInterrupted = false;
     // 指纹锚点和 actual input 原子保存，不复制整份请求或持久化正文；只在严格前缀
     // 仍相同、估计器版本一致时跨轮次/重开复用，不从累计或 total 推导输入。
     std::optional<MaiModelInputAnchor> mInputEstimateAnchor;

@@ -1882,14 +1882,25 @@ void test_steer_during_final_text_is_consumed_before_turn_completion() {
                 std::lock_guard<std::mutex> lock(mutex);
                 requests.push_back(request);
             }
-            sink.onText(requests.size() == 1 ? "Original answer" : "Adjusted answer");
             if (requests.size() == 1) {
+                // 本用例验证已完成发言在后续采样中保留；单纯 onText 是未确认草稿，
+                // 收到补充而取消响应时不能把草稿当作有效历史。
+                const MaiModelTextItem item{"completed_original", MaiModelTextPhase::FinalAnswer,
+                                            0};
+                if (sink.onTextItemStarted) sink.onTextItemStarted(item);
+                if (sink.onTextItemDelta) sink.onTextItemDelta(item, "Original answer");
+                if (sink.onTextItemCompleted) sink.onTextItemCompleted(item);
+                if (sink.onOutputItemCompleted)
+                    sink.onOutputItemCompleted(
+                        {0, "completed_original", "message",
+                         R"({"id":"completed_original","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Original answer"}]})"});
                 std::unique_lock<std::mutex> lock(mutex);
                 entered = true;
                 wake.notify_all();
                 if (!wake.wait_for(lock, std::chrono::seconds(5), [&] { return ready; }))
                     return MaiError::make(MaiErrorCode::Internal, "test gate timed out");
-            }
+            } else
+                sink.onText("Adjusted answer");
             return cancel.load() ? MaiError::make(MaiErrorCode::Canceled, "canceled") : MaiError{};
         }
         MaiWireApi wireApi() const override {
@@ -1932,9 +1943,16 @@ void test_steer_during_final_text_is_consumed_before_turn_completion() {
     CHECK(closedAtIdle.load());
     CHECK(gate->requests.size() == 2);
     if (gate->requests.size() == 2) {
-        CHECK(gate->requests[1].messages.size() == 4);
-        CHECK(gate->requests[1].messages[2].role == MaiModelRole::User);
-        CHECK(gate->requests[1].messages[2].content == "Adjust it now");
+        // 采样抢占在同一普通请求循环内继续，不消耗最后一次迭代或附加收尾提示。
+        CHECK(gate->requests[1].messages.size() == 3);
+        if (gate->requests[1].messages.size() == 3) {
+            CHECK(gate->requests[1].messages[0].role == MaiModelRole::User);
+            CHECK(gate->requests[1].messages[0].content == "Start");
+            CHECK(gate->requests[1].messages[1].role == MaiModelRole::Assistant);
+            CHECK(gate->requests[1].messages[1].content == "Original answer");
+            CHECK(gate->requests[1].messages[2].role == MaiModelRole::User);
+            CHECK(gate->requests[1].messages[2].content == "Adjust it now");
+        }
         CHECK(gate->requests[1].tools.empty());
     }
     CHECK(agent.listMessages(session).back().text() == "Adjusted answer");
