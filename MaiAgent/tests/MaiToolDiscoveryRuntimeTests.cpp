@@ -294,7 +294,9 @@ void testBuiltinHelpRoundTrip(std::size_t window, std::size_t reserve, std::size
     else {
         // Local capacity guards use InvalidInput; ContextWindowExceeded denotes
         // a provider-reported window error. Do not invent a different local code.
-        CHECK(window == 4096 && observed->requests == 1);
+        // Platform registries differ (for example OpenSSL CLI versus typed
+        // crypto tools), so the capacity guard can stop at either tool step.
+        CHECK(window == 4096 && observed->requests >= 1 && observed->requests < 3);
         CHECK(outcome.value().status == MaiTurnStatus::Failed);
         CHECK(outcome.value().error.code() == MaiErrorCode::InvalidInput);
         const auto& message = outcome.value().error.message();
