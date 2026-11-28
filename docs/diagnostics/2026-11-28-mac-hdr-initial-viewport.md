@@ -98,3 +98,41 @@ Root 从原 Qt 日志重新提取记录，与 `observer-events.json` 逐条完�
 不调用 owner->winId 或读取 frame；正常结束再一次导出，并记录线程与溢出事实。
 原产品、原测试 TU、70ms/3 秒及断言均不变；尚未批准或执行追加运行。
 不以增加 timeout、重复取绿或猜测修改状态机代替失败现场，未打包/签名/发布新版本。
+
+## 一次低扰动捕获：快照完整，原失败未重现
+
+Root 先审固定容量 POD 探针，要求收口 pre-footer 刷新状态及 export 采样区间，
+随后核验 v2 包的 9 项 manifest、三个 patch 的精确重建，以及 exporter 外所有回调、
+recordFs、初始化字节与 v1 完全相同。审定 post SHA256 为
+`9bf9efe5e46c8631f889a52bf3c0e82a42b04c5c3e7d43d5cfaed2eb12e6748a`。
+只开启一次同 slot 窗口，原测试 TU、70ms/3 秒/CHECK 不变；逐帧、controls、recording
+环境变量均未传入。探针不在转场回调中格式化/落盘或取 frame/winId，正常退出后一次导出。
+
+Mac 独立诊断构建退出 0（15.092 秒），新 exe 的 Mac 前后绑定为
+`05cad9011ecb482eeb42e47c2d9c82063e5b653343a864d51ffcfdc320932e14`，202915112 字节；
+未向 Root 提供该 binary，不称 Root 独立 binary 重哈希。单 slot 退出 0，
+QtTest 3 passed / 0 failed（含初始化/清理），13368ms，进程 15.288 秒；没有第二次运行。
+
+供件 ZIP 92455 字节，SHA256
+`08b07c4d9c098b7984ec800189afb6459e8971a93d9ca5247c97a63c9edd1fc7`。
+Root 独立核 16 项 manifest、实际提供的原 observer/test/helper 与 final Git blob、
+诊断 post/契约/patch 与审定 v2 原字节一致。原 QtTest log 有单个 3/0 Totals，
+每轮 fullscreen-return 均为 740×440。
+
+Root 用自己的解析器直接读取原 TSV：5726 字节，SHA256
+`ac557ff3a99300cf04a045f4bc7d88bc16678921a8b73047ff8e854bb5ed57c3`，
+93/93 条已发布；header/footer、序号、行数、重复元数据、tick 边界及 thread 状态均通过。
+与 Mac 的独立 readback JSON 逐条相同。所有记录及 exporter 均为 main 线程 199575317，
+timebase 125/3；overflow/incomplete/overlap/non-main/late 与 pre-footer 两状态均为 0。
+36 条观察器接收记录、18 个 Did event 的阶段完整，最大排队约 122.351583ms。
+Mac 回执记录文件 mode 为 0600，Root 不能在 Windows 端据内容验证原机文件模式。
+
+该探针只记录注册时 bound window ID，不查询 current window 或 frame，
+不能据此断言运行期间窗口 identity 未改变。快照完整仅限声明的 export 截止区间，
+不能证明 footer 后无回调，也不自证 fclose/fsync 或持久化。完整性与用例退出码分列核验。
+
+原始供件与 Root 独立输出在 `mac-final-fullscreen/pod-single-capture/` 和
+`root-pod-single-review.json`。本次低扰动 PASS 与前一次带实时日志 PASS 都属于不同诊断 binary，
+原 final binary 的 `!nativeTransition` FAIL 仍未解释，不能据此宣布最终全绿。
+本轮捕获窗口已用完并关闭；未追加运行、未更改产品/断言/timeout，未打包/签名/发布。
+后续修复仍需要实际失败时的决定性现场证据。
