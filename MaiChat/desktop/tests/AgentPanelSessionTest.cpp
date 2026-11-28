@@ -718,6 +718,8 @@ private slots:
     void emptyCachedSessionCanLoadEarlierBackgroundHistory();
     void changedCompletedMessageRefreshesItsCachedPage();
     void collapsedToolDetailsAreFormattedOnlyOnDisclosure();
+    void commandReceiptsShowReadableOutputWithoutChangingHistory_data();
+    void commandReceiptsShowReadableOutputWithoutChangingHistory();
     void stopKeepsUnacceptedDraftAndInputEditable();
     void quoteActionFollowsStreamedOwnerAfterSessionRestore();
     void waitingIndicatorAppearsBeforeFirstModelChunk();
@@ -1782,10 +1784,10 @@ void AgentPanelSessionTest::actionPanelMatchesMobileModelAndPolicyFlow() {
     QPushButton* more = harness.panel->findChild<QPushButton*>(QStringLiteral("agentMoreActions"));
     auto* title = harness.panel->findChild<QLabel*>(QStringLiteral("agentHeaderTitle"));
     QVERIFY(chip != nullptr);
-    QVERIFY(policy && more && title);
+    QVERIFY(policy && more);
+    QVERIFY(!title);
     QVERIFY(!chip->isVisible());
     QVERIFY(!policy->isVisible());
-    QCOMPARE(title->text(), QStringLiteral("创作中心"));
     QTest::mouseClick(more, Qt::LeftButton);
     auto* actions = harness.panel->findChild<QWidget*>(QStringLiteral("agentActionPanel"));
     QVERIFY(actions && actions->isVisible());
@@ -2028,14 +2030,13 @@ void AgentPanelSessionTest::anotherSessionTitleDoesNotRenameTheHeader() {
     Harness harness;
     QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
 
-    QLabel* title = nullptr;
-    for (QLabel* label : harness.panel->findChildren<QLabel*>()) {
-        if (label->text() == QStringLiteral("创作中心")) title = label;
-    }
-    QVERIFY(title != nullptr);
+    QVERIFY(!harness.panel->findChild<QLabel*>(QStringLiteral("agentHeaderTitle")));
+    auto* context = harness.panel->findChild<QLabel*>(QStringLiteral("agentContextStatus"));
+    QVERIFY(context);
+    const QString contextBefore = context->text();
 
     harness.publishFromOther(MaiEventType::SessionUpdated, QStringLiteral("子任务的名字"));
-    QCOMPARE(title->text(), QStringLiteral("创作中心"));
+    QCOMPARE(context->text(), contextBefore);
 
     // A 发起改名后用户可能已经切到 B；持久化标题的事件仍须刷新整个侧栏，
     // 同时不能切走当前选择、替换当前页头部或插入另一会话的消息。
@@ -2056,7 +2057,7 @@ void AgentPanelSessionTest::anotherSessionTitleDoesNotRenameTheHeader() {
     QVERIFY(list->currentItem() != nullptr);
     QCOMPARE(list->currentItem()->data(Qt::UserRole).toString(), harness.mine);
     QCOMPARE(harness.panel->sessionId(), harness.mine);
-    QCOMPARE(title->text(), QStringLiteral("创作中心"));
+    QCOMPARE(context->text(), contextBefore);
     QCOMPARE(harness.view()->itemCount(), messageItems);
 }
 
@@ -2067,8 +2068,10 @@ void AgentPanelSessionTest::currentSessionTitleStaysInTheSessionList() {
     QVERIFY(!titled.isEmpty());
     harness.panel->openSession(titled);
     auto* title = harness.panel->findChild<QLabel*>(QStringLiteral("agentHeaderTitle"));
-    QVERIFY(title);
-    QCOMPARE(title->text(), QStringLiteral("创作中心"));
+    QVERIFY(!title);
+    MaiSession stored;
+    QVERIFY(harness.controller->agent().getSession(titled.toStdString(), stored));
+    QCOMPARE(QString::fromStdString(stored.title), QStringLiteral("A named conversation"));
 }
 
 void AgentPanelSessionTest::subAgentCardsKeepTaskAndStreamedLatestLineVisible() {
@@ -5175,6 +5178,117 @@ void AgentPanelSessionTest::collapsedToolDetailsAreFormattedOnlyOnDisclosure() {
     for (int i = 1; i < labels.size(); ++i) QVERIFY(labels[i]->text().isEmpty());
 }
 
+void AgentPanelSessionTest::commandReceiptsShowReadableOutputWithoutChangingHistory_data() {
+    QTest::addColumn<QString>("tool");
+    QTest::addColumn<QString>("arguments");
+    QTest::addColumn<QString>("receipt");
+    QTest::addColumn<QString>("title");
+    QTest::addColumn<QString>("output");
+    QTest::addColumn<QStringList>("metadata");
+    const QString command = QStringLiteral("Get-Content fixture.txt");
+    const QString output = QStringLiteral("first line\nC:\\new\\test.txt\nlast line  \n");
+    const QJsonObject completed{{QStringLiteral("chunk_id"), QStringLiteral("chunk_owned_complete")},
+                                {QStringLiteral("exit_code"), 0},
+                                {QStringLiteral("wall_time_seconds"), 0.125},
+                                {QStringLiteral("output"), output}};
+    const auto packed = [](const QJsonObject& object) {
+        return QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    };
+    QTest::newRow("exec-completed") << QStringLiteral("exec_command") << packed({{QStringLiteral("cmd"), command}})
+                                    << packed(completed) << command << output
+                                    << QStringList{QStringLiteral("chunk_owned_complete"), QStringLiteral("0.125")};
+    QTest::newRow("write-stdin-running") << QStringLiteral("write_stdin")
+                                         << QStringLiteral("{\"session_id\":27,\"chars\":\"\"}")
+                                         << packed({{QStringLiteral("chunk_id"), QStringLiteral("chunk_owned_poll")},
+                                                    {QStringLiteral("session_id"), 27},
+                                                    {QStringLiteral("output"), output}})
+                                         << QStringLiteral("命令会话 27") << output
+                                         << QStringList{QStringLiteral("chunk_owned_poll"), QStringLiteral("27")};
+    QTest::newRow("legacy-shell") << QStringLiteral("shell") << packed({{QStringLiteral("command"), command}}) << output
+                                  << command << output.trimmed() << QStringList{};
+    QJsonObject longReceipt = completed;
+    longReceipt[QStringLiteral("output")] = output + QString(20000, QLatin1Char('x'));
+    longReceipt[QStringLiteral("output_id")] = QStringLiteral("out_owned_long");
+    longReceipt[QStringLiteral("original_token_count")] = 6000;
+    QTest::newRow("exec-long-json") << QStringLiteral("exec_command") << packed({{QStringLiteral("cmd"), command}})
+                                    << packed(longReceipt) << command << output
+                                    << QStringList{QStringLiteral("out_owned_long"), QStringLiteral("6000")};
+    QTest::newRow("exec-plain-error") << QStringLiteral("exec_command") << packed({{QStringLiteral("cmd"), command}})
+                                      << QStringLiteral("Command could not start.\nOwned failure detail.") << command
+                                      << QStringLiteral("Command could not start.\nOwned failure detail.")
+                                      << QStringList{};
+}
+
+// Replay only owned receipts through the real widgets. JSON decoding belongs
+// to presentation; stored call arguments and model-visible results stay intact.
+void AgentPanelSessionTest::commandReceiptsShowReadableOutputWithoutChangingHistory() {
+    QFETCH(QString, tool);
+    QFETCH(QString, arguments);
+    QFETCH(QString, receipt);
+    QFETCH(QString, title);
+    QFETCH(QString, output);
+    QFETCH(QStringList, metadata);
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    const QString database = storage.filePath(QStringLiteral("command-receipt.db"));
+    const std::string sessionId = "ses_owned_command_receipt";
+    {
+        auto opened = makeMaiSqliteStore(database.toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        MaiSession session;
+        session.id = sessionId;
+        session.directory = storage.path().toStdString();
+        session.created = session.updated = 1;
+        store->putSession(session);
+        MaiMessage message;
+        message.id = "msg_owned_command_receipt";
+        message.role = MaiRole::Assistant;
+        message.created = message.completed = 1;
+        MaiToolPart part;
+        part.tool = tool.toStdString();
+        part.callId = "call_owned_command_receipt";
+        part.input = arguments.toStdString();
+        part.output = receipt.toStdString();
+        part.state = MaiToolState::Completed;
+        message.parts.push_back({"prt_owned_command_receipt", std::move(part), 1});
+        store->putMessage(sessionId, message);
+        QVERIFY(!store->lastWriteError());
+    }
+    AgentController controller(std::make_unique<SilentModel>(), database);
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 800);
+    panel.show();
+    panel.openSession(QString::fromStdString(sessionId));
+    auto* group = panel.findChild<QPushButton*>(QStringLiteral("agentToolGroupDisclosure"));
+    QVERIFY(group);
+    group->click();
+    auto* detail = panel.findChild<QLabel*>(QStringLiteral("agentToolDetail"));
+    QVERIFY(detail);
+    QVERIFY(detail->text().isEmpty());
+    auto* card = detail->parentWidget();
+    auto* disclosure = card->findChild<QPushButton*>(QStringLiteral("agentToolDisclosure"));
+    QVERIFY(disclosure);
+    disclosure->click();
+    QVERIFY(captureAgentFixture(
+        panel, QStringLiteral("command-receipt-%1").arg(QString::fromLatin1(QTest::currentDataTag()))));
+    QVERIFY2(detail->text().contains(output), qPrintable(detail->text().left(500)));
+    QVERIFY(!detail->text().contains(QStringLiteral("\"output\":")));
+    QVERIFY(!detail->text().contains(QStringLiteral("cmd:")));
+    QVERIFY(!detail->text().contains(QStringLiteral("first line\\n")));
+    for (const QString& value : metadata) QVERIFY(detail->text().contains(value));
+    bool foundTitle = false;
+    for (QLabel* label : card->findChildren<QLabel*>())
+        if (label != detail && label->text().contains(title)) foundTitle = true;
+    QVERIFY2(foundTitle, qPrintable(title));
+    const auto history = controller.agent().listMessages(sessionId);
+    QCOMPARE(history.size(), std::size_t(1));
+    const auto& stored = std::get<MaiToolPart>(history.front().parts.front().body);
+    QCOMPARE(QString::fromStdString(stored.input), arguments);
+    QCOMPARE(QString::fromStdString(stored.output), receipt);
+    QVERIFY(detail->text().size() < 12500);
+}
+
 void AgentPanelSessionTest::busyComposerAcceptsOrderedSteeringWithoutStopping() {
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
@@ -5383,6 +5497,38 @@ void AgentPanelSessionTest::contextPercentageUsesProviderUsageAndNotEstimator() 
     QVERIFY(label->toolTip().contains(QStringLiteral("3,000,000")));
     QVERIFY(label->toolTip().contains(QStringLiteral("思考：未提供")));
     QVERIFY(captureAgentFixture(panel, QStringLiteral("actual-context-usage-owned")));
+    // 顶部去掉固定标题后，整组上下文相对页面居中，按钮仍在右侧且不重叠。
+    auto* header = panel.findChild<QWidget*>(QStringLiteral("agentHeader"));
+    auto* summary = panel.findChild<QWidget*>(QStringLiteral("agentContextSummary"));
+    auto* more = panel.findChild<QPushButton*>(QStringLiteral("agentMoreActions"));
+    QVERIFY(header && summary && more);
+    QVERIFY(!panel.findChild<QLabel*>(QStringLiteral("agentHeaderTitle")));
+    const auto originalStatus = status;
+    status.windowTokens = status.usage.windowTokens = 1050000;
+    status.usage.latestSampling.total = {74433, MaiUsageValueSource::Provider};
+    status.usage.latestSampling.input = {74000, MaiUsageValueSource::Provider};
+    status.usage.latestSampling.output = {433, MaiUsageValueSource::Provider};
+    QVERIFY(deliver());
+    for (int width : {1100, 780}) {
+        panel.resize(width, 600);
+        for (bool videoCircle : {false, true}) {
+            panel.setVideoCircleAvailable(videoCircle);
+            QTRY_VERIFY(std::abs(summary->mapTo(header, summary->rect().center()).x() -
+                                 header->rect().center().x()) <= 1);
+            QVERIFY(summary->mapTo(header, summary->rect().topRight()).x() <
+                    more->mapTo(header, QPoint()).x());
+            const QString evidence = qEnvironmentVariable("MAICHAT_AGENT_EVIDENCE_DIR");
+            if (!evidence.isEmpty()) {
+                QTest::qWait(60);
+                QVERIFY(header->grab().save(
+                    QDir(evidence).filePath(QStringLiteral("header-centered-%1-circle-%2.png")
+                                                .arg(width)
+                                                .arg(videoCircle))));
+            }
+        }
+    }
+    status = originalStatus;
+    QVERIFY(deliver());
     status.usage.samplingValid = false;
     QVERIFY(deliver());
     QTRY_VERIFY(label->text().contains(QStringLiteral("等待")));
@@ -5391,8 +5537,16 @@ void AgentPanelSessionTest::contextPercentageUsesProviderUsageAndNotEstimator() 
     QVERIFY(deliver());
     QVERIFY(controller.contextStatus(session)->usage.samplingValid);
     // 只破坏本用例拥有的提交日志，验证缓存不能遮住权威来源读取失败。
-    const auto metadata = MaiFilePath::fromUtf8(directory.filePath(
-        QStringLiteral("sessions/.journal/context.db.jsonl")).toUtf8().toStdString());
+    const auto selectedIndex = maiCurrentSessionDatabasePath(
+        directory.filePath(QStringLiteral("context.db")).toUtf8().toStdString());
+    QVERIFY(selectedIndex);
+    const QString journalName =
+        QFileInfo(QString::fromStdString(selectedIndex.value())).fileName() +
+        QStringLiteral(".jsonl");
+    const auto metadata =
+        MaiFilePath::fromUtf8(directory.filePath(QStringLiteral("sessions/.journal/") + journalName)
+                                  .toUtf8()
+                                  .toStdString());
     QVERIFY(MaiFileSystem::exists(metadata));
     {
         auto corrupt = MaiAppendFile::open(metadata);

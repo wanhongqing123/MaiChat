@@ -339,6 +339,10 @@ QString toolPrimaryArgument(const QString& tool, const QString& arguments) {
     const QJsonDocument document = QJsonDocument::fromJson(arguments.toUtf8());
     if (!document.isObject()) return arguments.simplified();
     const QJsonObject object = document.object();
+    if (tool == QStringLiteral("write_stdin")) {
+        const QJsonValue session = object.value(QStringLiteral("session_id"));
+        return session.isDouble() ? QStringLiteral("命令会话 %1").arg(session.toInt()) : QString();
+    }
     if (tool == QStringLiteral("maichat_broadcast_text")) {
         QStringList recipients;
         for (const QJsonValue& value : object.value(QStringLiteral("peer_ids")).toArray())
@@ -346,6 +350,7 @@ QString toolPrimaryArgument(const QString& tool, const QString& arguments) {
         return recipients.join(QStringLiteral("、"));
     }
     const QString key = tool == QStringLiteral("shell")               ? QStringLiteral("command")
+                        : tool == QStringLiteral("exec_command")      ? QStringLiteral("cmd")
                         : tool == QStringLiteral("file_glob")         ? QStringLiteral("pattern")
                         : tool == QStringLiteral("file_grep")         ? QStringLiteral("pattern")
                         : tool == QStringLiteral("curl_fetch")        ? QStringLiteral("url")
@@ -1229,9 +1234,11 @@ public:
 
     void setDetail(const QString& text) {
         // Bound the hidden preview without trimming or concatenating the full
-        // output. Core retains the complete receipt; UI formatting is deferred.
-        detailSource_ = text.left(12000);
-        detailTruncated_ = text.size() > 12000;
+        // output. Command receipts must remain valid JSON until disclosure;
+        // QString shares their storage, and the decoded display stays bounded.
+        const bool commandReceipt = tool_ == QStringLiteral("exec_command") || tool_ == QStringLiteral("write_stdin");
+        detailSource_ = commandReceipt ? text : text.left(12000);
+        detailTruncated_ = !commandReceipt && text.size() > 12000;
         detailDirty_ = true;
         expand_->setVisible(!detailSource_.isEmpty() || !arguments_.isEmpty());
         if (expanded_) ensureDetail();
@@ -1242,7 +1249,27 @@ public:
         detailDirty_ = false;
         const QString& text = detailSource_;
         QString rendered;
-        if (tool_ == QStringLiteral("shell") && !primaryArgument_.isEmpty()) {
+        if (tool_ == QStringLiteral("exec_command") || tool_ == QStringLiteral("write_stdin")) {
+            const QJsonObject input = QJsonDocument::fromJson(arguments_.toUtf8()).object();
+            rendered = tool_ == QStringLiteral("exec_command")
+                           ? QStringLiteral("$ ") + input.value(QStringLiteral("cmd")).toString()
+                           : primaryArgument_;
+            const QString chars = input.value(QStringLiteral("chars")).toString();
+            if (!chars.isEmpty()) rendered += QStringLiteral("\n输入：\n") + chars;
+            QJsonObject receipt = QJsonDocument::fromJson(text.toUtf8()).object();
+            QString output = text;
+            if (receipt.value(QStringLiteral("output")).isString()) {
+                // Decode the output field once; replacing backslash sequences
+                // would corrupt literal paths and command output. Keep receipt
+                // facts before the bounded preview so recovery IDs stay visible.
+                output = receipt.take(QStringLiteral("output")).toString();
+                if (!receipt.isEmpty())
+                    rendered +=
+                        QStringLiteral("\n\n") +
+                        formatToolArguments(QString::fromUtf8(QJsonDocument(receipt).toJson(QJsonDocument::Compact)));
+            }
+            if (!output.isEmpty()) rendered += QStringLiteral("\n\n") + output;
+        } else if (tool_ == QStringLiteral("shell") && !primaryArgument_.isEmpty()) {
             rendered = QStringLiteral("$ ") + primaryArgument_;
             if (!text.trimmed().isEmpty()) rendered += QStringLiteral("\n\n") + text.trimmed();
         } else if (tool_ == QStringLiteral("maichat_send_text") || tool_ == QStringLiteral("maichat_reply_message") ||
@@ -1469,7 +1496,6 @@ struct AgentChatPanel::Runtime : AgentChatPanel::ConversationState {
     QHash<QString, std::shared_ptr<ConversationState>> savedConversations;
     QStringList savedConversationLru;
 
-    QLabel* title = nullptr;
     QLabel* contextSize = nullptr;
     QProgressBar* contextUsageBar = nullptr;
     QLabel* compactionNotice = nullptr;
@@ -1555,7 +1581,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(0);
 
-    // 顶栏只展示固定页标题和更多；模型与权限在更多面板内原位展开。
+    // 顶栏居中展示整组上下文信息；模型与权限仍在右侧更多面板内原位展开。
     auto* head = new QWidget(this);
     head->setObjectName(QStringLiteral("agentHeader"));
     UiZoom::setStyle(head,
@@ -1564,6 +1590,13 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     head->setFixedHeight(UiZoom::s(54));
     headRow->setContentsMargins(UiZoom::s(16), UiZoom::s(8), UiZoom::s(16), UiZoom::s(8));
     headRow->setSpacing(UiZoom::s(8));
+    // 使用始终存在的等宽两翼，避免隐藏视频圈后布局回收左侧空列而挤偏中间信息。
+    auto* leftActions = new QWidget(head);
+    leftActions->setFixedWidth(UiZoom::s(76));
+    auto* leftRow = new QHBoxLayout(leftActions);
+    leftRow->setContentsMargins(0, 0, 0, 0);
+    leftRow->setSpacing(0);
+    headRow->addWidget(leftActions);
     auto* circle = new QPushButton(QStringLiteral("视频圈"), head);
     runtime_->videoCircleButton = circle;
     circle->setObjectName(QStringLiteral("agentVideoCircleOpen"));
@@ -1576,12 +1609,17 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
                        "QPushButton:hover{background:#dceefb;}"));
     circle->hide();
     connect(circle, &QPushButton::clicked, this, &AgentChatPanel::videoCircleRequested);
-    headRow->addWidget(circle);
-    runtime_->title = makeLabel(QStringLiteral("创作中心"), UiZoom::TextRole::Heading3, kInk, true);
-    runtime_->title->setObjectName(QStringLiteral("agentHeaderTitle"));
-    runtime_->title->setAlignment(Qt::AlignCenter);
-    runtime_->title->setWordWrap(false);
-    headRow->addWidget(runtime_->title, 1);
+    leftRow->addWidget(circle);
+    leftRow->addStretch(1);
+    auto* contextSummary = new QWidget(head);
+    contextSummary->setObjectName(QStringLiteral("agentContextSummary"));
+    auto* contextRow = new QHBoxLayout(contextSummary);
+    contextRow->setContentsMargins(0, 0, 0, 0);
+    contextRow->setSpacing(UiZoom::s(8));
+    contextRow->setSizeConstraint(QLayout::SetFixedSize);
+    headRow->addStretch(1);
+    headRow->addWidget(contextSummary, 0, Qt::AlignCenter);
+    headRow->addStretch(1);
 
     // 使用 Core 的上次请求容量与整理阶段，不把界面分页加载的字数当成模型占用。
     // 上下文用量是用户高频关注的信息，不能再用 Metadata 淡色弱化；
@@ -1590,18 +1628,18 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     runtime_->contextSize->setObjectName(QStringLiteral("agentContextStatus"));
     runtime_->contextSize->setTextFormat(Qt::RichText);
     runtime_->contextSize->setWordWrap(false);
-    runtime_->contextSize->setParent(head);
+    runtime_->contextSize->setParent(contextSummary);
     runtime_->contextSize->hide();
-    auto* contextBar = new QProgressBar(head);
+    auto* contextBar = new QProgressBar(contextSummary);
     contextBar->setObjectName(QStringLiteral("agentContextUsageBar"));
     contextBar->setRange(0, 100);
     contextBar->setTextVisible(false);
     contextBar->setFixedHeight(5);
     contextBar->setFixedWidth(110);
     contextBar->hide();
-    headRow->addWidget(contextBar);
+    contextRow->addWidget(contextBar);
     runtime_->contextUsageBar = contextBar;
-    headRow->addWidget(runtime_->contextSize);
+    contextRow->addWidget(runtime_->contextSize);
     auto* moreButton = new QPushButton(QStringLiteral("⋯"));
     runtime_->moreButton = moreButton;
     moreButton->setObjectName(QStringLiteral("agentMoreActions"));
@@ -1612,10 +1650,14 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         UiZoom::scaleQss(QStringLiteral("QPushButton{background:#f5f7fa;border:none;border-radius:8px;"
                                         "color:%1;padding:5px 9px;}QPushButton:hover{background:#eef2f6;}")
                              .arg(kInkSoft)));
-    headRow->addWidget(moreButton);
-    auto* rightBalance = new QWidget(head);
-    rightBalance->setFixedSize(UiZoom::s(34), UiZoom::s(34));
-    headRow->addWidget(rightBalance);
+    auto* rightActions = new QWidget(head);
+    rightActions->setFixedWidth(UiZoom::s(76));
+    auto* rightRow = new QHBoxLayout(rightActions);
+    rightRow->setContentsMargins(0, 0, 0, 0);
+    rightRow->setSpacing(0);
+    rightRow->addStretch(1);
+    rightRow->addWidget(moreButton);
+    headRow->addWidget(rightActions);
     root->addWidget(head);
 
     // ---- 对话流：整片就是一个 MarkdownView ----
@@ -2690,9 +2732,7 @@ void AgentChatPanel::openSessionInternal(const QString& sessionId, bool keepBlan
 
     MaiSession session;
     if (runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), session)) {
-        // 用 isUntitled() 而不是 title.isEmpty()：核心给新会话填的是一个占位标题
-        // （"New session"），不是空串。判空的话那串占位符会直接显示在头部。
-        runtime_->title->setText(QStringLiteral("创作中心"));
+        // 会话标题留在侧栏；切换会话只刷新更多面板中的工作目录。
         const QString directory = QDir::toNativeSeparators(fromUtf8(session.directory));
         QString name = QFileInfo(directory).fileName();
         if (name.isEmpty()) name = directory;
@@ -4953,7 +4993,6 @@ void AgentChatPanel::onClear() {
         appendNotice(fromUtf8(cleared.error().message()) + QStringLiteral("（先按停止，再清空）"), true);
         return;
     }
-    runtime_->title->setText(QStringLiteral("创作中心"));
     clearQuote();
     refreshCompactionNotice(nullptr);
     reloadFromStore();
