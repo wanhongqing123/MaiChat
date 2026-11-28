@@ -31,24 +31,16 @@ public:
         // 原生会话可保持活跃，stop 释放采集会话和工作线程；停止不需要截图审批或工作区。
         // JSON 返回工作区相对路径、类型、尺寸和原始帧元数据；用同一文件交付，不用脚本重截。
         // 独立截图不绑定桌面输入坐标或快照；需要操作时应重新观察明确显示器，避免跨屏或跨区域选点。
-        return "Capture the display containing the mouse pointer and inspect the returned image. "
-               "This is a whole-display image, not a window crop or browser viewport. It returns "
-               "no computer display_id or snapshot_id and does not renew an input token. "
-               "Capture does not release held mouse buttons or keys. Choose observation timing "
-               "from the task and current state. computer display observations bind their "
-               "own image, target and input token; this independent screenshot cannot substitute "
-               "for that binding. Never apply whole-screen ratios directly to target=window, "
-               "or mix a scaled preview's pixels with original image dimensions. "
-               "Use action=capture (the default) to retrieve the latest complete native frame. "
-               "The native capture session can remain active between calls; use action=stop "
-               "to release the capture session and worker. Capture follows per-call approval; "
-               "stop needs no screenshot approval or workspace. The JSON result includes "
-               "image_path relative to this Agent workspace, type, mime_type, width, height, "
-               "mode=display, frame_sequence, and frame_received_at_ms. Frame metadata reports "
-               "when the native frame was received, not when it was encoded. To show this same "
-               "screenshot in the current conversation, call agent_send_media with file_path "
-               "set to the returned image_path and type=image. Do not recapture it with shell "
-               "scripts.";
+        return "Capture the whole display containing the mouse pointer. action=capture (default) "
+               "returns the latest complete native frame; action=stop releases the persistent "
+               "capture session and worker without screenshot approval or a workspace. Capture "
+               "requires per-call approval and does not release held buttons/keys. It supplies "
+               "no computer display_id, snapshot_id or input token; computer observations must "
+               "bind their own image and target. Never mix whole-display coordinates with a "
+               "window or scaled-preview coordinates with original dimensions. JSON includes "
+               "workspace-relative image_path, type, mime_type, width, height, mode=display, "
+               "frame_sequence and frame_received_at_ms (native receipt time). Deliver that same "
+               "file with agent_send_media and type=image; do not recapture using shell scripts.";
     }
 
     bool isAvailableForModel(const std::string& model) const override {

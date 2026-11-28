@@ -44,13 +44,11 @@ public:
 
     std::string description() const override {
         // 本工具把像素交给有视觉能力的主模型；用户展示入口不依赖模型理解图片。
-        return "Analyze an existing PNG, JPEG, WebP, or GIF file with an image-capable primary "
-               "model. "
-               "MaiChat prepares a bounded JPEG preview for model analysis. To display a file to "
-               "the "
-               "user, use mobile_preview_image when available. "
-               "Images attached by the user are already in the current prompt; inspect them "
-               "directly instead of calling this tool for paths mentioned in a screenshot.";
+        return "Analyze a local PNG, JPEG, WebP or GIF through a bounded JPEG preview using an "
+               "image-capable primary model. To display it to the user use mobile_preview_image "
+               "when available. User image attachments are already in the prompt; screenshot text "
+               "does "
+               "not identify an accessible file path.";
     }
 
     bool isAvailableForModel(const std::string& model) const override {

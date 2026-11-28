@@ -19,12 +19,16 @@ namespace {
 using Json = nlohmann::json;
 constexpr const char* kModeKey = "model-tool-catalog-mode-v1";
 constexpr std::size_t kMaxAppendRecords = 1024;
+constexpr std::size_t kSummaryBytes = 8192;
+constexpr std::array<const char*, 8> kBootstrapTools = {
+    "exec_command", "write_stdin", "skill_read",      "tool_search",
+    "apply_patch",  "view_image",  "session_history", "tool_output_read"};
 
 bool missing(const MaiError& error) {
     return error.code() == MaiErrorCode::NotFound || error.code() == MaiErrorCode::NotSupported;
 }
 
-MaiResult<std::string> scopeKey(const std::string& model) {
+MaiResult<std::string> scopeKey(const std::string& model, const char* prefix = "model-tools-v5-") {
     if (model.empty())
         return {MaiErrorCode::InvalidInput, "A model is required for tool discovery."};
     std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
@@ -33,7 +37,7 @@ MaiResult<std::string> scopeKey(const std::string& model) {
         return {MaiErrorCode::Internal, "Cannot identify the model tool catalog."};
     constexpr char hex[] = "0123456789abcdef";
     // v5 对齐桌面文件注册范围；旧快照不能继续声明宿主已经移除的 file_*。
-    std::string key = "model-tools-v5-";
+    std::string key = prefix;
     for (unsigned int index = 0; index < length; ++index) {
         key += hex[digest[index] >> 4];
         key += hex[digest[index] & 15];
@@ -96,6 +100,79 @@ std::string shortDescription(const std::string& description) {
         --end;
     return description.substr(0, end);
 }
+
+// 这里只裁剪发现线索，不修改工具本身的使用合同；先折叠换行，避免一项占用多行。
+// 与 Chromium TruncateUTF8ToByteSize 一样退回完整码点边界，不截断多字节字符。
+std::string summaryPurpose(const std::string& description, std::size_t budget) {
+    std::string text;
+    for (const unsigned char byte : description) {
+        if (byte <= 0x20 || byte == 0x7f) {
+            if (!text.empty() && text.back() != ' ') text += ' ';
+        } else {
+            text += static_cast<char>(byte);
+        }
+        if (text.size() > budget + 4) break;
+    }
+    if (text.size() > budget) {
+        std::size_t end = budget - 3;
+        while (end && (static_cast<unsigned char>(text[end]) & 0xc0) == 0x80) --end;
+        text.resize(end);
+        text += "...";
+    }
+    while (!text.empty() && text.back() == ' ') text.pop_back();
+    return text;
+}
+
+MaiResult<std::string> renderSummary(std::vector<MaiToolMetadata> metadata,
+                                     std::size_t byteBudget) {
+    metadata.erase(std::remove_if(metadata.begin(), metadata.end(),
+                                  [](const auto& item) {
+                                      return std::find(kBootstrapTools.begin(),
+                                                       kBootstrapTools.end(),
+                                                       item.name) != kBootstrapTools.end();
+                                  }),
+                   metadata.end());
+    if (metadata.empty()) return std::string{};
+    std::sort(metadata.begin(), metadata.end(),
+              [](const auto& left, const auto& right) { return left.name < right.name; });
+    for (const auto& item : metadata) {
+        if (item.name.empty() || item.name.size() > 256)
+            return {MaiErrorCode::Internal, "Invalid public capability name."};
+        if (const auto error = maiValidateSessionContextContent(item.name)) return error;
+    }
+    const std::string header =
+        "Builtin capability index (names and short purposes only). Use tool_search with query "
+        "or select (up to 5 exact names); selected schemas appear in the next request. Call a "
+        "tool only after its schema is declared. This index grants no permissions and does not "
+        "confirm credentials or backend readiness.\n";
+    // 先压缩用途以保留全部真实名称；极大目录才省略整项，并始终保留可达的续查入口。
+    for (const std::size_t purposeBytes : {128u, 64u, 0u}) {
+        std::string result = header;
+        std::size_t included = 0;
+        for (const auto& item : metadata) {
+            // 非普通名称使用可逆 JSON 引号，不能让名称换行伪装成另一项，也不改写真实名称。
+            const bool quoteName =
+                std::any_of(item.name.begin(), item.name.end(), [](unsigned char byte) {
+                    return byte <= 0x20 || byte == 0x7f || byte == '"' || byte == '\\';
+                });
+            std::string line = "- " + (quoteName ? Json(item.name).dump() : item.name);
+            if (purposeBytes) line += ": " + summaryPurpose(item.description, purposeBytes);
+            line += '\n';
+            const std::string continuation =
+                "Additional capabilities omitted; browse tool_search "
+                "with an empty query and offset/limit.\n";
+            if (result.size() + line.size() + continuation.size() > byteBudget) {
+                if (purposeBytes) break;
+                result += continuation;
+                return result;
+            }
+            result += line;
+            ++included;
+        }
+        if (included == metadata.size()) return result;
+    }
+    return {MaiErrorCode::Internal, "Cannot fit the capability discovery instructions."};
+}
 }  // namespace
 
 struct MaiModelToolCatalog::Impl {
@@ -108,6 +185,7 @@ struct MaiModelToolCatalog::Impl {
     std::mutex mutex;
     std::map<std::string, bool> legacySessions;
     std::map<std::pair<std::string, std::string>, Snapshot> snapshots;
+    std::map<std::pair<std::string, std::string>, std::string> summaries;
     Impl(MaiSessionStore& value, const MaiToolRegistry& tools) : store(value), registry(tools) {}
 
     MaiResult<std::string> saved(const std::string& session, const std::string& key,
@@ -174,9 +252,7 @@ struct MaiModelToolCatalog::Impl {
                 initial = registry.specs(context.model);
             } else {
                 // 来源补读工具必须始终自举，否则压缩器不能安全地只发送来源索引。
-                for (const auto* name :
-                     {"exec_command", "write_stdin", "skill_read", "tool_search", "apply_patch",
-                      "view_image", "session_history", "tool_output_read"})
+                for (const auto* name : kBootstrapTools)
                     if (const auto* tool = registry.findForModel(name, context.model))
                         initial.push_back(tool->specForModel(context.model));
             }
@@ -245,6 +321,44 @@ struct MaiModelToolCatalog::Impl {
 MaiModelToolCatalog::MaiModelToolCatalog(MaiSessionStore& store, const MaiToolRegistry& registry)
     : mImplementation(std::make_unique<Impl>(store, registry)) {}
 MaiModelToolCatalog::~MaiModelToolCatalog() = default;
+MaiResult<std::string> MaiModelToolCatalog::capabilitySummary(const MaiTurnContext& context,
+                                                              std::size_t firstRenderByteBudget) {
+    const auto key = scopeKey(context.model, "model-tool-summary-v1-");
+    if (!key) return key.error();
+    std::lock_guard<std::mutex> lock(mImplementation->mutex);
+    const auto identity = std::make_pair(context.sessionId, context.model);
+    const auto cached = mImplementation->summaries.find(identity);
+    if (cached != mImplementation->summaries.end()) return cached->second;
+    MaiSession session;
+    if (!mImplementation->store.getSession(context.sessionId, session)) {
+        if (const auto error = mImplementation->store.lastReadError()) return error;
+        return {MaiErrorCode::NotFound, "Capability summary session does not exist."};
+    }
+    const auto stored = mImplementation->store.getSessionContext(context.sessionId, key.value());
+    if (const auto error = mImplementation->store.lastReadError()) return error;
+    std::string summary;
+    if (stored) {
+        summary = stored.value();
+    } else if (missing(stored.error())) {
+        MaiResult<std::string> candidate = std::string{};
+        if (mImplementation->registry.findForModel("tool_search", context.model))
+            candidate =
+                renderSummary(mImplementation->registry.metadata(context.model),
+                              std::clamp(firstRenderByteBudget, std::size_t{512}, kSummaryBytes));
+        if (!candidate) return candidate.error();
+        const auto winner =
+            mImplementation->saved(context.sessionId, key.value(), candidate.value());
+        if (!winner) return winner.error();
+        summary = winner.value();
+    } else {
+        return stored.error();
+    }
+    if (summary.size() > kSummaryBytes)
+        return {MaiErrorCode::Internal, "Persisted capability summary exceeds its byte budget."};
+    if (const auto error = maiValidateSessionContextContent(summary)) return error;
+    mImplementation->summaries.emplace(identity, summary);
+    return summary;
+}
 MaiError MaiModelToolCatalog::initializeNewSession(const std::string& sessionId) {
     std::lock_guard<std::mutex> lock(mImplementation->mutex);
     MaiSession session;
@@ -338,6 +452,11 @@ MaiResult<MaiToolCatalogPage> MaiModelToolCatalog::search(const MaiTurnContext& 
 void MaiModelToolCatalog::forgetSession(const std::string& sessionId) {
     std::lock_guard<std::mutex> lock(mImplementation->mutex);
     mImplementation->legacySessions.erase(sessionId);
+    for (auto item = mImplementation->summaries.begin(); item != mImplementation->summaries.end();)
+        if (item->first.first == sessionId)
+            item = mImplementation->summaries.erase(item);
+        else
+            ++item;
     for (auto item = mImplementation->snapshots.begin(); item != mImplementation->snapshots.end();)
         if (item->first.first == sessionId)
             item = mImplementation->snapshots.erase(item);

@@ -97,6 +97,10 @@ public:
         // 末尾追加保留既有聚合初始化字段顺序；所有 C++ 消费者仍须统一重新编译。
         std::function<void(const std::shared_ptr<std::atomic_bool>&)> beginSampling;
         std::function<bool(const std::shared_ptr<std::atomic_bool>&)> endSampling;
+        // 可选能力目录：固定真实型号后在工作线程仅准备一次，失败则中止本轮。
+        // 返回值在上下文准备和预算测量前并入 baseInstructions；不改变声明或执行门禁。
+        // 末尾追加保留旧聚合初始化顺序；所有 C++ 消费者仍须统一重新编译。
+        std::function<MaiResult<std::string>(const MaiTurnContext&)> prepareToolSummary;
     };
 
     MaiTurnRunner(Dependencies dependencies, std::string sessionId, MaiMessage assistant);

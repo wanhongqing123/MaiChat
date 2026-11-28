@@ -109,9 +109,7 @@ public:
 
     std::string description() const override {
         // 精确替换旧文本的一段；匹配不唯一时应先核对上下文，避免改错位置。
-        return "Replace an exact piece of text in a file. Prefer this over file_write when you are "
-               "changing part of an existing file: it only sends the difference, so it is faster "
-               "and cannot silently rewrite the parts you did not mean to touch. old_string must "
+        return "Replace exact text in a file without rewriting unrelated content. old_string must "
                "match the file exactly, including indentation, and must appear only once unless "
                "replace_all is set. Files and replacements must be UTF-8 text without NUL bytes; "
                "other encodings are rejected without conversion. Both the original and edited file "

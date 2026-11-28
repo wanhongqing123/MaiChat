@@ -33,9 +33,7 @@ public:
 
     std::string description() const override {
         // 记录完整任务清单及状态，每次更新提交全量列表，不能只报本次变化的一项。
-        return "Record the task list for the work you are doing, and update it as you go. Send "
-               "the whole list every time, not just the part that changed. Use it for anything "
-               "that takes more than a couple of steps, so nothing gets dropped. Exactly one item "
+        return "Replace the current task list with the complete updated list. Exactly one item "
                "may be in_progress at a time.";
     }
 

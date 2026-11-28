@@ -895,9 +895,10 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         mError = error;
         return;
     }
-    if (mDependencies.prepareSkills) {
+    for (const auto* prepare : {&mDependencies.prepareSkills, &mDependencies.prepareToolSummary}) {
+        if (!*prepare) continue;
         if (cancel.load(std::memory_order_relaxed)) return;
-        const auto instructions = mDependencies.prepareSkills(mContext);
+        const auto instructions = (*prepare)(mContext);
         if (!instructions) {
             mError = instructions.error();
             return;

@@ -18,8 +18,7 @@ public:
 
     std::string description() const override {
         // 遇到“今天”“刚才”等相对时间，先取系统当前时间再判断日志或文件新旧。
-        return "Return the current date and time. Use it before reasoning about anything relative "
-               "to now, such as how recent a commit or a log entry is.";
+        return "Return the current date and time for questions relative to now.";
     }
 
     std::string parametersSchema() const override {

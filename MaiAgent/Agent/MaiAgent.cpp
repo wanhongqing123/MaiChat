@@ -746,10 +746,19 @@ struct MaiAgent::Runtime {
         dependencies.reasoningEffort = options.reasoningEffort;
         dependencies.reasoningEffortProvider = options.reasoningEffortProvider;
         dependencies.baseInstructions = options.baseInstructions;
-        if (toolCatalog)
+        if (toolCatalog) {
             dependencies.prepareTools = [this](const MaiTurnContext& context) {
                 return toolCatalog->exposedSpecs(context);
             };
+            dependencies.prepareToolSummary = [this](const MaiTurnContext& context) {
+                // 只约束新目录的开销，不生成 Schema；完整请求的统一预算仍有最终决定权。
+                // 已有摘要保持首次赢家字节，不因窗口配置变化而原位裁剪。
+                const auto window = model->contextLimits(context.model).contextWindowTokens;
+                const auto byteBudget =
+                    window ? std::clamp<std::size_t>(window / 8 * 3, 512, 8192) : 8192;
+                return toolCatalog->capabilitySummary(context, byteBudget);
+            };
+        }
         if (options.skillsEnabled)
             dependencies.prepareSkills = [this](const MaiTurnContext& context) {
                 return prepareSkills(context);

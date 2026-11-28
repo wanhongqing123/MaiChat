@@ -90,18 +90,13 @@ public:
         // 工作区原图与编辑成品均在当前回复展示为持久卡片；图片直接显示缩略图。
         // 用户再次要求查看时重新交付相同相对路径，不要求相册资产 ID 或模型视觉。
         // 此入口不自动全屏、不保存到系统相册，也不发给联系人；生成视频仍须核验出处。
-        return "Show an existing photo/image, video, or audio file inline in the CURRENT reply "
-               "as a persistent media card, with an image thumbnail for photos/images. Use "
-               "this for original camera photos as well as edited or generated media whenever "
-               "the user asks to see the file in this conversation. Show it in this reply even "
-               "if the same file appeared in an earlier message. For a captured photo, set "
-               "file_path to the exact workspace path returned by mobile_take_photo and type "
-               "to image. file_path must be relative to this Agent workspace; no "
-               "Photos-library asset ID is needed. This displays media to the user without "
-               "requiring model vision or passing image pixels to the model. It does not open "
-               "full-screen preview, add to the system Photos library, or send to an IM "
-               "contact, and accepts no peer_id. For a completed generated video, include its "
-               "specialist source_task_id; it must own exactly this output file.";
+        return "Show an existing image, video or audio file as a persistent media card in the "
+               "current reply, including media shown earlier. Use a workspace-relative file_path; "
+               "for camera photos use the exact mobile_take_photo path and type=image. No Photos "
+               "asset ID or model vision is needed; image pixels are not sent to the model. "
+               "Does not open full-screen preview, save to Photos or send to IM; no peer_id. "
+               "A completed generated video requires the specialist source_task_id owning exactly "
+               "that output file.";
     }
     std::string parametersSchema() const override {
         // file_path 指向当前工作区已有成品；type 必须与 image/video/audio 实际类型一致。

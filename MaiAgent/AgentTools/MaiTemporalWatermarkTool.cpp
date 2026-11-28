@@ -40,21 +40,15 @@ public:
         // 会移动的区域借自身前后无遮挡帧，并在前景进入补画区时保留人物轮廓。
         // Agent 先用一张抽帧拼图定位移动区域，再用帧号钉住切换点；必须核对
         // before_s/after_s 指向无遮挡帧，不能让本工具在黑盒中猜测。
-        return "Remove explicitly requested visible overlays from a local MP4/MOV video in "
-               "one on-device job. Provide every watermark rectangle and active time window. "
-               "There is one fixed repair workflow. If the same area "
-               "is clean before or after an overlay appears, supply verified before_s and "
-               "optional after_s timestamps. The tool interpolates those clean frames, "
-               "matches color, feather-blends the background, and preserves a foreground "
-               "person when foreground_edge identifies the entering side. If no clean "
-               "reference exists, omit reference timestamps; the tool uses local LaMa ONNX "
-               "for that region. Bright text overlapping preserved foreground is repaired "
-               "locally with ONNX. The tool "
-               "writes a new MP4, keeps the source, and copies audio. It estimates hidden "
-               "pixels; review the output. Inspect one contact sheet sampled across the "
-               "video, then use start_frame/end_frame for exact transition boundaries and "
-               "call once with all regions. Clean reference times must show no overlay or "
-               "foreground in the repair area. Do not run FFmpeg/OpenCV repair loops.";
+        return "Remove user-requested visible overlays from a local MP4/MOV in one on-device job. "
+               "Inspect a contact sheet, then supply all rectangles/time windows together; use "
+               "start_frame/end_frame for exact boundaries. Verified before_s and optional "
+               "after_s must show neither overlay nor foreground in the repair area. Clean "
+               "references are interpolated, color-matched and blended; foreground_edge preserves "
+               "an entering person. Without clean references, omit timestamps to use local LaMa "
+               "ONNX; bright text over foreground also uses ONNX. Writes a new MP4, preserves "
+               "source and audio, and estimates hidden pixels: review the result. Do not run "
+               "FFmpeg/OpenCV repair loops.";
     }
 
     std::string parametersSchema() const override {

@@ -673,40 +673,13 @@ public:
     }
 
     std::string description() const override {
-        // Wan3.0 英文描述的对应含义：输出时长 2–30 秒或 -1 智能决定，
-        // 输入视频与输出时长总计不能超过 30 秒；支持 480P/720P/1080P 与声音开关。
-        // discover 查能力，diagnose 只读校验访问权限。delegate 可用文本或首尾帧
-        // 创建，也能在 edit/extend 模式传一个 video_path；reference 可把一个
-        // 本地视频与最多十张图结合。换人/动作模仿通过一图一视频加明确提示词引导，
-        // 不承诺像专用模型那样逐帧保留身份、动作或背景。
-        // file_path 走私有 OSS，file_url 是公开文档外链；link_url 是公开网页。
-        // App 自动查询并报告结果，continue 只用于手动排障；revise 在同一会话
-        // 对完成任务追加反馈。cancel 只取消 PENDING，delete 只移除已交付本地记录。
-        // 云端仍可能审核拒绝，不能把已提交当作已完成。
-        // 暂停事实必须先于保留的能力说明，旧工具实例也不能宣称自己能提交新任务。
+        // 费用暂停期间不把旧生成教程伪装成可执行能力；discover 仍可查询保留的能力元数据。
+        // 旧任务继续检查和收尾可达，取消/删除边界不能随教程精简而消失。
         return "Wan video generation (wan_video) is temporarily disabled to control costs. "
                "Delegate and revise are unavailable; do not retry or switch models silently. "
                "Existing task continue, cancel, and local delete remain supported internally. "
-               "Legacy Wan3.0 video capabilities through Beijing Model Studio: "
-               "diagnose checks model visibility without generating. Output: 2-30 seconds or "
-               "duration=-1, 480P/720P/1080P, adaptive or explicit ratio, optional audio. "
-               "Modes: create=text or one strict first frame or first+last frame; "
-               "reference=up to ten local images and optionally one video; edit=one source "
-               "video, optionally with person reference images; extend=one source video with "
-               "ratio=adaptive. For person replacement in Video 1, use mode=edit with one "
-               "image of the desired person and explicitly request replacing the person while "
-               "preserving the scene. For motion guided by Video 1, use mode=reference with "
-               "one person image and request that Image 1 follows Video 1's motion and "
-               "expressions while keeping Image 1's background. These "
-               "are prompt-guided approximations, not frame-accurate dedicated effects. "
-               "Measure source_duration_seconds for every local video: at most 15 seconds, "
-               "and source plus output at most 30 seconds. One document file_path/file_url "
-               "or one public link_url can guide "
-               "create/reference; it requires prompt_extend=true and cannot mix with strict "
-               "frames. All local image, video, and document inputs go through private OSS. "
-               "The provider supports more videos and reference audio, but this tool does not. "
-               "Delegate creates a paid job; continue only checks an existing job; revise "
-               "edits the prior completed output in this AI conversation. Cancel works only "
+               "Use discover for retained capability metadata; diagnose checks model visibility "
+               "without generating. Continue only checks an existing job. Cancel works only "
                "while PENDING; delete removes only a delivered local task record, not the "
                "cloud job or downloaded MP4. Cloud moderation may still reject inputs.";
     }

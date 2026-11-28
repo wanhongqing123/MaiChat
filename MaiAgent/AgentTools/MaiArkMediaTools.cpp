@@ -480,39 +480,30 @@ public:
     // 构造模型可见的工具说明和参数约束。
     // 字段名及可选值须与执行入口的真实校验保持一致。
     std::string description() const override {
-        if (!specialistInfo()->configured)
-            return "Seedance video specialist defaults to doubao-seedance-2-0-mini-260615. Ark "
-                   "API Key is not configured on this device. Use discover for capabilities.";
+        // 元数据发现不得读取密钥；配置状态由显式 discover 查询，使用合同保持静态。
         // prepare 是非付费素材准备，返回只含 ID 的参数；delegate 才走逐次付费确认。
         // 已完成的 Seedance 任务沿用供应商任务 ID；外部视频 URL 不作为新输入。
-        return "Seedance video through Ark. Use discover for capabilities, prepare for local "
-               "media, delegate for a new paid task, revise for a completed task in this AI "
-               "session, and continue to check status. Select Seedance 2.0 Mini (default), Fast, "
-               "or standard 2.0 before paying; "
-               "2.5 is disabled. Confirm duration, ratio, resolution, and audio. Mini and Fast "
-               "support 4-15 seconds at 480p/720p; standard 2.0 also supports 1080p/4k. "
-               "mode=create accepts text, up to nine reference images, or strict first and "
-               "optional last frames. reference_asset_ids, first_frame_asset_id, and "
-               "last_frame_asset_id must be Active Image assets. Strict frames cannot mix with "
-               "reference images. mode=reference, edit, or extend requires exactly one source: "
-               "video_asset_id or a completed Seedance video_task_id for paid submission; "
-               "prepare also accepts local video_path. "
-               "Direct video_url input is unsupported. Before paid delegate with "
-               "local image_path, last_frame_path, local_image_paths, or video_path, call "
-               "action=prepare with an existing asset_group_id and asset_group_type. Each "
-               "prepare call registers at most one local file and returns prepared_arguments "
-               "with its asset ID. If status is processing, call prepare again with "
-               "those prepared_arguments; it will not upload the same file twice. Delegate "
-               "rejects local paths and sends only asset:// IDs to Seedance. AIGC groups are for "
-               "fictional "
-               "subjects and must not be used for natural-person likenesses. A real person needs "
-               "a LivenessFace group after that person completes Ark H5 verification; do not "
-               "infer group type from the file. Existing asset IDs are checked for Active status "
-               "and Image or Video type before submission. Registration failure, cancellation, "
-               "or a processing timeout stops before the paid video request. The app checks "
-               "submitted tasks automatically; continue is for manual diagnostics. Cancel can "
-               "stop only queued tasks, and delete removes only delivered ended task records. "
-               "Use agent_send_media to deliver a completed video.";
+        return "Generate paid Seedance videos through Ark. discover reports capabilities; prepare "
+               "registers local media; delegate starts a paid task; revise uses a completed task "
+               "in this AI session; continue checks status. Select 2.0 Mini (default), Fast or "
+               "standard 2.0 and confirm duration, ratio, resolution and audio before payment. "
+               "2.5 is disabled. Mini/Fast support 4-15 seconds at 480p/720p; standard also "
+               "supports 1080p/4k. create accepts text, up to nine reference images, or strict "
+               "first/optional last frames. Image inputs must be Active Image assets; strict "
+               "frames "
+               "cannot mix with references. reference/edit/extend requires exactly one source: "
+               "video_asset_id or a completed Seedance video_task_id. Direct video_url is "
+               "unsupported. Local image_path, last_frame_path, local_image_paths and video_path "
+               "require prepare with existing asset_group_id and asset_group_type. Each call "
+               "registers at "
+               "most one file; repeat prepare with returned prepared_arguments while processing "
+               "without reuploading. Delegate rejects local paths and submits only asset:// IDs. "
+               "AIGC groups are only for fictional subjects. Real people require their own Ark "
+               "H5-verified LivenessFace group; never infer group type from a file. Asset Active "
+               "status and Image/Video type are checked before submission. Registration failure, "
+               "cancellation or processing timeout stops before payment. The app checks tasks "
+               "automatically; continue is for diagnostics. Cancel stops only queued tasks; "
+               "delete removes only delivered ended task records. Deliver with agent_send_media.";
     }
     std::string parametersSchema() const override {
         // JSON Schema 只定义字段形状；execute 还会核对模式组合、文件存在、数量、

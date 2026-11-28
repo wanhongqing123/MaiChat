@@ -434,32 +434,26 @@ public:
                "cmd uses the selected shell syntax; workdir defaults to the authorized session "
                "cwd. "
 #if defined(_WIN32)
-               "Windows selects the first available pwsh, Windows PowerShell, then cmd by default. "
-               "Use the selected interpreter's syntax; Bash commands are not PowerShell commands. "
-               "External executables need PATH discovery or an explicit path. If rg is "
-               "unavailable in PowerShell, use Get-ChildItem and Select-String; use -LiteralPath "
-               "for paths containing spaces or wildcard characters. "
+               "Windows defaults to the first available pwsh, Windows PowerShell or cmd. Use "
+               "that interpreter's syntax and discover executables through PATH or explicit "
+               "paths. Use -LiteralPath for PowerShell paths with spaces or wildcards. "
 #endif
-               "shell selects the interpreter; login defaults to true. tty defaults to false "
-               "(closed stdin and pipes); true allocates a native PTY for interactive input. "
-               "yield_time_ms limits this wait, not the command lifetime; default 10000, "
+               "tty=false closes stdin; tty=true allocates a native PTY for interaction. "
+               "yield_time_ms limits this wait, not process lifetime; "
 #if defined(_WIN32)
                "effective range 10000..30000 on Windows. "
 #else
                "effective range 250..30000. "
 #endif
                "Continue with write_stdin; do not restart a running command to obtain its output. "
-               "max_output_tokens defaults to 10000 and is capped by policy; omitted output "
-               "retains the beginning and end. An output_id permits tool_output_read without "
+               "Output is policy-bounded with beginning/end retention. output_id permits "
+               "tool_output_read without "
                "re-execution. Approval and workspace policies apply; exit_code belongs to the "
                "shell process and does not establish every pipeline stage succeeded. "
-               "On Windows, a completed command may report background_running=true: "
-               "its background services remain owned by this Agent session and count toward "
-               "process limits. "
-               "Use the service's own close command when finished; cancellation and owner cleanup "
-               "still "
-               "terminate owned processes. Do not reopen an existing service solely because its "
-               "launcher exited.";
+               "On Windows, background_running=true means owned services outlive the completed "
+               "launcher and still count toward process limits. Close them using their own "
+               "commands; cancellation/owner cleanup terminate them. Do not relaunch a service "
+               "just because its launcher exited.";
     }
 
     std::string parametersSchema() const override {
@@ -581,13 +575,12 @@ public:
     std::string description() const override {
         // 仅续接当前 Agent 所拥有的数字进程会话。空 chars 轮询，普通输入要求启动时已选 PTY。
         // Ctrl-C 中断原进程；非空输入仍走审批。预算只覆盖新输出，不把旧块重复塞回上下文。
-        return "Write characters to or poll an existing exec_command session owned by this Agent "
-               "session, returning only newly consumed output. session_id is the numeric ID "
-               "returned by exec_command. Empty chars polls without writing; normal input "
+        return "Write to or poll an owned exec_command session_id, returning only new output. "
+               "Empty chars polls without writing; normal input "
                "requires tty=true at launch. chars=\"\\u0003\" interrupts the process. "
                "Nonempty writes default to 250ms (250..30000); empty polls use 5000..300000ms. "
                "Nonempty input follows the approval policy; empty polls require no approval. "
-               "max_output_tokens defaults to 10000 and is capped by policy. Use output_id with "
+               "Output is policy-bounded. Use output_id with "
                "tool_output_read for retained output; never relaunch solely to recover output.";
     }
     std::string parametersSchema() const override {

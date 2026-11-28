@@ -38,8 +38,7 @@ struct MaiToolCatalogPage {
 // 普通入口与 tool_search 共用的核心。借用 store/registry，二者必须活到析构。
 // 注册表在使用期间不得增删；方法可跨线程调用，内部串行化会话快照的准备与追加。
 // 声明按 session/model 隔离，首次保存的字节及后续追加顺序跨轮次和重启保持固定。
-// v2 显式升级 canonical apply_patch 与原生输入格式；保留 v1 模式和快照原文，
-// 按当前注册表重建 v2 初始声明；升级可能使提示缓存失效一次，后续再次固定 v2 字节。
+// v5 声明与 v1 能力摘要独立保存；不改写既有声明描述、追加记录或消息历史。
 // 标准存储以 insert-if-absent 保存；不支持该能力的旧后端只保证实例生命周期。
 // 读写错误返回原错误；失败保存不激活候选声明，不授予执行权限。
 class MaiModelToolCatalog {
@@ -57,6 +56,17 @@ public:
     // 在工作线程调用；context.turnId 可为空，返回独立的不可变声明副本。
     // 已有旧历史而没有目录快照的会话保留全部声明，避免缩改旧前缀。
     MaiResult<std::vector<MaiToolSpec>> exposedSpecs(const MaiTurnContext& context);
+    // 在工作线程调用；只取公开且支持实际型号的 metadata，不构造 Schema、执行工具、
+    // 读取技能正文或查询凭据。返回精确名称与单行用途，总计至多 8192 个 UTF-8 字节。
+    // 预算不足先缩短用途，再省略完整条目并保留 tool_search 继续发现说明；不截断名称。
+    // 没有可达 tool_search 或没有延迟能力时返回空串。摘要不证明配置就绪或授予权限。
+    // 按 session/model/summary-version 首次保存后冻结；跨实例采用 insert-if-absent 赢家。
+    // firstRenderByteBudget 仅限制首次生成的新增目录开销，收敛到 512..8192 字节；
+    // 已保存的赢家不按后来预算重裁。它不保证完整请求能容纳任意基础指令或用户输入，
+    // 完整请求仍须经过统一上下文预算检查；未知窗口的普通调用默认使用 8192 字节。
+    // 失败不激活候选；读写错误原样返回。不支持持久化的后端只保证实例生命周期。
+    MaiResult<std::string> capabilitySummary(const MaiTurnContext& context,
+                                             std::size_t firstRenderByteBudget = 8192);
     // 元数据结果描述至多 512 字节，每页至多 10 项；选择只影响下一次声明快照。
     // 非公开、当前型号不支持或未知名称拒绝，选择批次先完整校验再写入。
     MaiResult<MaiToolCatalogPage> search(const MaiTurnContext& context,

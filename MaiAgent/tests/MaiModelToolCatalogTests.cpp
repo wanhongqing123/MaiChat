@@ -4,11 +4,13 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <json.hpp>
 #include <openssl/evp.h>
 
 #include "MaiMemoryStore.h"
+#include "MaiArkMediaTools.h"
 #include "MaiFileSystem.h"
 #include "MaiSqliteStore.h"
 #include "MaiModelToolCatalog.h"
@@ -29,6 +31,12 @@ class MaiCatalogFaultStore final : public MaiSessionStore {
 public:
     std::unique_ptr<MaiSessionStore> inner = makeMaiMemoryStore();
     bool failed = false;
+    bool readFailed = false;
+    bool contextUnsupported = false;
+    MaiError lastReadError() const override {
+        return readFailed ? MaiError{MaiErrorCode::Internal, "Owned storage read failed."}
+                          : inner->lastReadError();
+    }
     void putSession(const MaiSession& value) override {
         inner->putSession(value);
     }
@@ -71,11 +79,13 @@ public:
     }
     MaiResult<std::string> getSessionContext(const std::string& id,
                                              const std::string& key) const override {
+        if (contextUnsupported) return {MaiErrorCode::NotSupported, "Owned nonpersistent backend."};
         return inner->getSessionContext(id, key);
     }
     MaiResult<std::string> saveSessionContext(const std::string& id, const std::string& key,
                                               const std::string& value) override {
         if (failed) return {MaiErrorCode::Internal, "Injected session context write failure."};
+        if (contextUnsupported) return {MaiErrorCode::NotSupported, "Owned nonpersistent backend."};
         return inner->saveSessionContext(id, key, value);
     }
     MaiError insertSpecialistTask(const MaiSpecialistTask& value) override {
@@ -252,6 +262,17 @@ void run() {
     CHECK(legacy && has(legacy.value(), "alpha") && has(legacy.value(), "beta"));
     registry.add(std::make_unique<MaiCatalogTestTool>("gamma"));
     CHECK(!has(reopened.exposedSpecs(context).value(), "gamma"));
+    const auto legacyBeforeSummary = reopened.exposedSpecs(context);
+    CHECK(reopened.capabilitySummary(context));
+    const auto legacyAfterSummary = reopened.exposedSpecs(context);
+    CHECK(legacyAfterSummary.value().size() == legacyBeforeSummary.value().size());
+    for (std::size_t i = 0; i < legacyBeforeSummary.value().size(); ++i) {
+        CHECK(legacyAfterSummary.value()[i].name == legacyBeforeSummary.value()[i].name);
+        CHECK(legacyAfterSummary.value()[i].description ==
+              legacyBeforeSummary.value()[i].description);
+        CHECK(legacyAfterSummary.value()[i].parametersJson ==
+              legacyBeforeSummary.value()[i].parametersJson);
+    }
 
     // 保存候选超过后端内容上限时必须失败，不能激活未保存的声明。
     registry.add(
@@ -321,6 +342,16 @@ void testBuiltinDeclarationBudget() {
     CHECK(initial);
     if (!initial) return;
     const auto all = registry.specs(owner.model);
+    const auto summary = core->capabilitySummary(owner);
+    CHECK(summary && summary.value().size() <= 8192);
+    CHECK(summary && summary.value().find("omitted") == std::string::npos);
+    if (summary) {
+        MaiModelRequest request;
+        request.model = owner.model;
+        request.baseInstructions = summary.value();
+        std::printf("Builtin capability summary: %zu bytes/%zu estimated tokens\n",
+                    summary.value().size(), maiEstimateModelInputTokens(request).tokens);
+    }
     const auto bytes = [](const std::vector<MaiToolSpec>& specs) {
         std::size_t result = 0;
         for (const auto& spec : specs)
@@ -336,6 +367,175 @@ void testBuiltinDeclarationBudget() {
         all.size(), bytes(all), initial.value().size(), bytes(initial.value()));
 }
 
+void testMetadataDoesNotReadCredentials() {
+    int credentialReads = 0;
+    MaiToolRegistry registry;
+    registry.add(makeMaiSeedanceVideoTool([&] {
+        ++credentialReads;
+        return std::string{};
+    }));
+    const auto metadata = registry.metadata("glm-5.4");
+    CHECK(metadata.size() == 1);
+    CHECK(credentialReads == 0);
+    CHECK(!metadata.empty() && metadata[0].description.find("paid") != std::string::npos);
+    auto store = makeMaiMemoryStore();
+    create(*store, "no-credential-summary");
+    registry.add(std::make_unique<MaiCatalogTestTool>("tool_search"));
+    MaiModelToolCatalog catalog(*store, registry);
+    CHECK(catalog.capabilitySummary({"no-credential-summary", {}, "glm-5.4", {}, {}}));
+    CHECK(credentialReads == 0);
+}
+
+void testSummarySnapshot(MaiSessionStore& store) {
+    create(store, "summary");
+    create(store, "summary-other");
+    MaiToolRegistry registry;
+    int schemaCalls = 0;
+    registry.add(std::make_unique<MaiCatalogTestTool>("tool_search", "Search", &schemaCalls));
+    registry.add(std::make_unique<MaiCatalogTestTool>("beta", "Second purpose", &schemaCalls));
+    registry.add(std::make_unique<MaiCatalogTestTool>("alpha", "Read\nlocal \u6587\u4ef6 safely",
+                                                      &schemaCalls));
+    registry.add(std::make_unique<MaiCatalogTestTool>("unsupported", "Other model", &schemaCalls));
+    registry.addInternal(
+        std::make_unique<MaiCatalogTestTool>("hidden", "Hidden purpose", &schemaCalls));
+    MaiModelToolCatalog catalog(store, registry);
+    MaiTurnContext context{"summary", {}, "model", {}, {}};
+    const auto summary = catalog.capabilitySummary(context);
+    CHECK(summary &&
+          summary.value().find("alpha: Read local \u6587\u4ef6 safely") != std::string::npos);
+    CHECK(summary && summary.value().find("alpha") < summary.value().find("beta"));
+    CHECK(summary && summary.value().find("unsupported") == std::string::npos);
+    CHECK(summary && summary.value().find("hidden") == std::string::npos);
+    CHECK(summary && summary.value().find("schema_secret") == std::string::npos);
+    CHECK(summary && summary.value().find("next request") != std::string::npos);
+    CHECK(schemaCalls == 0);
+    const auto initial = catalog.exposedSpecs(context);
+    CHECK(initial && initial.value().size() == 1 && schemaCalls == 1);
+    MaiToolCatalogQuery query;
+    query.select = {"alpha"};
+    CHECK(catalog.search(context, query));
+    CHECK(catalog.capabilitySummary(context).value() == summary.value());
+    registry.add(std::make_unique<MaiCatalogTestTool>("alpha", "Changed purpose"));
+    MaiModelToolCatalog reopened(store, registry);
+    CHECK(reopened.capabilitySummary(context).value() == summary.value());
+    CHECK(findSpec(reopened.exposedSpecs(context).value(), "alpha")->description ==
+          "Read\nlocal \u6587\u4ef6 safely");
+    context.sessionId = "summary-other";
+    CHECK(reopened.capabilitySummary(context).value().find("Changed purpose") != std::string::npos);
+    context.sessionId = "summary";
+    context.model = "other";
+    CHECK(reopened.capabilitySummary(context).value().find("unsupported") != std::string::npos);
+    context.model.clear();
+    CHECK(!reopened.capabilitySummary(context));
+}
+
+void testSummaryBoundsFailureAndRace() {
+    MaiCatalogFaultStore store;
+    create(store, "bounds");
+    MaiToolRegistry registry;
+    registry.add(std::make_unique<MaiCatalogTestTool>("tool_search"));
+    std::string detail;
+    for (int i = 0; i < 300; ++i) detail += "\u6587";
+    for (int i = 0; i < 600; ++i)
+        registry.add(
+            std::make_unique<MaiCatalogTestTool>("capability_" + std::to_string(1000 + i), detail));
+    MaiModelToolCatalog catalog(store, registry);
+    MaiTurnContext context{"bounds", {}, "model", {}, {}};
+    store.failed = true;
+    CHECK(!catalog.capabilitySummary(context));
+    store.failed = false;
+    registry.add(std::make_unique<MaiCatalogTestTool>("aaa_saved_after_failure", "Fresh purpose"));
+    const auto summary = catalog.capabilitySummary(context);
+    CHECK(summary && summary.value().size() <= 8192);
+    CHECK(summary && !maiValidateSessionContextContent(summary.value()));
+    CHECK(summary && summary.value().find("aaa_saved_after_failure") != std::string::npos);
+    CHECK(summary && summary.value().find("omitted") != std::string::npos);
+    CHECK(summary && summary.value().find("tool_search") != std::string::npos);
+    create(store, "race");
+    context.sessionId = "race";
+    MaiToolRegistry leftRegistry, rightRegistry;
+    leftRegistry.add(std::make_unique<MaiCatalogTestTool>("tool_search"));
+    rightRegistry.add(std::make_unique<MaiCatalogTestTool>("tool_search"));
+    leftRegistry.add(std::make_unique<MaiCatalogTestTool>("left_candidate", "Left purpose"));
+    rightRegistry.add(std::make_unique<MaiCatalogTestTool>("right_candidate", "Right purpose"));
+    MaiModelToolCatalog leftCatalog(store, leftRegistry), rightCatalog(store, rightRegistry);
+    std::string left, right;
+    std::thread first([&] { left = leftCatalog.capabilitySummary(context).value(); });
+    std::thread second([&] { right = rightCatalog.capabilitySummary(context).value(); });
+    first.join();
+    second.join();
+    CHECK(!left.empty() && left == right);
+    CHECK((left.find("left_candidate") != std::string::npos) !=
+          (left.find("right_candidate") != std::string::npos));
+    create(store, "read-failure");
+    context.sessionId = "read-failure";
+    store.readFailed = true;
+    CHECK(!catalog.capabilitySummary(context));
+    store.readFailed = false;
+    CHECK(catalog.capabilitySummary(context));
+    create(store, "empty");
+    MaiToolRegistry empty;
+    MaiModelToolCatalog emptyCatalog(store, empty);
+    CHECK(emptyCatalog.capabilitySummary({"empty", {}, "model", {}, {}}).value().empty());
+    create(store, "missing-route");
+    empty.add(std::make_unique<MaiCatalogTestTool>("unreachable"));
+    CHECK(emptyCatalog.capabilitySummary({"missing-route", {}, "model", {}, {}}).value().empty());
+    create(store, "utf8-boundary");
+    MaiToolRegistry unicode;
+    unicode.add(std::make_unique<MaiCatalogTestTool>("tool_search"));
+    unicode.add(
+        std::make_unique<MaiCatalogTestTool>("unicode", std::string(124, 'a') + "\u6587\u4ef6"));
+    MaiModelToolCatalog unicodeCatalog(store, unicode);
+    const auto bounded = unicodeCatalog.capabilitySummary({"utf8-boundary", {}, "model", {}, {}});
+    CHECK(bounded && !maiValidateSessionContextContent(bounded.value()));
+    CHECK(bounded && bounded.value().find(std::string(124, 'a') + "...") != std::string::npos);
+}
+
+void testSummaryUnsupportedPersistenceBoundary() {
+    MaiCatalogFaultStore store;
+    store.contextUnsupported = true;
+    create(store, "volatile-summary");
+    MaiToolRegistry registry;
+    registry.add(std::make_unique<MaiCatalogTestTool>("tool_search"));
+    registry.add(std::make_unique<MaiCatalogTestTool>("alpha", "First purpose"));
+    MaiModelToolCatalog catalog(store, registry);
+    const MaiTurnContext context{"volatile-summary", {}, "model", {}, {}};
+    const auto first = catalog.capabilitySummary(context);
+    CHECK(first && first.value().find("First purpose") != std::string::npos);
+    registry.add(std::make_unique<MaiCatalogTestTool>("alpha", "New instance purpose"));
+    CHECK(catalog.capabilitySummary(context).value() == first.value());
+    MaiModelToolCatalog reopened(store, registry);
+    const auto next = reopened.capabilitySummary(context);
+    CHECK(next && next.value() != first.value());
+    CHECK(next && next.value().find("New instance purpose") != std::string::npos);
+}
+
+void testSummaryFirstBudgetFreezesTheWinner() {
+    auto store = makeMaiMemoryStore();
+    create(*store, "small-first-summary");
+    create(*store, "large-first-summary");
+    MaiToolRegistry registry;
+    int schemaCalls = 0;
+    registry.add(std::make_unique<MaiCatalogTestTool>("tool_search", "Search", &schemaCalls));
+    for (int i = 0; i < 40; ++i)
+        registry.add(std::make_unique<MaiCatalogTestTool>("capability_" + std::to_string(i),
+                                                          std::string(200, 'p'), &schemaCalls));
+    MaiModelToolCatalog catalog(*store, registry);
+    MaiTurnContext context{"small-first-summary", {}, "model", {}, {}};
+    const auto small = catalog.capabilitySummary(context, 1536);
+    CHECK(small && small.value().size() <= 1536);
+    CHECK(small && small.value().find("omitted") == std::string::npos);
+    CHECK(catalog.capabilitySummary(context, 8192).value() == small.value());
+    MaiModelToolCatalog reopened(*store, registry);
+    CHECK(reopened.capabilitySummary(context, 512).value() == small.value());
+    context.sessionId = "large-first-summary";
+    const auto large = catalog.capabilitySummary(context);
+    CHECK(large && large.value().size() > 1536 && large.value().size() <= 8192);
+    CHECK(catalog.capabilitySummary(context, 512).value() == large.value());
+    CHECK(reopened.capabilitySummary(context, 512).value() == large.value());
+    CHECK(schemaCalls == 0);
+}
+
 void testPersistentReopenAndToolAdapter() {
     const auto directory = MaiFileSystem::temporaryDirectory().append(MaiFilePath::fromUtf8(
         "mai-tool-catalog-" +
@@ -348,6 +548,7 @@ void testPersistentReopenAndToolAdapter() {
         CHECK(opened);
         if (!opened) return;
         create(*opened.value(), owner.sessionId);
+        testSummarySnapshot(*opened.value());
         MaiToolRegistry registry;
         registry.add(std::make_unique<MaiCatalogTestTool>("alpha", "ORIGINAL"));
         registry.add(std::make_unique<MaiCatalogTestTool>("apply_patch", "PATCH ORIGINAL"));
@@ -355,6 +556,8 @@ void testPersistentReopenAndToolAdapter() {
         auto tool = makeMaiToolSearchTool(core);
         registry.add(makeMaiToolSearchTool(core));
         CHECK(core->exposedSpecs(owner).value().size() == 2);
+        const auto summary = core->capabilitySummary(owner);
+        CHECK(summary && summary.value().find("alpha: ORIGINAL") != std::string::npos);
         MaiToolContext context;
         context.sessionId = owner.sessionId;
         context.model = owner.model;
@@ -377,6 +580,9 @@ void testPersistentReopenAndToolAdapter() {
         registry.add(std::make_unique<MaiCatalogTestTool>("tool_search", "MODIFIED SEARCH"));
         registry.add(std::make_unique<MaiCatalogTestTool>("apply_patch", "PATCH MODIFIED"));
         MaiModelToolCatalog reopened(*opened.value(), registry);
+        const auto summary = reopened.capabilitySummary(owner);
+        CHECK(summary && summary.value().find("alpha: ORIGINAL") != std::string::npos);
+        CHECK(summary && summary.value().find("MODIFIED") == std::string::npos);
         const auto specs = reopened.exposedSpecs(owner);
         CHECK(specs && specs.value().size() == 3 && specs.value().back().description == "ORIGINAL");
         const auto* patch = specs ? findSpec(specs.value(), "apply_patch") : nullptr;
@@ -526,6 +732,14 @@ int main() {
     testNewSessionMarkerBeforePendingInputs();
     testPersistentReopenAndToolAdapter();
     testBuiltinDeclarationBudget();
+    testMetadataDoesNotReadCredentials();
+    {
+        auto store = makeMaiMemoryStore();
+        testSummarySnapshot(*store);
+    }
+    testSummaryBoundsFailureAndRace();
+    testSummaryUnsupportedPersistenceBoundary();
+    testSummaryFirstBudgetFreezesTheWinner();
     testExplicitProtocolUpgradeKeepsOldSnapshot(1);
     testExplicitProtocolUpgradeKeepsOldSnapshot(2);
     testExplicitProtocolUpgradeKeepsOldSnapshot(3);

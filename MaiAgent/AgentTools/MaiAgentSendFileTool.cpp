@@ -104,12 +104,9 @@ public:
         return "agent_send_file";
     }
     std::string description() const override {
-        return "Deliver an existing workspace file as a persistent file card in the CURRENT AI "
-               "reply. "
-               "Use this for PDF, documents, spreadsheets, archives and other files. Provide a "
-               "relative "
-               "file_path and optional caption; no file bytes, peer_id or model vision are needed. "
-               "This does not upload, execute or modify the file. The file must remain in the "
+        return "Show an existing workspace file as a persistent file card in the current reply. "
+               "Use a relative file_path and optional caption; no file bytes, peer_id or model "
+               "vision are needed. Does not upload, execute or modify the file; keep it in the "
                "workspace.";
     }
     std::string parametersSchema() const override {

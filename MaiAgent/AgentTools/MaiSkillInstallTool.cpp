@@ -24,28 +24,15 @@ public:
         return "skill_install";
     }
     std::string description() const override {
-        return "Discover and install public GitHub skills when the user requests installation. "
-               "Start with mode=discover and the user's repository URL; it pins a commit, lists "
-               "actual SKILL.md "
-               "directories and README GitHub links. A framework repository may link to a separate "
-               "official "
-               "skill repository: inspect those links instead of installing an entire framework or "
-               "guessing "
-               "a maintenance skill. Then mode=install with the selected url/path/ref. Default "
-               "scope=user "
-               "writes the host user's .agents/skills; scope=workspace writes this session's "
-               ".agents/skills. "
-               "No arbitrary destination is accepted. It preserves resources and executable "
-               "metadata, validates "
-               "the skill, records source identity and atomically publishes a new directory "
-               "without replacing "
-               "existing skills. Installation never runs downloaded scripts or grants their "
-               "declared permissions. "
-               "New files are discoverable on the next user input in this conversation. Skill "
-               "installation does "
-               "not install or verify runtime dependencies such as browser CLIs: report that "
-               "separately and use "
-               "normal authorized command tools when the user's task requires dependency setup.";
+        return "Discover and install public GitHub skills on user request. mode=discover pins "
+               "a commit and lists actual SKILL.md directories and README repository links; "
+               "inspect those links before choosing a skill. mode=install uses the selected "
+               "url/path/ref. scope=user (default) targets the host user's .agents/skills; "
+               "scope=workspace targets this session's .agents/skills. No arbitrary destination "
+               "or replacement is allowed. Validates and atomically publishes resources, "
+               "executable metadata and source identity. Never runs downloaded scripts or grants "
+               "permissions. Discovery refreshes on the next user input. Runtime dependencies "
+               "are neither installed nor verified; report and handle those separately.";
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{)"
