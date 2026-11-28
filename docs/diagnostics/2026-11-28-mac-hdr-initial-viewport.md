@@ -64,3 +64,37 @@ Root 精核 717 字节安全回执（SHA256
 原 run 未启用逐帧或原生通知 trace，没有证据断言 Will/Did 缺失。
 Mac 准备仅在外置 observer 诊断副本记录通知到达、Did 排队/执行和窗口 identity；
 原产品与测试 TU、操作节奏、截止时间及断言均保留，增强观察的 binary 单独绑定。
+
+## 一次增强观察：未复现原失败
+
+Mac 随后供件 `fullscreen-observer-single-diagnostic-23288.zip`，29989 字节，SHA256
+`e3e05c932eae1ad8b8b10e0676ae36193716e634dfa63ce03d081f69280b8ad8`。
+Root 独立核全部 15 项 manifest 的大小/SHA，原 observer 与 final Git blob 完全相同，
+仅日志 diff 精确重建 diagnostic post，测试 TU 摘要与 final 相同。
+新诊断 exe 的供件绑定为
+`1621168768e30e839597b44301c649ec1b8d559140388d46b13b91298833cf23`；
+包内没有该二进制，Root 未独立重算 exe 摘要，不将源码/回执核验夸大为二进制复验。
+
+独立正常构建后的单 slot 增强观察退出 0，QtTest 为 3 passed / 0 failed（含初始化/清理），
+14.274 秒，进程总计 17.3 秒。这是另一个带日志的 executable，不是原 binary 重验。
+Root 从原 Qt 日志重新提取记录，与 `observer-events.json` 逐条完全相同：
+
+- 36 条观察器接收记录，包含主窗产品/test 两个 observer 各 16 条、重开窗产品 observer 4 条，
+  不能把双 observer 的计数说成 36 次独立全屏转场。
+- 每个 event 的 Will 同步调用或 Did 排队/执行/返回阶段完整，18 个 Did 回调均有对应记录。
+  所有记录的 bound/current window identity 相同、owner 与 active 为真。
+- 最大 Did 排队 155ms。首轮 DidExit，product 回调在 5000ms 执行、5153ms 返回；
+  test 回调在 5153ms 执行。此处时间均沿用同一原始 wallMs 的尾部，完整值见原轨迹。
+- 279 个逐帧样本属于原主窗 156228，最后一个样本在关闭/重开前恢复至 owner/AV bounds
+  740×440，native/Qt 均非全屏、active Space 为真；重开窗通知另用 observer 3 记录。
+
+原始日志、逐帧 JSONL、绑定与 Root 机器复核结果保存于
+`.cache/steer-input-20261128/mac-final-fullscreen/`，复核输出为 `root-independent-review.json`。
+这次没有观察到丢通知、Did 卡三秒或已记录时刻的窗口 identity 替换，
+不能据此回推原失败根因或关闭最终验收。原失败仍为 2 passed / 1 failed（6938ms）。
+
+该增强日志在转场回调中构建 JSON、调用窗口属性及写日志，可能影响调度。
+下一步仅准备外置的固定容量内存记录探针供审：回调不格式化、不写文件，
+不调用 owner->winId 或读取 frame；正常结束再一次导出，并记录线程与溢出事实。
+原产品、原测试 TU、70ms/3 秒及断言均不变；尚未批准或执行追加运行。
+不以增加 timeout、重复取绿或猜测修改状态机代替失败现场，未打包/签名/发布新版本。
