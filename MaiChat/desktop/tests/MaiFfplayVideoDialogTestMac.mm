@@ -1,3 +1,8 @@
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <unistd.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
 // 测试宿主走真实 macOS 前台激活，避免后台 QtTest 的逻辑窗口状态代替屏幕状态。
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -7,6 +12,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #include <QImage>
+#include <QGuiApplication>
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QPointer>
@@ -450,4 +456,46 @@ QJsonArray endOwnedFfplayWindowOrderProbe(void* value) {
     [probe->window release];
     delete probe;
     return records;
+}
+
+// 仅截取本测试进程的指定窗口；包含child HUD，避免Qt屏幕截图默认省略子窗口。
+bool saveFfplayTestOwnedWindow(QWidget* widget, const QString& output) {
+    if (!widget || QGuiApplication::platformName() != QStringLiteral("cocoa")) return false;
+    NSWindow* owner = reinterpret_cast<NSView*>(widget->winId()).window;
+    if (!owner) return false;
+    struct CaptureState {
+        std::atomic<bool> done{false};
+        CGImageRef image = nullptr;
+        ~CaptureState() { if (image) CGImageRelease(image); }
+    };
+    auto state = std::make_shared<CaptureState>();
+    const CGWindowID number = CGWindowID(owner.windowNumber);
+    const CGFloat scale = owner.backingScaleFactor;
+    [SCShareableContent getCurrentProcessShareableContentWithCompletionHandler:
+        ^(SCShareableContent* content, NSError*) {
+            SCWindow* selected = nil;
+            for (SCWindow* window in content.windows)
+                if (window.windowID == number && window.owningApplication.processID == getpid()) selected = window;
+            if (!selected) { state->done.store(true); return; }
+            SCContentFilter* filter = [[[SCContentFilter alloc] initWithDesktopIndependentWindow:selected] autorelease];
+            SCStreamConfiguration* config = [[[SCStreamConfiguration alloc] init] autorelease];
+            config.width = size_t(CGRectGetWidth(selected.frame) * scale);
+            config.height = size_t(CGRectGetHeight(selected.frame) * scale);
+            config.showsCursor = NO;
+            config.capturesAudio = NO;
+            config.ignoreShadowsSingleWindow = YES;
+            config.includeChildWindows = YES;
+            [SCScreenshotManager captureImageWithFilter:filter configuration:config
+                completionHandler:^(CGImageRef image, NSError*) {
+                    if (image) state->image = CGImageRetain(image);
+                    state->done.store(true);
+                }];
+        }];
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (!state->done.load() && std::chrono::steady_clock::now() < deadline)
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    if (!state->done.load() || !state->image) return false;
+    NSBitmapImageRep* bitmap = [[[NSBitmapImageRep alloc] initWithCGImage:state->image] autorelease];
+    NSData* png = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    return [png writeToFile:[NSString stringWithUTF8String:output.toUtf8().constData()] atomically:YES];
 }

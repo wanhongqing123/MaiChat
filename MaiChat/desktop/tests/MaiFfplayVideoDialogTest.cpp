@@ -36,6 +36,7 @@
 #include <QWidget>
 #include <QWindow>
 #include <QtTest>
+#include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
 #include <atomic>
@@ -57,6 +58,7 @@
 #include "MaiChatTools/DesktopMediaTools.h"
 #include "MaiTool.h"
 #include "ui/MaiFfplayVideoDialog.h"
+#include "MaiCloudVod.h"
 #include "ui/DesktopCameraDialog.h"
 #include "ui/MainWindow.h"
 #include "ui/UiZoom.h"
@@ -75,6 +77,7 @@ bool ffplayTestNativeWindowRetainsUi(int number);
 void restoreFfplayTestMainWindowSpacePolicy(QWidget* widget);
 QString ffplayTestNativeState(QWidget* widget);
 QJsonObject ffplayTestVideoLayerGeometry(QWidget* widget);
+bool saveFfplayTestOwnedWindow(QWidget* widget, const QString& output);
 void resizeFfplayTestNativeWindow(QWidget* widget, QSize size);
 void* beginOwnedFfplayDrawableProbe(QWidget* widget);
 void* beginOwnedFfplayWindowOrderProbe(QWidget* widget);
@@ -361,6 +364,7 @@ private slots:
     void videoOpensAtPreparedGeometry_data();
     void videoOpensAtPreparedGeometry();
     void preparedVideoKeepsFirstNativeViewport();
+    void cloudPreparedVideoKeepsFirstNativeViewport();
     void preparedVideoConfiguresBeforeNativeWindowOrders();
     void preparedVideoCanFailOrCancelWithoutLateShow();
     void closedPreparedVideoCanBeShownAgain();
@@ -1413,7 +1417,12 @@ void MaiFfplayVideoDialogTest::preparedVideoKeepsFirstNativeViewport() {
         if (!value.value("windowVisible").toBool()) continue;
         if (visible++ == 0) qInfo() << "[first-native-open]" << value;
         if (!value.value("windowOpeningAnimationDisabled").toBool()) ++nativeOpeningAnimations;
-        if (std::abs(value.value("shownMetalWidth").toDouble() - value.value("surfaceWidth").toDouble()) > 1 ||
+        // Metal容器铺满不代表实际AVPlayerLayer已经铺满；初显不能漏看HDR画面层。
+        const bool hdrBoundsMismatch = value.contains("videoBoundsWidth") &&
+            (std::abs(value.value("videoBoundsWidth").toDouble() - value.value("surfaceWidth").toDouble()) > 1 ||
+             std::abs(value.value("videoBoundsHeight").toDouble() - value.value("surfaceHeight").toDouble()) > 1);
+        if (hdrBoundsMismatch ||
+            std::abs(value.value("shownMetalWidth").toDouble() - value.value("surfaceWidth").toDouble()) > 1 ||
             std::abs(value.value("shownMetalHeight").toDouble() - value.value("surfaceHeight").toDouble()) > 1 ||
             std::abs(value.value("shownViewportWidth").toDouble() - value.value("surfaceWidth").toDouble()) > 1 ||
             std::abs(value.value("shownViewportHeight").toDouble() - value.value("surfaceHeight").toDouble()) > 1)
@@ -1425,6 +1434,79 @@ void MaiFfplayVideoDialogTest::preparedVideoKeepsFirstNativeViewport() {
     QCOMPARE(nativeOpeningAnimations, 0);
 #else
     QSKIP("Native Cocoa presentation sample");
+#endif
+}
+
+void MaiFfplayVideoDialogTest::cloudPreparedVideoKeepsFirstNativeViewport() {
+#if defined(Q_OS_MAC)
+    const QByteArray url = qgetenv("MAICHAT_OWNED_CLOUD_VIDEO_URL");
+    const QByteArray ca = qgetenv("MAICHAT_OWNED_CLOUD_VIDEO_CA");
+    const uint64_t size = qEnvironmentVariable("MAICHAT_OWNED_CLOUD_VIDEO_SIZE").toULongLong();
+    if (url.isEmpty() || ca.isEmpty() || !size) QSKIP("Owned local TLS Range fixture required");
+    auto pending = QtConcurrent::run([url, ca, size] {
+        MaiCloudVodOptions options{};
+        options.signed_url_utf8 = url.constData();
+        options.signed_host_suffix_utf8 = "localhost";
+        options.expected_size_bytes = size;
+        options.ca_path_utf8 = ca.constData();
+        options.proxy_url_utf8 = "";
+        MaiCloudVodResult result{};
+        return std::shared_ptr<MaiCloudVod>(mai_cloud_vod_open(&options, &result), mai_cloud_vod_close);
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(pending.isFinished(), 10000);
+    auto source = pending.result();
+    QVERIFY(source);
+    RemoteIMApplication app(QStringLiteral("owned-cloud-native-open"), std::make_unique<FakeRemoteIMClient>());
+    MainWindow main(app);
+    main.setMaiChatAccountIdProvider([] { return QStringLiteral("owned-cloud-native-open"); });
+    showOwnTestWindow(&main);
+    QVERIFY(main.openCloudVideo(QStringLiteral("owned-cloud-hlg.mov"), source));
+    QPointer<MaiFfplayVideoDialog> player = MaiFfplayVideoDialog::activeDialog();
+    QVERIFY(player);
+    const auto close = qScopeGuard([&] {
+        if (player) player->close();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    });
+    player->findChild<QSlider*>(QStringLiteral("ffplayVolumeSlider"))->setValue(0);
+    QTRY_VERIFY_WITH_TIMEOUT(player->hasPresentedFrame() && player->isVisible(), 10000);
+    auto* surface = player->findChild<QWidget*>(QStringLiteral("ffplayVideoSurface"));
+    auto* header = player->findChild<QWidget*>(QStringLiteral("ffplayTitleBar"));
+    auto* footer = player->findChild<QWidget*>(QStringLiteral("ffplayOverlay"));
+    QVERIFY(surface && header && footer);
+    activateOwnTestWindow(player);
+    QTRY_VERIFY_WITH_TIMEOUT(header->isVisible() && footer->isVisible(), 3000);
+    QTRY_COMPARE(header->mapToGlobal(QPoint()), surface->mapToGlobal(QPoint()));
+    QTRY_COMPARE(footer->mapToGlobal(QPoint(0, footer->height())),
+                 surface->mapToGlobal(QPoint(0, surface->height())));
+    const QPoint mouse = surface->rect().center();
+    QMouseEvent move(QEvent::MouseMove, QPointF(mouse), QPointF(surface->mapToGlobal(mouse)),
+                     Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(surface, &move);
+    QTest::qWait(80);
+    qInfo() << "[owned-cloud-header-native]" << ffplayTestVideoLayerGeometry(header);
+    qInfo() << "[owned-cloud-footer-native]" << ffplayTestVideoLayerGeometry(footer);
+    const QString capture = qEnvironmentVariable("MAICHAT_OWNED_CLOUD_VIDEO_CAPTURE");
+    if (!capture.isEmpty()) {
+        QVERIFY(saveFfplayTestOwnedWindow(player, capture));
+    }
+    int sampled = 0;
+    for (int index = 0; index < 20; ++index) {
+        const auto value = ffplayTestVideoLayerGeometry(surface);
+        qInfo() << "[owned-cloud-first-frame]" << value;
+        QCOMPARE(surface->size(), player->size());
+        QCOMPARE(header->mapToGlobal(QPoint()), surface->mapToGlobal(QPoint()));
+        QCOMPARE(footer->mapToGlobal(QPoint(0, footer->height())),
+                 surface->mapToGlobal(QPoint(0, surface->height())));
+        const char* width = value.contains("videoBoundsWidth") ? "videoBoundsWidth" : "shownMetalWidth";
+        const char* height = value.contains("videoBoundsHeight") ? "videoBoundsHeight" : "shownMetalHeight";
+        QVERIFY(std::abs(value.value(width).toDouble() - surface->width()) <= 1);
+        QVERIFY(std::abs(value.value(height).toDouble() - surface->height()) <= 1);
+        ++sampled;
+        QTest::qWait(10);
+    }
+    QCOMPARE(sampled, 20);
+#else
+    QSKIP("Owned Cocoa cloud opening regression");
 #endif
 }
 

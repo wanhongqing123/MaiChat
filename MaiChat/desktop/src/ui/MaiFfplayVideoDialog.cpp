@@ -1639,6 +1639,8 @@ void MaiFfplayVideoDialog::finishPreparedShow() {
     // show() 才将隐藏期间的 Qt 尺寸同步到 Cocoa。首次返回事件循环前完成
     // 同一原生视口/内容层的布局事务，避免先显示旧 480x270 子层再铺满窗口。
     maiGraphicsResizeMacLayer(nativeView_, surface_);
+    // HDR直接展示AVPlayerLayer；Metal容器完成映射不能替代实际画面层的同步。
+    if (macPlayback_) macPlayback_->resize();
     initialShowPending_ = false;
     initialOwnerMapping_ = false;
     if (!started_ || stopRequested_ || !isVisible()) return;

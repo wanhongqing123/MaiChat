@@ -357,11 +357,12 @@ void MaiMacVideoPlayback::resize() {
     if (!impl_->state || !impl_->surface)
         return;
     NSView* view = reinterpret_cast<NSView*>(impl_->surface->winId());
-    // 窗口已经由 AppKit/Qt 完成几何变化，视频层不能再隐式补一段缩放动画。
-    // 否则最大化/还原交替时，显示中的视频尺寸会落后视口数百像素。
+    // 隐藏准备与resizeEvent可先于Cocoa提交NSView几何；读view.bounds会把初始
+    // 480x270留在AVPlayerLayer，窗口/Metal已变大而HDR画面仍被裁在一角。
+    // 使用本轮Qt已确定的逻辑尺寸，不乘DPR；关闭隐式动画，保留同一原生视频层。
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    impl_->state->layer.frame = view.bounds;
+    impl_->state->layer.frame = CGRectMake(0, 0, impl_->surface->width(), impl_->surface->height());
     impl_->state->layer.contentsScale = view.window ? view.window.backingScaleFactor : 1;
     [CATransaction commit];
 }
