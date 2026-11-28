@@ -372,6 +372,7 @@ mai_add_llama_dependencies()
 # ── 核心库：纯 C++，无 Qt，无 HTTP 服务端依赖 ────────────────────
 # 文件名一律大驼峰 + Mai 前缀，见 docs/CodingStyle.md。
 include(cmake/MaiCurlNetworkRoute.cmake)
+include(cmake/MaiBuiltinSkills.cmake)
 add_library(maiagent STATIC
   Agent/MaiTime.cpp
   Agent/MaiError.cpp
@@ -396,6 +397,7 @@ add_library(maiagent STATIC
   Agent/MaiModelContextUsage.cpp
   Agent/MaiModelToolCatalog.cpp
   Agent/MaiSkillManager.cpp
+  Agent/MaiBuiltinSkills.cpp
   Agent/MaiSkillInstaller.cpp
   Agent/MaiCommandScript.cpp
   Agent/MaiFileCommands.cpp
@@ -464,6 +466,7 @@ add_library(maiagent STATIC
   AgentTools/MaiSkillTool.cpp
   AgentTools/MaiSkillInstallTool.cpp
   AgentTools/MaiToolSearchTool.cpp
+  AgentTools/MaiToolHelp.cpp
   AgentTools/MaiShellSessionManager.cpp
   AgentTools/MaiShellEnvironment.cpp
   AgentTools/MaiScreenshotTool.cpp
@@ -526,6 +529,7 @@ else()
 endif()
 
 target_include_directories(maiagent
+  PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated-skills
   # 头全在 include/ 里，Agent/ 和 AgentTools/ 里不放 .h
   # （见 docs/CodingStyle.md 第 1 节）。以前实现目录也在包含路径上，
   # 因为 MaiTurnRunner.h 这几个"内部头"放在那儿——
@@ -664,6 +668,7 @@ if(MAIAGENT_BUILD_TESTS)
       MaiModelContextUsageTests # 最近主请求占用、累计分离与缺失来源
       MaiModelToolCatalogTests # 小工具集、按需发现与稳定声明
       MaiToolDiscoveryRuntimeTests # 下一请求声明、执行门禁及会话隔离
+      MaiToolHelpTests     # Metadata-only grouped help and model adapter
       MaiSkillTests        # 标准路径、目录快照及技能正文按需读取
       MaiSkillInstallerTests
       MaiCommandScriptTests

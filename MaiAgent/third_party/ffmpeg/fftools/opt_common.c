@@ -25,6 +25,10 @@
 #include "cmdutils.h"
 #include "fopen_utf8.h"
 #include "opt_common.h"
+#ifndef MAI_FFMPEG_EMBEDDED
+#define mai_fftools_text_printf printf
+#endif
+
 #ifdef MAI_FFMPEG_EMBEDDED
 #include "mai_fftools_embed.h"
 #endif
@@ -82,12 +86,12 @@ static int report_file_level = AV_LOG_DEBUG;
 int show_license(void *optctx, const char *opt, const char *arg)
 {
 #if CONFIG_NONFREE
-    printf(
+    mai_fftools_text_printf(
     "This version of %s has nonfree parts compiled in.\n"
     "Therefore it is not legally redistributable.\n",
     program_name );
 #elif CONFIG_GPLV3
-    printf(
+    mai_fftools_text_printf(
     "%s is free software; you can redistribute it and/or modify\n"
     "it under the terms of the GNU General Public License as published by\n"
     "the Free Software Foundation; either version 3 of the License, or\n"
@@ -102,7 +106,7 @@ int show_license(void *optctx, const char *opt, const char *arg)
     "along with %s.  If not, see <http://www.gnu.org/licenses/>.\n",
     program_name, program_name, program_name );
 #elif CONFIG_GPL
-    printf(
+    mai_fftools_text_printf(
     "%s is free software; you can redistribute it and/or modify\n"
     "it under the terms of the GNU General Public License as published by\n"
     "the Free Software Foundation; either version 2 of the License, or\n"
@@ -118,7 +122,7 @@ int show_license(void *optctx, const char *opt, const char *arg)
     "Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA\n",
     program_name, program_name, program_name );
 #elif CONFIG_LGPLV3
-    printf(
+    mai_fftools_text_printf(
     "%s is free software; you can redistribute it and/or modify\n"
     "it under the terms of the GNU Lesser General Public License as published by\n"
     "the Free Software Foundation; either version 3 of the License, or\n"
@@ -133,7 +137,7 @@ int show_license(void *optctx, const char *opt, const char *arg)
     "along with %s.  If not, see <http://www.gnu.org/licenses/>.\n",
     program_name, program_name, program_name );
 #else
-    printf(
+    mai_fftools_text_printf(
     "%s is free software; you can redistribute it and/or\n"
     "modify it under the terms of the GNU Lesser General Public\n"
     "License as published by the Free Software Foundation; either\n"
@@ -275,12 +279,12 @@ int show_buildconf(void *optctx, const char *opt, const char *arg)
         avcodec_get_supported_config(NULL, codec, config, 0,                    \
                                      (const void **) &elem, &num);              \
         if (elem) {                                                             \
-            printf("    Supported " name ":");                                  \
+            mai_fftools_text_printf("    Supported " name ":");                                  \
             for (int i = 0; i < num; i++) {                                     \
-                printf(" " fmt, __VA_ARGS__);                                   \
+                mai_fftools_text_printf(" " fmt, __VA_ARGS__);                                   \
                 elem++;                                                         \
             }                                                                   \
-            printf("\n");                                                       \
+            mai_fftools_text_printf("\n");                                                       \
         }                                                                       \
     } while (0)
 
@@ -299,64 +303,64 @@ static void print_codec(const AVCodec *c)
     int encoder = av_codec_is_encoder(c);
     AVBPrint desc;
 
-    printf("%s %s [%s]:\n", encoder ? "Encoder" : "Decoder", c->name,
+    mai_fftools_text_printf("%s %s [%s]:\n", encoder ? "Encoder" : "Decoder", c->name,
            c->long_name ? c->long_name : "");
 
-    printf("    General capabilities: ");
+    mai_fftools_text_printf("    General capabilities: ");
     if (c->capabilities & AV_CODEC_CAP_DRAW_HORIZ_BAND)
-        printf("horizband ");
+        mai_fftools_text_printf("horizband ");
     if (c->capabilities & AV_CODEC_CAP_DR1)
-        printf("dr1 ");
+        mai_fftools_text_printf("dr1 ");
     if (c->capabilities & AV_CODEC_CAP_DELAY)
-        printf("delay ");
+        mai_fftools_text_printf("delay ");
     if (c->capabilities & AV_CODEC_CAP_SMALL_LAST_FRAME)
-        printf("small ");
+        mai_fftools_text_printf("small ");
     if (c->capabilities & AV_CODEC_CAP_EXPERIMENTAL)
-        printf("exp ");
+        mai_fftools_text_printf("exp ");
     if (c->capabilities & AV_CODEC_CAP_CHANNEL_CONF)
-        printf("chconf ");
+        mai_fftools_text_printf("chconf ");
     if (c->capabilities & AV_CODEC_CAP_PARAM_CHANGE)
-        printf("paramchange ");
+        mai_fftools_text_printf("paramchange ");
     if (c->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE)
-        printf("variable ");
+        mai_fftools_text_printf("variable ");
     if (c->capabilities & (AV_CODEC_CAP_FRAME_THREADS |
                            AV_CODEC_CAP_SLICE_THREADS |
                            AV_CODEC_CAP_OTHER_THREADS))
-        printf("threads ");
+        mai_fftools_text_printf("threads ");
     if (c->capabilities & AV_CODEC_CAP_AVOID_PROBING)
-        printf("avoidprobe ");
+        mai_fftools_text_printf("avoidprobe ");
     if (c->capabilities & AV_CODEC_CAP_HARDWARE)
-        printf("hardware ");
+        mai_fftools_text_printf("hardware ");
     if (c->capabilities & AV_CODEC_CAP_HYBRID)
-        printf("hybrid ");
+        mai_fftools_text_printf("hybrid ");
     if (c->capabilities & AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE)
-        printf("reorderedopaque ");
+        mai_fftools_text_printf("reorderedopaque ");
     if (c->capabilities & AV_CODEC_CAP_ENCODER_FLUSH)
-        printf("flush ");
+        mai_fftools_text_printf("flush ");
     if (c->capabilities & AV_CODEC_CAP_ENCODER_RECON_FRAME)
-        printf("reconframe ");
+        mai_fftools_text_printf("reconframe ");
     if (!c->capabilities)
-        printf("none");
-    printf("\n");
+        mai_fftools_text_printf("none");
+    mai_fftools_text_printf("\n");
 
     if (c->type == AVMEDIA_TYPE_VIDEO ||
         c->type == AVMEDIA_TYPE_AUDIO) {
-        printf("    Threading capabilities: ");
+        mai_fftools_text_printf("    Threading capabilities: ");
         switch (c->capabilities & (AV_CODEC_CAP_FRAME_THREADS |
                                    AV_CODEC_CAP_SLICE_THREADS |
                                    AV_CODEC_CAP_OTHER_THREADS)) {
         case AV_CODEC_CAP_FRAME_THREADS |
-             AV_CODEC_CAP_SLICE_THREADS: printf("frame and slice"); break;
-        case AV_CODEC_CAP_FRAME_THREADS: printf("frame");           break;
-        case AV_CODEC_CAP_SLICE_THREADS: printf("slice");           break;
-        case AV_CODEC_CAP_OTHER_THREADS: printf("other");           break;
-        default:                         printf("none");            break;
+             AV_CODEC_CAP_SLICE_THREADS: mai_fftools_text_printf("frame and slice"); break;
+        case AV_CODEC_CAP_FRAME_THREADS: mai_fftools_text_printf("frame");           break;
+        case AV_CODEC_CAP_SLICE_THREADS: mai_fftools_text_printf("slice");           break;
+        case AV_CODEC_CAP_OTHER_THREADS: mai_fftools_text_printf("other");           break;
+        default:                         mai_fftools_text_printf("none");            break;
         }
-        printf("\n");
+        mai_fftools_text_printf("\n");
     }
 
     if (avcodec_get_hw_config(c, 0)) {
-        printf("    Supported hardware devices: ");
+        mai_fftools_text_printf("    Supported hardware devices: ");
         for (int i = 0;; i++) {
             const AVCodecHWConfig *config = avcodec_get_hw_config(c, i);
             const char *name;
@@ -364,9 +368,9 @@ static void print_codec(const AVCodec *c)
                 break;
             name = av_hwdevice_get_type_name(config->device_type);
             if (name)
-                printf("%s ", name);
+                mai_fftools_text_printf("%s ", name);
         }
-        printf("\n");
+        mai_fftools_text_printf("\n");
     }
 
     PRINT_CODEC_SUPPORTED(c, AV_CODEC_CONFIG_FRAME_RATE, AVRational, "framerates",
@@ -448,10 +452,10 @@ static void show_help_demuxer(const char *name)
         return;
     }
 
-    printf("Demuxer %s [%s]:\n", fmt->name, fmt->long_name);
+    mai_fftools_text_printf("Demuxer %s [%s]:\n", fmt->name, fmt->long_name);
 
     if (fmt->extensions)
-        printf("    Common extensions: %s.\n", fmt->extensions);
+        mai_fftools_text_printf("    Common extensions: %s.\n", fmt->extensions);
 
     if (fmt->priv_class)
         show_help_children(fmt->priv_class, AV_OPT_FLAG_DECODING_PARAM);
@@ -485,23 +489,23 @@ static void show_help_muxer(const char *name)
         return;
     }
 
-    printf("Muxer %s [%s]:\n", fmt->name, fmt->long_name);
+    mai_fftools_text_printf("Muxer %s [%s]:\n", fmt->name, fmt->long_name);
 
     if (fmt->extensions)
-        printf("    Common extensions: %s.\n", fmt->extensions);
+        mai_fftools_text_printf("    Common extensions: %s.\n", fmt->extensions);
     if (fmt->mime_type)
-        printf("    Mime type: %s.\n", fmt->mime_type);
+        mai_fftools_text_printf("    Mime type: %s.\n", fmt->mime_type);
     if (fmt->video_codec != AV_CODEC_ID_NONE &&
         (desc = avcodec_descriptor_get(fmt->video_codec))) {
-        printf("    Default video codec: %s.\n", desc->name);
+        mai_fftools_text_printf("    Default video codec: %s.\n", desc->name);
     }
     if (fmt->audio_codec != AV_CODEC_ID_NONE &&
         (desc = avcodec_descriptor_get(fmt->audio_codec))) {
-        printf("    Default audio codec: %s.\n", desc->name);
+        mai_fftools_text_printf("    Default audio codec: %s.\n", desc->name);
     }
     if (fmt->subtitle_codec != AV_CODEC_ID_NONE &&
         (desc = avcodec_descriptor_get(fmt->subtitle_codec))) {
-        printf("    Default subtitle codec: %s.\n", desc->name);
+        mai_fftools_text_printf("    Default subtitle codec: %s.\n", desc->name);
     }
 
     if (fmt->priv_class)
@@ -523,40 +527,40 @@ static void show_help_filter(const char *name)
         return;
     }
 
-    printf("Filter %s\n", f->name);
+    mai_fftools_text_printf("Filter %s\n", f->name);
     if (f->description)
-        printf("  %s\n", f->description);
+        mai_fftools_text_printf("  %s\n", f->description);
 
     if (f->flags & AVFILTER_FLAG_SLICE_THREADS)
-        printf("    slice threading supported\n");
+        mai_fftools_text_printf("    slice threading supported\n");
 
-    printf("    Inputs:\n");
+    mai_fftools_text_printf("    Inputs:\n");
     count = avfilter_filter_pad_count(f, 0);
     for (i = 0; i < count; i++) {
-        printf("       #%d: %s (%s)\n", i, avfilter_pad_get_name(f->inputs, i),
+        mai_fftools_text_printf("       #%d: %s (%s)\n", i, avfilter_pad_get_name(f->inputs, i),
                av_get_media_type_string(avfilter_pad_get_type(f->inputs, i)));
     }
     if (f->flags & AVFILTER_FLAG_DYNAMIC_INPUTS)
-        printf("        dynamic (depending on the options)\n");
+        mai_fftools_text_printf("        dynamic (depending on the options)\n");
     else if (!count)
-        printf("        none (source filter)\n");
+        mai_fftools_text_printf("        none (source filter)\n");
 
-    printf("    Outputs:\n");
+    mai_fftools_text_printf("    Outputs:\n");
     count = avfilter_filter_pad_count(f, 1);
     for (i = 0; i < count; i++) {
-        printf("       #%d: %s (%s)\n", i, avfilter_pad_get_name(f->outputs, i),
+        mai_fftools_text_printf("       #%d: %s (%s)\n", i, avfilter_pad_get_name(f->outputs, i),
                av_get_media_type_string(avfilter_pad_get_type(f->outputs, i)));
     }
     if (f->flags & AVFILTER_FLAG_DYNAMIC_OUTPUTS)
-        printf("        dynamic (depending on the options)\n");
+        mai_fftools_text_printf("        dynamic (depending on the options)\n");
     else if (!count)
-        printf("        none (sink filter)\n");
+        mai_fftools_text_printf("        none (sink filter)\n");
 
     if (f->priv_class)
         show_help_children(f->priv_class, AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM |
                                           AV_OPT_FLAG_AUDIO_PARAM);
     if (f->flags & AVFILTER_FLAG_SUPPORT_TIMELINE)
-        printf("This filter has support for timeline through the 'enable' option.\n");
+        mai_fftools_text_printf("This filter has support for timeline through the 'enable' option.\n");
 #else
     av_log(NULL, AV_LOG_ERROR, "Build without libavfilter; "
            "can not to satisfy request\n");
@@ -576,15 +580,15 @@ static void show_help_bsf(const char *name)
         return;
     }
 
-    printf("Bit stream filter %s\n", bsf->name);
+    mai_fftools_text_printf("Bit stream filter %s\n", bsf->name);
     if (bsf->codec_ids) {
         const enum AVCodecID *id = bsf->codec_ids;
-        printf("    Supported codecs:");
+        mai_fftools_text_printf("    Supported codecs:");
         while (*id != AV_CODEC_ID_NONE) {
-            printf(" %s", avcodec_descriptor_get(*id)->name);
+            mai_fftools_text_printf(" %s", avcodec_descriptor_get(*id)->name);
             id++;
         }
-        printf("\n");
+        mai_fftools_text_printf("\n");
     }
     if (bsf->priv_class)
         show_help_children(bsf->priv_class, AV_OPT_FLAG_BSF_PARAM);
@@ -643,12 +647,12 @@ static void print_codecs_for_id(enum AVCodecID id, int encoder)
     void *iter = NULL;
     const AVCodec *codec;
 
-    printf(" (%s:", encoder ? "encoders" : "decoders");
+    mai_fftools_text_printf(" (%s:", encoder ? "encoders" : "decoders");
 
     while ((codec = next_codec_for_id(id, &iter, encoder)))
-        printf(" %s", codec->name);
+        mai_fftools_text_printf(" %s", codec->name);
 
-    printf(")");
+    mai_fftools_text_printf(")");
 }
 
 static int compare_codec_desc(const void *a, const void *b)
@@ -700,7 +704,7 @@ int show_codecs(void *optctx, const char *opt, const char *arg)
     if (nb_codecs < 0)
         return nb_codecs;
 
-    printf("Codecs:\n"
+    mai_fftools_text_printf("Codecs:\n"
            " D..... = Decoding supported\n"
            " .E.... = Encoding supported\n"
            " ..V... = Video codec\n"
@@ -720,7 +724,7 @@ int show_codecs(void *optctx, const char *opt, const char *arg)
         if (strstr(desc->name, "_deprecated"))
             continue;
 
-        printf(" %c%c%c%c%c%c",
+        mai_fftools_text_printf(" %c%c%c%c%c%c",
                avcodec_find_decoder(desc->id) ? 'D' : '.',
                avcodec_find_encoder(desc->id) ? 'E' : '.',
                get_media_type_char(desc->type),
@@ -728,7 +732,7 @@ int show_codecs(void *optctx, const char *opt, const char *arg)
                (desc->props & AV_CODEC_PROP_LOSSY)      ? 'L' : '.',
                (desc->props & AV_CODEC_PROP_LOSSLESS)   ? 'S' : '.');
 
-        printf(" %-20s %s", desc->name, desc->long_name ? desc->long_name : "");
+        mai_fftools_text_printf(" %-20s %s", desc->name, desc->long_name ? desc->long_name : "");
 
         /* print decoders/encoders when there's more than one or their
          * names are different from codec name */
@@ -746,7 +750,7 @@ int show_codecs(void *optctx, const char *opt, const char *arg)
             }
         }
 
-        printf("\n");
+        mai_fftools_text_printf("\n");
     }
     av_free(codecs);
     return 0;
@@ -760,7 +764,7 @@ static int print_codecs(int encoder)
     if (nb_codecs < 0)
         return nb_codecs;
 
-    printf("%s:\n"
+    mai_fftools_text_printf("%s:\n"
            " V..... = Video\n"
            " A..... = Audio\n"
            " S..... = Subtitle\n"
@@ -777,7 +781,7 @@ static int print_codecs(int encoder)
         void *iter = NULL;
 
         while ((codec = next_codec_for_id(desc->id, &iter, encoder))) {
-            printf(" %c%c%c%c%c%c",
+            mai_fftools_text_printf(" %c%c%c%c%c%c",
                    get_media_type_char(desc->type),
                    (codec->capabilities & AV_CODEC_CAP_FRAME_THREADS)   ? 'F' : '.',
                    (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS)   ? 'S' : '.',
@@ -785,11 +789,11 @@ static int print_codecs(int encoder)
                    (codec->capabilities & AV_CODEC_CAP_DRAW_HORIZ_BAND) ? 'B' : '.',
                    (codec->capabilities & AV_CODEC_CAP_DR1)             ? 'D' : '.');
 
-            printf(" %-20s %s", codec->name, codec->long_name ? codec->long_name : "");
+            mai_fftools_text_printf(" %-20s %s", codec->name, codec->long_name ? codec->long_name : "");
             if (strcmp(codec->name, desc->name))
-                printf(" (codec %s)", desc->name);
+                mai_fftools_text_printf(" (codec %s)", desc->name);
 
-            printf("\n");
+            mai_fftools_text_printf("\n");
         }
     }
     av_free(codecs);
@@ -811,10 +815,10 @@ int show_bsfs(void *optctx, const char *opt, const char *arg)
     const AVBitStreamFilter *bsf = NULL;
     void *opaque = NULL;
 
-    printf("Bitstream filters:\n");
+    mai_fftools_text_printf("Bitstream filters:\n");
     while ((bsf = av_bsf_iterate(&opaque)))
-        printf("%s\n", bsf->name);
-    printf("\n");
+        mai_fftools_text_printf("%s\n", bsf->name);
+    mai_fftools_text_printf("\n");
     return 0;
 }
 
@@ -827,7 +831,7 @@ int show_filters(void *optctx, const char *opt, const char *arg)
     int i, j;
     const AVFilterPad *pad;
 
-    printf("Filters:\n"
+    mai_fftools_text_printf("Filters:\n"
            "  T.. = Timeline support\n"
            "  .S. = Slice threading\n"
            "  A = Audio input/output\n"
@@ -855,13 +859,13 @@ int show_filters(void *optctx, const char *opt, const char *arg)
                                   ( i && (filter->flags & AVFILTER_FLAG_DYNAMIC_OUTPUTS))) ? 'N' : '|';
         }
         *descr_cur = 0;
-        printf(" %c%c %-17s %-10s %s\n",
+        mai_fftools_text_printf(" %c%c %-17s %-10s %s\n",
                filter->flags & AVFILTER_FLAG_SUPPORT_TIMELINE ? 'T' : '.',
                filter->flags & AVFILTER_FLAG_SLICE_THREADS    ? 'S' : '.',
                filter->name, descr, filter->description);
     }
 #else
-    printf("No filters available: libavfilter disabled\n");
+    mai_fftools_text_printf("No filters available: libavfilter disabled\n");
 #endif
     return 0;
 }
@@ -883,7 +887,7 @@ static int show_formats_devices(void *optctx, const char *opt, const char *arg, 
     int is_dev;
     const char *is_device_placeholder = device_only ? "" : ".";
 
-    printf("%s:\n"
+    mai_fftools_text_printf("%s:\n"
            " D.%s = Demuxing supported\n"
            " .E%s = Muxing supported\n"
            "%s"
@@ -938,7 +942,7 @@ static int show_formats_devices(void *optctx, const char *opt, const char *arg, 
             break;
         last_name = name;
 
-        printf(" %c%c%s %-15s %s\n",
+        mai_fftools_text_printf(" %c%c%s %-15s %s\n",
                decode ? 'D' : ' ',
                encode ? 'E' : ' ',
                device_only ? "" : (device ? "d" : " "),
@@ -973,13 +977,13 @@ int show_protocols(void *optctx, const char *opt, const char *arg)
     void *opaque = NULL;
     const char *name;
 
-    printf("Supported file protocols:\n"
+    mai_fftools_text_printf("Supported file protocols:\n"
            "Input:\n");
     while ((name = avio_enum_protocols(&opaque, 0)))
-        printf("  %s\n", name);
-    printf("Output:\n");
+        mai_fftools_text_printf("  %s\n", name);
+    mai_fftools_text_printf("Output:\n");
     while ((name = avio_enum_protocols(&opaque, 1)))
-        printf("  %s\n", name);
+        mai_fftools_text_printf("  %s\n", name);
     return 0;
 }
 
@@ -989,10 +993,10 @@ int show_colors(void *optctx, const char *opt, const char *arg)
     const uint8_t *rgb;
     int i;
 
-    printf("%-32s #RRGGBB\n", "name");
+    mai_fftools_text_printf("%-32s #RRGGBB\n", "name");
 
     for (i = 0; name = av_get_known_color_name(i, &rgb); i++)
-        printf("%-32s #%02x%02x%02x\n", name, rgb[0], rgb[1], rgb[2]);
+        mai_fftools_text_printf("%-32s #%02x%02x%02x\n", name, rgb[0], rgb[1], rgb[2]);
 
     return 0;
 }
@@ -1001,7 +1005,7 @@ int show_pix_fmts(void *optctx, const char *opt, const char *arg)
 {
     const AVPixFmtDescriptor *pix_desc = NULL;
 
-    printf("Pixel formats:\n"
+    mai_fftools_text_printf("Pixel formats:\n"
            "I.... = Supported Input  format for conversion\n"
            ".O... = Supported Output format for conversion\n"
            "..H.. = Hardware accelerated format\n"
@@ -1017,7 +1021,7 @@ int show_pix_fmts(void *optctx, const char *opt, const char *arg)
 
     while ((pix_desc = av_pix_fmt_desc_next(pix_desc))) {
         av_unused enum AVPixelFormat pix_fmt = av_pix_fmt_desc_get_id(pix_desc);
-        printf("%c%c%c%c%c %-16s       %d            %3d      %d",
+        mai_fftools_text_printf("%c%c%c%c%c %-16s       %d            %3d      %d",
                sws_isSupportedInput (pix_fmt)              ? 'I' : '.',
                sws_isSupportedOutput(pix_fmt)              ? 'O' : '.',
                pix_desc->flags & AV_PIX_FMT_FLAG_HWACCEL   ? 'H' : '.',
@@ -1029,8 +1033,8 @@ int show_pix_fmts(void *optctx, const char *opt, const char *arg)
                pix_desc->comp[0].depth);
 
         for (unsigned i = 1; i < pix_desc->nb_components; i++)
-            printf("-%d", pix_desc->comp[i].depth);
-        printf("\n");
+            mai_fftools_text_printf("-%d", pix_desc->comp[i].depth);
+        mai_fftools_text_printf("\n");
     }
     return 0;
 }
@@ -1042,28 +1046,28 @@ int show_layouts(void *optctx, const char *opt, const char *arg)
     char buf[128], buf2[128];
     int i = 0;
 
-    printf("Individual channels:\n"
+    mai_fftools_text_printf("Individual channels:\n"
            "NAME           DESCRIPTION\n");
     for (i = 0; i < 63; i++) {
         av_channel_name(buf, sizeof(buf), i);
         if (strstr(buf, "USR"))
             continue;
         av_channel_description(buf2, sizeof(buf2), i);
-        printf("%-14s %s\n", buf, buf2);
+        mai_fftools_text_printf("%-14s %s\n", buf, buf2);
     }
-    printf("\nStandard channel layouts:\n"
+    mai_fftools_text_printf("\nStandard channel layouts:\n"
            "NAME           DECOMPOSITION\n");
     while (ch_layout = av_channel_layout_standard(&iter)) {
             av_channel_layout_describe(ch_layout, buf, sizeof(buf));
-            printf("%-14s ", buf);
+            mai_fftools_text_printf("%-14s ", buf);
             for (i = 0; i < 63; i++) {
                 int idx = av_channel_layout_index_from_channel(ch_layout, i);
                 if (idx >= 0) {
                     av_channel_name(buf2, sizeof(buf2), i);
-                    printf("%s%s", idx ? "+" : "", buf2);
+                    mai_fftools_text_printf("%s%s", idx ? "+" : "", buf2);
                 }
             }
-            printf("\n");
+            mai_fftools_text_printf("\n");
     }
     return 0;
 }
@@ -1073,7 +1077,7 @@ int show_sample_fmts(void *optctx, const char *opt, const char *arg)
     int i;
     char fmt_str[128];
     for (i = -1; i < AV_SAMPLE_FMT_NB; i++)
-        printf("%s\n", av_get_sample_fmt_string(fmt_str, sizeof(fmt_str), i));
+        mai_fftools_text_printf("%s\n", av_get_sample_fmt_string(fmt_str, sizeof(fmt_str), i));
     return 0;
 }
 
@@ -1082,7 +1086,7 @@ int show_dispositions(void *optctx, const char *opt, const char *arg)
     for (int i = 0; i < 32; i++) {
         const char *str = av_disposition_to_string(1U << i);
         if (str)
-            printf("%s\n", str);
+            mai_fftools_text_printf("%s\n", str);
     }
     return 0;
 }
@@ -1373,19 +1377,19 @@ static void print_device_list(const AVDeviceInfoList *device_list)
     // print devices
     for (int i = 0; i < device_list->nb_devices; i++) {
         const AVDeviceInfo *device = device_list->devices[i];
-        printf("%c %s [%s] (", device_list->default_device == i ? '*' : ' ',
+        mai_fftools_text_printf("%c %s [%s] (", device_list->default_device == i ? '*' : ' ',
             device->device_name, device->device_description);
         if (device->nb_media_types > 0) {
             for (int j = 0; j < device->nb_media_types; ++j) {
                 const char* media_type = av_get_media_type_string(device->media_types[j]);
                 if (j > 0)
-                    printf(", ");
-                printf("%s", media_type ? media_type : "unknown");
+                    mai_fftools_text_printf(", ");
+                mai_fftools_text_printf("%s", media_type ? media_type : "unknown");
             }
         } else {
-            printf("none");
+            mai_fftools_text_printf("none");
         }
-        printf(")\n");
+        mai_fftools_text_printf(")\n");
     }
 }
 
@@ -1397,9 +1401,9 @@ static int print_device_sources(const AVInputFormat *fmt, AVDictionary *opts)
     if (!fmt || !fmt->priv_class  || !AV_IS_INPUT_DEVICE(fmt->priv_class->category))
         return AVERROR(EINVAL);
 
-    printf("Auto-detected sources for %s:\n", fmt->name);
+    mai_fftools_text_printf("Auto-detected sources for %s:\n", fmt->name);
     if ((ret = avdevice_list_input_sources(fmt, NULL, opts, &device_list)) < 0) {
-        printf("Cannot list sources: %s\n", av_err2str(ret));
+        mai_fftools_text_printf("Cannot list sources: %s\n", av_err2str(ret));
         goto fail;
     }
 
@@ -1418,9 +1422,9 @@ static int print_device_sinks(const AVOutputFormat *fmt, AVDictionary *opts)
     if (!fmt || !fmt->priv_class  || !AV_IS_OUTPUT_DEVICE(fmt->priv_class->category))
         return AVERROR(EINVAL);
 
-    printf("Auto-detected sinks for %s:\n", fmt->name);
+    mai_fftools_text_printf("Auto-detected sinks for %s:\n", fmt->name);
     if ((ret = avdevice_list_output_sinks(fmt, NULL, opts, &device_list)) < 0) {
-        printf("Cannot list sinks: %s\n", av_err2str(ret));
+        mai_fftools_text_printf("Cannot list sinks: %s\n", av_err2str(ret));
         goto fail;
     }
 
@@ -1448,7 +1452,7 @@ static int show_sinks_sources_parse_arg(const char *arg, char **dev, AVDictionar
             }
         }
     } else
-        printf("\nDevice name is not provided.\n"
+        mai_fftools_text_printf("\nDevice name is not provided.\n"
                 "You can pass devicename[,opt1=val1[,opt2=val2...]] as an argument.\n\n");
     return 0;
 }

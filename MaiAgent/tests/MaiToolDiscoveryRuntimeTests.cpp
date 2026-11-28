@@ -7,6 +7,7 @@
 #include <string>
 
 #include "MaiAgent.h"
+#include "MaiFileSystem.h"
 #include "MaiMemoryStore.h"
 
 static std::atomic<int> failures{0};
@@ -193,8 +194,119 @@ public:
     }
 };
 
+class MaiHelpRoundTripModel final : public MaiModelClient {
+public:
+    std::size_t window = 4096;
+    std::size_t reserve = 128;
+    std::size_t sampledMaximum = 0;
+    int requests = 0;
+    int summaries = 0;
+    bool readSkill = false;
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::Responses;
+    }
+    MaiModelContextLimits contextLimits(const std::string&) const override {
+        return {window, reserve, reserve};
+    }
+    MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                    const std::atomic<bool>&) override {
+        const auto input = estimateInputTokens(request).tokens;
+        sampledMaximum = std::max(sampledMaximum, input);
+        CHECK(input <= std::min(window * 95 / 100, window - reserve));
+        if (request.tools.empty()) {
+            ++summaries;
+            sink.onText("Owned context summary; the task is to inspect builtin help.");
+            return {};
+        }
+        const auto resultContains = [&](const char* text) {
+            return std::any_of(request.messages.begin(), request.messages.end(),
+                               [&](const auto& message) {
+                                   return message.role == MaiModelRole::ToolResult &&
+                                          message.content.find(text) != std::string::npos;
+                               });
+        };
+        switch (++requests) {
+            case 1:
+                sink.onToolCall({"help_select", "tool_search",
+                                 R"({"query":"tool_help","limit":1,"select":["tool_help"]})"});
+                break;
+            case 2:
+                CHECK(declared(request, "tool_help"));
+                sink.onToolCall({"help_groups", "tool_help", R"({"arguments":["-h"]})"});
+                break;
+            case 3:
+                CHECK(resultContains("Builtin tool groups"));
+                if (readSkill)
+                    sink.onToolCall(
+                        {"help_skill", "skill_read", R"({"skill":"builtin:builtin-media"})"});
+                else
+                    sink.onText("Owned grouped help round trip completed.");
+                break;
+            case 4:
+                CHECK(readSkill && resultContains("# Local media workflows"));
+                sink.onText("Owned help and bundled Skill round trip completed.");
+                break;
+            default:
+                CHECK(false);
+                sink.onText("Unexpected owned request.");
+                break;
+        }
+        return {};
+    }
+};
+
+void testBuiltinHelpRoundTrip(std::size_t window, std::size_t reserve, std::size_t baseBytes) {
+    auto model = std::make_unique<MaiHelpRoundTripModel>();
+    auto* observed = model.get();
+    observed->window = window;
+    observed->reserve = reserve;
+    observed->readSkill = window >= 8192;
+    auto tools = std::make_unique<MaiToolRegistry>();
+    registerMaiBuiltinTools(*tools);
+    MaiAgent::Options options;
+    options.toolDiscoveryEnabled = true;
+    options.skillsEnabled = true;
+    options.skillOptions.includeBuiltinSkills = true;
+    options.skillOptions.homeDirectory = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8("mai-owned-help-roundtrip-home"));
+    options.baseInstructions = std::string(baseBytes, 'b');
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools), options);
+    const auto created =
+        agent.submit(MaiCreateSession{{}, "Builtin help round trip", "glm-5.4", {}});
+    CHECK(created);
+    if (!created) return;
+    CHECK(agent.submit(MaiSendPrompt{created.value(), "Discover grouped builtin help."}));
+    agent.waitIdle();
+    const auto outcome = agent.getTurnOutcome(created.value());
+    CHECK(outcome);
+    if (!outcome) return;
+    const bool completed = outcome.value().status == MaiTurnStatus::Completed;
+    std::printf(
+        "Builtin help roundtrip: window=%zu reserve=%zu base=%zu requests=%d summaries=%d "
+        "sampled_max=%zu status=%s error_code=%s error=%s\n",
+        window, reserve, baseBytes, observed->requests, observed->summaries,
+        observed->sampledMaximum, maiTurnStatusToString(outcome.value().status),
+        maiErrorCodeToString(outcome.value().error.code()),
+        outcome.value().error.message().c_str());
+    if (window >= 8192) CHECK(completed);
+    if (completed)
+        CHECK(observed->requests == (observed->readSkill ? 4 : 3));
+    else {
+        // Local capacity guards use InvalidInput; ContextWindowExceeded denotes
+        // a provider-reported window error. Do not invent a different local code.
+        CHECK(window == 4096 && observed->requests == 1);
+        CHECK(outcome.value().status == MaiTurnStatus::Failed);
+        CHECK(outcome.value().error.code() == MaiErrorCode::InvalidInput);
+        const auto& message = outcome.value().error.message();
+        CHECK(message.find("safe context budget") != std::string::npos ||
+              message.find("protected recent tool observation exceed") != std::string::npos);
+        CHECK(agent.listMessages(created.value()).size() >= 2);
+    }
+}
+
 void testBuiltinSummaryFitsSmallWindow(bool baselineWithoutSummary, std::size_t outputTokens = 128,
-                                       std::size_t baseInstructionBytes = 0) {
+                                       std::size_t baseInstructionBytes = 0,
+                                       bool bundledSkills = false) {
     auto store = makeMaiMemoryStore();
     auto* observedStore = store.get();
     auto model = std::make_unique<MaiBuiltinWindowModel>();
@@ -205,7 +317,10 @@ void testBuiltinSummaryFitsSmallWindow(bool baselineWithoutSummary, std::size_t 
     registerMaiBuiltinTools(*tools);
     MaiAgent::Options options;
     options.toolDiscoveryEnabled = true;
-    options.skillsEnabled = false;
+    options.skillsEnabled = bundledSkills;
+    options.skillOptions.includeBuiltinSkills = bundledSkills;
+    options.skillOptions.homeDirectory = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8("mai-owned-help-budget-home"));
     options.baseInstructions = std::string(baseInstructionBytes, 'b');
     std::atomic<std::size_t> inputBudget{0};
     MaiAgent agent(std::move(store), std::move(model), std::move(tools), options);
@@ -268,12 +383,19 @@ void testBuiltinSummaryFitsSmallWindow(bool baselineWithoutSummary, std::size_t 
 }
 }  // namespace
 int main() {
+    testBuiltinHelpRoundTrip(4096, 128, 0);
+    testBuiltinHelpRoundTrip(4096, 512, 550);
+    testBuiltinHelpRoundTrip(8192, 512, 550);
     run(true);
     run(false);
     testBuiltinSummaryFitsSmallWindow(true);
     testBuiltinSummaryFitsSmallWindow(false);
     testBuiltinSummaryFitsSmallWindow(true, 512, 550);
     testBuiltinSummaryFitsSmallWindow(false, 512, 550);
+    testBuiltinSummaryFitsSmallWindow(true, 128, 0, true);
+    testBuiltinSummaryFitsSmallWindow(false, 128, 0, true);
+    testBuiltinSummaryFitsSmallWindow(true, 512, 550, true);
+    testBuiltinSummaryFitsSmallWindow(false, 512, 550, true);
     std::printf("MaiToolDiscoveryRuntimeTests: %d failures\n", failures.load());
     return failures ? 1 : 0;
 }

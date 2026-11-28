@@ -3,3 +3,6 @@
 # vitest 挂），整个测试文件收集失败、16 条测试静默不跑。Windows 上
 # core.autocrlf=true 会把它检出成 CRLF，所以必须在这里钉死 LF。
 bin/imcli.mjs text eol=lf
+
+# Shared embedded Skill resources must have identical bytes on every platform.
+MaiAgent/resources/skills/** text eol=lf

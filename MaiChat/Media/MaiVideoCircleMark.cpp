@@ -254,7 +254,8 @@ extern "C" void mai_video_circle_prepare_marked_mp4(const char* source_absolute_
         return;
     }
     const MaiFfmpegEngine engine{mai_ffmpeg_execute,           mai_ffmpeg_set_cancel_check, mai_ffprobe_execute,
-                                 mai_ffprobe_set_cancel_check, mai_fftools_set_log_sink,    mai_fftools_error_string};
+                                 mai_ffprobe_set_cancel_check, mai_fftools_set_log_sink,    mai_fftools_error_string,
+                                 mai_fftools_set_text_sink};
     std::vector<std::string> arguments{"ffmpeg",
                                        "-nostdin",
                                        "-y",

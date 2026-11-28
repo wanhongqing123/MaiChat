@@ -697,6 +697,8 @@ int main(int argc, char** argv) {
 
     MaiAgent::Options agentOptions;
     agentOptions.skillsEnabled = true;
+    // Bundled guides are immutable resources; user and workspace skills remain separate.
+    agentOptions.skillOptions.includeBuiltinSkills = true;
     agentOptions.toolDiscoveryEnabled = true;
     agentOptions.defaultModel = modelName;
     agentOptions.permissionTimeoutMs = permissionTimeoutMs;

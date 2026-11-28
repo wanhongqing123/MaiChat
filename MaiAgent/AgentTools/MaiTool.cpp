@@ -23,6 +23,7 @@
 #include "MaiScreenshotTool.h"
 #include "MaiExecCommandTool.h"
 #include "MaiToolOutputTool.h"
+#include "MaiToolHelp.h"
 #include "MaiSubAgentTools.h"
 #include "MaiTimeTool.h"
 #include "MaiTodoWriteTool.h"
@@ -265,6 +266,8 @@ MaiError MaiToolRegistry::finishTurn(const std::string& sessionId,
 }
 
 void registerMaiBuiltinTools(MaiToolRegistry& registry, bool includeFileTools) {
+    // 分组帮助只读取注册完成后的元数据；完整声明仍经现有按需目录加载。
+    registry.add(makeMaiToolHelpTool(registry));
     // 文件能力保留在共享核心；只有桌面宿主选择不暴露重复的 file_* 模型入口。
     if (includeFileTools)
         registerMaiFileTools(registry);

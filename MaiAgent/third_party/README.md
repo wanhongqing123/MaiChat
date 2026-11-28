@@ -56,6 +56,14 @@ FFmpeg 已链接的 zlib 符号冲突。OpenSSL 在上游源码上修改了 `app
 BIO 与重复调用路径；[`scripts/build-openssl.sh`](../scripts/build-openssl.sh) 为移动端
 和 macOS 从源码生成 `libcrypto.a`、`libssl.a`、`libapps.a` 与内嵌 CLI 静态库。
 Windows 当前仍使用源码构建的 `libcrypto.lib` 和类型化摘要/证书工具。
+
+FFmpeg 的内嵌补丁还包括 `fftools/mai_fftools_embed.h`、`mai_fftools_log.c` 的
+按调用文本回调，以及 `cmdutils.c`、`opt_common.c`、`ffmpeg_opt.c` 的帮助输出接线。
+只在 `MAI_FFMPEG_EMBEDDED` 下替换该命令的人类可读输出；普通上游/ffplay 构建
+保留原 `printf` 行为，FFprobe JSON 和媒体字节不走该文本通道。文本捕获和
+转换共用原执行核心/串行锁，不使用进程全局 stdout/stderr 重定向。
+构建输入显式跟踪这些补丁源；详细合同见[内置工具说明](../docs/EmbeddedFfmpegTools.md)。
+
 共享 SSH 客户端使用固定的 libssh2 源码快照和移动端同一份 OpenSSL `libcrypto.a`；
 这避免了 iOS、Android 分别维护两套 SSH 协议实现。
 该固定提交包含上游提交 `42e33d8`，修复 1.11.1 及更早版本的一处

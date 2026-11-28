@@ -46,6 +46,13 @@
 #include "libavutil/dict.h"
 #include "libavutil/opt.h"
 #include "cmdutils.h"
+#ifndef MAI_FFMPEG_EMBEDDED
+#define mai_fftools_text_printf printf
+#endif
+
+#ifdef MAI_FFMPEG_EMBEDDED
+#include "mai_fftools_embed.h"
+#endif
 #include "fopen_utf8.h"
 #include "opt_common.h"
 #ifdef _WIN32
@@ -83,7 +90,11 @@ void uninit_opts(void)
 
 void log_callback_help(void *ptr, int level, const char *fmt, va_list vl)
 {
+#ifdef MAI_FFMPEG_EMBEDDED
+    mai_fftools_text_vprintf(fmt, vl);
+#else
     vfprintf(stdout, fmt, vl);
+#endif
 }
 
 void init_dynload(void)
@@ -133,7 +144,7 @@ void show_help_options(const OptionDef *options, const char *msg, int req_flags,
             continue;
 
         if (first) {
-            printf("%s\n", msg);
+            mai_fftools_text_printf("%s\n", msg);
             first = 0;
         }
         av_strlcpy(buf, po->name, sizeof(buf));
@@ -146,9 +157,9 @@ void show_help_options(const OptionDef *options, const char *msg, int req_flags,
         if (po->argname)
             av_strlcatf(buf, sizeof(buf), " <%s>", po->argname);
 
-        printf("-%-17s  %s\n", buf, po->help);
+        mai_fftools_text_printf("-%-17s  %s\n", buf, po->help);
     }
-    printf("\n");
+    mai_fftools_text_printf("\n");
 }
 
 void show_help_children(const AVClass *class, int flags)
@@ -157,7 +168,7 @@ void show_help_children(const AVClass *class, int flags)
     const AVClass *child;
     if (class->option) {
         av_opt_show2(&class, NULL, flags, 0);
-        printf("\n");
+        mai_fftools_text_printf("\n");
     }
 
     while (child = av_opt_child_class_iterate(class, &iter))

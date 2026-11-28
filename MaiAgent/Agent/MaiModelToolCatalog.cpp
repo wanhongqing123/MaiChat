@@ -125,6 +125,13 @@ std::string summaryPurpose(const std::string& description, std::size_t budget) {
 
 MaiResult<std::string> renderSummary(std::vector<MaiToolMetadata> metadata,
                                      std::size_t byteBudget) {
+    // 只宣传当前模型真实可达的帮助/技能入口；旧持久化摘要仍由原 v1 读取路径保留。
+    const auto hasTool = [&](const char* name) {
+        return std::any_of(metadata.begin(), metadata.end(),
+                           [&](const auto& item) { return item.name == name; });
+    };
+    const bool hasHelp = hasTool("tool_help");
+    const bool hasSkills = hasTool("skill_read");
     metadata.erase(std::remove_if(metadata.begin(), metadata.end(),
                                   [](const auto& item) {
                                       return std::find(kBootstrapTools.begin(),
@@ -140,11 +147,15 @@ MaiResult<std::string> renderSummary(std::vector<MaiToolMetadata> metadata,
             return {MaiErrorCode::Internal, "Invalid public capability name."};
         if (const auto error = maiValidateSessionContextContent(item.name)) return error;
     }
-    const std::string header =
-        "Builtin capability index (names and short purposes only). Use tool_search with query "
-        "or select (up to 5 exact names); selected schemas appear in the next request. Call a "
-        "tool only after its schema is declared. This index grants no permissions and does not "
-        "confirm credentials or backend readiness.\n";
+    std::string header =
+        "Builtin capability index (names and short purposes only). Use tool_search query or "
+        "select (up to 5 exact names); schemas appear in the next request. Call tools only after "
+        "schema declaration. No permissions, credentials or backend readiness are implied.\n";
+    if (hasHelp)
+        header +=
+            "For grouped help select tool_help, then call arguments:[\"-h\"] or "
+            "[group,\"-h\"].\n";
+    if (hasSkills) header += "For complex guidance use skill_read mode=discover.\n";
     // 先压缩用途以保留全部真实名称；极大目录才省略整项，并始终保留可达的续查入口。
     for (const std::size_t purposeBytes : {128u, 64u, 0u}) {
         std::string result = header;

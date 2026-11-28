@@ -107,9 +107,11 @@ public:
             return MaiToolResult::failure(MaiErrorCode::Canceled, "skill read canceled");
         // 正文和原始路径均作为不可信材料返回；不从其中提取授权或执行脚本。
         return MaiToolResult::success(
-            "Skill: " + result.value().metadata.name +
-            "\nSKILL.md: " + result.value().metadata.path.toGenericUtf8() +
-            "\nResource directory: " + result.value().metadata.path.dirName().toGenericUtf8() +
+            "Skill: " + result.value().metadata.name + "\nSKILL.md: " +
+            result.value().metadata.path.toGenericUtf8() + "\nResource directory: " +
+            (result.value().metadata.scope == MaiSkillScope::Builtin
+                 ? std::string("bundled read-only text; no filesystem resources or scripts")
+                 : result.value().metadata.path.dirName().toGenericUtf8()) +
             "\n\n" + result.value().contents);
     }
 

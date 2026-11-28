@@ -676,7 +676,8 @@ struct MaiMobileAgent {
             throw std::runtime_error("Unsupported model wire protocol.");
         MaiFfmpegEngine ffmpegEngine{mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check,
                                      mai_ffprobe_execute,      mai_ffprobe_set_cancel_check,
-                                     mai_fftools_set_log_sink, mai_fftools_error_string};
+                                     mai_fftools_set_log_sink, mai_fftools_error_string,
+                                     mai_fftools_set_text_sink};
         config.prepareImage = makeMaiFfmpegModelImagePreparer(ffmpegEngine);
         std::function<std::unique_ptr<MaiModelClient>()> nextModelClientFactory;
         std::optional<MaiModelRoute> nextLocalRoute;
@@ -1004,6 +1005,7 @@ struct MaiMobileAgent {
         registerMobilePhotoTools(*tools, hostTools);
         MaiAgent::Options options;
         options.skillsEnabled = true;
+        options.skillOptions.includeBuiltinSkills = true;
         options.defaultModel = requestedModel;
         options.reasoningEffort = request.value("reasoningEffort", std::string("high"));
         if (!maiIsValidReasoningEffortForModel(options.defaultModel, options.reasoningEffort))

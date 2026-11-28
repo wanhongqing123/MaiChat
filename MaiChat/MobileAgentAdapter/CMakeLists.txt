@@ -196,6 +196,7 @@ add_custom_command(OUTPUT ${ffmpeg_archives}
   DEPENDS "${ffmpeg_source}/configure" "${ffmpeg_source}/RELEASE" "${ffmpeg_script}"
           "${ffmpeg_source}/fftools/Makefile" "${ffmpeg_source}/fftools/ffmpeg.c"
           "${ffmpeg_source}/fftools/ffprobe.c" "${ffmpeg_source}/fftools/cmdutils.c"
+          "${ffmpeg_source}/fftools/ffmpeg_opt.c"
           "${ffmpeg_source}/fftools/opt_common.c"
           "${ffmpeg_source}/fftools/mai_fftools_embed.h"
           "${ffmpeg_source}/fftools/mai_fftools_log.c"
@@ -377,6 +378,17 @@ endif()
 option(MAICHAT_MOBILE_TESTS "Build mobile adapter integration tests" OFF)
 if(MAICHAT_MOBILE_TESTS)
   enable_testing()
+  # The same ordinary/grouped-help and Skill contracts run against the normal
+  # mobile core and embedded resource bytes, without an App install or account.
+  foreach(help_test MaiToolHelpTests MaiSkillTests)
+    add_executable(${help_test} ../../MaiAgent/tests/${help_test}.cpp)
+    target_link_libraries(${help_test} PRIVATE
+      maichat_mobile maiagent mai_thirdparty_for_tests)
+    if(ANDROID)
+      target_link_libraries(${help_test} PRIVATE android log jnigraphics)
+    endif()
+    add_test(NAME ${help_test} COMMAND ${help_test})
+  endforeach()
   # 核心完整测试集关闭时仍能在正常移动生产库上验证网络及旗舰迁移契约。
   foreach(network_test MaiCurlNetworkRouteTests MaiNetworkRouteModelTests MaiGlm54Tests)
     if(NOT TARGET ${network_test})
@@ -441,6 +453,7 @@ if(MAICHAT_MOBILE_TESTS)
       ../desktop/tests/MaiEmbeddedFfmpegToolsTest.cpp)
     target_include_directories(MaiEmbeddedFfmpegToolsTest PRIVATE
       ../../MaiAgent/third_party/ffmpeg/fftools
+      ${ffmpeg_build}/install/include
       ../../MaiAgent/third_party/nlohmann)
     target_link_libraries(MaiEmbeddedFfmpegToolsTest PRIVATE
       maichat_mobile maiagent android log jnigraphics)
@@ -470,6 +483,7 @@ if(MAICHAT_MOBILE_TESTS)
       ../desktop/tests/MaiEmbeddedFfmpegToolsTest.cpp)
     target_include_directories(MaiEmbeddedFfmpegToolsTest PRIVATE
       ../../MaiAgent/third_party/ffmpeg/fftools
+      ${ffmpeg_build}/install/include
       ../../MaiAgent/third_party/nlohmann)
     target_link_libraries(MaiEmbeddedFfmpegToolsTest PRIVATE maichat_mobile maiagent)
     option(MAICHAT_IOS_METAL_RENDER_PROBE "Build the mixed Swift/C render probe" ON)

@@ -44,6 +44,44 @@ primaries、transfer、像素格式、HDR side data 等在源文件有标记时�
 默认转码仍只返回完成状态，避免把编码过程日志塞进模型上下文。若日志被截断，
 工具会如实标记，Agent 应缩短分析区间，不可把尾部当全量结果。
 
+## 内置帮助与信息查询
+
+帮助沿用同一内嵌执行入口，正文通过按调用注册的文本回调返回，不截获整个 App 的
+stdout/stderr，也不需要 `capture_log=true`：
+
+```json
+{"arguments":["-h"]}
+{"arguments":["-h","filter=scale"]}
+{"arguments":["-h","encoder=libx264"]}
+{"arguments":["-filters"]}
+```
+
+纯信息请求返回 `status`、`text` 和 `text_truncated`。文本最多保留 16 KiB 前缀，
+在完整 UTF-8 边界裁剪；单次格式化自身也有界，并把格式化截断/失败事实传回宿主。
+过长时应查询更具体的主题，本轮没有分页或完整续取接口。不存在的编码器/滤镜是否
+返回非零由上游决定；不能仅凭正文非空或退出码零就宣称该能力可用。
+
+接受完整的单项帮助或信息请求，可在开头加 `-hide_banner`。帮助别名为 `-h`、
+`-?`、`-help`、`--help`，可附一个不超过 256 字节的 ASCII 主题，如 `full`、
+`filter=scale`。首批信息列表为 `-L`/`-license`、`-version`、`-buildconf`、
+`-formats`、`-muxers`、`-demuxers`、`-devices`、`-codecs`、`-decoders`、
+`-encoders`、`-bsfs`、`-protocols`、`-filters`、`-pix_fmts`、`-layouts`、
+`-sample_fmts`、`-dispositions`、`-colors`、`-hwaccels`。它们查询当前构建的能力，
+不是平台编码器可运行、硬件或供应商配置就绪的证明。
+
+帮助与输入/输出或额外选项混合时明确拒绝，不能借帮助标志跳过普通文件路径检查。
+仅完整信息请求免去旧的“最后参数为输出路径”改写，因此帮助主题会原样交给上游。
+失败或取消会保留已捕获的有界正文并标明状态，部分帮助不冒充完整成功。引擎未接
+文本回调时，帮助明确报告不支持；常规转换和 `capture_log` 原合同保持不变。
+
+普通 C++ 调用 `maiRunFfmpegSerialized` 的结果也提供 `text`、`textTruncated` 和
+文本捕获失败事实，与模型工具共用执行锁、捕获和清理。宿主须重编并接入
+`MaiFfmpegEngine` 尾部 `setTextSink`；不能把新头文件与旧 CLI 对象混用。
+
+其他工具的分组短帮助由 `tool_help` 元数据入口提供，不能把该分组入口当作每个
+工具都支持原生 `-h` 的承诺。复杂媒体流程可通过 `skill_read` 按需读取随 App
+编译的 `builtin-media`；它不替代参数 Schema、路径授权或付费动作确认。
+
 工具固定禁用交互式标准输入和覆盖已有输出；`-stdin`、`-y` 会被拒绝。
 长任务通过现有 Agent 取消标志传给 FFmpeg 的中断回调。两个命令引擎共享原始
 FFmpeg 的进程级状态，所以工具层串行调用，并在每次调用后恢复日志设置。

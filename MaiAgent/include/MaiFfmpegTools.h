@@ -12,6 +12,11 @@
 #include "MaiTool.h"
 #include "MaiViewImageTool.h"
 
+// 命令文本按字节借出，只在回调期间有效；接收方不得抛出异常或保留指针。
+// flags 位 1 表示格式化阶段已截断，位 2 表示格式化失败；均不能冒充完整输出。
+using MaiFfmpegTextSink = void (*)(void* opaque, const char* bytes, std::size_t length,
+                                   unsigned flags);
+
 // 宿主持有并链接内嵌 FFmpeg 引擎。每个回调都在调用方进程的 Agent 工具线程运行；
 // 必须返回退出状态，不得直接终止 App。可选日志和错误回调在串行工具调用期间触发。
 // setLogSink(nullptr, nullptr) 返回后，日志接收方不得继续引用 opaque 指针；
@@ -23,12 +28,17 @@ struct MaiFfmpegEngine {
     void (*setFfprobeCancelCheck)(int (*check)(void*), void* opaque) = nullptr;
     void (*setLogSink)(void (*sink)(void* opaque, const char* line), void* opaque) = nullptr;
     int (*describeError)(int code, char* buffer, std::size_t size) = nullptr;
+    // 追加字段保留旧 aggregate 初始化的源码兼容性。宿主应同步重编并接线；
+    // 未接通时普通转换照旧，模型工具的只读帮助请求明确返回 NotSupported。
+    // 与日志 sink 共用命令锁；清空后不得继续调用旧 opaque。
+    void (*setTextSink)(MaiFfmpegTextSink sink, void* opaque) = nullptr;
 };
 
 // Runs a host-owned embedded FFmpeg command under the same process-wide lock
 // used by the Agent ffmpeg and ffprobe tools. The embedded command has global
 // mutable state, so callers outside the Agent tool path must also use this
-// entry point. Arguments include argv[0]. The caller owns the cancellation
+// entry point. Arguments include argv[0]; the wrapper adds argv[argc] == nullptr
+// without counting that sentinel in argc. The caller owns the cancellation
 // flag until this synchronous call returns; null disables cancellation.
 // Diagnostic text is bounded and may contain local paths: never display or
 // upload it without reviewing it. A nonzero exit status means no output is
@@ -37,6 +47,11 @@ struct MaiFfmpegExecutionResult {
     int exitStatus = -1;
     bool canceled = false;
     std::string diagnostic;
+    // 人类可读的命令正文，与诊断日志分离；最多保留 16 KiB UTF-8 前缀。
+    // 非零退出/取消也保留已有正文，不能据正文非空判断成功。
+    std::string text;
+    bool textTruncated = false;
+    bool textCaptureFailed = false;
 };
 
 MaiFfmpegExecutionResult maiRunFfmpegSerialized(const MaiFfmpegEngine& engine,

@@ -4,8 +4,11 @@
 #include "MaiVideoGeometryTool.h"
 
 #include <atomic>
+#include <algorithm>
+#include <mutex>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,6 +24,10 @@
 #include "MaiIdGenerator.h"
 #include "MaiThread.h"
 #include "mai_fftools_embed.h"
+
+extern "C" {
+#include "../../../MaiAgent/third_party/ffmpeg/libavutil/log.h"
+}
 
 namespace {
 
@@ -74,51 +81,269 @@ MaiToolResult runFilterGraph(MaiTool &convert, const MaiToolContext &context,
                          context);
 }
 
+int helpFailures = 0;
+void helpCheck(bool value, const char* label) {
+    if (!value) {
+        ++helpFailures;
+        std::fprintf(stderr, "OWNED_HELP_FAIL: %s\n", label);
+    }
+}
+
+MaiFfmpegEngine realHelpEngine() {
+    return {mai_ffmpeg_execute,           mai_ffmpeg_set_cancel_check, mai_ffprobe_execute,
+            mai_ffprobe_set_cancel_check, mai_fftools_set_log_sink,    mai_fftools_error_string,
+            mai_fftools_set_text_sink};
+}
+
+nlohmann::json helpResult(MaiTool& tool, const std::vector<std::string>& args, const MaiToolContext& context) {
+    const auto result = tool.execute(nlohmann::json{{"arguments", args}}.dump(), context);
+    helpCheck(!result.hasError(), "information query has no tool error");
+    const auto parsed = nlohmann::json::parse(result.output(), nullptr, false);
+    helpCheck(parsed.is_object() && parsed.contains("text") && parsed["text"].is_string(),
+              "automatic text body without capture_log");
+    if (!parsed.is_object()) return nlohmann::json::object();
+    helpCheck(parsed.value("text", "").size() <= 16 * 1024, "bounded information text");
+    helpCheck(result.isTruncated() == parsed.value("text_truncated", false), "structured and outer truncation agree");
+    return parsed;
+}
+
+int argumentVectorContract(int argc, char** argv) {
+    // argc excludes the mandatory null slot, for both ordinary and tool callers.
+    const bool ordinary = argc == 2;
+    const bool model = argc == 5;
+    if ((!ordinary && !model) || !argv || !argv[0] || !argv[argc - 1] || std::strcmp(argv[0], "ffmpeg") ||
+        std::strcmp(argv[argc - 1], "-h") || argv[argc] != nullptr)
+        return -44;
+    mai_fftools_text_printf("OWNED_ARGV_CONTRACT_OK");
+    return 0;
+}
+
+int largeFormatting(int, char**) {
+    const std::string large(20000, 'x');
+    mai_fftools_text_printf("OWNED_FORMAT_PREFIX:%s:OWNED_FORMAT_SUFFIX", large.c_str());
+    return 0;
+}
+int utf8Formatting(int, char**) {
+    // Repeated UTF-8 bytes cross the aggregate16KiB boundary. No source encoding dependency.
+    const char* word = "\xe4\xb8\xad\xe6\x96\x87";
+    for (int i = 0; i < 4000; ++i) mai_fftools_text_printf("%s", word);
+    return 0;
+}
+int byteLengthFormatting(int, char**) {
+    mai_fftools_text_printf("A%cB", 0);
+    return 0;
+}
+int partialFailure(int, char**) {
+    mai_fftools_text_printf("OWNED_PARTIAL_FAILURE");
+    return -22;
+}
+std::atomic<bool>* helpCancellation = nullptr;
+int partialCancellation(int, char**) {
+    mai_fftools_text_printf("OWNED_PARTIAL_CANCEL");
+    if (helpCancellation) helpCancellation->store(true);
+    return 255;
+}
+
+// Only command help, synthesized output and generated lavfi conversion are used.
+// Parent captures stdout/stderr separately to verify callback reset, without
+// redirecting process-global file descriptors inside the App/library.
+int runOwnedHelpChecks() {
+    helpFailures = 0;
+    auto engine = realHelpEngine();
+    auto tool = makeMaiFfmpegTool(engine);
+    MaiToolContext context;
+    context.root = ".";
+    const int originalLevel = av_log_get_level();
+    av_log_set_level(AV_LOG_WARNING);
+    const auto direct = maiRunFfmpegSerialized(engine, {"ffmpeg", "-hide_banner", "-h"}, nullptr);
+    helpCheck(direct.exitStatus == 0 && !direct.canceled && !direct.textCaptureFailed,
+              "ordinary API returns successful real help");
+    helpCheck(
+        direct.text.find("Getting help:") != std::string::npos && direct.text.find("-h type=name") != std::string::npos,
+        "ordinary API contains original help heading and topic route");
+    helpCheck(av_log_get_level() == AV_LOG_WARNING, "ordinary help restores caller log level");
+    av_log(nullptr, AV_LOG_ERROR, "OWNED_AVLOG_STDERR_AFTER_HELP\n");
+    mai_fftools_text_printf("OWNED_STDOUT_AFTER_CLEAR\n");
+
+    auto contractEngine = engine;
+    contractEngine.runFfmpeg = argumentVectorContract;
+    const auto contract = maiRunFfmpegSerialized(contractEngine, {"ffmpeg", "-h"}, nullptr);
+    helpCheck(contract.exitStatus == 0 && contract.text == "OWNED_ARGV_CONTRACT_OK",
+              "ordinary argv is null-terminated and argc excludes its sentinel");
+    auto contractTool = makeMaiFfmpegTool(contractEngine);
+    const auto contractText = helpResult(*contractTool, {"-h"}, context);
+    helpCheck(contractText.value("text", "") == "OWNED_ARGV_CONTRACT_OK",
+              "model argv preserves injected defaults and null terminator contract");
+
+    for (const std::string& flag : {"-h", "-?", "-help", "--help"}) {
+        const auto result = helpResult(*tool, {flag}, context);
+        helpCheck(
+            result.value("status", -1) == 0 && result.value("text", "").find("Getting help:") != std::string::npos,
+            "real help alias returns heading");
+        helpCheck(av_log_get_level() == AV_LOG_WARNING, "tool help restores caller log level");
+    }
+    for (const int level : {AV_LOG_ERROR, AV_LOG_QUIET}) {
+        av_log_set_level(level);
+        for (const std::string& flag : {"-version", "-buildconf"}) {
+            const auto result = helpResult(*tool, {flag}, context);
+            helpCheck(!result.value("text", "").empty(), "version/buildconf body at ERROR/QUIET");
+            helpCheck(av_log_get_level() == level, "version/buildconf restores low caller level");
+        }
+    }
+    av_log_set_level(AV_LOG_WARNING);
+    auto filter = helpResult(*tool, {"-h", "filter=scale"}, context);
+    helpCheck(filter.value("text", "").find("Filter scale") != std::string::npos &&
+                  filter.value("text", "").find("width") != std::string::npos,
+              "filter topic unchanged and AVOption body captured despite prior warning level");
+    auto encoder = helpResult(*tool, {"-h", "encoder=libx264"}, context);
+    helpCheck(encoder.value("text", "").find("Encoder libx264") != std::string::npos,
+              "encoder topic is not rewritten to an output path");
+    const auto unknown = helpResult(*tool, {"-h", "filter=owned_filter_does_not_exist"}, context);
+    const auto unknownDirect =
+        maiRunFfmpegSerialized(engine, {"ffmpeg", "-hide_banner", "-h", "filter=owned_filter_does_not_exist"}, nullptr);
+    helpCheck(unknown.value("status", -999) == unknownDirect.exitStatus &&
+                  unknown.value("text", "") == unknownDirect.text &&
+                  unknownDirect.text.find("owned_filter_does_not_exist") != std::string::npos,
+              "unknown topic preserves upstream status and body without invented success fact");
+
+    for (const std::string& flag :
+         {"-L",        "-license", "-version",     "-buildconf",    "-formats", "-muxers",    "-demuxers",
+          "-devices",  "-codecs",  "-decoders",    "-encoders",     "-bsfs",    "-protocols", "-filters",
+          "-pix_fmts", "-layouts", "-sample_fmts", "-dispositions", "-colors",  "-hwaccels"}) {
+        const auto result = helpResult(*tool, {flag}, context);
+        helpCheck(result.value("status", -1) == 0 && !result.value("text", "").empty(),
+                  "whitelisted native information option returns text");
+    }
+    const auto full = helpResult(*tool, {"-h", "full"}, context);
+    helpCheck(full.value("text_truncated", false) && full.value("text", "").find("Getting help:") != std::string::npos,
+              "full help is bounded prefix with real truncation");
+    for (const std::vector<std::string>& args : {std::vector<std::string>{"-h", "filter=scale", "-i", "outside.mp4"},
+                                                 {"-i", "outside.mp4", "-h"},
+                                                 {"-h", "full", "output.mp4"},
+                                                 {"-filters", "output.mp4"},
+                                                 {"-h", "-report"},
+                                                 {"-h", "../outside"},
+                                                 {"-hide_banner", "-h", "full", "-y"}}) {
+        const auto result = tool->execute(nlohmann::json{{"arguments", args}}.dump(), context);
+        helpCheck(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput,
+                  "mixed/invalid information argv rejects before executing");
+    }
+    auto legacyEngine = engine;
+    legacyEngine.setTextSink = nullptr;
+    const auto unavailable = makeMaiFfmpegTool(legacyEngine)->execute(R"({"arguments":["-h"]})", context);
+    helpCheck(unavailable.hasError() && unavailable.error().code() == MaiErrorCode::NotSupported,
+              "old aggregate without text writer does not report empty help success");
+
+    auto injected = engine;
+    injected.runFfmpeg = largeFormatting;
+    auto stress = makeMaiFfmpegTool(injected);
+    const auto formatted = helpResult(*stress, {"-h"}, context);
+    helpCheck(formatted.value("text_truncated", false) &&
+                  formatted.value("text", "").find("OWNED_FORMAT_PREFIX:") == 0 &&
+                  formatted.value("text", "").size() <= 4095,
+              "formatter bounded before host buffer and reports formatter truncation");
+    injected.runFfmpeg = utf8Formatting;
+    stress = makeMaiFfmpegTool(injected);
+    const auto unicode = helpResult(*stress, {"-h"}, context);
+    helpCheck(unicode.value("text_truncated", false) && unicode.value("text", "").size() % 3 == 0,
+              "aggregate prefix ends at complete UTF-8 code point");
+    injected.runFfmpeg = byteLengthFormatting;
+    stress = makeMaiFfmpegTool(injected);
+    const auto counted = helpResult(*stress, {"-h"}, context);
+    helpCheck(counted.value("text", "") == std::string("A\0B", 3), "text callback uses explicit length not strlen");
+    injected.runFfmpeg = partialFailure;
+    stress = makeMaiFfmpegTool(injected);
+    const auto failed = stress->execute(R"({"arguments":["-h"]})", context);
+    helpCheck(failed.hasError() && failed.error().message().find("OWNED_PARTIAL_FAILURE") != std::string::npos &&
+                  failed.error().message().find("status -22") != std::string::npos,
+              "failure retains captured text");
+    std::atomic<bool> canceled{false};
+    helpCancellation = &canceled;
+    context.cancel = &canceled;
+    injected.runFfmpeg = partialCancellation;
+    stress = makeMaiFfmpegTool(injected);
+    const auto stopped = stress->execute(R"({"arguments":["-h"]})", context);
+    helpCheck(stopped.hasError() && stopped.error().code() == MaiErrorCode::Canceled &&
+                  stopped.error().message().find("OWNED_PARTIAL_CANCEL") != std::string::npos &&
+                  stopped.error().message().find("status 255") != std::string::npos,
+              "cancellation retains partial captured text");
+    helpCancellation = nullptr;
+    context.cancel = nullptr;
+    const auto after = helpResult(*tool, {"-h", "filter=scale"}, context);
+    helpCheck(after.value("text", "").find("OWNED_PARTIAL") == std::string::npos,
+              "failure/cancellation does not leak into next call");
+
+    std::string concurrentFilter, concurrentEncoder;
+    std::thread first([&] {
+        const auto result = tool->execute(R"({"arguments":["-h","filter=scale"]})", context);
+        concurrentFilter = result.output();
+    });
+    std::thread second([&] {
+        const auto result = tool->execute(R"({"arguments":["-h","encoder=libx264"]})", context);
+        concurrentEncoder = result.output();
+    });
+    std::thread unrelated([] { std::printf("OWNED_UNRELATED_STDOUT\n"); });
+    first.join();
+    second.join();
+    unrelated.join();
+    helpCheck(concurrentFilter.find("Filter scale") != std::string::npos &&
+                  concurrentFilter.find("Encoder libx264") == std::string::npos &&
+                  concurrentEncoder.find("Encoder libx264") != std::string::npos &&
+                  concurrentEncoder.find("Filter scale") == std::string::npos &&
+                  concurrentFilter.find("OWNED_UNRELATED_STDOUT") == std::string::npos &&
+                  concurrentEncoder.find("OWNED_UNRELATED_STDOUT") == std::string::npos,
+              "concurrent command text is isolated and unrelated stdout is not redirected");
+    const auto converted = tool->execute(
+        R"({"arguments":["-f","lavfi","-i","color=c=red:s=16x16:r=1","-frames:v","1","-f","null","-"],"capture_log":true})",
+        context);
+    helpCheck(!converted.hasError(), "help-failure-help-normal conversion survives");
+    if (!converted.hasError()) {
+        const auto logs = nlohmann::json::parse(converted.output(), nullptr, false);
+        helpCheck(logs.is_object() && logs.contains("log_tail") && !logs.contains("text"),
+                  "ordinary conversion capture_log output contract unchanged");
+    }
+    helpCheck(av_log_get_level() == AV_LOG_WARNING, "log level restored after full sequence");
+    av_log(nullptr, AV_LOG_ERROR, "OWNED_AVLOG_STDERR_AT_END\n");
+    av_log_set_level(originalLevel);
+    std::printf("Owned embedded FFmpeg help: %d failures\n", helpFailures);
+    return helpFailures ? 90 : 0;
+}
+
 } // namespace
 
 // 使用本地媒体样本集中验证 FFmpeg 工具入口、参数限制和产物，不向付费服务提交任务。
 int main(int argc, char **argv) {
-  if (argc != 2)
-    return 2;
-  const MaiFilePath input = MaiFilePath::fromUtf8(argv[1]);
-  if (!MaiFileSystem::exists(input))
-    return 3;
+    if (argc == 2 && std::string(argv[1]) == "--help-output-smoke") return runOwnedHelpChecks();
+    if (argc != 2) return 2;
+    const MaiFilePath input = MaiFilePath::fromUtf8(argv[1]);
+    if (!MaiFileSystem::exists(input)) return 3;
 
-  MaiFfmpegEngine engine{mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check,
-                         mai_ffprobe_execute,      mai_ffprobe_set_cancel_check,
-                         mai_fftools_set_log_sink, mai_fftools_error_string};
-  auto probe = makeMaiFfprobeTool(engine);
-  auto convert = makeMaiFfmpegTool(engine);
-  MaiToolContext context;
-  context.root = input.dirName().toUtf8();
-  context.allowOutsideWorkingDirectory = true;
-  context.fileAccessRoot = MaiFileSystem::temporaryDirectory().toUtf8();
+    MaiFfmpegEngine engine{mai_ffmpeg_execute,           mai_ffmpeg_set_cancel_check, mai_ffprobe_execute,
+                           mai_ffprobe_set_cancel_check, mai_fftools_set_log_sink,    mai_fftools_error_string,
+                           mai_fftools_set_text_sink};
+    auto probe = makeMaiFfprobeTool(engine);
+    auto convert = makeMaiFfmpegTool(engine);
+    MaiToolContext context;
+    context.root = input.dirName().toUtf8();
+    context.allowOutsideWorkingDirectory = true;
+    context.fileAccessRoot = MaiFileSystem::temporaryDirectory().toUtf8();
 
-  const MaiToolResult missing =
-      probe->execute(R"({"path":"no-such-video.mp4"})", context);
-  if (!missing.hasError())
-    return 4;
-  const MaiToolResult invalidConversion = convert->execute(
-      nlohmann::json{
-          {"arguments", {"-i", "no-such-video.mp4", "-f", "null", "-"}}}
-          .dump(),
-      context);
-  if (!invalidConversion.hasError())
-    return 9;
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    const MaiToolResult metadata = probe->execute(
-        nlohmann::json{{"path", input.toUtf8()}}.dump(), context);
-    if (metadata.hasError()) {
-      std::fprintf(stderr, "probe failed: %s\n",
-                   metadata.error().message().c_str());
-      return 5;
+    const MaiToolResult missing = probe->execute(R"({"path":"no-such-video.mp4"})", context);
+    if (!missing.hasError()) return 4;
+    const MaiToolResult invalidConversion =
+        convert->execute(nlohmann::json{{"arguments", {"-i", "no-such-video.mp4", "-f", "null", "-"}}}.dump(), context);
+    if (!invalidConversion.hasError()) return 9;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const MaiToolResult metadata = probe->execute(nlohmann::json{{"path", input.toUtf8()}}.dump(), context);
+        if (metadata.hasError()) {
+            std::fprintf(stderr, "probe failed: %s\n", metadata.error().message().c_str());
+            return 5;
+        }
+        const nlohmann::json parsed = nlohmann::json::parse(metadata.output(), nullptr, false);
+        if (parsed.is_discarded() || !parsed.contains("streams") || !parsed["streams"].is_array() ||
+            parsed["streams"].empty())
+            return 6;
     }
-    const nlohmann::json parsed =
-        nlohmann::json::parse(metadata.output(), nullptr, false);
-    if (parsed.is_discarded() || !parsed.contains("streams") ||
-        !parsed["streams"].is_array() || parsed["streams"].empty())
-      return 6;
-  }
   const MaiToolResult counted =
       probe->execute(nlohmann::json{{"path", input.toUtf8()},
                                     {"count_frames", true},
@@ -590,8 +815,10 @@ int main(int argc, char **argv) {
 #endif
 
   std::atomic<bool> canceled{false};
-  MaiFfmpegEngine fakeEngine{runUntilCanceled, setFakeCancelCheck, nullptr,
-                             nullptr};
+  // The cancellation fixture uses -version as its dummy command; that is now
+  // an information query and must explicitly provide the text capability.
+  MaiFfmpegEngine fakeEngine{runUntilCanceled, setFakeCancelCheck,       nullptr, nullptr, nullptr,
+                             nullptr,          mai_fftools_set_text_sink};
   auto fakeTool = makeMaiFfmpegTool(fakeEngine);
   context.cancel = &canceled;
   std::thread requestCancel([&] {

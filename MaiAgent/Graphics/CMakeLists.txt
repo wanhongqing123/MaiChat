@@ -64,6 +64,7 @@ if(APPLE AND NOT IOS)
       ${ffmpeg_source}/../build-media-codecs.sh
       ${ffmpeg_source}/fftools/Makefile
       ${ffmpeg_source}/fftools/ffmpeg.c ${ffmpeg_source}/fftools/ffprobe.c
+      ${ffmpeg_source}/fftools/ffmpeg_opt.c
       ${ffmpeg_source}/fftools/cmdutils.c ${ffmpeg_source}/fftools/opt_common.c
       ${ffmpeg_source}/fftools/mai_fftools_embed.h
       ${ffmpeg_source}/fftools/mai_fftools_log.c
@@ -77,6 +78,9 @@ if(APPLE AND NOT IOS)
   add_library(maiagent_embedded_fftools STATIC IMPORTED GLOBAL)
   set_target_properties(maiagent_embedded_fftools PROPERTIES
     IMPORTED_LOCATION ${ffmpeg_runtime_dir}/libmaifftools.a)
+  # Consumers of public FFmpeg headers also need this same build's avconfig.h.
+  target_include_directories(maiagent_embedded_fftools INTERFACE
+    ${ffmpeg_runtime_dir}/install/include)
   add_dependencies(maiagent_embedded_fftools maiagent_ffmpeg_runtime)
   target_link_libraries(maiagent_embedded_fftools INTERFACE
     ${ffmpeg_runtime_dir}/libavdevice/libavdevice.a

@@ -373,9 +373,9 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
 #endif
     registerDesktopComputerTools(*tools, computer);
 #if defined(MAICHAT_EMBEDDED_FFMPEG)
-    const MaiFfmpegEngine ffmpegEngine{mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check,
-                                       mai_ffprobe_execute,      mai_ffprobe_set_cancel_check,
-                                       mai_fftools_set_log_sink, mai_fftools_error_string};
+    const MaiFfmpegEngine ffmpegEngine{
+        mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check, mai_ffprobe_execute,      mai_ffprobe_set_cancel_check,
+        mai_fftools_set_log_sink, mai_fftools_error_string,    mai_fftools_set_text_sink};
     const MaiVideoMetadataProvider seedanceVideoMetadata = makeMaiFfprobeVideoMetadataProvider(ffmpegEngine);
 #else
     const MaiVideoMetadataProvider seedanceVideoMetadata;
@@ -493,6 +493,7 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     MaiAgent::Options options;
     // 技能目录由工作线程按会话工作目录及标准用户目录发现，构造 UI 时不扫描磁盘。
     options.skillsEnabled = true;
+    options.skillOptions.includeBuiltinSkills = true;
     // 普通注入客户端保留完整工具合同；账号桌面运行时使用按需工具目录。
     options.toolDiscoveryEnabled = discoverModelTools;
     if (!defaultModel.isEmpty()) options.defaultModel = toUtf8(defaultModel);
@@ -578,7 +579,8 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
 #if defined(MAICHAT_EMBEDDED_FFMPEG)
         MaiFfmpegEngine ffmpegEngine{mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check,
                                      mai_ffprobe_execute,      mai_ffprobe_set_cancel_check,
-                                     mai_fftools_set_log_sink, mai_fftools_error_string};
+                                     mai_fftools_set_log_sink, mai_fftools_error_string,
+                                     mai_fftools_set_text_sink};
         config.prepareImage = makeMaiFfmpegModelImagePreparer(ffmpegEngine);
 #endif
         auto accountClient = std::make_unique<DesktopAccountModelClient>(std::move(config));
@@ -592,7 +594,8 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
 #if defined(MAICHAT_EMBEDDED_FFMPEG)
         MaiFfmpegEngine ffmpegEngine{mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check,
                                      mai_ffprobe_execute,      mai_ffprobe_set_cancel_check,
-                                     mai_fftools_set_log_sink, mai_fftools_error_string};
+                                     mai_fftools_set_log_sink, mai_fftools_error_string,
+                                     mai_fftools_set_text_sink};
         config.prepareImage = makeMaiFfmpegModelImagePreparer(ffmpegEngine);
 #endif
         client = makeMaiModelClient(config);

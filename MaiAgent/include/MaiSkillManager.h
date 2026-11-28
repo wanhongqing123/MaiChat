@@ -9,7 +9,7 @@
 #include "MaiError.h"
 #include "MaiFilePath.h"
 
-enum class MaiSkillScope { Workspace, User, Additional };
+enum class MaiSkillScope { Workspace, User, Additional, Builtin };
 
 // 路径保持平台原生编码。空 homeDirectory 禁用个人技能；空 workspaceDirectory
 // 禁用工作区技能。宿主提供实际用户主目录，不从模型参数接收根目录。
@@ -27,10 +27,13 @@ struct MaiSkillManagerOptions {
     // 目录提示 token 预算；0 按实际模型窗口的 2%，窗口未知时用 8000 字符。
     // 显式预算优先于窗口，并限制到 10000；不限制被显式选中的完整正文。
     std::size_t maxCatalogTokens = 0;
+    // 宿主显式启用随 App 编译的只读资源，不解压、不覆盖用户技能目录。
+    bool includeBuiltinSkills = false;
 };
 
-// id 是规范化 SKILL.md 路径的稳定标识，只用于已经发现的条目查找。
-// 同名技能保留，按工作区、个人、附加目录及名称/路径排序；名称有歧义时必须用 id。
+// id 是已发现文件的规范路径或内置资源的 builtin: 标识，仅用于已有目录条目查找。
+// 同名技能保留，按工作区、个人、附加目录、内置资源及名称/路径排序；歧义时必须用 id。
+// Builtin 使用 builtin: 稳定标识；逻辑 path 不授予磁盘路径或资源目录读取权限。
 // 描述经过单行化；正文不会进入目录快照。所有字符串以 UTF-8 交付。
 struct MaiSkillMetadata {
     std::string id;
@@ -79,7 +82,8 @@ struct MaiSkillDiscoveryPage {
 
 struct MaiSkillContents {
     MaiSkillMetadata metadata;
-    // 完整 SKILL.md，包括 frontmatter；相对资源以 metadata.path.dirName() 为基准。
+    // 完整 SKILL.md，包括 frontmatter；磁盘技能资源以 path.dirName() 为基准。
+    // Builtin 为自包含只读文本，没有外部资源目录或可执行脚本。
     std::string contents;
 };
 

@@ -3,6 +3,9 @@
 #include "MaiFfmpegTools.h"
 
 #include <atomic>
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -49,30 +52,152 @@ void captureDiagnostic(void* opaque, const char* line) {
     }
 }
 
+constexpr std::size_t kMaximumCommandTextBytes = 16 * 1024;
+constexpr unsigned kTextFormatTruncated = 1u;
+constexpr unsigned kTextFormatError = 2u;
+
+struct CommandTextCapture {
+    std::mutex mutex;
+    std::string text;
+    bool truncated = false;
+    bool sealed = false;
+    std::atomic<bool> failed{false};
+};
+
+// 仅保留前缀；一旦格式化或总量截断，后续片段不能追加在半个字符后面。
+// C 回调不允许异常跨越 FFmpeg 栈；失败由调用方如实返回。
+void captureCommandText(void* opaque, const char* bytes, std::size_t length,
+                        unsigned flags) noexcept {
+    if (!opaque) return;
+    auto& capture = *static_cast<CommandTextCapture*>(opaque);
+    if (capture.failed.load()) return;
+    try {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        if (flags & kTextFormatError) capture.failed.store(true);
+        if (capture.sealed) return;
+        if ((!bytes && length) || (flags & ~(kTextFormatTruncated | kTextFormatError))) {
+            capture.failed.store(true);
+            capture.sealed = true;
+            return;
+        }
+        const auto remaining = kMaximumCommandTextBytes - capture.text.size();
+        if (bytes && remaining) capture.text.append(bytes, std::min(length, remaining));
+        if (length > remaining || (flags & kTextFormatTruncated)) {
+            capture.truncated = true;
+            capture.sealed = true;
+        }
+        if (flags & kTextFormatError) capture.sealed = true;
+    } catch (...) {
+        capture.failed.store(true);
+    }
+}
+
+void finishCommandText(CommandTextCapture& capture) {
+    if (!capture.truncated || capture.text.empty()) return;
+    auto start = capture.text.size() - 1;
+    while (start && (static_cast<unsigned char>(capture.text[start]) & 0xc0) == 0x80) --start;
+    const auto lead = static_cast<unsigned char>(capture.text[start]);
+    const std::size_t width = lead < 0x80             ? 1
+                              : (lead & 0xe0) == 0xc0 ? 2
+                              : (lead & 0xf0) == 0xe0 ? 3
+                              : (lead & 0xf8) == 0xf0 ? 4
+                                                      : 1;
+    if (capture.text.size() - start < width) capture.text.resize(start);
+}
+
+bool isHelpFlag(const std::string& value) {
+    return value == "-h" || value == "-?" || value == "-help" || value == "--help";
+}
+
+bool isInformationFlag(const std::string& value) {
+    // 与当前 opt_common.h/ffmpeg_opt.c 的只读 OPT_EXIT 项逐一对应。
+    static const std::array<const char*, 19> flags{
+        "-L",        "-license",     "-version",      "-buildconf", "-formats",
+        "-muxers",   "-demuxers",    "-devices",      "-codecs",    "-decoders",
+        "-encoders", "-bsfs",        "-protocols",    "-filters",   "-pix_fmts",
+        "-layouts",  "-sample_fmts", "-dispositions", "-colors"};
+    return isHelpFlag(value) || value == "-hwaccels" ||
+           std::find(flags.begin(), flags.end(), value) != flags.end();
+}
+
+enum class InformationRequest { NotInformation, Valid, Invalid };
+
+InformationRequest classifyInformation(const std::vector<std::string>& arguments) {
+    if (std::none_of(arguments.begin(), arguments.end(), isInformationFlag))
+        return InformationRequest::NotInformation;
+    std::size_t index = 0;
+    if (!arguments.empty() && arguments.front() == "-hide_banner") ++index;
+    if (index == arguments.size() || !isInformationFlag(arguments[index]))
+        return InformationRequest::Invalid;
+    const bool help = isHelpFlag(arguments[index++]);
+    if (index == arguments.size()) return InformationRequest::Valid;
+    if (!help || index + 1 != arguments.size()) return InformationRequest::Invalid;
+    const auto& topic = arguments[index];
+    // CLI 原样解释 topic，包括合法但不存在的名字；此处只拒绝 argv 混入和路径。
+    if (topic.empty() || topic.size() > 256 || topic.front() == '-')
+        return InformationRequest::Invalid;
+    for (const unsigned char byte : topic)
+        if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+              (byte >= '0' && byte <= '9') || byte == '_' || byte == '-' || byte == '+' ||
+              byte == '.' || byte == '='))
+            return InformationRequest::Invalid;
+    return InformationRequest::Valid;
+}
+
+// 注册、执行和全部清理均处于同一命令锁内；帮助可能替换 av_log callback，
+// 因此退出时也必须通过引擎重置日志回调/等级，而不只是清空文本指针。
+struct EngineSinksScope {
+    const MaiFfmpegEngine& engine;
+    void (*setCancelCheck)(int (*)(void*), void*);
+    ~EngineSinksScope() {
+        if (engine.setLogSink) engine.setLogSink(nullptr, nullptr);
+        if (engine.setTextSink) engine.setTextSink(nullptr, nullptr);
+        if (setCancelCheck) setCancelCheck(nullptr, nullptr);
+    }
+};
+
 int runEngine(int (*execute)(int, char**), void (*setCancelCheck)(int (*)(void*), void*),
               const MaiFfmpegEngine& engine, std::vector<std::string> arguments,
               const MaiToolContext& context, std::string& diagnostic,
               bool* diagnosticTruncated = nullptr,
-              std::size_t diagnosticLimit = kMaximumDiagnosticBytes) {
+              std::size_t diagnosticLimit = kMaximumDiagnosticBytes,
+              std::string* commandText = nullptr, bool* textTruncated = nullptr,
+              bool* textCaptureFailed = nullptr) {
     std::lock_guard<std::mutex> commandLock(sFfmpegCommandMutex);
     if (context.isCanceled()) return -1;
-
     std::vector<char*> argv;
-    argv.reserve(arguments.size());
+    // FFmpeg 的 OPT_EXIT 可选参数路径会读取 argv[argc]；即使没有 topic，
+    // 也必须提供标准 C argv 的空终止槽，且该槽不能计入 argc。
+    argv.reserve(arguments.size() + 1);
     for (std::string& argument : arguments) argv.push_back(argument.data());
-
-    if (setCancelCheck)
-        setCancelCheck(context.cancel ? shouldCancel : nullptr,
-                       const_cast<std::atomic<bool>*>(context.cancel));
+    argv.push_back(nullptr);
     DiagnosticCapture capture;
     capture.limit = diagnosticLimit;
-    if (engine.setLogSink) engine.setLogSink(captureDiagnostic, &capture);
-    const int status = execute(static_cast<int>(argv.size()), argv.data());
-    if (engine.setLogSink) engine.setLogSink(nullptr, nullptr);
+    CommandTextCapture text;
+    text.text.reserve(kMaximumCommandTextBytes);
+    int status;
+    {
+        EngineSinksScope cleanup{engine, setCancelCheck};
+        if (setCancelCheck)
+            setCancelCheck(context.cancel ? shouldCancel : nullptr,
+                           const_cast<std::atomic<bool>*>(context.cancel));
+        if (engine.setTextSink) engine.setTextSink(captureCommandText, &text);
+        if (engine.setLogSink) engine.setLogSink(captureDiagnostic, &capture);
+        status = execute(static_cast<int>(arguments.size()), argv.data());
+    }
+    finishCommandText(text);
     diagnostic = std::move(capture.text);
-    if (diagnosticTruncated != nullptr) *diagnosticTruncated = capture.truncated;
-    if (setCancelCheck) setCancelCheck(nullptr, nullptr);
+    if (diagnosticTruncated) *diagnosticTruncated = capture.truncated;
+    if (commandText) *commandText = std::move(text.text);
+    if (textTruncated) *textTruncated = text.truncated;
+    if (textCaptureFailed) *textCaptureFailed = text.failed.load();
     return status;
+}
+
+std::string capturedInformation(const std::string& text, bool truncated) {
+    if (text.empty() && !truncated) return {};
+    return "\nCaptured command text:\n" + text +
+           (truncated ? "\n[Command text truncated; request a narrower help topic.]" : "");
 }
 
 std::string errorDescription(const MaiFfmpegEngine& engine, int status,
@@ -114,13 +239,12 @@ public:
     }
 
     std::string description() const override {
-        // FFmpeg 在进程内执行：只接参数数组，不提供 stdin，目标文件必须是新路径。
-        // 分析滤镜需要 capture_log=true 才会把诊断日志交回主模型。
-        return "Transform an accessible local image, audio, or video using the in-process FFmpeg "
-               "engine. Supply FFmpeg arguments without the program name. Stdin is disabled "
-               "and existing outputs cannot be overwritten; choose a new output path. For "
-               "analysis filters such as volumedetect or blackdetect, set capture_log=true to "
-               "receive up to 16 KiB of FFmpeg diagnostic output.";
+        // 只声明宿主实际接通的帮助能力；旧 aggregate 仍可提供普通转换。
+        std::string text =
+            "Run in-process FFmpeg on accessible local media. Pass arguments without the program "
+            "name; no stdin or overwriting. Use capture_log=true for analysis logs.";
+        if (mEngine.setTextSink) text += " -h and -h filter=NAME return bounded help text.";
+        return text;
     }
 
     std::string parametersSchema() const override {
@@ -157,6 +281,23 @@ public:
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                           "unsupported FFmpeg argument field");
         const bool captureLog = request.value("capture_log", false);
+        std::vector<std::string> requestedArguments;
+        for (const auto& item : request["arguments"]) {
+            if (!item.is_string())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "every FFmpeg argument must be a string");
+            requestedArguments.push_back(item.get<std::string>());
+        }
+        const auto information = classifyInformation(requestedArguments);
+        if (information == InformationRequest::Invalid)
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "Use a single information option, optionally followed by one help topic; "
+                "do not mix help with input/output or other options.");
+        const bool informationOnly = information == InformationRequest::Valid;
+        if (informationOnly && !mEngine.setTextSink)
+            return MaiToolResult::failure(MaiErrorCode::NotSupported,
+                                          "Embedded FFmpeg text output is unavailable.");
 
         std::vector<std::string> arguments = {"ffmpeg", "-nostdin", "-n", "-hide_banner"};
         for (const json& item : request["arguments"]) {
@@ -187,7 +328,7 @@ public:
                                               "FFmpeg input path is outside the accessible area");
             arguments[index] = resolved;
         }
-        if (arguments.size() > 4 && arguments[arguments.size() - 2] != "-i") {
+        if (!informationOnly && arguments.size() > 4 && arguments[arguments.size() - 2] != "-i") {
             std::string& output = arguments.back();
             if (output != "-" && output.rfind("pipe:", 0) != 0 &&
                 output.find("://") == std::string::npos && output[0] != '-') {
@@ -209,17 +350,45 @@ public:
             if (arguments[index] == "-filter_complex") filterGraph = arguments[index + 1];
         }
         std::string diagnostic;
+        std::string text;
         bool logTruncated = false;
+        bool textTruncated = false;
+        bool textFailed = false;
         const int status = runEngine(mEngine.runFfmpeg, mEngine.setFfmpegCancelCheck, mEngine,
                                      std::move(arguments), context, diagnostic, &logTruncated,
-                                     captureLog ? 16 * 1024 : kMaximumDiagnosticBytes);
+                                     captureLog ? 16 * 1024 : kMaximumDiagnosticBytes, &text,
+                                     &textTruncated, &textFailed);
+        const auto captured = capturedInformation(text, textTruncated);
         if (context.isCanceled())
-            return MaiToolResult::failure(MaiErrorCode::Canceled, "FFmpeg was canceled");
+            return MaiToolResult::failure(MaiErrorCode::Canceled,
+                                          "FFmpeg was canceled with status " +
+                                              std::to_string(status) +
+                                              "; captured text is partial." + captured +
+                                              (diagnostic.empty() ? "" : "\n" + diagnostic),
+                                          textTruncated || logTruncated);
+        if (textFailed)
+            return MaiToolResult::failure(MaiErrorCode::Internal,
+                                          "FFmpeg command text capture failed after status " +
+                                              std::to_string(status) + "." + captured +
+                                              (diagnostic.empty() ? "" : "\n" + diagnostic),
+                                          true);
         if (status != 0)
             return MaiToolResult::failure(
                 MaiErrorCode::InvalidInput,
-                "FFmpeg failed: " + errorDescription(mEngine, status, diagnostic) +
-                    filterGraphFailureContext(filterGraph, diagnostic));
+                (informationOnly ? "FFmpeg information request exited with status " +
+                                       std::to_string(status) + ": "
+                                 : "FFmpeg failed: ") +
+                    errorDescription(mEngine, status, diagnostic) +
+                    filterGraphFailureContext(filterGraph, diagnostic) + captured,
+                textTruncated || logTruncated);
+        if (informationOnly) {
+            if (text.empty())
+                return MaiToolResult::failure(MaiErrorCode::Internal,
+                                              "FFmpeg returned status 0 with no information text.");
+            return MaiToolResult::success(
+                json{{"status", status}, {"text", text}, {"text_truncated", textTruncated}}.dump(),
+                textTruncated);
+        }
         if (captureLog)
             return MaiToolResult::success(
                 json{{"status", 0}, {"log_tail", diagnostic}, {"log_truncated", logTruncated}}
@@ -415,8 +584,16 @@ MaiFfmpegExecutionResult maiRunFfmpegSerialized(const MaiFfmpegEngine& engine,
     if (!engine.runFfmpeg || arguments.empty()) return result;
     MaiToolContext context;
     context.cancel = cancel;
-    result.exitStatus = runEngine(engine.runFfmpeg, engine.setFfmpegCancelCheck, engine,
-                                  std::move(arguments), context, result.diagnostic);
+    if (!engine.setTextSink &&
+        std::any_of(arguments.begin() + 1, arguments.end(), isInformationFlag)) {
+        result.diagnostic = "Embedded FFmpeg text output is unavailable.";
+        result.textCaptureFailed = true;
+        return result;
+    }
+    result.exitStatus =
+        runEngine(engine.runFfmpeg, engine.setFfmpegCancelCheck, engine, std::move(arguments),
+                  context, result.diagnostic, nullptr, kMaximumDiagnosticBytes, &result.text,
+                  &result.textTruncated, &result.textCaptureFailed);
     result.canceled = context.isCanceled();
     return result;
 }

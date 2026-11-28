@@ -192,6 +192,7 @@ if(WIN32)
               "${MAICHAT_FFMPEG_SOURCE}/fftools/Makefile"
               "${MAICHAT_FFMPEG_SOURCE}/fftools/ffmpeg.c"
               "${MAICHAT_FFMPEG_SOURCE}/fftools/ffprobe.c"
+              "${MAICHAT_FFMPEG_SOURCE}/fftools/ffmpeg_opt.c"
               "${MAICHAT_FFMPEG_SOURCE}/fftools/cmdutils.c"
               "${MAICHAT_FFMPEG_SOURCE}/fftools/opt_common.c"
               "${MAICHAT_FFMPEG_SOURCE}/fftools/mai_fftools_embed.h"
@@ -1876,11 +1877,17 @@ if((APPLE AND TARGET maiagent_embedded_fftools) OR
   if(APPLE)
     target_link_libraries(MaiEmbeddedFfmpegToolsTest PRIVATE maiagent_embedded_fftools)
   else()
+    target_include_directories(MaiEmbeddedFfmpegToolsTest PRIVATE
+      ${MAICHAT_FFMPEG_BUILD_DIR}/install/include)
     target_link_libraries(MaiEmbeddedFfmpegToolsTest PRIVATE
       maichat_ffmpeg_tools maichat_image_filter)
   endif()
   add_test(NAME MaiEmbeddedFfmpegToolsTest COMMAND MaiEmbeddedFfmpegToolsTest
     ${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/Graphics/tests/fixtures/tiny-red.mp4)
+  add_test(NAME MaiEmbeddedFfmpegHelpSmokeTest COMMAND ${CMAKE_COMMAND}
+    "-DHELP_EXECUTABLE=$<TARGET_FILE:MaiEmbeddedFfmpegToolsTest>"
+    "-DHELP_EVIDENCE_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-help-evidence"
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify-ffmpeg-help.cmake)
 endif()
 
 add_executable(pdf_preview_dialog_test tests/PdfPreviewDialogTest.cpp)
@@ -2211,10 +2218,10 @@ foreach(context_regression MaiCoreTests MaiRuntimeTests MaiOpenAiSolTests MaiGlm
         MaiContextCompactorTests MaiSpecialistNotificationTests MaiSubAgentTests MaiTurnRunnerTests
         MaiContextBuilderImageTests MaiToolLoopTests MaiToolOutputReadTests
         MaiJournalStoreTests MaiJournalRuntimeTests MaiRolloutRuntimeFactsTests MaiModelContextUsageTests
-        MaiModelToolCatalogTests MaiToolDiscoveryRuntimeTests
+        MaiModelToolCatalogTests MaiToolDiscoveryRuntimeTests MaiToolHelpTests
         MaiUnifiedExecToolTests MaiShellToolTests MaiShellPtyTests MaiExecSessionTests
         MaiRequestBodyRecoveryTests MaiResponsesProtocolTests
-        MaiCustomPatchWireTests MaiToolTests MaiEditToolTests MaiApplyPatchToolTests
+        MaiCustomPatchWireTests MaiToolTests MaiPermissionTests MaiEditToolTests MaiApplyPatchToolTests
         MaiFileSearchTests MaiTextFileReaderTests MaiFilePathTests
         MaiSessionMigrationTests MaiSqliteProjectionMutationTests MaiSkillTests MaiSkillRuntimeTests
         MaiSkillInstallerTests MaiSkillDirectoryPublishTests
@@ -2246,6 +2253,8 @@ if(NOT TARGET MaiModelClientTests)
     target_compile_definitions(MaiModelClientTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(MaiModelClientTests PRIVATE ws2_32 crypt32)
   endif()
+  # Keep the normal desktop wrapper's Core protocol gate executable through CTest.
+  add_test(NAME MaiModelClientTests COMMAND MaiModelClientTests)
 endif()
 
 # Runtime validation of the pinned source SDK, with no native capture or provider calls.

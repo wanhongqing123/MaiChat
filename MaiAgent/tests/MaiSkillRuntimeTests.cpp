@@ -103,6 +103,38 @@ void prompt(MaiAgent& agent, const std::string& session, const std::string& text
     agent.waitIdle();
 }
 
+void testBundledSkillIsLoadedOnDemand(const MaiFilePath& root) {
+    const auto workspace = child(root, "bundled-runtime");
+    CHECK(!MaiFileSystem::createDirectories(workspace));
+    MaiAgent::Options options;
+    options.skillsEnabled = true;
+    options.skillOptions.includeBuiltinSkills = true;
+    options.skillOptions.homeDirectory = child(root, "bundled-home");
+    auto model = std::make_unique<SkillModel>();
+    model->windowTokens = 24000;
+    int attempts = 0;
+    model->respond = [&](const MaiModelRequest& request, const MaiStreamSink& sink, int attempt) {
+        ++attempts;
+        CHECK(request.baseInstructions.find("builtin-media") != std::string::npos);
+        CHECK(request.baseInstructions.find("# Local media workflows") == std::string::npos);
+        if (attempt == 1) {
+            CHECK(!hasToolResult(request, "# Local media workflows"));
+            sink.onToolCall({"read_builtin", "skill_read", R"({"skill":"builtin:builtin-media"})"});
+        } else {
+            CHECK(attempt == 2);
+            CHECK(hasToolResult(request, "# Local media workflows"));
+            CHECK(hasToolResult(request, "filter=scale"));
+            sink.onText("Read the requested bundled workflow.");
+        }
+        return MaiError{};
+    };
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), nullptr, options);
+    const auto session = createSession(agent, workspace);
+    prompt(agent, session, "Explain the local media workflow.");
+    CHECK(attempts == 2);
+    CHECK(!MaiFileSystem::exists(child(options.skillOptions.homeDirectory, ".agents/skills")));
+}
+
 void testStoreContextWinnerAndOwner() {
     auto store = makeMaiMemoryStore();
     MaiSession first;
@@ -773,6 +805,7 @@ int main() {
               "mai-skill-runtime-" +
                   std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     CHECK(!MaiFileSystem::createDirectories(root));
+    testBundledSkillIsLoadedOnDemand(root);
     testStoreContextWinnerAndOwner();
     testWorkerDiscoveryPinnedPrefixAndFreshBody(root);
     testSavedHeaderWinnerAndDisabledDefault(root);

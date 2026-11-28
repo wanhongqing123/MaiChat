@@ -30,7 +30,14 @@
 #include "ffmpeg.h"
 #include "ffmpeg_sched.h"
 #include "cmdutils.h"
+#ifdef MAI_FFMPEG_EMBEDDED
+#include "mai_fftools_embed.h"
+#endif
 #include "opt_common.h"
+#ifndef MAI_FFMPEG_EMBEDDED
+#define mai_fftools_text_printf printf
+#endif
+
 
 #include "libavformat/avformat.h"
 
@@ -178,11 +185,11 @@ static int show_hwaccels(void *optctx, const char *opt, const char *arg)
 {
     enum AVHWDeviceType type = AV_HWDEVICE_TYPE_NONE;
 
-    printf("Hardware acceleration methods:\n");
+    mai_fftools_text_printf("Hardware acceleration methods:\n");
     while ((type = av_hwdevice_iterate_types(type)) !=
            AV_HWDEVICE_TYPE_NONE)
-        printf("%s\n", av_hwdevice_get_type_name(type));
-    printf("\n");
+        mai_fftools_text_printf("%s\n", av_hwdevice_get_type_name(type));
+    mai_fftools_text_printf("\n");
     return 0;
 }
 
@@ -756,11 +763,11 @@ static int opt_init_hw_device(void *optctx, const char *opt, const char *arg)
 {
     if (!strcmp(arg, "list")) {
         enum AVHWDeviceType type = AV_HWDEVICE_TYPE_NONE;
-        printf("Supported hardware device types:\n");
+        mai_fftools_text_printf("Supported hardware device types:\n");
         while ((type = av_hwdevice_iterate_types(type)) !=
                AV_HWDEVICE_TYPE_NONE)
-            printf("%s\n", av_hwdevice_get_type_name(type));
-        printf("\n");
+            mai_fftools_text_printf("%s\n", av_hwdevice_get_type_name(type));
+        mai_fftools_text_printf("\n");
         return AVERROR_EXIT;
     } else {
         return hw_device_init_from_string(arg, NULL);
@@ -1289,7 +1296,7 @@ void show_help_default(const char *opt, const char *arg)
 
     show_usage();
 
-    printf("Getting help:\n"
+    mai_fftools_text_printf("Getting help:\n"
            "    -h      -- print basic options\n"
            "    -h long -- print more options\n"
            "    -h full -- print all options (including all format and codec specific options, very long)\n"
@@ -1374,7 +1381,7 @@ void show_help_default(const char *opt, const char *arg)
     if (show_advanced)
         show_help_options(options, "Data stream options:",
                           OPT_DATA, OPT_VIDEO | OPT_AUDIO | OPT_SUBTITLE);
-    printf("\n");
+    mai_fftools_text_printf("\n");
 
     if (show_avoptions) {
         int flags = AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM;

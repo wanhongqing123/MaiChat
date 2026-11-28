@@ -13,6 +13,7 @@
 #endif
 
 #include "MaiFileSystem.h"
+#include "MaiBuiltinSkills.h"
 #include "MaiModelClient.h"
 #include "MaiSkillManager.h"
 #include "MaiSkillTool.h"
@@ -34,6 +35,64 @@ MaiFilePath child(const MaiFilePath& path, const std::string& name) {
 void writeSkill(const MaiFilePath& directory, const std::string& text) {
     CHECK(!MaiFileSystem::createDirectories(directory));
     CHECK(!MaiFileSystem::writeFile(child(directory, "SKILL.md"), text));
+}
+
+// Builtins use the normal catalog/read contracts and never populate a user directory.
+void testBundledSkills(const MaiFilePath& root) {
+    auto manager = std::make_shared<MaiSkillManager>();
+    MaiSkillManagerOptions options;
+    const auto plain = manager->snapshot(options);
+    CHECK(plain && plain.value().skills().empty());
+    options.includeBuiltinSkills = true;
+    const auto catalog = manager->snapshot(options);
+    CHECK(catalog.isOk());
+    if (!catalog) return;
+    CHECK(catalog.value().skills().size() == maiBuiltinSkillResources().size());
+    CHECK(catalog.value().skills().size() == 5);
+    CHECK(catalog.value().errors().empty());
+    MaiSkillManager other;
+    for (const auto& resource : maiBuiltinSkillResources()) {
+        const std::string name(resource.name);
+        const auto read = manager->read(catalog.value(), "builtin:" + name);
+        CHECK(read.isOk());
+        if (read) {
+            CHECK(read.value().contents == resource.contents);
+            CHECK(read.value().metadata.scope == MaiSkillScope::Builtin);
+            CHECK(read.value().metadata.description == resource.description);
+            CHECK(manager->readCurrent(catalog.value(), name).isOk());
+            CHECK(!other.read(catalog.value(), read.value().metadata.id));
+        }
+    }
+    auto tool = makeMaiSkillTool(manager, catalog.value());
+    const auto result = tool->execute(R"({"skill":"builtin:builtin-media"})", {});
+    CHECK(!result.hasError());
+    CHECK(result.output().find("filter=scale") != std::string::npos);
+    CHECK(result.output().find("Local media workflows") != std::string::npos);
+    CHECK(!manager->read(catalog.value(), "builtin:builtin-media/../builtin-agent"));
+    options.maxBodyBytes = 64;
+    const auto small = manager->snapshot(options);
+    CHECK(small && !manager->read(small.value(), "builtin:builtin-media"));
+    options.maxBodyBytes = 256 * 1024;
+    options.maxDiscoveredSkills = 2;
+    const auto capped = manager->snapshot(options);
+    CHECK(capped && capped.value().skills().size() == 2);
+    CHECK(capped && !capped.value().errors().empty());
+    options.maxDiscoveredSkills = 2048;
+    options.homeDirectory = child(root, "builtin-user");
+    const auto userDir = child(options.homeDirectory, ".agents/skills/builtin-media");
+    const std::string userBody =
+        "---\nname: builtin-media\ndescription: Personal guide\n---\nKEEP USER BODY\n";
+    writeSkill(userDir, userBody);
+    const auto duplicate = manager->snapshot(options);
+    CHECK(duplicate && duplicate.value().skills().size() == 6);
+    if (duplicate) {
+        CHECK(!manager->read(duplicate.value(), "builtin-media"));
+        CHECK(manager->read(duplicate.value(), "builtin:builtin-media").isOk());
+        CHECK(duplicate.value().skills().front().scope == MaiSkillScope::User);
+    }
+    std::string after;
+    CHECK(!MaiFileSystem::readFile(child(userDir, "SKILL.md"), after));
+    CHECK(after == userBody);
 }
 
 void testDiscoveryAndRead(const MaiFilePath& root) {
@@ -506,6 +565,7 @@ int main() {
               "mai-skill-tests-" +
                   std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     CHECK(!MaiFileSystem::createDirectories(root));
+    testBundledSkills(root);
     testDiscoveryAndRead(root);
     testMetadataCompatibilityAndBudgets(root);
     testLazyReadAndConcurrentSnapshots(root);
