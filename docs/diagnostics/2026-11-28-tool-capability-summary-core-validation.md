@@ -382,3 +382,30 @@ file-drop39/0 only validates the unchanged composer v2 source, not this new Core
 No published4.0.2 tag/assets, user installation, backend, HTTP2 classification or FFmpeg output
 plumbing was modified. The old independent fullscreen failure remains tracked separately.
 No provider/model/paid media request or real credential access was performed for this work.
+
+
+## Exact-final Mac consumer accepted
+
+Mac consumed fd0d7cd7457f1cd7ff83de80471781e3314755e5. Normal target14.4
+configure/build returned0 (10.352s/58.269s); the four full same-final-TU consumers
+Catalog/Discovery/TurnRunner/InputQueue returned0, UI regression was39/0 and App
+smoke returned0 (3.084s). The host was macOS27.2 arm64; this does not establish
+runtime acceptance on14.4 or Intel.
+
+Root independently verified the supplied ZIP SHA256
+27b05c89e2a3b87f242389e4cfc18b960a53659f8d71c0cce7540af3200a5d6b,
+all21 manifest entries,26 canonical source inputs, four frozen test TUs and result
+logs. Actual archive/executable hashes are Mac-reported bindings; those binaries
+were not supplied for independent Root rehash. Private evidence remains outside
+this repository under the owned core-summary diagnostics directory.
+
+Real4k context fixtures on Mac used reserve128/input-budget3891 and
+reserve512/input-budget3584: baseline/feature tokens2591/2867 and2775/3051.
+All cases streamed once and completed. Mac's registry43/initial7/deferred36 and
+827-byte names summary differ from Windows44/initial7/deferred37 and859 bytes
+because the actual MAI_HAS_OPENSSL_CLI=1 branch registers one openssl tool;
+the fallback registers crypto_digest and crypto_certificate_info. Root checked
+that source branch and the32-byte names difference. No flags or fixtures were
+changed to force matching counts. Initial consumer compile failure from missing
+OpenSSL include paths was retained; only consumer paths were corrected to the
+actual App vendor/source includes before the successful build.

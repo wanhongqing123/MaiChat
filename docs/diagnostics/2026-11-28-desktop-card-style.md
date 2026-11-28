@@ -1,0 +1,54 @@
+# Desktop card styling, 2026-11-28
+
+## User operation and expected result
+
+Open a creation-center session, run a tool, expand its result, then add local
+files/images/video to the draft. The user requested a fresh visual treatment and
+explicitly limited the scope to card styling. Tool cards should have a light
+border, rounded white shell, soft blue details and color-coded status pills.
+Draft attachments should share the lighter border and remove-button treatment.
+The page/header/composer frame, contents, approval and disclosure actions,
+attachment identity and model payload must retain their existing behavior.
+
+## Source and review
+
+Baseline fd0d7cd7457f1cd7ff83de80471781e3314755e5. Only
+MaiChat/desktop/src/agent/AgentChatPanel.cpp changes product code. Metrics use
+UiZoom; card QSS targets object IDs to avoid applying card borders to children.
+Details preserve platform fixed-font family through UiZoom's TypeWriter path.
+Independent review caught the initial Monospace hint being overwritten by
+UiZoom; the final card-local fix uses TypeWriter, without changing shared UiZoom.
+No test or Core/transport source changed. Offline comparison confirms13 existing
+content/attachment/send methods retain their original text. No metadata was
+removed or added to the model conversation.
+
+## Windows verification
+
+Normal App and agent_panel_session_test were rebuilt from checked final overlays
+in the private r311 lane, which retains its older checkout plus verified source
+inputs. Final source LF SHA256 is
+aeb0483e686e2740b4e6ab86a279b565f1b4c7017063c42d379bd66551e7b85a.
+Build returned0 (24.946s), including windeployqt and the PE import gate.
+The official Windows wrapper, native windows QPA and isolated profiles ran the
+existing39 attachment/media/text/header/receipt cases plus lazy disclosure,
+consecutive tools and two approval/session cases:43 passed,0 failed (12239ms).
+The earlier pre-font-correction43/0 result is retained separately.
+
+Developer inspected final actual QWidget screenshots of completed/long tool
+receipts and ordinary attachment drafts. Cards, status pills, escaped Windows
+paths and separate output lines remain visible; long output retains its existing
+truncation notice. Images come from owned fixture data, not user conversations.
+The supplied HTML proposal was a design sketch, not an App screenshot. Evidence
+is private under .cache/ui-refresh-20261128/windows-final-02/.
+
+This does not claim manual Finder/Explorer drag or mobile runtime acceptance.
+No user installation, model/provider request, backend operation or published
+4.0.2 release asset is involved. Mac exact-source card verification is pending.
+
+
+Final normal staging and independently extracted ZIP each passed bare-PATH smoke
+with owned profiles and matching executable SHA256
+8dafaddbe9c80c8ec699710498062ef9814c673cfab48fbcd758b4191093296a.
+Package/stage/ZIP exits were0; receipt is private under
+.cache/ui-refresh-20261128/candidate-windows-final-01/receipt.json.
+This was a private validation package, not a replacement release asset.

@@ -25,6 +25,7 @@
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
 #include <QFileInfo>
+#include <QFontDatabase>
 #include <QFontMetrics>
 #include <QFrame>
 #include <QFutureWatcher>
@@ -1140,8 +1141,9 @@ public:
         // 按 id 选只命中这张卡本身。
         setObjectName(QStringLiteral("agentToolCard"));
         auto* column = new QVBoxLayout(this);
-        column->setContentsMargins(0, UiZoom::s(2), 0, UiZoom::s(2));
-        column->setSpacing(UiZoom::s(5));
+        // 只调整卡片视觉留白；现有展开、授权和详情的装配顺序保持一致。
+        column->setContentsMargins(UiZoom::s(12), UiZoom::s(10), UiZoom::s(12), UiZoom::s(10));
+        column->setSpacing(UiZoom::s(8));
 
         auto* head = new QHBoxLayout;
         head->setSpacing(UiZoom::s(8));
@@ -1149,6 +1151,10 @@ public:
         icon_->setWordWrap(false);
         name_ = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkSoft);
         name_->setWordWrap(false);
+        QFont nameFont = name_->font();
+        nameFont.setWeight(QFont::DemiBold);
+        UiZoom::setFont(name_, UiZoom::TextRole::Metadata, nameFont);
+        UiZoom::setStyle(name_, QStringLiteral("color:#344c63;background:transparent;"));
         state_ = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkFaint);
         state_->setWordWrap(false);
         expand_ = new QPushButton(QStringLiteral("›"));
@@ -1156,8 +1162,9 @@ public:
         expand_->setCursor(Qt::PointingHandCursor);
         expand_->setFixedSize(UiZoom::s(22), UiZoom::s(22));
         expand_->setStyleSheet(
-            QStringLiteral("QPushButton{background:transparent;border:none;color:#"
-                           "98a2b3;padding:0;}"));
+            UiZoom::scaleQss(QStringLiteral("QPushButton{background:transparent;border:none;color:#8195a8;"
+                                            "border-radius:7px;padding:0;}"
+                                            "QPushButton:hover{background:#edf6fc;color:#3987bc;}")));
         expand_->hide();
         head->addWidget(icon_);
         head->addWidget(name_);
@@ -1173,15 +1180,15 @@ public:
         detail_->setTextInteractionFlags(Qt::TextSelectableByMouse);
         detail_->setTextFormat(Qt::PlainText);
         QFont detailFont = detail_->font();
-        detailFont.setStyleHint(QFont::Monospace);
-        detailFont.setFamily(QStringLiteral("Menlo"));
-        detail_->setFont(detailFont);
+        // UiZoom preserves explicit fixed-font families for the TypeWriter role.
+        detailFont.setStyleHint(QFont::TypeWriter);
+        detailFont.setFamily(QFontDatabase::systemFont(QFontDatabase::FixedFont).family());
+        UiZoom::setFont(detail_, UiZoom::TextRole::Detail, detailFont);
         detail_->setStyleSheet(
-            // 详情块必须与窗口底色有明确区分：浅蓝灰底 + 可见边框，不能融进背景。
-            UiZoom::scaleQss(QStringLiteral("QLabel#agentToolDetail{background:#f4f6fb;"
-                                            "border:1px solid #c9d2e0;"
-                                            "border-radius:7px;color:%1;padding:9px;}")
-                                 .arg(kInk)));
+            // 浅蓝详情承托原有纯文本，不改变内容、截断规则或懒加载行为。
+            UiZoom::scaleQss(QStringLiteral("QLabel#agentToolDetail{background:#f5f9fd;"
+                                            "border:1px solid #e4edf5;"
+                                            "border-radius:10px;color:#354d63;padding:12px;}")));
         detail_->hide();
         column->addWidget(detail_);
 
@@ -1193,12 +1200,14 @@ public:
         deny_ = new QPushButton(QStringLiteral("拒绝"));
         always_ = new QPushButton(QStringLiteral("本会话都允许"));
         UiZoom::setStyle(allow_, QStringLiteral("QPushButton{background:%1;color:#fff;"
-                                                "border:none;border-radius:6px;"
-                                                "padding:4px 14px;}")
+                                                "border:none;border-radius:8px;"
+                                                "padding:4px 14px;}"
+                                                "QPushButton:hover{background:#238dc9;}")
                                      .arg(kAccent));
         UiZoom::setStyle(deny_, QStringLiteral("QPushButton{background:#fff;color:%1;border:1px solid %2;"
-                                               "border-radius:6px;padding:4px 14px;}")
-                                    .arg(kInk, kLine));
+                                               "border-radius:8px;padding:4px 14px;}"
+                                               "QPushButton:hover{background:#f2f7fb;}")
+                                    .arg(kInk, QStringLiteral("#dce7f0")));
         always_->setStyleSheet(
             UiZoom::scaleQss(QStringLiteral("QPushButton{background:transparent;color:%1;border:none;"
                                             "padding:4px 6px;text-decoration:underline;}")
@@ -1233,7 +1242,8 @@ public:
     }
 
     void apply(MaiToolState toolState, bool waitingForUser) {
-        const char* edge = kInkFaint;
+        const char* edge = "#8799ad";
+        const char* badge = "#f0f5f9";
         QString label;
         const bool wasWaiting = waiting_;
         stateValue_ = toolState;
@@ -1245,31 +1255,39 @@ public:
         }
         switch (toolState) {
             case MaiToolState::Pending:
-                edge = waitingForUser ? "#d9a441" : kInkFaint;
+                edge = waitingForUser ? "#a77a26" : "#8799ad";
+                badge = waitingForUser ? "#fff7e8" : "#f0f5f9";
                 label = waitingForUser ? QStringLiteral("等你点头") : QStringLiteral("排队中");
                 break;
             case MaiToolState::Running:
-                edge = kAccent;
+                edge = "#287fb9";
+                badge = "#eaf5ff";
                 label = QStringLiteral("执行中…");
                 break;
             case MaiToolState::Completed:
-                edge = "#12b76a";
+                edge = "#1a896b";
+                badge = "#eaf8f2";
                 label = QStringLiteral("完成");
                 break;
             case MaiToolState::Error:
-                edge = kDanger;
+                edge = "#bd526b";
+                badge = "#fff0f3";
                 label = QStringLiteral("失败");
                 break;
             case MaiToolState::Canceled:
-                edge = kInkFaint;
+                edge = "#8799ad";
                 label = QStringLiteral("已取消");
                 break;
         }
         state_->setText(label);
-        state_->setStyleSheet(QStringLiteral("color:%1;background:transparent;")
-                                  .arg(toolState == MaiToolState::Error ? kDanger : kInkFaint));
-        setStyleSheet(QStringLiteral("QFrame#agentToolCard{background:transparent;border:none;}"));
-        icon_->setStyleSheet(QStringLiteral("color:%1;background:transparent;").arg(edge));
+        UiZoom::setStyle(state_, QStringLiteral("color:%1;background:%2;border:none;"
+                                                "border-radius:9px;padding:3px 8px;")
+                                     .arg(edge, badge));
+        UiZoom::setStyle(this, QStringLiteral("QFrame#agentToolCard{background:#ffffff;"
+                                              "border:1px solid #dfeaf1;border-radius:13px;}"));
+        UiZoom::setStyle(icon_, QStringLiteral("color:%1;background:%2;border:none;"
+                                               "border-radius:8px;padding:4px 6px;")
+                                    .arg(edge, badge));
         approval_->setVisible(waitingForUser);
         always_->setVisible(waitingForUser && allowForSession_ && !rememberOnApproval_ && !isVideoTaskManagement());
         if (waitingForUser && !allowForSession_) {
@@ -4823,7 +4841,9 @@ void AgentChatPanel::refreshComposerMediaTray() {
                                      : video ? QStringLiteral("agentVideoDraftCard") : QStringLiteral("agentImageDraftCard"));
             card->setToolTip(QStringLiteral("<qt>%1</qt>").arg(path.toHtmlEscaped()));
             card->setFixedSize(UiZoom::s(136), UiZoom::s(90));
-            card->setStyleSheet(QStringLiteral("background:#f3f7fb;border-radius:8px;"));
+            UiZoom::setStyle(card, QStringLiteral("QWidget#agentFileDraftCard, QWidget#agentImageDraftCard, "
+                                                  "QWidget#agentVideoDraftCard{background:#ffffff;"
+                                                  "border:1px solid #dfeaf3;border-radius:10px;}"));
             auto* cover = new QLabel(card);
             cover->setGeometry(0, 0, UiZoom::s(136), UiZoom::s(70));
             cover->setScaledContents(true);
@@ -4834,6 +4854,8 @@ void AgentChatPanel::refreshComposerMediaTray() {
                 document->addResource(QTextDocument::ImageResource, QUrl(name), marker);
                 cover->setAlignment(Qt::AlignCenter);
                 cover->setText(QStringLiteral("文件\n%1").arg(QFileInfo(path).suffix().left(12).toUpper()));
+                UiZoom::setStyle(cover, QStringLiteral("background:#eff7ff;color:#4385b8;"
+                                                       "border:none;border-radius:9px;font-size:@metadata;"));
             } else if (video) {
                 QImage marker(1, 1, QImage::Format_ARGB32_Premultiplied);
                 marker.fill(Qt::transparent);
@@ -4875,14 +4897,17 @@ void AgentChatPanel::refreshComposerMediaTray() {
                          QFileInfo(path).fileName()));
             remove->setGeometry(UiZoom::s(109), UiZoom::s(2), UiZoom::s(25), UiZoom::s(25));
             remove->setCursor(Qt::PointingHandCursor);
-            remove->setStyleSheet(
-                QStringLiteral("QPushButton{background:rgba(0,0,0,180);border:0;border-radius:12px;color:white;}"));
+            UiZoom::setStyle(remove, QStringLiteral("QPushButton{background:#ffffff;border:1px solid #dfebf3;"
+                                                    "border-radius:12px;color:#7892a8;}"
+                                                    "QPushButton:hover{background:#fff0f3;border-color:#f4d5df;"
+                                                    "color:#bd526b;}"));
             connect(remove, &QPushButton::clicked, this, [this, name] { removeComposerMedia(name); });
             auto* label = new QLabel(QFileInfo(path).fileName().replace(QLatin1Char('\n'), QLatin1Char(' ')), card);
             label->setTextFormat(Qt::PlainText);
             label->setGeometry(UiZoom::s(4), UiZoom::s(72), UiZoom::s(128), UiZoom::s(16));
             label->setText(label->fontMetrics().elidedText(label->text(), Qt::ElideMiddle, UiZoom::s(124)));
-            UiZoom::setStyle(label, QStringLiteral("color:#172033;background:transparent;font-size: @metadata;"));
+            UiZoom::setStyle(label, QStringLiteral("color:#39566e;background:transparent;"
+                                                   "border:none;font-size: @metadata;"));
             row->addWidget(card);
         }
         if (pending > 0) {
