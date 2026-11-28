@@ -1,6 +1,8 @@
 """Keep Ninja's MSVC include marker ASCII, independently of the console code page."""
 
 import argparse
+import ctypes
+import locale
 import re
 import subprocess
 import sys
@@ -38,13 +40,38 @@ def probe(compiler):
         return include_prefix(result.stdout, header.name.encode("ascii")).hex()
 
 
+def include_prefixes(prefix):
+    # CMake retains the original probe bytes across builds. cl can later emit
+    # the same localized marker as UTF-8 instead of the Windows ANSI code page.
+    # Decode only the marker, strictly; never transcode a path or diagnostic.
+    ansi = ("cp" + str(ctypes.windll.kernel32.GetACP())
+            if sys.platform == "win32" else locale.getpreferredencoding(False))
+    encodings = ("utf-8", ansi)
+    variants = {prefix}
+    for encoding in encodings:
+        try:
+            marker = prefix.decode(encoding)
+        except UnicodeError:
+            continue
+        for target in encodings:
+            try:
+                variants.add(marker.encode(target))
+            except UnicodeError:
+                pass
+        break
+    return sorted(variants, key=len, reverse=True)
+
+
 def launch(prefix, command):
     # Stream diagnostics as bytes. Only the include marker changes; paths,
     # warnings, errors and the compiler's exit status remain intact.
+    prefixes = include_prefixes(prefix)
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     for line in process.stdout:
-        if line.startswith(prefix):
-            line = MARKER + line[len(prefix):]
+        for candidate in prefixes:
+            if line.startswith(candidate):
+                line = MARKER + line[len(candidate):]
+                break
         sys.stdout.buffer.write(line)
         sys.stdout.buffer.flush()
     return process.wait()

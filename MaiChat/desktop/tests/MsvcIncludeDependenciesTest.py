@@ -1,9 +1,11 @@
 """Exercise real MSVC/Ninja transitive header invalidation, including spaced paths."""
 
 import argparse
+import ctypes
 import importlib.util
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -32,6 +34,42 @@ def main():
         marker = "\u6ce8\u610f: \u5305\u542b\u6587\u4ef6:".encode(encoding)
         path = "C:\\Users\\\u6d4b\u8bd5\\maichat_include_probe.h".encode(encoding)
         assert includes.include_prefix(marker + b"  " + path, owned_header) == marker
+    # A configured build can retain an ACP probe while later cl output is UTF-8.
+    # Keep that equivalent saved marker in the real target launcher, rather than
+    # reprobe immediately before each compilation and hide stale dependency data.
+    code_page = "cp" + str(ctypes.windll.kernel32.GetACP())
+    detected = bytes.fromhex(includes.probe(args.compiler))
+    try:
+        marker_text = detected.decode("utf-8")
+    except UnicodeError:
+        marker_text = detected.decode(code_page)
+    marker_encodings = []
+    for encoding in ("utf-8", code_page):
+        try:
+            marker_text.encode(encoding)
+        except UnicodeError:
+            continue
+        marker_encodings.append(encoding)
+    configured = marker_text.encode(marker_encodings[-1])
+    if configured == detected:
+        configured = marker_text.encode(marker_encodings[0])
+    # Only the leading marker may change. Include suffixes deliberately contain
+    # undecodable bytes, and diagnostics contain the same marker away from BOL.
+    suffix = b"   C:\\owned space \\raw-\xff\\contract.h\r\n"
+    for configured_encoding in marker_encodings:
+        for emitted_encoding in marker_encodings:
+            saved_marker = marker_text.encode(configured_encoding)
+            emitted_marker = marker_text.encode(emitted_encoding)
+            diagnostic = b"warning C9999: preserve " + emitted_marker + b" \x81\r\n"
+            result = subprocess.run(
+                [sys.executable, str(launcher), "--include-prefix-hex", saved_marker.hex(), "--",
+                 sys.executable, "-c",
+                 "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1])); "
+                 "sys.stdout.buffer.flush(); sys.stderr.buffer.write(bytes.fromhex(sys.argv[2])); "
+                 "sys.exit(7)", (emitted_marker + suffix).hex(), diagnostic.hex()],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            assert result.returncode == 7, result.stdout
+            assert result.stdout == includes.MARKER + suffix + diagnostic, result.stdout
     with tempfile.TemporaryDirectory(prefix="maichat deps \u8def\u5f84 ") as directory:
         root = Path(directory)
         build = root / "build"
@@ -53,6 +91,12 @@ def main():
         (root / "child/CMakeLists.txt").write_text(
             'project(NestedConsumer LANGUAGES C CXX)\n'
             'add_executable(include_probe ../main.cpp ../probe.c)\n'
+            'target_compile_options(include_probe PRIVATE /utf-8)\n'
+            f'string(REPLACE "${{_maichat_include_prefix}}" "{configured.hex()}" '
+            '_saved_launcher "${CMAKE_CXX_COMPILER_LAUNCHER}")\n'
+            'set_target_properties(include_probe PROPERTIES '
+            'C_COMPILER_LAUNCHER "${_saved_launcher}" '
+            'CXX_COMPILER_LAUNCHER "${_saved_launcher}")\n'
             'set_target_properties(include_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")\n',
             encoding="utf-8")
         run([args.cmake, "-S", str(root), "-B", str(build), "-G", "Ninja",
